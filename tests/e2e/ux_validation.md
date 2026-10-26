@@ -1,0 +1,251 @@
+# Made terminal-first v1 UX validation checklist
+
+This checklist retains the pre-split v1 scenario evidence plan. The normative contracts are now
+[`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md)
+for behavior and [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md)
+for UI/UX. Rows below preserve the original 97 scenario evidence plan; UI-derived presentation
+scenarios are tracked in [made-ui-ux-v1 tasks](../../specs/changes/made-ui-ux-v1/tasks.md)
+and [v1 evidence](../../wiki/records/20261026-v1-evidence.md).
+
+## How to read this checklist
+
+| Method | Meaning |
+|---|---|
+| **Automated** | A model/headless test asserts the behavior. |
+| **Automated + Xvfb** | Recorded Linux GUI/process evidence under Xvfb/software rendering; not native desktop. |
+| **Automated + real shell/spike** | Real installed-shell or Phase 0 evidence in the stated scope. |
+| **Manual pending** | Requires a native desktop/OS/input platform and has not been run. |
+| **Pending** | No current evidence; do not mark pass. |
+
+The `Expected` column is the spec `Then` clause verbatim. Do not weaken it. Manual rows need a recorded platform run with command/log and screenshot/recording. Final performance detail: [Performance](../../wiki/performance.md). Curated screenshots: [wiki assets](../../wiki/assets/screenshots/).
+
+Commands use `cargo test` from the repository root. Current Linux baseline: **602 passed, 0 failed,
+2 ignored**; final software performance is in
+[Performance](../../wiki/performance.md). Every scenario remains
+pending for native Linux/macOS/Windows input unless marked otherwise.
+
+## Workspace Launch
+
+> Made MUST accept an explicit workspace folder at launch through a launch argument or equivalent mechanism. When no workspace folder and no `--picker` request is provided, Made MUST open the current user's home directory as the workspace without blocking on a folder picker; this default MUST use the platform's user-home resolution and behave the same way on macOS, Linux, and Windows. The in-app folder picker MUST remain available through an explicit UI action and a `--picker` launch flag. An explicit workspace path (`--workspace <path>` or positional) MUST take precedence over `--picker`. Made MUST open the selected workspace folder and present a usable terminal whose shell starts in that folder and an explorer rooted at that folder. If the home directory cannot be opened, Made MUST show a visible workspace error, keep a usable terminal in a fallback directory, and MUST NOT replace startup with a blocking picker or crash. Shell and explorer startup MUST NOT depend on OpenCode installation, startup, version detection, plugin readiness, or connection. Made MUST NOT automatically launch OpenCode. The test-only smoke harness without a folder MAY retain its no-workbench startup behavior so automated checks do not start a real home shell.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| WL-01 | Workspace chosen via picker or argument | Automated + Xvfb | launch/picker tests; explicit workspace smoke; picker and workspace captures | the terminal shell starts with that folder as its working directory and the explorer shows that folder as its root | crates/made-app/tests/launch_workspace.rs; ui_model.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) RF-4; [picker](../../wiki/assets/screenshots/picker-1280.png), [workspace](../../wiki/assets/screenshots/workspace-glass-1280.png) |
+| WL-02 | No workspace provided | Automated + Xvfb | no-arg home smoke with isolated HOME; home shell cwd and explorer root checked | Made opens the current user's home directory directly with a usable terminal and explorer and does not show a blocking folder picker | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) RF-1; launch_workspace::no_workspace_opens_the_platform_home_as_the_default_workspace; ui_model::app_model_without_a_workspace_opens_the_default_home_not_the_picker |
+| WL-03 | Picker requested explicitly | Automated + Xvfb | `--picker` smoke (`surface=picker`); no process before confirmation; picker selected/Close captures | the folder picker is the explicit selection surface, no workspace process starts before confirmation, and the confirmed folder opens in the current or a new workspace tab as appropriate | launch_workspace::picker_selection_shows_only_the_picker_until_confirmed; ui_model picker close/selection tests; [picker](../../wiki/assets/screenshots/picker-1280.png) |
+| WL-04 | Explicit workspace overrides picker | Automated | CLI precedence and launch-state tests | it opens the explicit workspace folder and does not show the picker | crates/made-app/src/cli.rs tests; launch_workspace::an_explicit_workspace_overrides_the_default_home |
+| WL-05 | Workspace remains usable before OpenCode starts | Automated + Xvfb | no-OpenCode smoke: terminal/explorer running, status inactive; shells don't wait | the shell and explorer are immediately usable in the chosen folder, no OpenCode launch/detection/connection is awaited, and normal shell use is not presented as degraded | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) TF-1/TF-3; crates/made-app/tests/launch_workspace.rs |
+| WL-06 | Invalid workspace folder | Automated | invalid/missing/unreadable workspace tests | Made shows a clear workspace error, keeps the terminal usable, and does not crash | crates/made-app/tests/invalid_workspace.rs; ui_model.rs |
+| WL-07 | Default home workspace unavailable | Automated | missing, unresolvable and non-directory home tests; terminal-only fallback | Made shows a visible workspace error, keeps a usable terminal in a fallback directory, does not block on the folder picker, and does not crash | launch_workspace::{a_missing_default_home_falls_back_to_a_usable_terminal_without_a_picker, an_unresolvable_home_falls_back_terminal_only, a_non_directory_home_falls_back_terminal_only}; ui_model::an_invalid_workspace_keeps_the_terminal_surface_and_reports_the_error |
+
+## OpenCode Integration Loading
+
+> Made MUST observe the active OpenCode v2 session identity and working directory as the user switches sessions. Made MUST load its integration without persistently modifying the user's OpenCode configuration.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| IL-01 | Plugin loads on first OpenCode launch | Automated + spike; revised app-level pending | plugin tests 29/29 and Phase 0 gate; app-level real OpenCode not re-run on revised build | Made receives the active session identity and working directory and reports connected state in Diagnostics without adding routine technical status chrome | crates/made-app/tests/degraded.rs; [Phase 0 gate](../../wiki/records/20261025-phase-0-gate.md) (harness removed) |
+| IL-02 | Existing user plugins are preserved | Automated + spike; real user plugin pending | config injection/immutability tests and spike fixture preservation | those extensions remain available, the Made integration is added for that launch, and the user's configuration file content is unchanged after OpenCode exits | crates/made-bridge/tests/config_injection.rs, config_immutability.rs; [Phase 0 gate](../../wiki/records/20261025-phase-0-gate.md) (harness removed) |
+| IL-03 | No OpenCode session yet | Automated (model); real app pending | degraded/session-follow no-active tests; shell fallback tests | Diagnostics reports connected with no active session and the explorer follows the latest known shell cwd, falling back to the launch folder only until cwd is known | crates/made-app/tests/degraded.rs; session_follow.rs |
+
+## Shell Directory Follow
+
+> For supported launch-local shell integration, Made MUST follow real directory changes in bash, zsh, fish and PowerShell, including paths with spaces and non-ASCII characters, without requiring user configuration edits. Directory reports MUST be validated as local absolute paths, bounded, and treated as untrusted data, never commands. Made MUST NOT scrape prompts or titles, or inject commands into an already-running shell to discover cwd. Hooks MUST be scoped to that shell launch, preserve existing startup/profile behavior and prompt hooks, and leave user shell files byte-for-byte unchanged. If a shell, launch mode or policy cannot safely support reporting, Made MUST keep the terminal usable at the latest known cwd or initial folder and explain the capability in Diagnostics without claiming live follow. cmd MUST have this explicit fallback unless a safe reporting mechanism is demonstrated; receiving OSC 7 alone MUST NOT be described as guaranteed cmd or arbitrary-shell integration.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| SDF-01 | Real shell directory change | Automated + real bash; zsh/fish/PS pending | real bash rc + `cd` spaces/Unicode; shell integration tests; workspace_tabs bash test | the owning explorer follows the reported directory within the 500 ms SHOULD target without restarting the shell or requiring OpenCode | [v1 evidence](../../wiki/records/20261026-v1-evidence.md); crates/made-platform/tests/shell_integration.rs; workspace_tabs::isolated_real_bash_cd_follows_hidden_tabs_without_painting |
+| SDF-02 | Shell hooks preserve user setup | Automated + real bash; zsh/fish/PS pending | real bash rc hash; shell integration profile/zsh source tests | those behaviors remain intact, cwd reports are emitted, user shell files are unchanged, and only that launch's app-owned bootstrap resources are cleaned up | [v1 evidence](../../wiki/records/20261026-v1-evidence.md); crates/made-platform/tests/shell_integration.rs |
+| SDF-03 | Unsupported or restricted cwd reporting | Automated + real fallback | dash unsupported-shell smoke and Diagnostics capability/reason | the shell remains usable, Made does not claim guaranteed live follow, the latest known cwd or launch folder remains the fallback, and Diagnostics explains capability and reason | [v1 evidence](../../wiki/records/20261026-v1-evidence.md); crates/made-platform/tests/shell_integration.rs |
+| SDF-04 | Malformed or unavailable shell directory | Automated + native deleted-cwd pass | OSC 7 malformed tests; deleted-in-place shell root revalidation test | invalid data cannot change the root or execute anything, unavailable local roots receive contextual feedback without showing unrelated contents as current, and the terminal remains usable | crates/made-terminal/tests/emulation.rs; workspace_tabs::deleted_in_place_shell_root_is_marked_unavailable_once_and_recovers |
+| SDF-05 | Active OpenCode overrides shell then returns | Automated (model); live OpenCode pending | shell/OpenCode precedence model tests; live revised run pending | B wins while active, C is retained independently, and the explorer switches to C after disconnect rather than retaining B | crates/made-app/tests/session_follow.rs; workspace_tabs.rs |
+
+## Independent Workspace Tabs
+
+> Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tabs MUST be visually distinct from the optional OpenCode session map. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. No tab persistence across app restart is required.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| IWT-01 | Open and switch independent workspaces | Automated + Xvfb | 3-tab GUI/model test and captures | both shells remain alive with separate cwd, explorer, session state and input focus, and each tab restores its own preview mode, selection and explorer layout | workspace_tabs::three_live_tabs_keep_independent_resources_and_close_only_the_owner; [tabs](../../wiki/assets/screenshots/tabs-1100.png) |
+| IWT-02 | Workspace bridge isolation | Automated | two bridge endpoints/tokens/pane-id isolation; cross-workspace rejection | only its own accepted state can change, cross-workspace routing is rejected without disclosure, and the other connection and explorer remain unchanged | crates/made-bridge/tests/security.rs; crates/made-app/tests/workspace_tabs.rs |
+| IWT-03 | Close workspace releases only its resources | Automated + Xvfb | close-owner test; close B left A/C live; final close picker | only that tab's resources are terminated/released, late results are discarded, and the surviving tab remains live and unchanged | workspace_tabs.rs; [tabs](../../wiki/assets/screenshots/tabs-1100.png) |
+| IWT-04 | Close final workspace | Automated + Xvfb | close final workspace test / GUI close | its resources are released and Made returns to the folder picker without launching another shell or OpenCode | crates/made-app/tests/workspace_tabs.rs; ui_model.rs |
+| IWT-05 | Hidden workspaces remain current and bounded | Automated + perf | hidden-tab bounded/no hidden paint final perf; workspace_tabs hidden test | output and connection state have progressed with bounded queues/scrollback, no hidden grid was painted, no input was sent to the inactive tab, and current state is displayed without an unbounded replay | [Performance](../../wiki/performance.md); workspace_tabs.rs |
+
+## Minimal Workspace Layout
+
+> Made MUST preserve the implemented Calm Editor theme while reducing default chrome to workspace tabs, essential folder context and discoverable controls. Persistent header actions MUST be icon-only buttons with tooltips and accessible labels: Open folder, Explorer toggle, Diagnostics, and the optional Sessions action when shown. The top header MUST NOT show text labels for these actions; the Made identity and workspace-tab folder labels remain text, and workspace tabs MUST retain a close affordance. Routine integration, shell-running, watcher, version, branch, revision and performance statuses MUST NOT consume persistent banners, pills, path/status rows or empty session strips; technical details belong in Diagnostics. Real shell/input, file/root and explicitly requested action errors MUST remain contextual and non-blocking. The explorer MUST occupy the full right content column with no preview below it, MUST be hideable/restorable through the header Explorer toggle, and MUST have a resizable width constrained to leave a usable left pane. Explorer width MUST be adjusted only by pointer-dragging its divider; the explorer header MUST NOT contain Wider, Narrower, Reload or Hide text actions. At rest the divider MUST NOT paint a persistent line or grip; hover or drag MAY reveal a thin line/grip while retaining a comfortable pointer hit area. Hiding it MUST give the left surface the reclaimed width without killing the shell, resetting the root or losing tree/preview state; restoring MUST reconcile changes that occurred while hidden. Width and visibility need only be retained for that live workspace, not across app restart. All persistent controls MUST remain keyboard reachable, have accessible names, and show visible focus at both 1280×800 and 720×480, with no clipped essential actions or noisy default technical chrome. The divider is pointer-drag only and is not a keyboard stop; hide/restore remains keyboard reachable through the header Explorer toggle.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| MWL-01 | Quiet shell workspace | Automated + Xvfb captures | quiet workspace model test; in-app glass/native fallback, wordmark/tab and captures; no status bar/banner/preview placeholder | a usable terminal and full-height right explorer appear without an empty preview, empty session strip, degraded/waiting banner, technical status bar or routine status pills; the header shows only icon-only Open folder, Explorer and Diagnostics actions with accessible labels, and the explorer header shows no text action buttons | crates/made-app/tests/ui_model.rs::quiet_workspace_chrome_has_no_default_technical_status; theme::glass_tokens_are_translucent_and_tonal; theme::clear_color_respects_the_kill_switch_and_native_backdrop; native_backdrop Linux fallback smoke; [workspace](../../wiki/assets/screenshots/workspace-glass-1280.png), [tabs](../../wiki/assets/screenshots/tabs-1100.png) |
+| MWL-02 | Icon-only header controls | Automated + Xvfb | icon header tests; 1280/720 captures; tooltip and focus checks | Open folder, Explorer toggle, Diagnostics and the visible optional Sessions action are icon-only with matching tooltips and accessible labels, no persistent action text labels are rendered, workspace tabs retain their close affordance, and each action is reachable and visibly focused by keyboard | ui_model::icon_only_header_actions_expose_tooltips_and_visible_focus; ui_model::optional_session_map_appears_only_after_session_data; ui_model::quiet_workspace_chrome_has_no_default_technical_status; [workspace chrome](../../wiki/assets/screenshots/tabs-1100.png) |
+| MWL-03 | Explorer hide and restore | Automated + Xvfb captures | explorer hide/restore/resize and animation tests; mid-animation capture | the left surface reclaims/releases its width, shell and preview state survive, the restored tree reflects current files while preserving valid expansion/selection, and the toggle remains reachable and focused by keyboard | ui_model::explorer_hide_restore_and_resize_keep_state_and_reclaim_width; ui_model::explorer_animation_slides_without_reflow_and_stops_capturing_when_closed; [explorer animation](../../wiki/assets/screenshots/explorer-mid-animation-1280.png) |
+| MWL-04 | Explorer resize and compact layout | Automated + Xvfb 720 | compact/explorer resize tests and 720 capture | its full-height width changes within usable bounds, the divider is invisible at rest and reveals a thin line/grip on hover or drag, the active left surface reflows without terminal corruption, no Wider/Narrower/Reload/Hide text action is present, essential controls have visible focus and do not clip, and the pointer-only divider is not a keyboard stop | ui_model::compact_layout_keeps_essential_controls_inside_the_window; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| MWL-05 | Explorer header action removal | Automated + Xvfb | explorer header capture; quiet test rejects Wider/Narrower/Reload/Hide text | no Wider, Narrower, Reload or Hide text action is present, and no routine manual refresh control is offered for normal live updates | ui_model::quiet_workspace_chrome_has_no_default_technical_status; [workspace](../../wiki/assets/screenshots/workspace-glass-1280.png) |
+| MWL-06 | Hover-only explorer divider | Automated + Xvfb | splitter rest/hover/drag paint and width test; captures | no vertical divider line or grip is painted; when hovered or dragged, a thin line/grip appears while the pointer hit area remains usable, and a mere hover does not change the stored per-workspace width | ui_model::explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag; [divider](../../wiki/assets/screenshots/divider-hover-1280.png) |
+
+## Active Session Follow
+
+> While integration is connected with an active OpenCode session directory, the explorer MUST follow that directory in its owning workspace tab, taking precedence over shell cwd. Without such an active directory, including disconnect and normal OpenCode exit, Made MUST resume the latest known shell cwd, then the launch folder if none is known; an old agent root MUST NOT override that fallback. Shell cwd updates MUST continue to be recorded while OpenCode takes precedence. When the active session changes, Made MUST update the explorer root as soon as the change is received and SHOULD complete it within 500 ms for a local workspace. Made MUST NOT redirect to a repository's main checkout by default. An unavailable active directory MUST be represented as unavailable, not silently replaced with unrelated root content.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| ASF-01 | Switch between sessions in the same worktree | Automated (model); live pending | same-worktree session-follow test | the explorer root stays the same and the active-session indication updates | crates/made-app/tests/session_follow.rs |
+| ASF-02 | Switch to a session in a different worktree | Automated (model); live pending | different-worktree model test; historical real worktree follow | the explorer switches to that worktree root and the terminal content is unchanged, with the switch completing within the 500 ms SHOULD target | crates/made-app/tests/session_follow.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) (historical) |
+| ASF-03 | Active session returns to main checkout | Automated (model); live pending | main-checkout model test; historical real main follow | the explorer shows the main checkout because it is the active directory, not because Made defaults to it | crates/made-app/tests/session_follow.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) (historical) |
+| ASF-04 | Rapid tab switching | Automated (model); live pending | rapid switching/stale revision test | the explorer shows the final session's directory and no stale session update overwrites it | crates/made-app/tests/session_follow.rs |
+| ASF-05 | Active session directory unavailable | Automated (model) | missing/unreadable active directory tests | Made shows an unavailable-root message, keeps the terminal usable, and does not crash | crates/made-app/tests/session_follow.rs; unavailable_root.rs |
+
+## Worktree Awareness
+
+> Made MUST treat an OpenCode-managed worktree as the active workspace when the active session's working directory is that worktree. Made MUST make the worktree root, branch or worktree metadata, and active session inspectable in Diagnostics and the optional session map without persistent technical chrome. The explorer MUST identify its current root. Made MUST NOT create, remove, merge, or otherwise manage worktrees.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| WA-01 | OpenCode-created worktree becomes active | Automated + historical real OpenCode; revised pending | worktree metadata tests + historical API-created worktree follow | the explorer shows the worktree root, its branch/worktree and active-session details are inspectable in Diagnostics and the optional session map, and the main checkout is not shown or modified | crates/made-app/tests/worktree.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) (historical) |
+| WA-02 | Worktree metadata unavailable | Automated (model) | non-git/missing-git metadata tests | the explorer still shows the worktree root, Diagnostics reports the active session and unknown metadata, and Made does not crash | crates/made-app/tests/worktree.rs |
+| WA-03 | Worktree removal by OpenCode | Manual pending | no automated removal-while-active proof on revised build | Made does not recreate the worktree, shows the root as unavailable, and keeps the terminal usable | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) pending |
+
+## Session Map
+
+> Made MUST provide an optional, initially hidden session map of open OpenCode root-session tabs for the selected workspace only. It MUST NOT be confused with workspace tabs or reserve empty space before OpenCode is used. When opened, the map MUST show each session's title, working directory or worktree path, and active state, and MUST update when sessions open, close, or change active state. Made SHOULD show busy, attention, and unread indicators. Made SHOULD focus the selected session in that workspace's OpenCode instance when the user activates it from the map.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| SM-01 | Multiple open sessions | Automated (model); native map pending | session map model tests; optional hidden UI test | it lists every open root session with its title and path and marks exactly one active session | crates/made-app/tests/session_map.rs; ui_model.rs |
+| SM-02 | Session activity indicators | Automated (model) | activity indicator model tests | the corresponding indicator is shown and updates when the state changes | crates/made-app/tests/session_map.rs |
+| SM-03 | Session closes | Automated (model) | session close model test | the session is removed from the map within 1 second and the active indication remains consistent | crates/made-app/tests/session_map.rs |
+| SM-04 | Click focuses session | Automated (controller) + spike; native click pending | focus controller/plugin tests; spike focus result; UI click pending | OpenCode makes that session active and Made's explorer follows its directory | crates/made-app/tests/session_focus.rs; plugins/.../lifecycle.test.ts; [Phase 0 gate](../../wiki/records/20261025-phase-0-gate.md) (harness removed) |
+| SM-05 | Focus command fails | Automated | focus failure/timeout/state-refresh tests | Made shows a non-blocking error, keeps the current workspace, and refreshes session state | crates/made-app/tests/session_focus.rs; degraded.rs |
+
+## Read-Only File Preview
+
+> Made MUST open a file from the explorer in a read-only preview occupying the entire left content pane in place of the terminal visually, never underneath the explorer or in a split with the terminal. No preview pane or placeholder MUST occupy space before a file is opened. The terminal process MUST remain running and consume output while preview is visible; hidden terminal input MUST NOT receive preview keystrokes. Close or a visible return-to-terminal control MUST restore the same live terminal and its focus without relaunch or lost output. A root change MUST clear the prior root's preview and reject stale preview results. The preview MUST NOT allow editing, saving, or any file modification. Binary files and files above the documented preview size limit MUST show a clear, safe message instead of raw content. Made SHOULD refresh an open preview when the file changes on disk. Made SHOULD provide syntax highlighting for supported text files and MUST fall back to plain text when highlighting is unavailable.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| PR-01 | Text file preview | Automated + native preview | preview/full-left roundtrip tests; final preview captures | Made shows its content read-only across the entire left content pane, the full-height right explorer remains intact, and no editing or saving controls exist | crates/made-app/tests/read_only_ui.rs; ui_model.rs; [preview](../../wiki/assets/screenshots/preview-1280.png) |
+| PR-02 | Binary file | Automated + native preview | binary guard tests | Made shows a clear binary-file message and does not render raw binary content | crates/made-explorer/tests/preview.rs; read_only_ui.rs |
+| PR-03 | Large file | Automated + native preview | large-file guard tests | Made shows a clear size-limit message with the file size and does not attempt to render the full file | crates/made-explorer/tests/preview.rs |
+| PR-04 | External change refresh | Automated | preview refresh tests | Made refreshes the preview within 1 second or shows that the preview is stale | crates/made-explorer/tests/preview_refresh.rs |
+| PR-05 | Syntax highlighting | Automated | highlight fallback tests | syntax highlighting is applied where available and plain text is shown when highlighting is unavailable | crates/made-explorer/tests/highlight.rs |
+| PR-06 | File disappears | Automated + native preview | missing/deleted preview tests | Made shows an unavailable-file message and keeps the rest of the app usable | crates/made-explorer/tests/preview.rs; preview_refresh.rs |
+| PR-07 | Preview terminal roundtrip | Automated + Xvfb | preview roundtrip and hidden input/output model + native captures | preview used the entire left content area, preview keys never reached the hidden shell, and the same still-running terminal returns with accumulated output and terminal focus | ui_model::file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| PR-08 | Root change clears preview | Automated + Xvfb | root change clears preview test and capture | the old preview is cleared to the terminal surface, late reads cannot restore old content, and no other workspace's preview is affected | ui_model::root_change_clears_a_loaded_preview_and_returns_terminal; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+
+## Explorer Live Updates
+
+> While the explorer is visible, Made MUST reflect filesystem changes in the active root without requiring a manual refresh. The explorer MUST NOT expose a manual Reload action; live refresh remains watcher-driven. A created file MUST appear in the explorer within 1 second, a deleted file MUST disappear from the explorer within 1 second, and a renamed file MUST remove the old path and show the new path. When the active root changes, Made MUST discard stale loads and events from the previous root so they cannot populate the new tree. An unreadable directory MUST show an error row and MUST NOT crash the explorer. Made SHOULD preserve expansion and selection where possible across updates.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| EX-01 | No manual refresh control | Automated | quiet test rejects Reload; watcher create/delete/rename tests | no routine manual Reload control exists and creates, deletes and renames still appear automatically through the watcher | ui_model::quiet_workspace_chrome_has_no_default_technical_status; crates/made-explorer/tests/watch.rs |
+| EX-02 | Created file appears | Automated (headless) | tree/watcher create test | the new file appears in the tree within 1 second | crates/made-explorer/tests/tree.rs; watch.rs |
+| EX-03 | Deleted file disappears | Automated (headless) | tree delete test | the file disappears from the tree within 1 second | crates/made-explorer/tests/tree.rs; watch.rs |
+| EX-04 | Renamed file updates | Automated (headless) | tree rename test | the old path disappears and the new path appears | crates/made-explorer/tests/tree.rs |
+| EX-05 | Active root switch discards stale events | Automated | root_switch stale load/event tests | the event cannot populate or modify the new tree | crates/made-explorer/tests/root_switch.rs |
+| EX-06 | Unreadable directory shows an error row | Automated | tree unreadable-directory test | the explorer shows an error row and does not crash | crates/made-explorer/tests/tree.rs |
+| EX-07 | Expansion and selection preserved | Automated | tree/watch expansion/selection tests | the expansion and selection are preserved where possible | crates/made-explorer/tests/tree.rs; watch.rs |
+
+## Degraded Integration
+
+> OpenCode integration is optional. If it is unavailable, disabled, incompatible, disconnected, or OpenCode is missing or older than v2, Made MUST keep the terminal and explorer usable with shell-directory fallback as defined in Active Session Follow. Normal shell use and normal OpenCode exit MUST NOT show degraded/waiting/unsupported banners or status pills. Attempted integration failures MUST remain inspectable with actionable reasons in Diagnostics; actual shell, filesystem, or user-action failures MUST retain contextual non-blocking feedback. Made MUST NOT crash or block terminal input. Made SHOULD reconnect automatically when integration becomes available, but MUST NOT launch OpenCode itself.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| DG-01 | Plugin unavailable | Automated | degraded plugin-unavailable test; no routine banner | the terminal remains fully usable, the explorer follows shell-directory fallback, and Diagnostics records integration unavailability without a routine degraded banner | crates/made-app/tests/degraded.rs; ui_model.rs |
+| DG-02 | OpenCode missing or older than v2 | Automated | OpenCode missing/old degraded test | the terminal remains usable and Diagnostics provides an unavailable or unsupported integration state with an actionable reason | crates/made-app/tests/degraded.rs |
+| DG-03 | OpenCode started with extension loading disabled | Automated | extension-disabled/config-failure degraded test | Diagnostics names disabled integration, shell follow continues, and Made does not crash | crates/made-app/tests/degraded.rs |
+| DG-04 | Bridge disconnects mid-session | Automated | disconnect/heartbeat fallback test | Made resumes the latest known shell cwd (launch folder only if unknown), keeps the terminal usable, and records the disconnected reason in Diagnostics | crates/made-app/tests/degraded.rs; session_follow.rs |
+| DG-05 | Incompatible protocol version | Automated | protocol mismatch unsupported test | Made rejects the state, records unsupported integration in Diagnostics, and keeps the terminal and shell-following explorer usable | crates/made-app/tests/degraded.rs |
+| DG-06 | OpenCode exits normally | Automated | normal exit fallback test | Made resumes shell-directory fallback without a degraded banner and leaves the same shell usable for a new user-initiated launch | crates/made-app/tests/degraded.rs |
+| DG-07 | Reconnect | Automated | reconnect/foreign lifecycle test | Diagnostics reports connected and Made resumes following the active session in that workspace without applying stale connection state | crates/made-app/tests/degraded.rs |
+| DG-08 | Session tabs unavailable | Automated | tabs-unavailable degraded test | Diagnostics identifies the v1 tabs requirement and Made keeps the terminal and shell-following explorer usable | crates/made-app/tests/degraded.rs |
+| DG-09 | Configuration composition fails | Automated | config composition failure test; shell remains usable | OpenCode can run without Made integration, Diagnostics reports the composition failure, shell use remains normal, and user files stay unchanged | crates/made-app/tests/degraded.rs; config_injection.rs |
+
+## Terminal Fidelity
+
+> The embedded terminal MUST run the real OpenCode v2 TUI and MUST support the terminal features it relies on: truecolor, alternate screen, mouse reporting, bracketed paste, resize, Unicode and emoji fallback, focus reporting, title updates, scrollback, selection, copy and paste, keyboard encoding, and basic IME composition.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| TF-01 | OpenCode TUI renders | Automated (real PTY) | opencode_tui alternate-screen test | the OpenCode TUI renders in its alternate screen with correct truecolor output and layout and accepts keyboard input | crates/made-app/tests/opencode_tui.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| TF-02 | Resize | Automated (headless) + manual pending | emulation/PTY resize tests | the TUI reflows without corruption and the terminal reports the new size to OpenCode | crates/made-terminal/tests/emulation.rs; pty.rs |
+| TF-03 | Mouse | Automated (headless) + manual pending | mouse encoding tests | OpenCode receives the corresponding mouse events | crates/made-terminal/tests/input.rs |
+| TF-04 | Bracketed paste | Automated (headless) + manual pending | bracketed-paste tests | OpenCode receives it as a bracketed paste rather than as individual keystrokes | crates/made-terminal/tests/input.rs |
+| TF-05 | Unicode and emoji | Automated (headless) + manual pending | Unicode/emoji width tests; ZWJ caveat | glyphs and widths are correct or a documented fallback is used, and the TUI does not corrupt | crates/made-terminal/tests/emulation.rs; limitations |
+| TF-06 | IME composition | Automated (headless) + manual pending | IME normalizer/encoding tests | OpenCode receives the composed text exactly once and no duplicate characters appear | crates/made-platform/tests/contract.rs; made-terminal/tests/input.rs |
+| TF-07 | Scrollback and copy | Automated (headless) + manual pending | selection/copy test; native clipboard pending | the selected text is placed on the system clipboard | crates/made-terminal/tests/emulation.rs |
+| TF-08 | Title and focus reporting | Automated (headless) + manual pending | title/focus tests | Made reflects the title and reports focus changes to OpenCode | crates/made-terminal/tests/emulation.rs; input.rs |
+
+## Cross-Platform Delivery
+
+> Made MUST build from one source tree for macOS arm64, macOS x64, Linux x64 on X11 and Wayland, and Windows x64 using the native OpenCode v2 distribution. Platform-specific behavior MUST be isolated so the user-visible workflow and UI structure are the same on every supported platform. CI MUST produce development artifacts for every supported target.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| CP-01 | CI builds all targets | Pending (CI not observed) | workflow definitions read; no CI run IDs/artifacts recorded | it produces development artifacts for macOS arm64, macOS x64, Linux x64, and Windows x64 | `.github/workflows/ci.yml`, `ci-artifacts.yml`; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) pending |
+| CP-02 | Linux X11 and Wayland | Manual pending | Xvfb/WSLg smokes only; native X11/Wayland required | the app starts, the terminal runs OpenCode, and session follow works in both display-server sessions | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) pending |
+| CP-03 | Windows native OpenCode | Manual pending | native Windows required | the terminal, session follow, explorer, and preview work without a WSL dependency | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) pending |
+| CP-04 | macOS | Manual pending | native macOS arm64/x64 required | the terminal and session follow work on both architectures | [v1 evidence](../../wiki/records/20261026-v1-evidence.md) pending |
+| CP-05 | No per-OS UI rewrite | Automated code audit | one platform crate/UI source tree; contract test | the same panels, workflows, and session-follow behavior are present, with no per-OS UI rewrite | crates/made-platform/tests/cross_platform.rs; [Architecture](../../wiki/architecture.md) |
+
+## Security and Local-Only Integration
+
+> Made MUST accept integration connections only over the loopback interface, on a randomly assigned port, authenticated by a per-workspace-instance secret. Credentials and routing MUST isolate workspace tabs: a valid client for one tab MUST NOT mutate, focus, replace the connection of, or disclose state from another tab. Made MUST reject unauthenticated or unauthorized clients before disclosing state. Made MUST NOT persistently modify user shell or OpenCode configuration files. Made MUST load integration code from an app-owned location. Made MUST restrict workspace-content reads to the owning tab's current root and paths the user explicitly selects, and MUST reject path traversal outside those roots. Explicit folder selection, the default home workspace, and validated local cwd/session reports authorize root changes only for their owning tab; they MUST NOT authorize arbitrary file reads in other tabs. Read-only user configuration composition and app-owned resources remain separate from workspace-content reads. The integration bridge MUST NOT be reachable from non-loopback interfaces.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| SEC-01 | Unauthorized bridge client rejected | Automated | unauthorized/cross-workspace rejection tests | Made rejects the connection, discloses no session state, and records the rejection | crates/made-bridge/tests/security.rs |
+| SEC-02 | Non-loopback bind | Automated + live socket | bind test; socket observation | it is bound only to a loopback address and not to a wildcard or external interface | crates/made-bridge/tests/security.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| SEC-03 | User config unchanged | Automated + real isolated runs | config guard/immutability tests; user config hash evidence | the file's content is byte-for-byte unchanged and no Made-managed content was persisted into it | crates/made-bridge/tests/config_immutability.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| SEC-04 | Path traversal blocked | Automated | path traversal/symlink tests | Made rejects the request and shows no content from outside the root | crates/made-explorer/tests/paths.rs; preview.rs |
+| SEC-05 | Plugin from app-owned path | Automated + artifact layout verified; packaged launch pending | plugin path tests; ci-artifacts stages plugins/opencode-made | it resolves inside the app-owned installation or resource area and not inside the user's configuration directory | crates/made-bridge/tests/config_injection.rs; platform contract; ci-artifacts.yml |
+| SEC-06 | Read-only preview enforced | Automated + native preview | read-only action/UI tests; preview no-write tests | no file content is written and the preview remains read-only | crates/made-app/tests/read_only_ui.rs; crates/made-explorer/tests/preview.rs |
+
+## Responsiveness and Lightness
+
+> Made MUST NOT use a webview runtime. Extreme responsiveness, Calm Editor visual quality, and fluid interaction are base v1 acceptance criteria, not optional post-delivery polish. Shell use, optional OpenCode, tab switching, preview roundtrip, and explorer hide/resize MUST NOT block input or perform synchronous tree/preview scans on the UI thread. On a supported reference machine, Made SHOULD meet these targets: startup to an interactive terminal and browsable explorer within 2 seconds for a 10,000-file workspace, reported cwd/active-session change to explorer update within 500 ms, terminal input-to-render within 50 ms, and sustained output at 60 frames per second without losing input. Hidden tabs and preview-covered terminals MUST consume bounded output and connection state without rendering hidden grids; activation MUST show current state without replaying an unbounded UI backlog. Evidence MUST distinguish automated/model and software-rendered checks from real hardware-accelerated GUI measurements, with machine, backend, workload, tab count and unverified platforms recorded; software evidence alone MUST NOT claim hardware smoothness.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| RESP-01 | Startup budget | Observed (software) + native pending | final 10k startup 108.7–115.3 ms first tab; 8.9–14.4 ms later | the terminal is interactive and the explorer is available for browsing within 2 seconds, excluding first-run OS prompts | [Performance](../../wiki/performance.md) |
+| RESP-02 | Session switch budget | Automated (model) + live pending | session-follow model tests; live real OpenCode pending | the explorer updates within 500 ms | crates/made-app/tests/session_follow.rs |
+| RESP-03 | Input latency | Observed (software) + native pending | final release input-to-render 5.11–5.39 ms | the resulting terminal update is rendered within 50 ms under normal load | [Performance](../../wiki/performance.md) |
+| RESP-04 | Sustained output | Observed (software) + hardware pending | final software p95 14.86–15.80 ms; no hardware claim | the terminal remains responsive, input is not lost, and rendering stays near 60 frames per second or degrades without blocking input | [Performance](../../wiki/performance.md) |
+| RESP-05 | No webview | Automated | no-webview tests | no webview runtime is present | crates/made-app/tests/no_webview.rs |
+| RESP-06 | Complete terminal-first performance evidence | Observed (software); hardware pending | final perf report: startup/cwd/input/p95/hidden paints; explicit hardware distinction | evidence records startup, cwd/session-follow latency, input latency and frame pacing against the stated targets, verifies bounded hidden-tab processing with no hidden grid painting, and separates hardware GUI evidence from software/model checks and unverified platforms | [Performance](../../wiki/performance.md) |
+
+## Diagnostics
+
+> Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session and workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible there rather than occupying routine chrome. User-action failures MUST remain discoverable without a debugger. Logs and copied diagnostics MUST NOT contain workspace-instance secrets.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| DIAG-01 | Connected diagnostics | Automated + Xvfb | diagnostics tests; optional connected state | Made shows connected status, the active session, the workspace or worktree path, and the integration version | crates/made-app/tests/diagnostics.rs; [v1 evidence](../../wiki/records/20261026-v1-evidence.md) |
+| DIAG-02 | Degraded diagnostics | Automated + Xvfb | degraded diagnostics tests including shell cwd/root/source | Made shows the integration failure reason, owning workspace, latest shell cwd, effective root and its source, without treating the shell workspace as degraded | crates/made-app/tests/diagnostics.rs; workspace_tabs.rs |
+| DIAG-03 | Unsupported integration | Automated | unsupported diagnostics test | Made shows an unsupported or unavailable status with an actionable reason | crates/made-app/tests/diagnostics.rs |
+| DIAG-04 | Logs redact token | Automated | token/log redaction tests | the per-instance secret is absent and the log entries identify the relevant session or connection | crates/made-app/tests/diagnostics.rs; bridge security |
+| DIAG-05 | Shell follow diagnostics without chrome noise | Automated + Xvfb | workspace shell/capability diagnostics test and capture | its workspace identity, reporting capability/reason, latest shell cwd, effective root/source and inactive optional integration are inspectable, secrets are absent from displayed/copied logs, and routine technical chrome remains hidden outside Diagnostics | diagnostics_expose_workspace_shell_and_inactive_integration; ui_model.rs |
+
+## V1 Scope Boundary
+
+> V1 MUST support only OpenCode v2 and MUST NOT integrate with other agent TUIs or ACP. V1 MUST NOT require remote, SSH, or WSL-hosted OpenCode. V1 MUST NOT provide an AI or chat UI that replaces the OpenCode TUI. Made MUST NOT create, remove, merge, or orchestrate worktrees; worktree lifecycle remains owned by OpenCode. V1 MUST NOT require a separate OpenCode server process.
+
+| ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
+|---|---|---|---|---|---|
+| SCOPE-01 | Unsupported agent not offered | Automated | scope boundary tests | only OpenCode v2 is offered and no Claude Code, Codex, Grok, ACP, or other agent integration is presented | crates/made-app/tests/scope_boundary.rs |
+| SCOPE-02 | No replacement chat UI | Automated | scope boundary tests | no AI or chat UI replaces the OpenCode TUI | crates/made-app/tests/scope_boundary.rs |
+| SCOPE-03 | Worktree lifecycle remains in OpenCode | Automated | scope/worktree allowlist tests | no create, remove, merge, or orchestration action is available, and worktree changes appear only after OpenCode reports them | crates/made-app/tests/scope_boundary.rs; worktree.rs |
+| SCOPE-04 | Direct launch | Automated | direct-launch scope test; no Made server | integration works without starting a separate server or attach process | crates/made-app/tests/scope_boundary.rs |
+
+## Coverage check
+
+The checklist retains the 97 pre-split scenario rows. The split preserves all 97 original titles:
+85 in the core spec and 12 in the UI spec, plus 2 derived core scenarios and 21 derived UI
+scenarios. Current contract: core 87 scenarios / 16 requirements; UI 33 scenarios / 9 requirements.
+Rows above remain the evidence plan; derived UI presentation scenarios are tracked in
+[made-ui-ux-v1 tasks](../../specs/changes/made-ui-ux-v1/tasks.md) and
+[v1 evidence](../../wiki/records/20261026-v1-evidence.md). Native Linux/macOS/Windows input and home/header behavior remain
+pending unless a row states recorded Xvfb evidence.

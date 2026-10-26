@@ -1,0 +1,10 @@
+[package]
+name = "made-terminal"
+description = "Terminal core, PTY adapter, and input encoding for Made"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
+made-platform = { path = "../made-platform" }

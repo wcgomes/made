@@ -1,0 +1,17 @@
+[package]
+name = "made-explorer"
+description = "Lazy read-only explorer, watcher, and preview for Made"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+notify = "8.2"
+syntect = { version = "5.3", default-features = false, features = [
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,261 @@
+name: Linux display smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-display-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  x11:
+    name: X11 smoke (xvfb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install X11 and software-rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            mesa-vulkan-drivers \
+            vulkan-tools \
+            libvulkan1 \
+            libegl1 \
+            libgl1 \
+            libxkbcommon-x11-0 \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libvulkan-dev
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x11
+
+      - name: Build the app
+        run: cargo build -p made-app --locked
+
+      - name: Select a software rendering backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            echo "MANUAL VALIDATION REQUIRED: xvfb-run is unavailable; the X11 smoke test was not run." | tee logs/x11-smoke.log
+            {
+              echo "## Linux X11 smoke: NOT RUN"
+              echo ""
+              echo "Manual validation required: install \`xvfb\` and run \`xvfb-run -a ./target/debug/made-app --smoke-test\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          icd=""
+          for candidate in /usr/share/vulkan/icd.d/lvp_icd.*.json; do
+            if [ -f "$candidate" ]; then
+              icd="$candidate"
+              break
+            fi
+          done
+          if [ -n "$icd" ]; then
+            echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+            echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+            echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+          else
+            echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+            echo "WGPU_BACKEND=gl" >> "$GITHUB_ENV"
+            echo "::warning title=Software Vulkan unavailable::Falling back to the software GL backend."
+          fi
+
+      # The hidden `--smoke-test` entry point is owned by the app UI task. This
+      # workflow invokes it; it does not implement the mode.
+      - name: Run the app smoke test under Xvfb
+        shell: bash
+        env:
+          WINIT_UNIX_BACKEND: x11
+        run: |
+          set -o pipefail
+          unset WAYLAND_DISPLAY
+          timeout 180s xvfb-run -a -s "-screen 0 1280x800x24" \
+            ./target/debug/made-app --smoke-test 2>&1 | tee logs/x11-smoke.log
+
+      - name: Record X11 validation scope
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Linux X11 smoke"
+            echo ""
+            echo "This job runs the hidden app \`--smoke-test\` entry point under \`xvfb-run\` with"
+            echo "software rendering when the runner provides the prerequisites. The job result is"
+            echo "shown above; the summary does not claim the smoke step passed."
+            echo ""
+            echo "**Manual validation required:** this headless runner does not validate a real X11"
+            echo "window manager, mouse reporting, IME composition, clipboard integration, or the"
+            echo "OpenCode v2 TUI rendering. Record those checks in the Phase 4 platform validation"
+            echo "results; do not claim them from this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload X11 logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: made-linux-x11-smoke-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  wayland:
+    name: Wayland smoke (headless Weston)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Wayland and software-rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            weston \
+            mesa-vulkan-drivers \
+            vulkan-tools \
+            libvulkan1 \
+            libegl1 \
+            libgl1 \
+            libwayland-client0 \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libvulkan-dev
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-wayland
+
+      - name: Build the app
+        run: cargo build -p made-app --locked
+
+      - name: Select a software rendering backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          if ! command -v weston >/dev/null 2>&1; then
+            echo "MANUAL VALIDATION REQUIRED: weston is unavailable; the Wayland smoke test was not run." | tee logs/wayland-smoke.log
+            {
+              echo "## Linux Wayland smoke: NOT RUN"
+              echo ""
+              echo "Manual validation required: install \`weston\` and run the app under a Wayland"
+              echo "session, then repeat the OpenCode TUI, IME, clipboard, and session-follow checks."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          icd=""
+          for candidate in /usr/share/vulkan/icd.d/lvp_icd.*.json; do
+            if [ -f "$candidate" ]; then
+              icd="$candidate"
+              break
+            fi
+          done
+          if [ -n "$icd" ]; then
+            echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+            echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+            echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+          else
+            echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+            echo "WGPU_BACKEND=gl" >> "$GITHUB_ENV"
+            echo "::warning title=Software Vulkan unavailable::Falling back to the software GL backend."
+          fi
+
+      # The hidden `--smoke-test` entry point is owned by the app UI task. This
+      # workflow invokes it; it does not implement the mode.
+      - name: Run the app smoke test under headless Weston
+        shell: bash
+        env:
+          WINIT_UNIX_BACKEND: wayland
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export XDG_SESSION_TYPE=wayland
+          unset DISPLAY
+
+          weston \
+            --backend=headless-backend.so \
+            --socket=wayland-made \
+            --idle-time=0 \
+            --no-config \
+            --width=1280 \
+            --height=800 \
+            --log="$PWD/logs/weston.log" &
+          weston_pid=$!
+          cleanup() {
+            kill "$weston_pid" 2>/dev/null || true
+            wait "$weston_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 100); do
+            if [ -S "$XDG_RUNTIME_DIR/wayland-made" ]; then
+              break
+            fi
+            sleep 0.1
+          done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-made" ]; then
+            echo "Weston did not create the wayland-made socket; see logs/weston.log." | tee logs/wayland-smoke.log
+            exit 1
+          fi
+
+          WAYLAND_DISPLAY=wayland-made \
+            timeout 180s ./target/debug/made-app --smoke-test 2>&1 | tee logs/wayland-smoke.log
+
+      - name: Record Wayland validation scope
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Linux Wayland smoke"
+            echo ""
+            echo "This job runs the hidden app \`--smoke-test\` entry point against a headless Weston"
+            echo "compositor with software rendering when the runner provides the prerequisites. The"
+            echo "job result is shown above; the summary does not claim the smoke step passed."
+            echo ""
+            echo "**Manual validation required:** a headless compositor does not validate real input"
+            echo "handling, IME composition, clipboard behavior, or the OpenCode v2 TUI. Repeat those"
+            echo "checks in a real Wayland session and record the results in the Phase 4 platform"
+            echo "validation results; do not claim them from this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Wayland logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: made-linux-wayland-smoke-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14

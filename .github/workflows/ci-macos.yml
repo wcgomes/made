@@ -1,0 +1,141 @@
+name: macOS smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos-native:
+    name: macOS ${{ matrix.arch }} build and app smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            target: aarch64-apple-darwin
+            artifact: made-macos-arm64
+          - os: macos-15-intel
+            arch: x64
+            target: x86_64-apple-darwin
+            artifact: made-macos-x64
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build the workspace
+        run: cargo build --workspace --locked --target ${{ matrix.target }}
+
+      - name: Run the platform contract tests
+        run: cargo test -p made-platform --test contract --locked --target ${{ matrix.target }}
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Native OpenCode v2 is not guaranteed to be installable on a hosted
+      # runner. This step attempts it and records the result; the summary step
+      # below states plainly when the TUI was not validated.
+      - name: Try native OpenCode v2
+        id: opencode
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p logs
+          set +e
+          npm install --global opencode-ai@2 > logs/opencode-install.log 2>&1
+          install_status=$?
+          set -e
+          if [ "$install_status" -ne 0 ]; then
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          set +e
+          opencode --version > logs/opencode-version.log 2>&1
+          version_status=$?
+          set -e
+          version="$(head -n 1 logs/opencode-version.log)"
+          if [ "$version_status" -eq 0 ] && printf '%s' "$version" | grep -Eq '(^|[^0-9])2\.'; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # The hidden `--smoke-test` entry point is owned by the app UI task. This
+      # workflow invokes it; it does not implement the mode.
+      - name: Run the app smoke test
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          ./target/${{ matrix.target }}/debug/made-app --smoke-test 2>&1 |
+            tee logs/macos-smoke.log
+
+      - name: Record native OpenCode TUI validation status
+        if: always()
+        shell: bash
+        env:
+          OPENCODE_INSTALLED: ${{ steps.opencode.outputs.installed }}
+          OPENCODE_VERSION: ${{ steps.opencode.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p logs
+          {
+            echo "## macOS ${TARGET} OpenCode TUI"
+            echo ""
+            if [ "$OPENCODE_INSTALLED" = "true" ]; then
+              echo "A native OpenCode v2 binary was installed on the runner: ${OPENCODE_VERSION}"
+              echo "This hosted runner has no interactive desktop, so the OpenCode TUI was NOT"
+              echo "driven inside the Made terminal by this job."
+            else
+              echo "Native OpenCode v2 was not installable on this runner. The TUI smoke did not"
+              echo "run, so this job does not claim macOS OpenCode v2 support as validated."
+            fi
+            echo ""
+            echo "Manual validation required on macOS ${TARGET}:"
+            echo "1. Install native OpenCode v2 and confirm opencode --version reports 2.x."
+            echo "2. Run Made from an interactive display session and start opencode in its terminal."
+            echo "3. Confirm TUI rendering, session follow across two worktrees, session-map focus,"
+            echo "   read-only preview, copy/paste, resize, and IME composition."
+            echo ""
+            echo "See the uploaded logs for the installation attempt and smoke-test output."
+          } | tee logs/opencode-manual-validation.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS smoke logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-smoke-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,29 @@
+[package]
+name = "made-app"
+description = "Native desktop shell for the Made agent workspace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+made-bridge = { path = "../made-bridge" }
+made-explorer = { path = "../made-explorer" }
+made-platform = { path = "../made-platform" }
+made-terminal = { path = "../made-terminal" }
+
+# The windowing/GPU/UI stack is confined to `made-app` by `wiki/architecture.md`.
+# Default features are off: no accessibility bridge, link handler, persistence, or
+# glow backend. X11 and Wayland are both enabled from one source tree.
+eframe = { version = "0.37", default-features = false, features = [
+    "wgpu",
+    "x11",
+    "wayland",
+    "default_fonts",
+    "system_fonts",
+    "clipboard",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+tungstenite = "0.30"

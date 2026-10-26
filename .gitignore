@@ -1,0 +1,18 @@
+/target/
+.codegraph/
+**/*.rs.bk
+
+# Node tooling for the app-owned OpenCode plugin
+node_modules/
+dist/
+
+# Local environment and logs
+.env
+.env.*
+*.log
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

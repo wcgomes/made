@@ -1,0 +1,140 @@
+name: Development artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifacts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  package:
+    name: Package development build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            exe: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libvulkan-dev
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: artifacts-${{ matrix.target }}
+
+      - name: Build the workspace
+        run: cargo build --workspace --locked --target ${{ matrix.target }}
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # Development artifacts only: debug binaries, the app-owned OpenCode
+      # plugin package, README, and version metadata. No signing, notarization,
+      # installer, or auto-update payload is produced.
+      - name: Stage the development artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          stage="dist/made-development-${TARGET}"
+          mkdir -p "$stage/plugins"
+          cp "target/${TARGET}/debug/made-app${EXE}" "$stage/"
+          cp README.md Cargo.toml Cargo.lock rust-toolchain.toml "$stage/"
+          # Release AppPaths resolves the app-owned plugin at
+          # <install_root>/plugins/opencode-made, so the artifact root must
+          # contain plugins/opencode-made rather than plugin/opencode-made.
+          cp -R plugins/opencode-made "$stage/plugins/opencode-made"
+          rm -rf "$stage/plugins/opencode-made/node_modules"
+          test -f "$stage/plugins/opencode-made/package.json"
+          test ! -e "$stage/plugin"
+
+          node - "$stage" <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const { execSync } = require("node:child_process");
+
+          const stage = process.argv[2];
+          const root = process.cwd();
+          const workspace = fs.readFileSync(path.join(root, "Cargo.toml"), "utf8");
+          const version = /\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"/.exec(workspace);
+          const plugin = JSON.parse(
+            fs.readFileSync(path.join(root, "plugins", "opencode-made", "package.json"), "utf8"),
+          );
+
+          const metadata = {
+            name: "made",
+            version: version ? version[1] : "unknown",
+            profile: "debug",
+            target: process.env.TARGET,
+            runner_os: process.env.RUNNER_OS,
+            runner_arch: process.env.RUNNER_ARCH,
+            commit: process.env.GITHUB_SHA,
+            ref: process.env.GITHUB_REF_NAME,
+            rustc: execSync("rustc --version", { encoding: "utf8" }).trim(),
+            cargo: execSync("cargo --version", { encoding: "utf8" }).trim(),
+            plugin: { name: plugin.name, version: plugin.version },
+            signing: "none",
+            notarization: "none",
+            installer: "none",
+            auto_update: "none",
+          };
+          fs.writeFileSync(
+            path.join(stage, "version.json"),
+            `${JSON.stringify(metadata, null, 2)}\n`,
+          );
+          NODE
+
+          find "$stage" -maxdepth 3 -type f -print | sort
+
+      - name: Upload the development artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: made-development-${{ matrix.target }}
+          path: dist/made-development-${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 14

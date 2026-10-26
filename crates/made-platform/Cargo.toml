@@ -1,0 +1,32 @@
+[package]
+name = "made-platform"
+description = "OS-specific platform capabilities for Made"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Text-only clipboard. X11 is used when available; wayland-data-control adds the
+# native Wayland clipboard path required by the Linux Wayland target.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+# POSIX PTY and Windows ConPTY behind one cross-platform interface.
+portable-pty = "0.9"
+# Unix file modes, process-group signalling, and O_NOFOLLOW for local logs.
+libc = "0.2"
+# Narrow window-handle contract used by the optional native backdrop.
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Optional NSVisualEffectView vibrancy; the in-app glass remains the fallback.
+window-vibrancy = "0.8.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Mica only: window-vibrancy documents resize lag for Windows acrylic/blur.
+window-vibrancy = "0.8.1"
+# Scoped ConPTY descendant cleanup through a kill-on-close Job Object.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

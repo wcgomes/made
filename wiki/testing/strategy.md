@@ -1,0 +1,69 @@
+# Test Strategy
+
+Made's tests are layered: fast domain/model tests, real PTY/bridge integration tests, an OpenCode TUI smoke, the historical Phase 0 plugin gate, and a Linux/Xvfb UX validation pass. The **normative scenario list** is the 97-row checklist in [`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md); results are summarized in the [v1 evidence record](../records/20261026-v1-evidence.md). Requirements remain in [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md); do not treat this page as a substitute for the checklist or those specs.
+
+## Layers and commands
+
+| Layer | Command | What it covers |
+|---|---|---|
+| Rust workspace | `cargo test --workspace` | Unit, model, PTY, bridge, explorer, platform and app tests across all crates. Current Linux baseline: 602 passed, 0 failed, 2 ignored. |
+| Format/lint | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | House style and warnings-as-errors. |
+| App UI model | `cargo test -p made-app --test ui_model` | Header/tabs, glass tokens, Explorer animation/divider, preview roundtrip, picker, quiet chrome. |
+| Workspace tabs | `cargo test -p made-app --test workspace_tabs` | Independent PTYs/roots/bridges, close-owner, hidden output, deleted-cwd recovery. |
+| Launch/picker | `cargo test -p made-app --test launch_workspace`; `workspace_picker`; `invalid_workspace` | Home default, explicit path, picker, fallback errors. |
+| Session follow/focus | `cargo test -p made-app --test session_follow`; `session_focus`; `degraded`; `diagnostics` | Root precedence, status transitions, focus timeout, diagnostics. |
+| Bridge | `cargo test -p made-bridge` | Protocol, auth/replacement, snapshot bounds, config injection/immutability, security. |
+| Explorer | `cargo test -p made-explorer` | Tree, watcher, root generation, preview guards, path guard. |
+| Terminal | `cargo test -p made-terminal` | VT emulation, input encoding, PTY/ConPTY behavior. |
+| Platform | `cargo test -p made-platform` | Paths, shell integration, contract tests, native backdrop. |
+| Plugin | `cd plugins/opencode-made && npm test && npm run typecheck` | Lifecycle, handshake, state bounds, focus, reconnect, redaction. Current: 29/29 plus typecheck. |
+| Phase 0 gate (historical) | Harness removed after the gate | Real OpenCode v2.1.4 TUI: load, auth, tabs, worktree location, focus, reconnection, config immutability. 19/19 + 5/5; outcomes in the [Phase 0 record](../records/20261025-phase-0-gate.md). |
+| Real TUI smoke | `cargo test -p made-app --test opencode_tui -- --nocapture` | PTY/TerminalCore runs a real OpenCode TUI when installed; skips otherwise. |
+| App smoke | `cargo run -p made-app -- --smoke-test` | Creates the window, pumps frames, prints `made smoke: OK`, exits. |
+| Session-follow E2E | `tests/e2e/run-session-follow-e2e.sh` | Real window plus synthetic plugin: bridge -> root follow -> explorer. Not real OpenCode evidence. |
+
+## Scenario validation
+
+[`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md) maps every core-spec scenario to a method (automated, Xvfb, real shell/spike, manual pending) and evidence. It has 97 scenario rows covering workspace launch, integration loading, shell follow, tabs, layout, session follow, worktrees, session map, preview, explorer updates, degraded state, terminal fidelity, cross-platform delivery, security, responsiveness, diagnostics, and scope boundary.
+
+Results and current status are in the [v1 evidence record](../records/20261026-v1-evidence.md). A row is not “passed” merely because a model test exists; native/manual rows require native evidence.
+
+## Evidence layout
+
+| Location | Contents |
+|---|---|
+| [`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md) | Normative 97-row scenario checklist and evidence method. |
+| [v1 evidence record](../records/20261026-v1-evidence.md) | Baseline, verified behavior, open gaps, and performance summary. |
+| [Performance](../performance.md) | Final release software measurements and method. |
+| [Platform matrix](platform-matrix.md) | Build/automated coverage versus native runtime evidence. |
+| [`wiki/assets/screenshots/`](../assets/screenshots/) | Curated current UI captures. |
+
+The wiki carries distilled outcomes only; raw logs, JSON, historical runs, and old screenshots were removed after summarization.
+
+## Isolation rules
+
+Every app-level run should isolate user state:
+
+```bash
+root="$(mktemp -d)"
+mkdir -p "$root/home" "$root/tmp"
+HOME="$root/home" \
+XDG_CONFIG_HOME="$root/home/.config" \
+XDG_DATA_HOME="$root/home/.local/share" \
+XDG_STATE_HOME="$root/home/.local/state" \
+XDG_CACHE_HOME="$root/home/.cache" \
+TMPDIR="$root/tmp" \
+  cargo run -p made-app -- --smoke-test /path/to/workspace
+```
+
+`--smoke-test` with a workspace starts the real workbench and can read real app paths/config. The folder-less form stays on the picker surface so CI does not start a shell in the user's home. `unset WAYLAND_DISPLAY` when forcing X11; set `LIBGL_ALWAYS_SOFTWARE=1` for software rendering.
+
+## Current status
+
+- Rust: 602 passed, 0 failed, 2 ignored on Linux x64 WSL2; fmt/clippy clean.
+- Plugin: 29/29 and typecheck pass.
+- Phase 0: 19/19 gate plus 5/5 supporting against OpenCode v2.1.4.
+- UI/behavior: Linux Xvfb + headless evidence for launch, tabs, preview, Explorer, glass fallback, picker, bash cwd, deleted-cwd recovery, 10k startup, final software performance.
+- Not validated: native Linux desktop, macOS, Windows/ConPTY, real zsh/fish/PowerShell, live real-OpenCode switching, native IME/clipboard/mouse, hardware-GPU pacing, native backdrop rendering, packaged artifact launch, observed CI artifacts.
+
+Related: [Platform matrix](platform-matrix.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).
