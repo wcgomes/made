@@ -285,7 +285,9 @@ fn powershell_allows_bootstrap(request: &PtyRequest) -> bool {
     let Ok(mut child) = child else {
         return false;
     };
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Cold PowerShell start can exceed 2s on loaded CI runners. This is only
+    // a capability probe; a timeout still falls back to normal startup.
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -318,11 +320,11 @@ fn powershell_allows_bootstrap(request: &PtyRequest) -> bool {
 // LC_ALL=C makes substring indexing byte-oriented, percent-encoding UTF-8 bytes.
 const BASH: &str = r#"
 __made_cwd() {
-    local LC_ALL=C p=$PWD out='' c n i
+    local LC_ALL=C p=$PWD out='' c n i v
     (( ${#p} <= 4096 )) || return 0
     for ((i=0; i<${#p}; i++)); do
         c=${p:i:1}
-        case "$c" in [a-zA-Z0-9/._~-]) out+=$c;; *) printf -v n '%%%02X' "'$c"; out+=$n;; esac
+        case "$c" in [a-zA-Z0-9/._~-]) out+=$c;; *) printf -v v '%d' "'$c"; printf -v n '%%%02X' "$((v & 255))"; out+=$n;; esac
     done
     (( ${#out} <= 8000 )) || return 0
     printf '\033]7;file://%s\007' "$out"
@@ -401,12 +403,12 @@ fn zsh_chain_script(name: &str) -> String {
 
 const ZSH: &str = r#"
 __made_cwd() {
-    local LC_ALL=C p=$PWD out='' c n
+    local LC_ALL=C p=$PWD out='' c n v
     local -i i
     (( ${#p} <= 4096 )) || return 0
     for ((i=1; i<=${#p}; i++)); do
         c=$p[i]
-        case "$c" in [a-zA-Z0-9/._~-]) out+=$c;; *) printf -v n '%%%02X' "'$c"; out+=$n;; esac
+        case "$c" in [a-zA-Z0-9/._~-]) out+=$c;; *) printf -v v '%d' "'$c"; printf -v n '%%%02X' "$((v & 255))"; out+=$n;; esac
     done
     (( ${#out} <= 8000 )) || return 0
     printf '\033]7;file://%s\007' "$out"

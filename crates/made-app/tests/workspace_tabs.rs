@@ -95,6 +95,14 @@ fn type_command(workbench: &mut made_app::Workbench, command: &str) {
     );
 }
 
+fn isolated_opencode_config_path() -> PathBuf {
+    use made_platform::Platform;
+    made_platform::host_platform()
+        .app_paths()
+        .expect("isolated app paths")
+        .opencode_config_path
+}
+
 fn credentials(workbench: &made_app::Workbench) -> Value {
     let content = workbench
         .terminal()
@@ -1660,8 +1668,7 @@ fn oversized_user_config_is_skipped_without_blocking_workspace_start() {
     if isolated("oversized_user_config_is_skipped_without_blocking_workspace_start") {
         return;
     }
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").expect("isolated XDG config");
-    let config = PathBuf::from(xdg).join("opencode").join("cli.json");
+    let config = isolated_opencode_config_path();
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
         &config,
@@ -1696,8 +1703,7 @@ fn special_user_config_is_rejected_without_blocking_workspace_start() {
     if isolated("special_user_config_is_rejected_without_blocking_workspace_start") {
         return;
     }
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").expect("isolated XDG config");
-    let config = PathBuf::from(xdg).join("opencode").join("cli.json");
+    let config = isolated_opencode_config_path();
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     let created = std::process::Command::new("mkfifo")
         .arg(&config)

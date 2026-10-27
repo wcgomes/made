@@ -2151,13 +2151,17 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
             .spawn_pty(&request)
             .expect("spawn PowerShell in a Job Object");
 
-        // Drain output so a chatty child cannot fill the ConPTY buffer, and
-        // retain the tail for a useful failure message.
+        // Drain output so a chatty child cannot fill the ConPTY buffer, retain
+        // the tail for a useful failure message, and answer the console host's
+        // cursor-position query; Windows PowerShell waits for that reply before
+        // running the script.
         let mut reader = session.take_reader().expect("take reader");
+        let mut writer = session.take_writer().expect("take writer");
         let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
         let reader_captured = Arc::clone(&captured);
         let reader_thread = thread::spawn(move || {
             let mut buffer = [0; 4096];
+            let mut carry = Vec::new();
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
@@ -2170,6 +2174,22 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
                             let excess = output.len() - 8192;
                             output.drain(..excess);
                         }
+                        drop(output);
+
+                        let mut scan = Vec::with_capacity(carry.len() + read);
+                        scan.extend_from_slice(&carry);
+                        scan.extend_from_slice(&buffer[..read]);
+                        let requests = scan
+                            .windows(4)
+                            .filter(|window| *window == b"\x1b[6n")
+                            .count();
+                        for _ in 0..requests {
+                            if writer.write_all(b"\x1b[1;1R").is_err() {
+                                return;
+                            }
+                            let _ = writer.flush();
+                        }
+                        carry = scan[scan.len().saturating_sub(3)..].to_vec();
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(_) => break,

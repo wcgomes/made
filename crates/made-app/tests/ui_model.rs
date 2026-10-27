@@ -2830,7 +2830,10 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     );
 
     let before_hover = headless.model.workspace(id).unwrap().explorer_width();
-    let hover_start = headless.render_events(vec![egui::Event::PointerMoved(position)]);
+    let hover_start = headless.render_events_at(
+        vec![egui::Event::PointerMoved(position)],
+        headless.last_time + 1.0 / 60.0,
+    );
     let early_alpha = rect_shapes(&hover_start)
         .into_iter()
         .find(|shape| {

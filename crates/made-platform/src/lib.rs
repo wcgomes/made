@@ -2025,6 +2025,24 @@ pub(crate) fn host_environment(
     environment
 }
 
+/// Windows shells do not accept the extended-length `\\?\` path prefix that
+/// `fs::canonicalize` returns. Keep canonical paths for app comparisons, but
+/// hand the shell a normal absolute path so `cmd.exe`/PowerShell can start in
+/// the workspace.
+fn shell_compatible_cwd(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Spawn a PTY through `portable-pty`, which uses ConPTY on Windows.
 pub(crate) fn spawn_portable_pty(
     request: &PtyRequest,
@@ -2049,7 +2067,7 @@ pub(crate) fn spawn_portable_pty(
 
     let mut command = CommandBuilder::new(&request.program);
     command.args(&request.args);
-    command.cwd(&request.cwd);
+    command.cwd(shell_compatible_cwd(&request.cwd));
     command.env_clear();
     for (key, value) in &request.env {
         command.env(key, value);
