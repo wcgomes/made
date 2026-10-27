@@ -93,6 +93,24 @@ pub fn handshake_with(
         .map_err(|error| error.to_string())
 }
 
+/// Platform-absolute directory used by state fixtures. POSIX `/tmp` paths are
+/// not absolute under Windows path rules and would be rejected by validation.
+pub fn test_path(name: &str) -> String {
+    std::env::temp_dir()
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Platform-absolute path that includes traversal segments.
+pub fn test_traversal_path(parts: &[&str]) -> String {
+    let mut path = std::env::temp_dir();
+    for part in parts {
+        path.push(part);
+    }
+    path.to_string_lossy().into_owned()
+}
+
 pub fn hello(token: &Token) -> Value {
     hello_with(token, PANE, 1, OPENCODE_VERSION)
 }
@@ -111,7 +129,7 @@ pub fn hello_with(
         "pluginVersion": PLUGIN_VERSION,
         "opencodeVersion": opencode_version,
         "pid": 4321,
-        "cwd": "/tmp/made-test-workspace"
+        "cwd": test_path("made-test-workspace")
     })
 }
 

@@ -330,7 +330,21 @@ __made_cwd() {
     printf '\033]7;file://%s\007' "$out"
 }
 if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == 'declare -a '* ]]; then
-    PROMPT_COMMAND+=(__made_cwd)
+    # Bash 5.1 added PROMPT_COMMAND array execution. Older shells (including
+    # macOS /bin/bash 3.2) execute only element zero, so flatten every hook
+    # into a newline-separated command string before appending ours.
+    if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+        PROMPT_COMMAND+=(__made_cwd)
+    else
+        __made_ifs=$IFS
+        IFS=$'\n'
+        __made_prompt="${PROMPT_COMMAND[*]}"
+        IFS=$__made_ifs
+        unset __made_ifs
+        unset PROMPT_COMMAND
+        PROMPT_COMMAND="${__made_prompt:+$__made_prompt$'\n'}__made_cwd"
+        unset __made_prompt
+    fi
 else
     PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__made_cwd"
 fi

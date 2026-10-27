@@ -13,7 +13,54 @@ use made_explorer::tree::{EntryKind, TreeModel};
 use made_platform::{
     host_platform, resolve_user_home, validate_user_home, Platform, PlatformFamily,
 };
-use made_terminal::{PtyOptions, PtyProcess};
+use made_terminal::{PtyEvent, PtyOptions, PtyProcess};
+
+/// Drain shell output while answering the console host's cursor-position
+/// query. Returns `(saw_query, terminal_ended)`.
+fn drain_console(pty: &mut PtyProcess, carry: &mut Vec<u8>) -> (bool, bool) {
+    let mut saw_query = false;
+    while let Some(event) = pty.poll() {
+        match event {
+            PtyEvent::Data(bytes) => {
+                let mut scan = Vec::with_capacity(carry.len() + bytes.len());
+                scan.extend_from_slice(carry);
+                scan.extend_from_slice(&bytes);
+                let requests = scan
+                    .windows(4)
+                    .filter(|window| *window == b"\x1b[6n")
+                    .count();
+                for _ in 0..requests {
+                    let _ = pty.write(b"\x1b[1;1R");
+                }
+                saw_query |= requests > 0;
+                *carry = scan[scan.len().saturating_sub(3)..].to_vec();
+            }
+            PtyEvent::Exited(_)
+            | PtyEvent::Eof
+            | PtyEvent::ReadError(_)
+            | PtyEvent::MonitorError(_) => return (saw_query, true),
+        }
+    }
+    (saw_query, false)
+}
+
+/// Answer the startup ConPTY query before writing a command. Best effort; a
+/// console host that never asks simply proceeds after the deadline.
+#[cfg(windows)]
+fn settle_console(pty: &mut PtyProcess) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut carry = Vec::new();
+    loop {
+        let (saw_query, ended) = drain_console(pty, &mut carry);
+        if saw_query || ended || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(windows))]
+fn settle_console(_pty: &mut PtyProcess) {}
 
 fn fixture(temp: &tempfile::TempDir) -> PathBuf {
     let root = temp.path().join("workspace");
@@ -94,12 +141,15 @@ fn terminal_shell_starts_in_the_workspace_folder() {
         PlatformFamily::Linux | PlatformFamily::MacOs => {
             format!("pwd > {}\n", quote_posix(&marker))
         }
-        PlatformFamily::Windows => format!("cd > \"{}\"\n", marker.display()),
+        PlatformFamily::Windows => format!("cd > \"{}\"\r\n", marker.display()),
     };
+    settle_console(&mut pty);
     pty.write(command.as_bytes()).expect("write cwd probe");
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut carry = Vec::new();
     while Instant::now() < deadline && !marker.is_file() {
+        let _ = drain_console(&mut pty, &mut carry);
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(marker.is_file(), "shell did not run the cwd probe");

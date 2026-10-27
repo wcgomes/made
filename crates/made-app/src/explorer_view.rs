@@ -2740,9 +2740,14 @@ mod tests {
         p95s.sort_unstable();
         let p95 = p95s[1];
         // Test-local guard. The product contract is a 60 Hz frame p95 below
-        // 16.667 ms (wiki/performance.md); Windows debug runners are slower
-        // than the tighter Unix guard. One frame is the defensible ceiling.
-        let budget = if cfg!(windows) {
+        // 16.667 ms (wiki/performance.md). Windows and macOS x86_64 CI debug
+        // runners exceed the tighter 5 ms guard (macOS x86_64 measured 5.465
+        // ms); macOS arm64 and Linux keep 5 ms. One frame is the defensible
+        // ceiling where the slower runners need it.
+        let budget = if cfg!(any(
+            windows,
+            all(target_os = "macos", target_arch = "x86_64")
+        )) {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(5)

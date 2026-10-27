@@ -342,17 +342,28 @@ impl Headless {
         self.render()
     }
 
-    /// Hover until the tooltip text appears. The assertion remains exact; this
-    /// only tolerates tooltip-Area creation lag under a loaded runner.
-    fn hover_until_text(&mut self, id: egui::Id, needle: &str) -> egui::FullOutput {
+    /// Hover until `ready` accepts the rendered text. The assertions remain
+    /// exact; this only tolerates tooltip-Area creation lag under a loaded
+    /// runner.
+    fn hover_until(
+        &mut self,
+        id: egui::Id,
+        mut ready: impl FnMut(&str) -> bool,
+    ) -> egui::FullOutput {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let output = self.hover(id);
-            if output_text(&output).contains(needle) || Instant::now() >= deadline {
+            if ready(&output_text(&output)) || Instant::now() >= deadline {
                 return output;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Hover until the tooltip text appears. The assertion remains exact; this
+    /// only tolerates tooltip-Area creation lag under a loaded runner.
+    fn hover_until_text(&mut self, id: egui::Id, needle: &str) -> egui::FullOutput {
+        self.hover_until(id, |text| text.contains(needle))
     }
 
     fn press_hold(&mut self, id: egui::Id) -> egui::FullOutput {
@@ -1113,7 +1124,10 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
         "explorer must fill the main content height: {explorer_card:?}"
     );
 
-    let wordmark = output_text(&headless.hover(made_app::theme::wordmark_id()));
+    let wordmark = output_text(&headless.hover_until_text(
+        made_app::theme::wordmark_id(),
+        made_app::theme::WORDMARK_TOOLTIP,
+    ));
     assert!(
         wordmark.contains(made_app::theme::WORDMARK_TOOLTIP),
         "wordmark tooltip missing: {wordmark}"
@@ -1265,7 +1279,7 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
 
     let inactive_tab = headless.response(workspace_tab_id(alpha_id)).rect;
     let full_path = fs::canonicalize(&alpha).unwrap().display().to_string();
-    let output = headless.hover(workspace_tab_close_id(alpha_id));
+    let output = headless.hover_until_text(workspace_tab_close_id(alpha_id), "Close workspace");
     assert!(
         output_text(&output).contains("Close workspace"),
         "close affordance must keep its tooltip"
@@ -1303,7 +1317,8 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
     let active_tab = headless.response(workspace_tab_id(beta_id)).rect;
     let active_path = fs::canonicalize(&beta).unwrap().display().to_string();
     let active_close = headless.response(workspace_tab_close_id(beta_id)).rect;
-    let active_output = headless.hover(workspace_tab_close_id(beta_id));
+    let active_output =
+        headless.hover_until_text(workspace_tab_close_id(beta_id), "Close workspace");
     let active_text = output_text(&active_output);
     assert!(
         active_text.contains("Close workspace"),
@@ -1899,7 +1914,10 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: the space above and below the strip must both equal the pane gap"
         );
 
-        let wordmark_hover = headless.hover(made_app::theme::wordmark_id());
+        let wordmark_hover = headless.hover_until_text(
+            made_app::theme::wordmark_id(),
+            made_app::theme::WORDMARK_TOOLTIP,
+        );
         assert!(
             output_text(&wordmark_hover).contains(made_app::theme::WORDMARK_TOOLTIP),
             "{width}px: wordmark tooltip missing"
@@ -3494,7 +3512,9 @@ fn diagnostics_previous_log_row_reflects_existence_and_copies() {
     });
     headless.render_events_at(Vec::new(), headless.last_time + 1.0);
     let before_tooltip = output_text(&headless.render()).matches(&previous).count();
-    let hovered = headless.hover(path_id);
+    let hovered = headless.hover_until(path_id, |text| {
+        text.matches(&previous).count() > before_tooltip
+    });
     let after_tooltip = output_text(&hovered).matches(&previous).count();
     assert!(
         after_tooltip > before_tooltip,
@@ -3712,7 +3732,9 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
     let before_tooltip = output_text(&headless.render())
         .matches(previous.as_ref())
         .count();
-    let hovered = headless.hover(path_id);
+    let hovered = headless.hover_until(path_id, |text| {
+        text.matches(previous.as_ref()).count() > before_tooltip
+    });
     let after_tooltip = output_text(&hovered).matches(previous.as_ref()).count();
     assert!(
         after_tooltip > before_tooltip,
@@ -4069,7 +4091,8 @@ fn picker_click_expands_tree_keeps_ancestors_and_updates_target() {
             .any(|rect| rect.intersects(chip)),
         "the path chip must use the selected row target: {chip:?}"
     );
-    let hovered = output_text(&picker.hover(picker_path_id()));
+    let hovered =
+        output_text(&picker.hover_until_text(picker_path_id(), &alpha.display().to_string()));
     assert!(
         hovered.contains(&alpha.display().to_string()),
         "the path chip tooltip must expose the selected row path: {hovered}"
@@ -4083,14 +4106,13 @@ fn picker_click_expands_tree_keeps_ancestors_and_updates_target() {
         nested_target.path_target(),
         fs::canonicalize(root.join("alpha/nested")).unwrap()
     );
-    let hovered = output_text(&picker.hover(picker_path_id()));
+    let nested = fs::canonicalize(root.join("alpha/nested"))
+        .unwrap()
+        .display()
+        .to_string();
+    let hovered = output_text(&picker.hover_until_text(picker_path_id(), &nested));
     assert!(
-        hovered.contains(
-            &fs::canonicalize(root.join("alpha/nested"))
-                .unwrap()
-                .display()
-                .to_string()
-        ),
+        hovered.contains(&nested),
         "the path chip must follow the selected child row: {hovered}"
     );
 
@@ -4397,7 +4419,7 @@ fn picker_current_path_chip_is_selected_and_fits() {
             text_colors(&output, "segment", 250.0).contains(&made_app::theme::TEXT_PRIMARY),
             "path chip text must be primary at {width}x{height}"
         );
-        let hovered = output_text(&picker.hover(picker_path_id()));
+        let hovered = output_text(&picker.hover_until_text(picker_path_id(), &full));
         assert!(
             hovered.contains(&full),
             "path chip must keep the full-path tooltip at {width}x{height}: {hovered}"
@@ -4536,7 +4558,7 @@ fn picker_close_without_workspace_falls_back_to_home() {
         "picker close target below 24px: {:?}",
         close.rect
     );
-    let hovered = output_text(&closed.hover(picker_control_id("close")));
+    let hovered = output_text(&closed.hover_until_text(picker_control_id("close"), "Close picker"));
     assert!(
         hovered.contains("Close picker"),
         "picker close tooltip missing: {hovered}"

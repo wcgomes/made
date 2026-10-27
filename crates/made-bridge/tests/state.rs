@@ -2,9 +2,33 @@ use std::path::PathBuf;
 
 use made_bridge::{
     protocol::StateMessage,
+    security::MAX_PATH_CHARS,
     state::{SessionInfo, SessionSnapshot, SnapshotError, SnapshotTracker, MAX_PROJECT_ID_CHARS},
 };
 use serde_json::json;
+
+fn absolute_test_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(name)
+}
+
+fn absolute_path_with_len(length: usize) -> PathBuf {
+    #[cfg(windows)]
+    let prefix = "C:\\";
+    #[cfg(not(windows))]
+    let prefix = "/";
+    let mut path = String::from(prefix);
+    path.push_str(&"a".repeat(length - prefix.len()));
+    PathBuf::from(path)
+}
+
+fn absolute_traversal_paths() -> [PathBuf; 3] {
+    let base = std::env::temp_dir();
+    [
+        base.join("..").join("etc"),
+        base.join(".").join("worktree"),
+        base.join("a").join("..").join("..").join("b"),
+    ]
+}
 
 fn info(id: &str, title: &str) -> SessionInfo {
     SessionInfo {
@@ -38,7 +62,7 @@ fn valid_snapshot_is_accepted() {
     session.busy = true;
     session.attention = true;
     session.prompt_pulse = 3;
-    session.directory = Some(PathBuf::from("/tmp/worktree"));
+    session.directory = Some(absolute_test_path("worktree"));
     session.subpath = Some("src".into());
     session.project_id = Some("project-1".into());
 
@@ -105,7 +129,7 @@ fn title_length_is_measured_in_characters() {
 #[test]
 fn path_length_is_bounded() {
     let mut value = snapshot(1, vec![info("session-a", "Alpha")]);
-    value.sessions[0].directory = Some(PathBuf::from(format!("/{}", "a".repeat(4096))));
+    value.sessions[0].directory = Some(absolute_path_with_len(MAX_PATH_CHARS + 1));
     assert!(matches!(
         value.validate(),
         Err(SnapshotError::PathTooLong {
@@ -115,7 +139,7 @@ fn path_length_is_bounded() {
         })
     ));
 
-    value.sessions[0].directory = Some(PathBuf::from(format!("/{}", "a".repeat(4095))));
+    value.sessions[0].directory = Some(absolute_path_with_len(MAX_PATH_CHARS));
     assert!(value.validate().is_ok());
 
     value.sessions[0].directory = None;
@@ -240,6 +264,9 @@ fn tracker_validates_before_accepting() {
 
 #[test]
 fn wire_field_names_match_the_production_plugin() {
+    let directory = absolute_test_path("worktree")
+        .to_string_lossy()
+        .into_owned();
     let wire = json!({
         "type": "state",
         "revision": 7,
@@ -254,7 +281,7 @@ fn wire_field_names_match_the_production_plugin() {
             "unread": true,
             "promptPulse": 4,
             "renaming": false,
-            "directory": "/tmp/worktree",
+            "directory": directory,
             "subpath": "src/lib.rs",
             "projectID": "project-1",
             "futureField": "ignored"
@@ -273,7 +300,7 @@ fn wire_field_names_match_the_production_plugin() {
     assert_eq!(snapshot.sessions[0].prompt_pulse, 4);
     assert_eq!(
         snapshot.sessions[0].directory.as_deref(),
-        Some(std::path::Path::new("/tmp/worktree"))
+        Some(std::path::Path::new(&directory))
     );
     assert_eq!(snapshot.sessions[0].subpath.as_deref(), Some("src/lib.rs"));
     assert_eq!(
@@ -312,7 +339,7 @@ fn unread_is_optional_for_forward_compatibility() {
 #[test]
 fn snapshot_serializes_with_protocol_names() {
     let mut session = info("session-a", "Alpha");
-    session.directory = Some(PathBuf::from("/tmp/alpha"));
+    session.directory = Some(absolute_test_path("alpha"));
     let mut value = snapshot(3, vec![session]);
     value.active_session_id = Some("session-a".into());
     let wire = serde_json::to_value(StateMessage::new(value)).expect("serializes");
@@ -340,19 +367,23 @@ fn directory_must_be_absolute_nonempty_and_without_traversal() {
         Err(SnapshotError::DirectoryNotAbsolute { index: 0 })
     );
 
-    for traversal in ["/tmp/../etc", "/tmp/./worktree", "/tmp/a/../../b"] {
-        value.sessions[0].directory = Some(PathBuf::from(traversal));
+    for traversal in absolute_traversal_paths() {
+        value.sessions[0].directory = Some(traversal.clone());
         assert_eq!(
             value.validate(),
             Err(SnapshotError::PathTraversal {
                 index: 0,
                 field: "directory"
             }),
-            "directory {traversal}"
+            "directory {}",
+            traversal.display()
         );
     }
 
-    value.sessions[0].directory = Some(PathBuf::from("/tmp/\0worktree"));
+    value.sessions[0].directory = Some(PathBuf::from(format!(
+        "{}\0worktree",
+        std::env::temp_dir().display()
+    )));
     assert_eq!(
         value.validate(),
         Err(SnapshotError::NulInField {
@@ -361,7 +392,7 @@ fn directory_must_be_absolute_nonempty_and_without_traversal() {
         })
     );
 
-    value.sessions[0].directory = Some(PathBuf::from("/tmp/worktree"));
+    value.sessions[0].directory = Some(absolute_test_path("worktree"));
     assert!(value.validate().is_ok());
 }
 

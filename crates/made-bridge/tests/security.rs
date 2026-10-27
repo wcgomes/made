@@ -498,7 +498,7 @@ fn bridge_debug_output_and_events_never_contain_the_token() {
     let mut socket = connect(&handle);
     authenticate(&handle, &mut socket, &token);
     let title = format!("session {secret}");
-    let directory = format!("/tmp/{secret}");
+    let directory = test_path(&secret);
     send(
         &mut socket,
         &state(1, None, vec![session("a", &title, false, Some(&directory))]),
@@ -525,7 +525,7 @@ fn unauthorized_connection_gets_no_state() {
             "pluginVersion": PLUGIN_VERSION,
             "opencodeVersion": OPENCODE_VERSION,
             "pid": 1,
-            "cwd": "/tmp"
+            "cwd": test_path("workspace")
         }),
     );
     assert_eq!(read_close_code(&mut socket), Some(4401));
@@ -795,7 +795,7 @@ fn hello_fields_are_redacted_in_connected_event() {
 
     let mut hello = hello(&token);
     hello["pluginVersion"] = json!(format!("0.1.0-{secret}"));
-    hello["cwd"] = json!(format!("/tmp/{secret}"));
+    hello["cwd"] = json!(test_path(&secret));
     send(&mut socket, &hello);
     assert_eq!(read_json(&mut socket)["type"], "welcome");
 

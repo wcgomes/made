@@ -49,6 +49,15 @@ fn options(cwd: &std::path::Path) -> PtyOptions {
         .with_channel_capacity(64)
 }
 
+/// Build one shell command line. ConPTY needs a line terminator on the input
+/// pipe; this whole-line CRLF submission is distinct from the single `\r` the
+/// product sends for a physical Enter key. POSIX shells accept LF.
+fn command(text: &str) -> Vec<u8> {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.extend_from_slice(if cfg!(windows) { b"\r\n" } else { b"\n" });
+    bytes
+}
+
 /// Answer the console host's cursor-position query. Windows conhost and
 /// PowerShell wait for the reply before accepting the next command.
 fn answer_console_dsr(pty: &mut PtyProcess, bytes: &[u8], carry: &mut Vec<u8>) -> usize {
@@ -199,7 +208,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     assert!(pty.pid().is_some());
     assert_eq!(pty.size().expect("size"), PtySize { rows: 24, cols: 80 });
 
-    pty.write(b"echo made-pty-ok\n").expect("write echo");
+    pty.write(&command("echo made-pty-ok")).expect("write echo");
     let mut output = Vec::new();
     assert!(
         read_until(
@@ -214,7 +223,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     );
 
     let marker = root.join("made-cwd-probe.txt");
-    pty.write(b"echo cwd-ok > made-cwd-probe.txt\n")
+    pty.write(&command("echo cwd-ok > made-cwd-probe.txt"))
         .expect("write cwd probe");
     assert!(
         wait_for_file(&mut pty, &marker, Duration::from_secs(5)),
@@ -231,7 +240,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
         }
     );
 
-    pty.write(b"exit\n").expect("exit");
+    pty.write(&command("exit")).expect("exit");
     let status = wait_for_exit(&mut pty, Duration::from_secs(5)).expect("exit status");
     assert!(status.success(), "unexpected status: {status}");
     assert!(!pty.is_running());
@@ -280,7 +289,7 @@ fn pty_can_be_relaunched_after_exit() {
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
     settle_console(&mut pty);
 
-    pty.write(b"exit\n").expect("exit first shell");
+    pty.write(&command("exit")).expect("exit first shell");
     wait_for_exit(&mut pty, Duration::from_secs(5)).expect("first exit");
     assert!(!pty.is_running());
 
@@ -289,7 +298,7 @@ fn pty_can_be_relaunched_after_exit() {
     assert!(pty.is_running());
     assert!(pty.pid().is_some());
 
-    pty.write(b"echo relaunched-ok\n").expect("write");
+    pty.write(&command("echo relaunched-ok")).expect("write");
     let mut output = Vec::new();
     assert!(
         read_until(
@@ -330,9 +339,9 @@ fn queued_writes_are_delivered_in_order() {
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
     settle_console(&mut pty);
 
-    pty.write(b"echo ORDER-ONE >> order.txt\n")
+    pty.write(&command("echo ORDER-ONE >> order.txt"))
         .expect("first ordered write");
-    pty.write(b"echo ORDER-TWO >> order.txt\n")
+    pty.write(&command("echo ORDER-TWO >> order.txt"))
         .expect("second ordered write");
 
     let order_file = root.join("order.txt");
@@ -374,7 +383,7 @@ fn wait_for_file_returns_after_the_shell_exits() {
     let platform = host_platform();
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
     settle_console(&mut pty);
-    pty.write(b"exit\n").expect("exit");
+    pty.write(&command("exit")).expect("exit");
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
@@ -966,6 +975,81 @@ fn real_bash_reports_initial_and_cd_preserving_rc_hooks_and_relaunch_cleanup() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn bash_prompt_command_array_keeps_every_hook_in_order() {
+    // macOS /bin/bash is 3.2.57, where PROMPT_COMMAND arrays execute only the
+    // first element. MADE_TEST_BASH32 lets a local run exercise both a real
+    // 3.2 shell and the platform bash (5.x on Linux).
+    let mut candidates = vec![OsString::from("bash")];
+    if let Some(path) = std::env::var_os("MADE_TEST_BASH32") {
+        candidates.push(path);
+    }
+
+    for shell in candidates {
+        let available = std::process::Command::new(&shell)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            eprintln!(
+                "PENDING (not passed): {} unavailable",
+                shell.to_string_lossy()
+            );
+            continue;
+        }
+
+        let root = unique_temp("bash-hooks");
+        std::fs::create_dir_all(&root).expect("create cwd");
+        let markers = root.join("hooks.txt");
+        let rc = r#"PS1='USER_PROMPT> '
+PROMPT_COMMAND=('printf "FIRST\n" >> "$HOME/hooks.txt"' 'printf "SECOND\n" >> "$HOME/hooks.txt"')
+"#;
+        std::fs::write(root.join(".bashrc"), rc).expect("write bashrc");
+
+        let mut opts = options(&root);
+        opts.shell = Some(shell.clone());
+        opts.env
+            .push(("HOME".into(), root.clone().into_os_string()));
+        let platform = host_platform();
+        let mut pty = PtyProcess::spawn(&platform, opts).expect("spawn bash");
+        let mut output = Vec::new();
+        assert!(
+            read_until(
+                &mut pty,
+                &mut output,
+                "USER_PROMPT>",
+                1,
+                Duration::from_secs(5)
+            ),
+            "{}: no prompt: {}",
+            shell.to_string_lossy(),
+            String::from_utf8_lossy(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("\x1b]7;"),
+            "{}: missing OSC 7: {}",
+            shell.to_string_lossy(),
+            String::from_utf8_lossy(&output)
+        );
+
+        let contents = std::fs::read_to_string(&markers).expect("hook markers");
+        let observed: Vec<&str> = contents.lines().take(2).collect();
+        assert_eq!(
+            observed,
+            vec!["FIRST", "SECOND"],
+            "{}: hooks were reordered or swallowed: {contents:?}",
+            shell.to_string_lossy()
+        );
+
+        pty.terminate().expect("terminate");
+        drop(pty);
+        let _ = std::fs::remove_dir_all(&root);
+        eprintln!("PASSED bash hook order: {}", shell.to_string_lossy());
+    }
+}
+
 struct CaptureLaunchPlatform {
     host: Box<dyn Platform>,
     requests: Mutex<Vec<PtyRequest>>,

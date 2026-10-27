@@ -34,12 +34,13 @@ fn hello_authenticates_and_welcome_matches_protocol() {
     assert_eq!(info.protocol_version, 1);
     assert_eq!(info.pid, 4321);
 
+    let alpha = test_path("alpha");
     send(
         &mut socket,
         &state(
             1,
             Some("session-a"),
-            vec![session("session-a", "Alpha", true, Some("/tmp/alpha"))],
+            vec![session("session-a", "Alpha", true, Some(&alpha))],
         ),
     );
     let snapshot = match wait_for(&handle, |event| matches!(event, BridgeEvent::State(_))) {
@@ -53,7 +54,7 @@ fn hello_authenticates_and_welcome_matches_protocol() {
     assert_eq!(snapshot.sessions[0].title, "Alpha");
     assert_eq!(
         snapshot.sessions[0].directory.as_deref(),
-        Some(std::path::Path::new("/tmp/alpha"))
+        Some(std::path::Path::new(&alpha))
     );
 
     let _ = socket.close(None);
@@ -373,12 +374,13 @@ fn replacement_discards_old_epoch_state_and_delivers_the_new_state() {
         .expect("new connection registered");
     assert_ne!(new_id, old_id);
 
+    let new_dir = test_path("new");
     send(
         &mut new,
         &state(
             1,
             Some("new"),
-            vec![session("new", "New", true, Some("/tmp/new"))],
+            vec![session("new", "New", true, Some(&new_dir))],
         ),
     );
 
@@ -457,12 +459,13 @@ fn final_state_and_lifecycle_survive_event_queue_pressure() {
         "event queue did not report pressure"
     );
 
+    let final_dir = test_path("final");
     send(
         &mut socket,
         &state(
             1,
             Some("final"),
-            vec![session("final", "Final", true, Some("/tmp/final"))],
+            vec![session("final", "Final", true, Some(&final_dir))],
         ),
     );
     send(
@@ -546,12 +549,13 @@ fn unauth_flood_cannot_fill_the_authenticated_event_queue() {
 
     let mut socket = connect(&handle);
     authenticate(&handle, &mut socket, &token);
+    let auth_dir = test_path("auth");
     send(
         &mut socket,
         &state(
             1,
             Some("auth"),
-            vec![session("auth", "Authenticated", true, Some("/tmp/auth"))],
+            vec![session("auth", "Authenticated", true, Some(&auth_dir))],
         ),
     );
 
@@ -625,13 +629,10 @@ fn invalid_paths_and_project_ids_are_rejected_on_the_wire() {
     let mut socket = connect(&handle);
     authenticate(&handle, &mut socket, &token);
 
+    let escape = test_traversal_path(&["..", "escape"]);
     send(
         &mut socket,
-        &state(
-            1,
-            None,
-            vec![session("a", "A", false, Some("/tmp/../escape"))],
-        ),
+        &state(1, None, vec![session("a", "A", false, Some(&escape))]),
     );
     assert_eq!(read_close_code(&mut socket), Some(1008));
     let error = wait_for(&handle, |event| {
@@ -644,7 +645,8 @@ fn invalid_paths_and_project_ids_are_rejected_on_the_wire() {
 
     let mut socket = connect(&handle);
     authenticate(&handle, &mut socket, &token);
-    let mut session = session("a", "A", false, Some("/tmp/ok"));
+    let ok = test_path("ok");
+    let mut session = session("a", "A", false, Some(&ok));
     session["projectID"] = json!("p".repeat(129));
     send(&mut socket, &state(1, None, vec![session]));
     assert_eq!(read_close_code(&mut socket), Some(1008));

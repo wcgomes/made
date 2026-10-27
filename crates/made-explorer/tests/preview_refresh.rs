@@ -1,12 +1,69 @@
 use std::fs;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
+use notify::Watcher;
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
 use made_explorer::preview::{Preview, PreviewKind, PREVIEW_SIZE_LIMIT};
 use made_explorer::preview_refresh::{PreviewError, PreviewRefresher};
 use made_explorer::root_switch::RootGeneration;
 
 const GENERATION: RootGeneration = RootGeneration::new(1);
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drain setup events (including the fixture write) until the watcher has been
+/// quiet longer than the debounce thread's 600 ms maximum latency. The measured
+/// `refresh()` runs after this point, so its own event is never drained here.
+fn settle_events(refresher: &mut PreviewRefresher) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut quiet_since = std::time::Instant::now();
+    while std::time::Instant::now() < deadline {
+        if refresher.poll_event().is_some() {
+            quiet_since = std::time::Instant::now();
+        }
+        if quiet_since.elapsed() >= Duration::from_millis(700) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct RawEventProbe {
+    events: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+#[cfg(target_os = "macos")]
+impl RawEventProbe {
+    fn start(root: &Path) -> Self {
+        let (sender, events) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .expect("probe watcher");
+        watcher
+            .watch(root, notify::RecursiveMode::NonRecursive)
+            .expect("probe watch");
+        Self {
+            events,
+            _watcher: watcher,
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        std::thread::sleep(Duration::from_millis(100));
+        self.events
+            .try_iter()
+            .map(|result| match result {
+                Ok(event) => format!("{:?} {:?}", event.kind, event.paths),
+                Err(error) => format!("error: {error}"),
+            })
+            .collect()
+    }
+}
 
 fn fixture_root(temp: &tempfile::TempDir) -> std::path::PathBuf {
     let root = temp.path().join("root");
@@ -51,15 +108,24 @@ fn reading_the_preview_does_not_trigger_its_own_refresh() {
 
     let mut refresher = PreviewRefresher::new(&root, GENERATION).unwrap();
     let selection = refresher.select(&file).unwrap();
-    assert_eq!(
-        refresher.refresh(selection).unwrap().kind(),
-        PreviewKind::Text
-    );
+    settle_events(&mut refresher);
 
-    std::thread::sleep(Duration::from_millis(300));
+    #[cfg(target_os = "macos")]
+    let probe = RawEventProbe::start(&root);
+    let preview = refresher.refresh(selection).expect("first open read");
+    assert_eq!(preview.kind(), PreviewKind::Text);
+
+    // The debounce thread can hold a burst up to 600 ms; wait beyond that so a
+    // first-read self-event cannot be mistaken for a missing one.
+    std::thread::sleep(Duration::from_millis(700));
+    let event = refresher.poll_event();
+    #[cfg(target_os = "macos")]
+    let raw_events = probe.finish();
+    #[cfg(not(target_os = "macos"))]
+    let raw_events: Vec<String> = Vec::new();
     assert!(
-        refresher.poll_event().is_none(),
-        "opening the preview must not enqueue an access event"
+        event.is_none(),
+        "opening the preview must not enqueue an access event; got {event:?}; raw watcher events: {raw_events:?}"
     );
 }
 
