@@ -978,34 +978,22 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     .layout(egui::Layout::left_to_right(Align::Center)),
             );
             right.spacing_mut().item_spacing.x = control_gap;
-            for (index, (name, glyph, label, selected)) in right_specs.iter().enumerate() {
+            for (name, glyph, label, selected) in &right_specs {
                 let id = match *name {
                     "explorer" | "sessions" => active
                         .map(|active| top_workspace_action_id(active, name))
                         .unwrap_or_else(|| top_action_id(name)),
                     _ => top_action_id(name),
                 };
-                let action = if index + 1 == right_specs.len() {
-                    theme::icon_action_right_aligned(
-                        &mut right,
-                        id,
-                        *glyph,
-                        label,
-                        *selected,
-                        layout.tab_height,
-                        theme::BG_CLEAR,
-                    )
-                } else {
-                    theme::icon_action(
-                        &mut right,
-                        id,
-                        *glyph,
-                        label,
-                        *selected,
-                        layout.tab_height,
-                        theme::BG_CLEAR,
-                    )
-                };
+                let action = theme::icon_action(
+                    &mut right,
+                    id,
+                    *glyph,
+                    label,
+                    *selected,
+                    layout.tab_height,
+                    theme::BG_CLEAR,
+                );
                 match *name {
                     "sessions" if action.activated => toggle_sessions = true,
                     "explorer" if action.activated => toggle_explorer = true,

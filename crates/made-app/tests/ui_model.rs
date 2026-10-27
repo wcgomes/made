@@ -1740,9 +1740,19 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             })
             .map(|shape| shape.rect)
             .expect("Explorer panel glyph");
+        let left_padding = explorer_glyph.left() - explorer.left();
+        let right_padding = explorer.right() - explorer_glyph.right();
         assert!(
-            (explorer_glyph.right() - content_right).abs() < 0.75,
-            "{width}px: the last visible glyph edge must align with the card right edge: {explorer_glyph:?} vs {content_right}"
+            (left_padding - right_padding).abs() < 0.75,
+            "{width}px: the last glyph must be centered in its target: glyph {explorer_glyph:?}, target {explorer:?}, padding {left_padding}/{right_padding}"
+        );
+        assert!(
+            (explorer_glyph.center().x - explorer.center().x).abs() < 0.75,
+            "{width}px: the last glyph center must match the target center: glyph {explorer_glyph:?}, target {explorer:?}"
+        );
+        assert!(
+            explorer_glyph.right() < content_right - 0.5,
+            "{width}px: the centered glyph must sit inside the card right edge: {explorer_glyph:?} vs {content_right}"
         );
         assert!(
             explorer.contains_rect(explorer_glyph),

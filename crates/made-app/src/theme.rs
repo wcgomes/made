@@ -742,11 +742,6 @@ pub fn icon_action_extent(height: f32) -> f32 {
     height.max(24.0)
 }
 
-/// Optical inset from the 14px glyph edge to its square hit-target edge.
-pub fn icon_glyph_inset(height: f32) -> f32 {
-    (icon_action_extent(height) - ICON_GLYPH_WIDTH) / 2.0
-}
-
 /// Icon-only ghost action with a caller-supplied stable id.
 ///
 /// The square target is at least 24 points, uses the same selected/hover/focus
@@ -760,37 +755,6 @@ pub fn icon_action(
     selected: bool,
     height: f32,
     gap: Color32,
-) -> ActionResponse {
-    icon_action_impl(ui, id, glyph, label, selected, height, gap, false)
-}
-
-/// Icon-only action whose glyph is optically right-aligned inside its target.
-///
-/// The target, selected/hover fill, focus ring, tooltip, and accessibility
-/// bounds remain centered on the normal square action rect; only the painted
-/// 14px glyph shifts right so its visible edge meets the target's right edge.
-pub fn icon_action_right_aligned(
-    ui: &mut Ui,
-    id: egui::Id,
-    glyph: IconGlyph,
-    label: &str,
-    selected: bool,
-    height: f32,
-    gap: Color32,
-) -> ActionResponse {
-    icon_action_impl(ui, id, glyph, label, selected, height, gap, true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn icon_action_impl(
-    ui: &mut Ui,
-    id: egui::Id,
-    glyph: IconGlyph,
-    label: &str,
-    selected: bool,
-    height: f32,
-    gap: Color32,
-    right_align_glyph: bool,
 ) -> ActionResponse {
     let extent = icon_action_extent(height);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(extent, extent), egui::Sense::hover());
@@ -809,12 +773,7 @@ fn icon_action_impl(
     } else {
         inactive_icon_color()
     };
-    let glyph_rect = if right_align_glyph {
-        rect.translate(egui::vec2(icon_glyph_inset(height), 0.0))
-    } else {
-        rect
-    };
-    paint_icon(ui.painter(), glyph_rect, glyph, color);
+    paint_icon(ui.painter(), rect, glyph, color);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -1687,13 +1646,6 @@ mod tests {
         );
         assert!(compact.explorer_max_width(compact.content_width()) < 440.0);
         assert!(compact.hide_preview_meta);
-    }
-
-    #[test]
-    fn icon_glyph_inset_centers_the_fourteen_pixel_glyph() {
-        assert_eq!(icon_glyph_inset(26.0), 6.0);
-        assert_eq!(icon_glyph_inset(24.0), 5.0);
-        assert_eq!(icon_glyph_inset(30.0), 8.0);
     }
 
     #[test]

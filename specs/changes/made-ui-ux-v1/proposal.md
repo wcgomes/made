@@ -50,7 +50,7 @@ Extract the durable visual contract into this change's `spec.md` (normative UI o
 - **Q:** Which spec is normative for a UI behavior that also touches runtime behavior?
   **A:** The core spec owns the observable behavior/data/security outcome; this spec owns the observable presentation/interaction outcome. Requirements cross-reference rather than duplicate each other.
 - **Q:** Are the UI requirements implemented?
-  **A:** Yes on Linux: 631 tests pass, with Xvfb/headless test evidence summarized in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Visual captures are ad hoc validation artifacts and are not committed. Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
+  **A:** Yes on Linux: 630 tests pass, with Xvfb/headless test evidence summarized in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Visual captures are ad hoc validation artifacts and are not committed. Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
 - **Q:** Does this change add scope beyond the active v1?
   **A:** No. It extracts already implemented/discussed UI behavior; derived scenarios only make implicit presentation guarantees explicit. The 6.x–12.x refinements stay inside this UI contract and do not add runtime/product scope.
 - **Q:** Does the proposal's “no code changes” statement still apply?
