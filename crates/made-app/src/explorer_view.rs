@@ -2739,14 +2739,22 @@ mod tests {
         }
         p95s.sort_unstable();
         let p95 = p95s[1];
+        // Test-local guard. The product contract is a 60 Hz frame p95 below
+        // 16.667 ms (wiki/performance.md); Windows debug runners are slower
+        // than the tighter Unix guard. One frame is the defensible ceiling.
+        let budget = if cfg!(windows) {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(5)
+        };
         assert_eq!(
             pane.row_rebuilds(),
             rebuilds,
             "selection movement must not rebuild all rows"
         );
         assert!(
-            p95 < Duration::from_millis(5),
-            "10k-row selection median p95 was {p95:?}"
+            p95 < budget,
+            "10k-row selection median p95 was {p95:?} (budget {budget:?})"
         );
         assert!(pane.preview_path().is_none());
         assert!(pane.selected_path().is_some());

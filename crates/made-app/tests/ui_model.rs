@@ -342,6 +342,19 @@ impl Headless {
         self.render()
     }
 
+    /// Hover until the tooltip text appears. The assertion remains exact; this
+    /// only tolerates tooltip-Area creation lag under a loaded runner.
+    fn hover_until_text(&mut self, id: egui::Id, needle: &str) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = self.hover(id);
+            if output_text(&output).contains(needle) || Instant::now() >= deadline {
+                return output;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn press_hold(&mut self, id: egui::Id) -> egui::FullOutput {
         self.render();
         self.render();
@@ -1694,7 +1707,7 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
         );
     }
     let open_folder_rect = headless.response(top_action_id("open-folder")).rect;
-    let hovered_output = headless.hover(top_action_id("open-folder"));
+    let hovered_output = headless.hover_until_text(top_action_id("open-folder"), "Open folder");
     let hovered = output_text(&hovered_output);
     assert!(
         hovered.contains("Open folder"),
@@ -1706,12 +1719,15 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
             .any(|rect| rect.contains_rect(open_folder_rect)),
         "hovered header icon must use BG_HOVER"
     );
-    let hovered = output_text(&headless.hover(top_workspace_action_id(id, "explorer")));
+    let hovered = output_text(
+        &headless.hover_until_text(top_workspace_action_id(id, "explorer"), "Hide explorer"),
+    );
     assert!(
         hovered.contains("Hide explorer"),
         "Explorer tooltip missing: {hovered}"
     );
-    let hovered = output_text(&headless.hover(top_action_id("diagnostics")));
+    let hovered =
+        output_text(&headless.hover_until_text(top_action_id("diagnostics"), "Diagnostics"));
     assert!(
         hovered.contains("Diagnostics"),
         "Diagnostics tooltip missing: {hovered}"
@@ -4599,7 +4615,9 @@ fn optional_session_map_appears_only_after_session_data() {
             && explorer.left() > sessions.left(),
         "right icon order must be Sessions, Diagnostics, Explorer (Explorer rightmost): sessions {sessions:?}, diagnostics {diagnostics:?}, explorer {explorer:?}"
     );
-    let hovered = output_text(&headless.hover(top_workspace_action_id(id, "sessions")));
+    let hovered = output_text(
+        &headless.hover_until_text(top_workspace_action_id(id, "sessions"), "Show sessions"),
+    );
     assert!(
         hovered.contains("Show sessions"),
         "Sessions tooltip missing: {hovered}"

@@ -145,6 +145,23 @@ impl From<PathError> for PreviewError {
     }
 }
 
+/// Whether an event can change previewable file content. Access-time and
+/// metadata-only notifications (notably macOS FSEvents INODE_META_MOD) must
+/// not make reading the preview feed its own refresh.
+///
+/// This intentionally drops permission and attribute changes (chmod, chown,
+/// xattr, touch): they can affect whether a file is readable, but never its
+/// bytes, so a preview re-read is not required. The tradeoff is that a preview
+/// whose file becomes unreadable keeps its current contents until the next
+/// content event or explicit refresh.
+fn is_content_event(kind: &notify::EventKind) -> bool {
+    !matches!(
+        kind,
+        notify::EventKind::Access(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+    )
+}
+
 /// Internal debounced signal; the current selection supplies the path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RefreshSignal;
@@ -460,7 +477,7 @@ impl PreviewRefresher {
             raw_overflow,
             self.debounce,
             move |event| {
-                if matches!(event.kind, notify::EventKind::Access(_)) {
+                if !is_content_event(&event.kind) {
                     // Reading the preview must not feed its own watcher.
                     return Vec::new();
                 }
@@ -491,3 +508,36 @@ impl PreviewRefresher {
 
 /// Convenience alias matching the module name.
 pub type PreviewRefresh = PreviewRefresher;
+
+#[cfg(test)]
+mod tests {
+    use super::is_content_event;
+    use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+    use notify::EventKind;
+
+    #[test]
+    fn access_and_metadata_events_are_not_content_changes() {
+        assert!(!is_content_event(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Any
+        ))));
+        assert!(!is_content_event(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+    }
+
+    #[test]
+    fn create_remove_and_data_changes_are_content_changes() {
+        assert!(is_content_event(&EventKind::Create(
+            notify::event::CreateKind::File
+        )));
+        assert!(is_content_event(&EventKind::Remove(
+            notify::event::RemoveKind::File
+        )));
+        assert!(is_content_event(&EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content
+        ))));
+    }
+}

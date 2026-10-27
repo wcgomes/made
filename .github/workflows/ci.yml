@@ -107,7 +107,7 @@ jobs:
         run: cargo build --workspace --locked --target ${{ matrix.target }}
 
       - name: Test the workspace
-        run: cargo test --workspace --locked --target ${{ matrix.target }}
+        run: cargo test --workspace --locked --no-fail-fast --target ${{ matrix.target }}
 
       - name: Stage the development binary
         shell: bash

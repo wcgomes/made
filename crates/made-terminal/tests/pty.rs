@@ -49,20 +49,86 @@ fn options(cwd: &std::path::Path) -> PtyOptions {
         .with_channel_capacity(64)
 }
 
+/// Answer the console host's cursor-position query. Windows conhost and
+/// PowerShell wait for the reply before accepting the next command.
+fn answer_console_dsr(pty: &mut PtyProcess, bytes: &[u8], carry: &mut Vec<u8>) -> usize {
+    let mut scan = Vec::with_capacity(carry.len() + bytes.len());
+    scan.extend_from_slice(carry);
+    scan.extend_from_slice(bytes);
+    let requests = scan
+        .windows(4)
+        .filter(|window| *window == b"\x1b[6n")
+        .count();
+    for _ in 0..requests {
+        let _ = pty.write(b"\x1b[1;1R");
+    }
+    *carry = scan[scan.len().saturating_sub(3)..].to_vec();
+    requests
+}
+
+/// Drain immediately queued PTY events while answering DSR queries. Returns
+/// whether the terminal event stream ended and how many queries were answered.
+/// `poll` repeats `Exited` after the child is reaped, so terminal events must
+/// end the drain loop instead of being ignored.
+fn drain_console_events(pty: &mut PtyProcess, carry: &mut Vec<u8>) -> (bool, usize) {
+    let mut requests = 0;
+    while let Some(event) = pty.poll() {
+        match event {
+            PtyEvent::Data(bytes) => requests += answer_console_dsr(pty, &bytes, carry),
+            PtyEvent::Exited(_)
+            | PtyEvent::Eof
+            | PtyEvent::ReadError(_)
+            | PtyEvent::MonitorError(_) => return (true, requests),
+        }
+    }
+    (false, requests)
+}
+
+/// Wait for Windows conhost/PowerShell to issue its startup cursor-position
+/// query before sending commands, so the reply is not queued behind input.
+/// A cold PowerShell can take several seconds to reach its first prompt.
+#[cfg(windows)]
+fn settle_console(pty: &mut PtyProcess) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut carry = Vec::new();
+    loop {
+        let (ended, requests) = drain_console_events(pty, &mut carry);
+        if requests > 0 {
+            return;
+        }
+        assert!(
+            !ended,
+            "console host exited before issuing its cursor-position query"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "console host did not issue a cursor-position query within 5s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(windows))]
+fn settle_console(_pty: &mut PtyProcess) {}
+
 fn read_until(
-    pty: &PtyProcess,
+    pty: &mut PtyProcess,
     output: &mut Vec<u8>,
     needle: &str,
     occurrences: usize,
     timeout: Duration,
 ) -> bool {
     let deadline = Instant::now() + timeout;
+    let mut carry = Vec::new();
     while Instant::now() < deadline {
         if String::from_utf8_lossy(output).matches(needle).count() >= occurrences {
             return true;
         }
         match pty.recv_timeout(Duration::from_millis(100)) {
-            Ok(PtyEvent::Data(bytes)) => output.extend_from_slice(&bytes),
+            Ok(PtyEvent::Data(bytes)) => {
+                let _ = answer_console_dsr(pty, &bytes, &mut carry);
+                output.extend_from_slice(&bytes);
+            }
             Ok(
                 PtyEvent::Eof
                 | PtyEvent::ReadError(_)
@@ -79,15 +145,47 @@ fn read_until(
     String::from_utf8_lossy(output).matches(needle).count() >= occurrences
 }
 
-fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+fn wait_for_file(pty: &mut PtyProcess, path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let mut carry = Vec::new();
+    loop {
         if path.is_file() {
             return true;
         }
+        // A repeated `Exited` poll must end the wait rather than livelock.
+        let (ended, _) = drain_console_events(pty, &mut carry);
+        if ended {
+            return path.is_file();
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    path.is_file()
+}
+
+fn wait_for_exit(pty: &mut PtyProcess, timeout: Duration) -> Result<ExitStatus, PtyError> {
+    let deadline = Instant::now() + timeout;
+    let mut carry = Vec::new();
+    loop {
+        while let Some(event) = pty.poll() {
+            match event {
+                PtyEvent::Data(bytes) => {
+                    let _ = answer_console_dsr(pty, &bytes, &mut carry);
+                }
+                PtyEvent::Exited(status) => return Ok(status),
+                PtyEvent::MonitorError(message) => return Err(PtyError::Monitor(message)),
+                PtyEvent::Eof | PtyEvent::ReadError(_) => {}
+            }
+        }
+        if let Some(status) = pty.exit_status() {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(PtyError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -96,6 +194,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     std::fs::create_dir_all(&root).expect("create cwd");
     let platform = host_platform();
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
+    settle_console(&mut pty);
     assert!(pty.is_running());
     assert!(pty.pid().is_some());
     assert_eq!(pty.size().expect("size"), PtySize { rows: 24, cols: 80 });
@@ -103,7 +202,13 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     pty.write(b"echo made-pty-ok\n").expect("write echo");
     let mut output = Vec::new();
     assert!(
-        read_until(&pty, &mut output, "made-pty-ok", 2, Duration::from_secs(5)),
+        read_until(
+            &mut pty,
+            &mut output,
+            "made-pty-ok",
+            2,
+            Duration::from_secs(5)
+        ),
         "no echo output: {}",
         String::from_utf8_lossy(&output)
     );
@@ -112,7 +217,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     pty.write(b"echo cwd-ok > made-cwd-probe.txt\n")
         .expect("write cwd probe");
     assert!(
-        wait_for_file(&marker, Duration::from_secs(5)),
+        wait_for_file(&mut pty, &marker, Duration::from_secs(5)),
         "shell did not run in the requested cwd: {}",
         root.display()
     );
@@ -127,9 +232,7 @@ fn pty_spawns_shell_with_cwd_echo_resize_and_exit_event() {
     );
 
     pty.write(b"exit\n").expect("exit");
-    let status = pty
-        .wait_timeout(Some(Duration::from_secs(5)))
-        .expect("exit status");
+    let status = wait_for_exit(&mut pty, Duration::from_secs(5)).expect("exit status");
     assert!(status.success(), "unexpected status: {status}");
     assert!(!pty.is_running());
     assert!(pty.exit_status().is_some());
@@ -175,13 +278,14 @@ fn pty_can_be_relaunched_after_exit() {
     std::fs::create_dir_all(&root).expect("create cwd");
     let platform = host_platform();
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
+    settle_console(&mut pty);
 
     pty.write(b"exit\n").expect("exit first shell");
-    pty.wait_timeout(Some(Duration::from_secs(5)))
-        .expect("first exit");
+    wait_for_exit(&mut pty, Duration::from_secs(5)).expect("first exit");
     assert!(!pty.is_running());
 
     pty.relaunch(&platform).expect("relaunch");
+    settle_console(&mut pty);
     assert!(pty.is_running());
     assert!(pty.pid().is_some());
 
@@ -189,7 +293,7 @@ fn pty_can_be_relaunched_after_exit() {
     let mut output = Vec::new();
     assert!(
         read_until(
-            &pty,
+            &mut pty,
             &mut output,
             "relaunched-ok",
             2,
@@ -224,6 +328,7 @@ fn queued_writes_are_delivered_in_order() {
     std::fs::create_dir_all(&root).expect("create cwd");
     let platform = host_platform();
     let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
+    settle_console(&mut pty);
 
     pty.write(b"echo ORDER-ONE >> order.txt\n")
         .expect("first ordered write");
@@ -232,14 +337,22 @@ fn queued_writes_are_delivered_in_order() {
 
     let order_file = root.join("order.txt");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut contents = String::new();
-    while Instant::now() < deadline {
+    let mut carry = Vec::new();
+    let mut contents;
+    loop {
         contents = std::fs::read_to_string(&order_file).unwrap_or_default();
         if contents.contains("ORDER-TWO") {
             break;
         }
+        // PowerShell can issue DSR queries after the commands were queued;
+        // answer them so the shell is not blocked waiting for a reply.
+        let (ended, _) = drain_console_events(&mut pty, &mut carry);
+        if ended || Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let contents = std::fs::read_to_string(&order_file).unwrap_or_default();
     let first = contents
         .find("ORDER-ONE")
         .expect("first queued command ran");
@@ -250,6 +363,29 @@ fn queued_writes_are_delivered_in_order() {
 
     pty.terminate().expect("terminate");
     drop(pty);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn wait_for_file_returns_after_the_shell_exits() {
+    let root = unique_temp("exit-before-file");
+    std::fs::create_dir_all(&root).expect("create cwd");
+    let missing = root.join("never-created.txt");
+    let platform = host_platform();
+    let mut pty = PtyProcess::spawn(&platform, options(&root)).expect("spawn");
+    settle_console(&mut pty);
+    pty.write(b"exit\n").expect("exit");
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let found = wait_for_file(&mut pty, &missing, Duration::from_secs(5));
+        let _ = sender.send(found);
+    });
+    let found = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("wait_for_file hung after the shell exited");
+    assert!(!found, "the shell exited before creating the file");
+    waiter.join().expect("waiter thread");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -784,12 +920,12 @@ fn real_bash_reports_initial_and_cd_preserving_rc_hooks_and_relaunch_cleanup() {
         let bootstrap = pty.bootstrap_directory().unwrap().to_owned();
         let mut output = Vec::new();
         assert!(
-            read_until(&pty, &mut output, "\x1b]7;", 1, Duration::from_secs(5)),
+            read_until(&mut pty, &mut output, "\x1b]7;", 1, Duration::from_secs(5)),
             "{}",
             String::from_utf8_lossy(&output)
         );
         assert!(read_until(
-            &pty,
+            &mut pty,
             &mut output,
             "USER_PROMPT>",
             1,
@@ -807,7 +943,7 @@ fn real_bash_reports_initial_and_cd_preserving_rc_hooks_and_relaunch_cleanup() {
         )
         .unwrap();
         assert!(
-            read_until(&pty, &mut output, "\x1b]7;", 2, Duration::from_secs(5)),
+            read_until(&mut pty, &mut output, "\x1b]7;", 2, Duration::from_secs(5)),
             "{}",
             String::from_utf8_lossy(&output)
         );
