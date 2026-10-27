@@ -1165,12 +1165,7 @@ fn workspace_tab_ui(
     // path tooltip is suppressed so the close tooltip is the one shown.
     let close_hovered = close_response.hovered();
     let hovered = response.hovered() || close_hovered;
-    let close_scale = theme::close_glyph_scale(ui.ctx().animate_bool_with_time_and_easing(
-        egui::Id::unique(("made-close-scale", tab.id.get())),
-        close_hovered,
-        theme::CLOSE_HOVER_SCALE_TIME,
-        egui::emath::easing::quadratic_out,
-    ));
+    let close_visible = hovered || response.has_focus() || close_response.has_focus();
     let fill = if active {
         theme::BG_TAB_SELECTED
     } else if hovered {
@@ -1203,17 +1198,19 @@ fn workspace_tab_ui(
         galley,
         color,
     );
-    ui.painter().text(
-        close_rect.center(),
-        Align2::CENTER_CENTER,
-        "×",
-        FontId::proportional(theme::CLOSE_GLYPH_SIZE * close_scale),
-        if close_hovered {
-            theme::ERROR
-        } else {
-            theme::inactive_icon_color()
-        },
-    );
+    if close_visible {
+        ui.painter().text(
+            close_rect.center(),
+            Align2::CENTER_CENTER,
+            "×",
+            FontId::proportional(theme::CLOSE_GLYPH_SIZE),
+            if close_hovered {
+                theme::ERROR
+            } else {
+                theme::inactive_icon_color()
+            },
+        );
+    }
     if response.has_focus() {
         theme::paint_focus_ring(ui, rect, CornerRadius::same(6), theme::BG_CLEAR);
     }

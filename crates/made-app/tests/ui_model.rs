@@ -1311,18 +1311,20 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
         "selected-tab close hover must not switch to BG_TAB_HOVER"
     );
 
-    headless.advance(0.18);
-    let active_scaled = headless.render();
-    let close_target = made_app::theme::CLOSE_GLYPH_SIZE * made_app::theme::CLOSE_HOVER_SCALE;
-    assert!(
-        text_font_sizes(&active_scaled, "×", 55.0)
-            .iter()
-            .any(|size| (size - close_target).abs() < 0.2),
-        "selected-tab close hover must reach the scaled glyph target"
+    assert_eq!(
+        text_rects(&active_output, "×", 55.0).len(),
+        1,
+        "selected-tab close hover must show one close glyph"
     );
     assert!(
-        text_colors(&active_scaled, "×", 55.0).contains(&made_app::theme::ERROR),
-        "selected-tab close hover must keep the red glyph after settling"
+        text_font_sizes(&active_output, "×", 55.0)
+            .iter()
+            .all(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "selected-tab close hover must keep the fixed close glyph size"
+    );
+    assert!(
+        text_colors(&active_output, "×", 55.0).contains(&made_app::theme::ERROR),
+        "selected-tab close hover must keep the red glyph"
     );
 }
 
@@ -1999,8 +2001,8 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
 }
 
 #[test]
-fn workspace_tab_close_hover_scales_glyph_without_layout_growth() {
-    if isolated("workspace_tab_close_hover_scales_glyph_without_layout_growth") {
+fn workspace_tab_close_is_hidden_until_hover_or_focus_without_layout_growth() {
+    if isolated("workspace_tab_close_is_hidden_until_hover_or_focus_without_layout_growth") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -2012,84 +2014,129 @@ fn workspace_tab_close_hover_scales_glyph_without_layout_growth() {
     let mut headless = Headless::new(model, 1280.0, 800.0);
     wait_explorer_ready(&mut headless, alpha_id);
     wait_explorer_ready(&mut headless, beta_id);
-    let close_id = workspace_tab_close_id(alpha_id);
-    let rest = headless.render();
-    let close_rect = headless.response(close_id).rect;
-    let tab_rect = headless.response(workspace_tab_id(alpha_id)).rect;
-    assert!(
-        close_rect.width() >= 24.0 && close_rect.height() >= 24.0,
-        "close hit area must stay at least 24×24: {close_rect:?}"
-    );
-    assert!(
-        text_font_sizes(&rest, "×", 55.0)
-            .iter()
-            .any(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
-        "close glyph must start at the rest size"
-    );
-    let rest_glyph = text_rects(&rest, "×", 55.0)
-        .into_iter()
-        .find(|rect| close_rect.contains_rect(*rect))
-        .expect("rest close glyph");
 
-    headless.hover(close_id);
-    headless.advance(0.18);
-    let scaled = headless.render();
-    let target = made_app::theme::CLOSE_GLYPH_SIZE * made_app::theme::CLOSE_HOVER_SCALE;
+    let alpha_tab_id = workspace_tab_id(alpha_id);
+    let beta_tab_id = workspace_tab_id(beta_id);
+    let alpha_close_id = workspace_tab_close_id(alpha_id);
+    let beta_close_id = workspace_tab_close_id(beta_id);
+    let rest = headless.render();
     assert!(
-        text_font_sizes(&scaled, "×", 55.0)
-            .iter()
-            .any(|size| (size - target).abs() < 0.2),
-        "hovered close glyph must reach the ~1.15 scale target"
+        text_rects(&rest, "×", 55.0).is_empty(),
+        "the close glyph must be absent at rest for idle and selected tabs"
     );
-    let scaled_glyph = text_rects(&scaled, "×", 55.0)
+    let alpha_tab = headless.response(alpha_tab_id).rect;
+    let beta_tab = headless.response(beta_tab_id).rect;
+    let alpha_close = headless.response(alpha_close_id).rect;
+    let beta_close = headless.response(beta_close_id).rect;
+    for (name, rect) in [("idle close", alpha_close), ("selected close", beta_close)] {
+        assert!(
+            rect.width() >= 24.0 && rect.height() >= 24.0,
+            "{name} target must remain at least 24×24 while hidden: {rect:?}"
+        );
+    }
+    let alpha_label = text_rects(&rest, "alpha", 55.0)
         .into_iter()
-        .find(|rect| close_rect.contains_rect(*rect))
-        .expect("scaled close glyph");
+        .find(|rect| alpha_tab.contains_rect(*rect))
+        .expect("idle tab label");
+
+    let hovered_tab = headless.hover(alpha_tab_id);
+    let hovered_glyphs = text_rects(&hovered_tab, "×", 55.0);
+    assert_eq!(hovered_glyphs.len(), 1, "tab hover must reveal one X");
     assert!(
-        scaled_glyph.center().distance(rest_glyph.center()) < 0.5,
-        "scaling must stay centered in the same rect"
-    );
-    assert_eq!(
-        headless.response(close_id).rect,
-        close_rect,
-        "close hit area must not grow"
-    );
-    assert_eq!(
-        headless.response(workspace_tab_id(alpha_id)).rect,
-        tab_rect,
-        "tab width and layout must not change"
+        alpha_close.contains_rect(hovered_glyphs[0]),
+        "the revealed X must stay in the idle tab close target"
     );
     assert!(
-        !rects_with_fill(&scaled, made_app::theme::BG_HOVER)
+        text_font_sizes(&hovered_tab, "×", 55.0)
             .iter()
-            .any(|rect| rect.intersects(close_rect)),
-        "close hover must not paint a background fill"
+            .all(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "the revealed X must use the fixed close glyph size"
     );
     assert!(
-        text_colors(&scaled, "×", 55.0).contains(&made_app::theme::ERROR),
-        "scaled close glyph must keep the ERROR tone"
+        !text_colors(&hovered_tab, "×", 55.0).contains(&made_app::theme::ERROR),
+        "tab hover alone must not paint the close glyph red"
     );
-    let close_parent = rect_shapes(&scaled)
+    assert_eq!(headless.response(alpha_tab_id).rect, alpha_tab);
+    let hovered_label = text_rects(&hovered_tab, "alpha", 55.0)
         .into_iter()
-        .find(|shape| shape.rect == tab_rect && shape.fill == made_app::theme::BG_TAB_HOVER)
-        .expect("close hover must apply the parent tab hover fill");
+        .find(|rect| alpha_tab.contains_rect(*rect))
+        .expect("hovered tab label");
     assert_eq!(
-        close_parent.stroke,
-        egui::Stroke::NONE,
-        "close hover must keep the parent tab borderless"
+        hovered_label, alpha_label,
+        "showing the X must not move or resize the label"
+    );
+
+    let hovered_close = headless.hover(alpha_close_id);
+    let close_glyphs = text_rects(&hovered_close, "×", 55.0);
+    assert_eq!(close_glyphs.len(), 1, "close hover must keep one X visible");
+    assert!(
+        alpha_close.contains_rect(close_glyphs[0]),
+        "close hover must keep the X in its target"
+    );
+    assert!(
+        text_font_sizes(&hovered_close, "×", 55.0)
+            .iter()
+            .all(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "close hover must not scale the glyph"
+    );
+    assert!(
+        text_colors(&hovered_close, "×", 55.0).contains(&made_app::theme::ERROR),
+        "direct close hover must paint ERROR"
+    );
+    assert!(
+        !rects_with_fill(&hovered_close, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(alpha_close)),
+        "direct close hover must not paint an X background"
     );
 
     headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
         4.0,
         headless.height - 4.0,
     ))]);
-    headless.advance(0.18);
-    let rested = headless.render();
+    headless.focus(alpha_tab_id);
+    let focused_tab = headless.render();
+    assert_eq!(
+        text_rects(&focused_tab, "×", 55.0).len(),
+        1,
+        "tab focus must reveal the X"
+    );
     assert!(
-        text_font_sizes(&rested, "×", 55.0)
+        text_font_sizes(&focused_tab, "×", 55.0)
             .iter()
-            .any(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
-        "close glyph must animate back to its rest size"
+            .all(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "focused tab X must keep the fixed size"
+    );
+    assert!(
+        !focus_ring_rects(&focused_tab, alpha_tab).is_empty(),
+        "focused tab must keep its focus ring"
+    );
+
+    headless.focus(alpha_close_id);
+    let focused_close = headless.render();
+    assert_eq!(
+        text_rects(&focused_close, "×", 55.0).len(),
+        1,
+        "close focus must keep the X visible"
+    );
+    assert!(
+        text_font_sizes(&focused_close, "×", 55.0)
+            .iter()
+            .all(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "focused close X must keep the fixed size"
+    );
+    assert!(
+        !focus_ring_rects(&focused_close, alpha_close).is_empty(),
+        "focused close must paint its inside focus ring"
+    );
+    assert_eq!(headless.response(alpha_tab_id).rect, alpha_tab);
+    assert_eq!(headless.response(beta_tab_id).rect, beta_tab);
+
+    headless.press_key(egui::Key::Enter);
+    headless.render();
+    assert!(
+        headless.model.workspace(alpha_id).is_none(),
+        "Enter on the focused close must close the workspace"
     );
 }
 

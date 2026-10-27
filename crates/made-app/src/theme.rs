@@ -169,17 +169,8 @@ pub fn wordmark_gap(compact: bool) -> f32 {
     }
 }
 
-/// Resting font size of the workspace-tab close glyph.
-pub const CLOSE_GLYPH_SIZE: f32 = 12.0;
-/// Direct-hover close glyph scale.
-pub const CLOSE_HOVER_SCALE: f32 = 1.15;
-/// Duration of the close glyph scale in seconds.
-pub const CLOSE_HOVER_SCALE_TIME: f32 = 0.13;
-
-/// Smoothly map an animation progress to the close glyph scale.
-pub fn close_glyph_scale(progress: f32) -> f32 {
-    1.0 + (CLOSE_HOVER_SCALE - 1.0) * progress.clamp(0.0, 1.0)
-}
+/// Fixed font size of the workspace-tab close glyph.
+pub const CLOSE_GLYPH_SIZE: f32 = 14.0;
 
 /// Explorer splitter fade duration in seconds.
 pub const SPLITTER_FADE_TIME: f32 = 0.14;
@@ -1466,14 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn close_scale_and_splitter_fade_helpers_are_bounded_and_discreet() {
-        assert!((CLOSE_HOVER_SCALE - 1.15).abs() < f32::EPSILON);
-        assert!((CLOSE_HOVER_SCALE_TIME - 0.13).abs() < f32::EPSILON);
-        assert!((close_glyph_scale(0.0) - 1.0).abs() < f32::EPSILON);
-        assert!((close_glyph_scale(1.0) - CLOSE_HOVER_SCALE).abs() < f32::EPSILON);
-        assert!(close_glyph_scale(0.5) > 1.0 && close_glyph_scale(0.5) < CLOSE_HOVER_SCALE);
-        assert!((close_glyph_scale(2.0) - CLOSE_HOVER_SCALE).abs() < f32::EPSILON);
-
+    fn splitter_fade_helper_is_bounded_and_discreet() {
         assert!((SPLITTER_FADE_TIME - 0.14).abs() < f32::EPSILON);
         assert!(splitter_opacity(0.0, false).abs() < f32::EPSILON);
         assert!((splitter_opacity(1.0, false) - SPLITTER_HOVER_OPACITY).abs() < f32::EPSILON);

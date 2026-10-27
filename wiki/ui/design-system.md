@@ -112,7 +112,7 @@ No text below 10px. `Style.text_styles`: Small 10.0, Body 12.5, Button 12.0, Hea
 - Header geometry: the row spans gutter..width-gutter with no extra horizontal padding; tabs start at the card/window content left edge; the wordmark sits before the right icon group with a reserved 24/18 strip-side gap and an exact 24/18 icon-side gap; the last icon’s 26/24 target, selected/hover fill, and focus ring all end exactly at the card right (`content.right`) with no gutter overhang; the 14px glyph stays centered in its target with normal optical padding. Session-map strip/tabs remain 36/34 and 28/26.
 - Floating scrollbars are overlay-only: 8px expanded bar, 3px thin thumb, 24px minimum handle, and zero allocated width. They are hidden at rest, fade in on scroll-area hover, and expand with a faint track only on bar hover or drag.
 - Shadows: `SHADOW_FLOAT` for floating overlays, `SHADOW_POPUP`, `SHADOW_TOAST`, and `GLASS_SHADOW` for the Explorer card/header. The floating header/selected tab and terminal/preview cards have no shadow.
-- Motion is limited to spinners, hover-triggered scrollbar fades (~120–160 ms), the close-glyph scale (1.0→1.15 over 0.13 s), the Explorer splitter fade (~0.14 s), the Explorer hide/show width transition (~150 ms, quadratic ease-out), and standard control animation. Tabs never animate width; the close scale stays inside the existing 24×24 hit rect. No essential information exists only in motion.
+- Motion is limited to spinners, hover-triggered scrollbar fades (~120–160 ms), the Explorer splitter fade (~0.14 s), the Explorer hide/show width transition (~150 ms, quadratic ease-out), and standard control animation. Tabs never animate width; the close X is hidden at rest, appears on hover/focus at a fixed size, and never changes its 24×24 hit rect. No essential information exists only in motion.
 
 ## Contrast and interaction
 
@@ -121,7 +121,7 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 | Element | Rest | Hover | Selected/Active |
 |---|---|---|---|
 | Workspace tab | `BG_TAB_IDLE`; `TEXT_SECONDARY` 12.5px at 0.72; no stroke | `BG_TAB_HOVER`; primary label; no stroke | `BG_TAB_SELECTED`; `TEXT_PRIMARY` 13.0px; no stroke, underline, or dot |
-| Workspace tab close | no fill; tertiary glyph | no fill; `ERROR` glyph scales 1.0→1.15 over 0.13 s; parent tab uses its hover fill (selected keeps `BG_TAB_SELECTED`); “Close workspace” suppresses the parent path tooltip | n/a |
+| Workspace tab close | hidden; 24×24 target reserved | visible at fixed 14px; no fill; `ERROR` glyph on direct X hover; parent tab uses its hover fill (selected keeps `BG_TAB_SELECTED`); “Close workspace” suppresses the parent path tooltip | n/a |
 | Open-folder `+` | tab-strip icon; tertiary at 0.80; focus ring; Enter/Space | `BG_HOVER`; primary | n/a |
 | Header icon | transparent; `TEXT_TERTIARY` at 0.80 | borderless radius-6 `BG_HOVER`; primary | `BG_SELECTED`; primary; no border or accent bar |
 | Session tab | transparent; secondary at 0.72 | borderless radius-6 `BG_HOVER`; primary | `BG_SELECTED`; primary; no underline or border |
@@ -140,14 +140,14 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 - Picker keyboard: Up/Down selects visible rows; Right expands or selects the first child; Left collapses or selects the parent; Enter toggles expansion; Cmd/Ctrl+Enter confirms; Backspace or Up re-roots to the parent and clears expansion/selection. Refresh preserves valid expansion/selection, each directory keeps the 1000-entry cap, and an unreadable child stays collapsed with an error. Minimal scrolling reveals the selected row and its visible ancestors without centering.
 - Scrollbars are hidden at rest. The floating overlay fades in as a thumb over about 120–160 ms when the scroll area is hovered, expands and strengthens on bar hover/drag with a faint track only then, and fades out on leave. They allocate zero width and never shift layout. The custom terminal scrollback bar matches this behavior: full 8px hit area, thumb only on pane hover, and a track only on bar hover/drag.
 - Status uses shape + text + color: busy spinner, attention `!`, unread number, renaming `*`, tree error `!`, shell state text. Success is a cooler teal than the mint accent, and no status relies on hue alone.
-- Close hover carries the `ERROR` tone plus the parent hover/selected fill and label, and the 1.0→1.15 scale; the scale is supplementary, not the only cue. The pointer-only Explorer divider is not a keyboard stop; its fade is independent of the 8px hit area, resize cursor, and tooltip, and the header Explorer toggle remains the keyboard hide/restore path.
+- Close hover carries the `ERROR` tone plus the parent hover/selected fill and label; visibility is driven by hover/focus, not motion, so the state is not cue-only. The pointer-only Explorer divider is not a keyboard stop; its fade is independent of the 8px hit area, resize cursor, and tooltip, and the header Explorer toggle remains the keyboard hide/restore path.
 - `accesskit` is not enabled in `Cargo.toml`. Icon actions set tooltip and `Response::widget_info` names, but platform screen-reader exposure is not claimed.
 
 ## Implementation notes
 
 - Theme install runs once per egui context behind `theme_ready`; headless UI tests use the same path.
 - `paint_glass_card` and `paint_glass_card_header` paint the Explorer alpha/shadow/highlight treatment. Workspace tabs paint `BG_TAB_IDLE`, `BG_TAB_HOVER`, or `BG_TAB_SELECTED` with no stroke. `wordmark_galley` caches the two-tone layout by pixels-per-point.
-- `paint_disclosure` and `paint_bullet` draw the Explorer/picker markers from the row's optical center; `BG_TAB_IDLE` supplies the idle workspace-tab fill. `close_glyph_scale` and `splitter_opacity` drive the supplementary close/splitter motion.
+- `paint_disclosure` and `paint_bullet` draw the Explorer/picker markers from the row's optical center; `BG_TAB_IDLE` supplies the idle workspace-tab fill. close visibility is state-driven at a fixed glyph size (no scale), and `splitter_opacity` drives the supplementary splitter fade.
 - `scroll_style` installs floating overlay scrollbars with dormant track/thumb opacity 0 and zero allocated width; the terminal paints its own matching scrollback bar. `wordmark_galley` and the brand-gap layout place the wordmark 28px (20 compact) before the first tab without a divider.
 - Root frame has margin but no fill, otherwise the translucent backdrop is hidden.
 - Terminal card border is overpainted after content because card and terminal fills are both `BG_TERMINAL`.
