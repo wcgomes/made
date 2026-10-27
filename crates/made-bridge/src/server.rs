@@ -37,7 +37,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -82,6 +82,8 @@ use crate::{
 
 const REPLACEMENT_WAIT: Duration = Duration::from_millis(500);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const CLOSE_DRAIN_TOTAL: Duration = Duration::from_millis(250);
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 const AUTH_READ_SLICE: Duration = Duration::from_millis(100);
 const HANDSHAKE_POLL: Duration = Duration::from_millis(2);
@@ -853,6 +855,7 @@ fn connection_thread(
         }
     }
 
+    session.finish_close();
     drop(session);
     let _ = done_sender.send(());
 }
@@ -893,6 +896,10 @@ impl DeadlineStream {
 
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Write)
     }
 
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -1882,6 +1889,34 @@ impl Session {
         self.set_close(Some(code), reason);
         if !was_closed {
             close_socket(&mut self.socket, code, reason);
+        }
+    }
+
+    /// Finish a close without letting the operating system replace the close
+    /// frame with a TCP reset. Flush the queued frame, half-close the write
+    /// side, then drain unread input for a bounded time. Windows resets a
+    /// socket that is dropped with unread receive data; draining lets the peer
+    /// read the close frame first. The timeout bounds a silent peer.
+    fn finish_close(&mut self) {
+        self.socket.get_mut().clear_auth_deadline();
+        let _ = self.socket.flush();
+        let _ = self.socket.get_mut().shutdown_write();
+        let _ = self
+            .socket
+            .get_mut()
+            .set_read_timeout(Some(CLOSE_DRAIN_TIMEOUT));
+        let deadline = Instant::now() + CLOSE_DRAIN_TOTAL;
+        let mut buffer = [0u8; 4096];
+        loop {
+            match self.socket.get_mut().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if is_would_block(&error) => break,
+                Err(_) => break,
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
         }
     }
 }

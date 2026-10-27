@@ -71,10 +71,12 @@ fn workspace_endpoints_credentials_state_and_focus_are_independent() {
     let mut socket_b = connect(&b);
     let id_a = authenticate_workspace(&a, &mut socket_a, &token_a);
     let id_b = authenticate_workspace(&b, &mut socket_b, &token_b);
+    let workspace_a = test_path("workspace-a");
+    let workspace_b = test_path("workspace-b");
     // Session and request ids are local to an endpoint, not global routing keys.
     for (handle, socket, directory) in [
-        (&a, &mut socket_a, "/workspace-a"),
-        (&b, &mut socket_b, "/workspace-b"),
+        (&a, &mut socket_a, workspace_a.as_str()),
+        (&b, &mut socket_b, workspace_b.as_str()),
     ] {
         send(
             socket,
