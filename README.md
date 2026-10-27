@@ -4,15 +4,13 @@
 
 A native, terminal-first desktop workspace for developers: one window, independent live workspace tabs, and a real shell plus file explorer in every tab. Use it without an agent installed; when you launch OpenCode v2 in a tab, Made follows the active session and worktree.
 
-![Made workspace with glass chrome, terminal, and full-height explorer](wiki/assets/screenshots/workspace-glass-1280.png)
-
 ## Why Made
 
 - **Terminal-first, not agent-gated.** A shell and explorer open immediately. Made does not install, launch, probe, or wait for an agent.
 - **Your workspace follows you.** `cd` in a supported shell and the explorer follows. If OpenCode v2 is running with an active session, that session's directory and worktree take precedence; disconnect returns to the shell cwd.
 - **Independent tabs for real work.** Each workspace tab owns its own shell, process, explorer, preview, and focus. Close one without disturbing the others.
 - **Native and fast.** Rust, `egui`, and a real PTY-backed terminal renderer. No webview.
-- **Quiet by design.** Full-height explorer, full-left read-only preview, icon-only controls, and a glass UI that keeps the terminal readable.
+- **Quiet by design.** Full-height explorer, full-left read-only preview, icon-only controls, and a mint-accented, card-edge-aligned floating header over a frosted explorer that keeps the terminal readable.
 
 ## What you get
 
@@ -21,9 +19,9 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **Optional OpenCode session follow** — run `opencode` yourself in a tab; Made follows the active session directory and worktree when available.
 - **Full-height explorer** — hide, restore, and pointer-resize it without stopping the shell.
 - **Full-left read-only preview** — inspect a file over the still-running terminal, then return without relaunching anything.
-- **Home startup and folder picker** — no argument opens your home workspace; `--picker` chooses a folder; an explicit path wins over both.
+- **Home startup and inline folder picker** — no argument opens your home workspace; `--picker` browses an inline expandable folder tree; an explicit path wins over both.
 - **Diagnostics** — inspect workspace, cwd capability, effective root, integration state, logs, and metrics without routine status chrome.
-- **Glass UI** — frosted-glass chrome and a full-height explorer, with optional macOS vibrancy or Windows 11 Mica behind the window. Linux and unsupported compositors use the in-app glass fallback.
+- **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Mica may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
 
 ## Quick start
 

@@ -1,14 +1,15 @@
 //! Headless folder picker used when Made starts without a workspace.
 //!
-//! The picker is a model, not a widget: it exposes the current directory, the
-//! sorted child directories, selection, and navigation. The UI renders it and
-//! calls [`WorkspacePicker::confirm_current`] to produce a validated
-//! [`LaunchPlan`].
+//! The picker is a model, not a widget: it exposes the start directory as a
+//! tree root, flattened visible rows, expansion state, selection, and refresh.
+//! The UI renders it and calls [`WorkspacePicker::confirm_current`] to produce a
+//! validated [`LaunchPlan`].
 //!
 //! No workspace surfaces are created while the picker is visible. Reading a
-//! directory failure keeps the picker usable, and an invalid selection returns
-//! an error instead of panicking.
+//! directory failure keeps the picker usable, leaves the failed row collapsed,
+//! and stores a non-blocking error instead of panicking.
 
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::workspace::{LaunchPlan, WorkspaceError, WorkspaceRoot, WorkspaceSource};
 
-/// One directory displayed in the picker.
+/// One root child directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PickerEntry {
     path: PathBuf,
@@ -36,7 +37,38 @@ impl PickerEntry {
     }
 }
 
-/// Maximum directories retained in the picker list.
+/// One visible flattened tree row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerRow {
+    path: PathBuf,
+    name: String,
+    depth: usize,
+    expanded: bool,
+}
+
+impl PickerRow {
+    /// Canonical directory path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Display name (the final path component).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Tree depth below the picker root; root children are depth 0.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Whether this folder's children are visible below the row.
+    pub fn expanded(&self) -> bool {
+        self.expanded
+    }
+}
+
+/// Maximum directories retained for each directory read.
 pub const MAX_PICKER_ENTRIES: usize = 1_000;
 
 static NEXT_PICKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -46,21 +78,21 @@ static NEXT_PICKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 pub enum PickerError {
     /// The directory could not be opened.
     Workspace(WorkspaceError),
-    /// The requested index is outside the visible entry list.
+    /// The requested index is outside the visible row list.
     InvalidSelection {
         /// Requested index.
         index: usize,
-        /// Number of visible entries.
+        /// Number of visible rows.
         len: usize,
     },
-    /// The selected entry is not a directory.
+    /// The selected row is not a directory.
     NotADirectory {
         /// Selected path.
         path: PathBuf,
     },
-    /// The current directory has no parent to navigate to.
+    /// The current tree root has no parent to navigate to.
     AtRoot {
-        /// Current directory.
+        /// Current root.
         path: PathBuf,
     },
 }
@@ -72,15 +104,11 @@ impl fmt::Display for PickerError {
             Self::InvalidSelection { index, len } => {
                 write!(
                     formatter,
-                    "picker selection {index} is outside {len} entries"
+                    "picker row {index} is outside {len} visible rows"
                 )
             }
             Self::NotADirectory { path } => {
-                write!(
-                    formatter,
-                    "picker entry is not a folder: {}",
-                    path.display()
-                )
+                write!(formatter, "picker row is not a folder: {}", path.display())
             }
             Self::AtRoot { path } => {
                 write!(formatter, "no parent directory above {}", path.display())
@@ -104,12 +132,15 @@ impl From<WorkspaceError> for PickerError {
     }
 }
 
-/// Headless folder picker state.
+/// Headless folder picker tree state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePicker {
     current_dir: PathBuf,
     entries: Vec<PickerEntry>,
+    rows: Vec<PickerRow>,
     selection: Option<usize>,
+    expanded: BTreeSet<PathBuf>,
+    children: HashMap<PathBuf, Vec<PickerEntry>>,
     error: Option<PickerError>,
     instance: u64,
     revision: u64,
@@ -121,19 +152,24 @@ impl WorkspacePicker {
     ///
     /// The starting directory must exist and be readable; use
     /// [`crate::workspace::WorkspaceLaunch::waiting_for_picker`] for a
-    /// best-effort launch-time start directory.
+    /// best-effort launch-time start directory. The start directory is the tree
+    /// root and is not itself a selectable row.
     pub fn new(start: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
         let root = WorkspaceRoot::resolve(start, WorkspaceSource::Picker)?;
+        let (entries, truncated) = read_directories(root.path())?;
         let mut picker = Self {
             current_dir: root.path().to_path_buf(),
-            entries: Vec::new(),
+            entries,
+            rows: Vec::new(),
             selection: None,
+            expanded: BTreeSet::new(),
+            children: HashMap::new(),
             error: None,
             instance: NEXT_PICKER_INSTANCE.fetch_add(1, Ordering::Relaxed),
             revision: 0,
-            truncated: 0,
+            truncated,
         };
-        picker.refresh()?;
+        picker.rebuild_rows(None);
         Ok(picker)
     }
 
@@ -145,7 +181,7 @@ impl WorkspacePicker {
         )
     }
 
-    /// Current canonical directory.
+    /// Current canonical tree root.
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
     }
@@ -155,29 +191,49 @@ impl WorkspacePicker {
         self.instance
     }
 
-    /// Monotonic revision bumped by refresh and directory navigation.
+    /// Monotonic revision bumped by refresh and tree expansion/collapse.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// Number of directories omitted by the list cap.
+    /// Number of root directories omitted by the list cap.
     pub fn truncated_entries(&self) -> usize {
         self.truncated
     }
 
-    /// Visible child directories, sorted case-insensitively.
+    /// Root child directories, sorted case-insensitively.
+    ///
+    /// Root children are depth-0 rows in [`Self::rows`]; this accessor remains
+    /// for callers that need the root directory itself.
     pub fn entries(&self) -> &[PickerEntry] {
         &self.entries
     }
 
-    /// Selected entry index.
+    /// Visible flattened tree rows.
+    pub fn rows(&self) -> &[PickerRow] {
+        &self.rows
+    }
+
+    /// Selected visible row index.
     pub fn selection(&self) -> Option<usize> {
         self.selection
     }
 
-    /// Selected entry.
-    pub fn selected_entry(&self) -> Option<&PickerEntry> {
-        self.selection.and_then(|index| self.entries.get(index))
+    /// Selected visible row.
+    pub fn selected_row(&self) -> Option<&PickerRow> {
+        self.selection.and_then(|index| self.rows.get(index))
+    }
+
+    /// Selected row path, or the tree root when no row is selected.
+    pub fn path_target(&self) -> &Path {
+        self.selected_row()
+            .map(PickerRow::path)
+            .unwrap_or(&self.current_dir)
+    }
+
+    /// Selected row path, when one exists.
+    pub fn selected_path(&self) -> Option<&Path> {
+        self.selected_row().map(PickerRow::path)
     }
 
     /// Last picker error.
@@ -195,40 +251,42 @@ impl WorkspacePicker {
         self.error = None;
     }
 
-    /// Re-read the current directory.
+    /// Re-read the root and every expanded directory.
     ///
-    /// The previous selection is preserved by name when possible. On failure
-    /// the current directory and entries are kept and the error is stored.
+    /// Expansion and selection are preserved by canonical path when still
+    /// valid; removed/unreadable expanded directories are pruned. On a root
+    /// failure the current tree is kept and the error is stored.
     pub fn refresh(&mut self) -> Result<(), WorkspaceError> {
         self.revision = self.revision.saturating_add(1);
-        let previous = self.selected_entry().map(|entry| entry.name.clone());
-        match read_directories(&self.current_dir) {
-            Ok((entries, truncated)) => {
-                self.entries = entries;
-                self.truncated = truncated;
-                self.selection = previous
-                    .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
-                    .or(if self.entries.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    });
-                self.error = None;
-                Ok(())
-            }
+        let selected = self.selected_path().map(Path::to_path_buf);
+        let desired = self.expanded.clone();
+        let (entries, truncated) = match read_directories(&self.current_dir) {
+            Ok(read) => read,
             Err(error) => {
                 self.error = Some(PickerError::Workspace(error.clone()));
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        self.entries = entries;
+        self.truncated = truncated;
+        self.children.clear();
+        self.expanded.clear();
+        self.error = None;
+        let root_entries = self.entries.clone();
+        let mut valid = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        self.reload_expanded(&root_entries, &desired, &mut valid, &mut visited);
+        self.expanded = valid;
+        self.rebuild_rows(selected.as_deref());
+        Ok(())
     }
 
-    /// Select an index.
+    /// Select a visible row.
     pub fn select(&mut self, index: usize) -> Result<(), PickerError> {
-        if index >= self.entries.len() {
+        if index >= self.rows.len() {
             let error = PickerError::InvalidSelection {
                 index,
-                len: self.entries.len(),
+                len: self.rows.len(),
             };
             self.error = Some(error.clone());
             return Err(error);
@@ -238,57 +296,128 @@ impl WorkspacePicker {
         Ok(())
     }
 
-    /// Move the selection by `delta`, wrapping at the ends.
+    /// Move the selection by `delta` visible rows, wrapping at the ends.
+    ///
+    /// From no selection, Down chooses the first row and Up chooses the last.
     pub fn move_selection(&mut self, delta: isize) {
-        if self.entries.is_empty() {
+        if self.rows.is_empty() {
             self.selection = None;
             return;
         }
-        let len = self.entries.len() as isize;
-        let current = self.selection.unwrap_or(0) as isize;
-        let next = current.saturating_add(delta).rem_euclid(len);
+        let len = self.rows.len() as isize;
+        let next = match self.selection {
+            Some(current) => (current as isize).saturating_add(delta).rem_euclid(len),
+            None if delta > 0 => 0,
+            None => len - 1,
+        };
         self.selection = Some(next as usize);
         self.error = None;
     }
 
-    /// Move the selection to the next entry.
+    /// Move the selection to the next visible row.
     pub fn select_next(&mut self) {
         self.move_selection(1);
     }
 
-    /// Move the selection to the previous entry.
+    /// Move the selection to the previous visible row.
     pub fn select_previous(&mut self) {
         self.move_selection(-1);
     }
 
-    /// Enter the selected directory.
-    pub fn enter_selected(&mut self) -> Result<(), PickerError> {
-        let index = self.selection.ok_or(PickerError::InvalidSelection {
-            index: 0,
-            len: self.entries.len(),
-        })?;
-        self.enter(index)
+    /// Toggle expansion of the selected folder.
+    pub fn toggle_selected(&mut self) -> Result<(), PickerError> {
+        match self.selection {
+            Some(index) => self.toggle(index),
+            None => Ok(()),
+        }
     }
 
-    /// Enter the directory at `index`.
-    pub fn enter(&mut self, index: usize) -> Result<(), PickerError> {
-        let entry = self
-            .entries
+    /// Toggle expansion of the folder at `index`.
+    ///
+    /// The row is selected first. Collapsing removes only that subtree; expanding
+    /// reads the children synchronously (capped per directory). An unreadable
+    /// directory keeps the row collapsed and stores the error.
+    pub fn toggle(&mut self, index: usize) -> Result<(), PickerError> {
+        let row = self
+            .rows
             .get(index)
             .cloned()
             .ok_or(PickerError::InvalidSelection {
                 index,
-                len: self.entries.len(),
+                len: self.rows.len(),
             })?;
-        if !entry.path.is_dir() {
-            let error = PickerError::NotADirectory { path: entry.path };
-            self.error = Some(error.clone());
-            return Err(error);
+        self.selection = Some(index);
+        if row.expanded {
+            self.expanded.remove(&row.path);
+            self.rebuild_rows(Some(&row.path));
+            self.error = None;
+            return Ok(());
         }
-        self.navigate_to(&entry.path)
+        let entries = match read_directories(&row.path) {
+            Ok((entries, _)) => entries,
+            Err(error) => {
+                let error = PickerError::Workspace(error);
+                self.error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        self.children.insert(row.path.clone(), entries);
+        self.expanded.insert(row.path.clone());
+        self.rebuild_rows(Some(&row.path));
+        self.error = None;
+        Ok(())
     }
 
-    /// Navigate to the parent directory.
+    /// Expand the selected folder, or select its first child when already open.
+    pub fn expand_selected(&mut self) -> Result<(), PickerError> {
+        let Some(index) = self.selection else {
+            return Ok(());
+        };
+        let row = self.rows[index].clone();
+        if !row.expanded {
+            return self.toggle(index);
+        }
+        if self
+            .rows
+            .get(index + 1)
+            .is_some_and(|child| child.depth == row.depth + 1)
+        {
+            self.selection = Some(index + 1);
+            self.error = None;
+        }
+        Ok(())
+    }
+
+    /// Collapse the selected folder, or select its parent row when collapsed.
+    ///
+    /// Depth-0 rows have no parent row, so Left on a collapsed root child is a
+    /// no-op apart from keeping the row selected.
+    pub fn collapse_selected(&mut self) -> Result<(), PickerError> {
+        let Some(index) = self.selection else {
+            return Ok(());
+        };
+        let row = self.rows[index].clone();
+        if row.expanded {
+            self.expanded.remove(&row.path);
+            self.rebuild_rows(Some(&row.path));
+            self.error = None;
+            return Ok(());
+        }
+        if row.depth > 0 {
+            if let Some(parent) = self.rows[..index]
+                .iter()
+                .rposition(|candidate| candidate.depth + 1 == row.depth)
+            {
+                self.selection = Some(parent);
+                self.error = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-root the picker to the current root's parent directory.
+    ///
+    /// The new tree starts at the top with no expansion or selection.
     pub fn go_up(&mut self) -> Result<(), PickerError> {
         let parent = self.current_dir.parent().map(Path::to_path_buf);
         let Some(parent) = parent else {
@@ -298,33 +427,7 @@ impl WorkspacePicker {
             self.error = Some(error.clone());
             return Err(error);
         };
-        self.navigate_to(&parent)
-    }
-
-    /// Confirm the current directory as the workspace.
-    pub fn confirm_current(&self) -> Result<LaunchPlan, WorkspaceError> {
-        LaunchPlan::open(&self.current_dir, WorkspaceSource::Picker)
-    }
-
-    /// Confirm the directory at `index` as the workspace.
-    pub fn confirm_entry(&self, index: usize) -> Result<LaunchPlan, PickerError> {
-        let entry = self
-            .entries
-            .get(index)
-            .ok_or(PickerError::InvalidSelection {
-                index,
-                len: self.entries.len(),
-            })?;
-        if !entry.path.is_dir() {
-            return Err(PickerError::NotADirectory {
-                path: entry.path.clone(),
-            });
-        }
-        LaunchPlan::open(&entry.path, WorkspaceSource::Picker).map_err(PickerError::Workspace)
-    }
-
-    fn navigate_to(&mut self, path: &Path) -> Result<(), PickerError> {
-        match Self::new(path) {
+        match Self::new(parent) {
             Ok(next) => {
                 *self = next;
                 Ok(())
@@ -333,6 +436,91 @@ impl WorkspacePicker {
                 let error = PickerError::Workspace(error);
                 self.error = Some(error.clone());
                 Err(error)
+            }
+        }
+    }
+
+    /// Confirm the selected row path, or the tree root when nothing is selected.
+    pub fn confirm_current(&self) -> Result<LaunchPlan, WorkspaceError> {
+        LaunchPlan::open(self.path_target(), WorkspaceSource::Picker)
+    }
+
+    /// Confirm the visible row at `index` as the workspace.
+    pub fn confirm_row(&self, index: usize) -> Result<LaunchPlan, PickerError> {
+        let row = self.rows.get(index).ok_or(PickerError::InvalidSelection {
+            index,
+            len: self.rows.len(),
+        })?;
+        if !row.path.is_dir() {
+            return Err(PickerError::NotADirectory {
+                path: row.path.clone(),
+            });
+        }
+        LaunchPlan::open(&row.path, WorkspaceSource::Picker).map_err(PickerError::Workspace)
+    }
+
+    fn rebuild_rows(&mut self, preserve: Option<&Path>) {
+        self.revision = self.revision.saturating_add(1);
+        let mut rows = Vec::new();
+        let mut visited = BTreeSet::new();
+        collect_rows(
+            &self.entries,
+            0,
+            &self.expanded,
+            &self.children,
+            &mut visited,
+            &mut rows,
+        );
+        self.rows = rows;
+        self.selection =
+            preserve.and_then(|path| self.rows.iter().position(|row| row.path == path));
+    }
+
+    fn reload_expanded(
+        &mut self,
+        entries: &[PickerEntry],
+        desired: &BTreeSet<PathBuf>,
+        valid: &mut BTreeSet<PathBuf>,
+        visited: &mut BTreeSet<PathBuf>,
+    ) {
+        for entry in entries {
+            if !desired.contains(&entry.path) || !visited.insert(entry.path.clone()) {
+                continue;
+            }
+            match read_directories(&entry.path) {
+                Ok((children, _)) => {
+                    self.children.insert(entry.path.clone(), children.clone());
+                    valid.insert(entry.path.clone());
+                    self.reload_expanded(&children, desired, valid, visited);
+                }
+                Err(error) => {
+                    self.error = Some(PickerError::Workspace(error));
+                }
+            }
+        }
+    }
+}
+
+fn collect_rows(
+    entries: &[PickerEntry],
+    depth: usize,
+    expanded: &BTreeSet<PathBuf>,
+    children: &HashMap<PathBuf, Vec<PickerEntry>>,
+    visited: &mut BTreeSet<PathBuf>,
+    rows: &mut Vec<PickerRow>,
+) {
+    for entry in entries {
+        let cycle = !visited.insert(entry.path.clone());
+        let is_expanded = !cycle && expanded.contains(&entry.path);
+        rows.push(PickerRow {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            depth,
+            expanded: is_expanded,
+        });
+        if is_expanded {
+            if let Some(entries) = children.get(&entry.path) {
+                collect_rows(entries, depth + 1, expanded, children, visited, rows);
             }
         }
     }

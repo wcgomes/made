@@ -414,12 +414,27 @@ impl AppModel {
         }
     }
 
-    /// Navigate the picker to an entry.
-    pub fn picker_enter(
+    /// Toggle expansion of a picker row.
+    pub fn picker_toggle(
         &mut self,
         index: usize,
     ) -> Result<(), crate::workspace_picker::PickerError> {
-        self.launch.picker_enter(index)
+        self.launch.picker_toggle(index)
+    }
+
+    /// Toggle expansion of the selected picker row.
+    pub fn picker_toggle_selected(&mut self) -> Result<(), crate::workspace_picker::PickerError> {
+        self.launch.picker_toggle_selected()
+    }
+
+    /// Expand the selected picker row, or select its first child.
+    pub fn picker_expand_selected(&mut self) -> Result<(), crate::workspace_picker::PickerError> {
+        self.launch.picker_expand_selected()
+    }
+
+    /// Collapse the selected picker row, or select its parent row.
+    pub fn picker_collapse_selected(&mut self) -> Result<(), crate::workspace_picker::PickerError> {
+        self.launch.picker_collapse_selected()
     }
 
     /// Navigate the picker to the parent folder.

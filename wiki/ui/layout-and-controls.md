@@ -2,66 +2,70 @@
 
 Made uses one native window with workspace tabs above a content area, a selected left surface (terminal or full-left preview), and a full-height Explorer in the right column. The normative layout and interaction contract is [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md). This page maps the implemented composition in [`ui.rs`](../../crates/made-app/src/ui.rs) and [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
 
-![Current workspace layout](../assets/screenshots/workspace-glass-1280.png)
-
 ## Window geometry
 
 | Region | 1280×800 | 720×480 |
 |---|---|---|
 | Window gutter | 10 | 8 |
-| Top workspace strip | 1260×40 at `(10,10)` | 704×36 at `(8,8)` |
+| Floating header | 1260×26 at `(10,8)` | 704×24 at `(8,6)` |
 | Gap below strip | 8 | 6 |
-| Main content | 1260×732 at `y=58` | 704×422 at `y=50` |
+| Main content | 1260×748 at `y=42` | 704×436 at `y=36` |
 | Explorer column | 448 total: 8 gap + 440 card | 294 total: 6 gap + 288 card |
-| Left terminal/preview | 812×732 | 410×422 |
-| Explorer hidden | Left surface gets full 1260×732 | Full 704×422 |
+| Left terminal/preview | 812×748 | 410×436 |
+| Explorer hidden | Left surface gets full 1260×748 | Full 704×436 |
 
 Panels have no separator lines; cards and gaps do the grouping. The Explorer is always full content height, never reduced by preview. At 900–1099 width the Explorer defaults to 35% of usable content width; below 900 it uses compact gutter/header/radii and a 288px default. Essential controls must fit or move to labeled overflow, never clip.
 
 ## Header and workspace tabs
 
-- Top band: `BG_CHROME_GLASS` at 205/255, 1px border, radius 8/7, soft shadow and 1px top highlight, 12×7 or 10×5 padding.
-- Left: cached two-tone monospace `MADE` wordmark (accent `M`, primary `ADE`, 14px, 1.8px tracking, tooltip “Minimal Agentic Development Environment”), then a 1px divider and workspace tabs.
-- Workspace tabs: folder label, full-path tooltip, reachable close X, active full-opacity `BG_CARD` + 2px accent underline, no dot/hollow marker, no active border. Tabs use stable workspace-scoped ids and an overflow list when needed.
-- Right: icon-only Open folder, Explorer toggle, Diagnostics, and optional Sessions. Each has a monochrome app-drawn glyph, at least 24×24 target, matching tooltip, accessible name, and visible focus. No persistent action text labels; no version row.
+- Floating header: no persistent band fill, border, shadow, or top highlight. The 26/24 strip equals the workspace tab height; the header row spans gutter..width-gutter with no extra horizontal padding, tabs start at the card/window content left edge, and the card content top is 42/36 with one 8/6 pane gap above and below the strip.
+- Left: editor-like workspace tabs start at the content left edge. The cached two-tone monospace `MADE` wordmark (mint `ACCENT` `M`, primary `ADE`, 14px, 1.8px tracking, tooltip “Minimal Agentic Development Environment”) sits between the tab strip and the right icon group, with a reserved 24px wide / 18px compact strip-side gap and an exact 24/18 icon-side gap; it has no tab fill/hover/selection and no divider.
+- Workspace tabs are fill-only. Selected uses opaque `BG_TAB_SELECTED` dark green-gray with a `TEXT_PRIMARY` 13.0px label and no stroke; idle uses translucent black `BG_TAB_IDLE` with secondary 12.5px text at 0.72 opacity and no rest stroke; hover uses opaque `BG_TAB_HOVER` with a primary label and no stroke, while a selected tab keeps its own fill on hover. There is no `ACCENT`/`BORDER` outline, underline, dot/hollow marker, or width animation. Tabs use stable workspace-scoped ids and an overflow list when needed.
+- Close “×”: no hover fill. Hovering the X turns only the close glyph `ERROR` and scales it 1.0→1.15 over 0.13 s inside the same 24×24 hit rect; tab width/layout do not change. The parent tab uses `BG_TAB_HOVER` (or keeps `BG_TAB_SELECTED` when selected) and a primary label; there is no tab stroke. The parent path tooltip is suppressed so “Close workspace” is the tooltip shown.
+- Tab-strip tail: the app-drawn `+` Open folder action sits immediately after the last visible workspace tab and before the overflow trigger. It keeps the same tooltip/ID/target/keyboard activation as the other icon actions and is reserved in the tab-fitting budget.
+- Right: icon-only Sessions (when shown), Diagnostics, Explorer, left-to-right so Explorer is rightmost. The last icon’s 26/24 target, 14px glyph, selected/hover fill, and focus ring all end exactly at the card right border (`content.right`) with no gutter overhang; the 14px glyph is optically right-aligned inside its target. Each has a monochrome app-drawn glyph at 0.80 opacity when inactive, at least 24×24 target, matching tooltip, accessible name, and visible focus; hover is `BG_HOVER` and selection is `BG_SELECTED` without a border or accent bar. No persistent action text labels; no version row. Session-map strip/tabs remain 36/34 and 28/26.
 - The Explorer toggle is the only hide/restore action and remains keyboard reachable.
-
-![Workspace tabs with active underline](../assets/screenshots/tabs-1100.png)
 
 ## Explorer
 
 - Full-height right card using `BG_CARD_GLASS` at 202/255, 1px border, radius 10/8, painted glass shadow.
-- Header 34/30 uses `BG_HEADER_GLASS` at 208/255 with a 1px top highlight. It shows only `EXPLORER` and the root name (full-path tooltip). There are no Wider, Narrower, Reload, or Hide text actions and no routine refresh control.
+- Card header 34/30 uses `BG_HEADER_GLASS` at 208/255 with a 1px top highlight. It shows only `EXPLORER` and the root name (full-path tooltip). There are no Wider, Narrower, Reload, or Hide text actions and no routine refresh control.
 - Hiding/restoring animates the panel width over about 150 ms with quadratic ease-out. The tree stays laid out at its stored width and is clipped to the sliding panel, so content does not reflow. Reversal settles at the stored width; closed state removes tree/splitter input.
-- Resize is pointer-drag only on an 8px boundary that is transparent at rest. Hover or drag reveals a 1px line and 6×32 grip (accent while dragging); hover alone does not change width. It is not a keyboard Tab stop.
+- Resize is pointer-drag only on an 8px boundary that is transparent at rest. Hover fades in a 1px line and 6×32 grip at partial-opacity `BORDER_CONTROL` over about 0.14 s; dragging uses the restrained mint `ACCENT` with the same geometry, and leaving fades both out. Hover alone does not change width. It keeps a resize cursor and “Drag to resize explorer” tooltip and is not a keyboard Tab stop.
 - Width, visibility, expansion, and valid selection survive tab switches and hide/restore, not app restart.
-- Tree rows are 24px, indent 14/depth. Directories and files use distinct glyphs; symlinks and errors are explicit. Live refresh is watcher-driven; there is no routine Reload action.
+- Tree rows are 24px high with a 4px horizontal inset, 6px radius, a 16px icon slot, and text starting 24px from the row's left edge plus 14px per depth. Directories and files use distinct glyphs; symlinks and errors are explicit.
+- Hover is a borderless radius-6 `BG_HOVER` fill; selected/opened rows use only the inset radius-6 `BG_SELECTED` fill plus primary text, with no row or tree-container focus outline, border, or accent side bar.
+- Expanded folders are marked only by a small app-drawn disclosure triangle and a brighter label, with no extra fill. Files keep a quiet app-drawn bullet. The markers and label share the text galley's optical center in the 16px slot. Live refresh is watcher-driven; there is no routine Reload action.
+- Keyboard focus entering the tree with no prior selection selects the first visible row without opening a preview.
+- The tree scrolls with a floating overlay bar hidden at rest; it allocates zero width and never reflows content.
 - Hiding gives the reclaimed width to the left surface without stopping the shell or losing preview/tree state. Restore reconciles changes that occurred while hidden.
-
-![Explorer during hide/show animation](../assets/screenshots/explorer-mid-animation-1280.png)
-
-![Hover-revealed Explorer divider](../assets/screenshots/divider-hover-1280.png)
 
 ## Full-left preview
 
 - Opening a file replaces the entire left terminal surface visually; it is never stacked below the Explorer or split beside the terminal. No preview placeholder exists before a file is opened.
-- Header 34/30: filename, full-path tooltip, understated read-only label, `Copy path`, `Refresh`, a return-to-terminal action, and `Close`. Both Close and return restore the same live terminal and its focus.
+- Card header 34/30: filename, full-path tooltip, understated read-only label, `Copy path`, `Refresh`, a return-to-terminal action, and `Close`. Both Close and return restore the same live terminal and its focus.
 - Content uses a 44px right-aligned line-number gutter and 13px monospace code at 18px lines with horizontal scrolling. Syntax highlighting comes from syntect with a plain-text fallback; low-contrast spans are blended toward primary at document build time, not per frame.
 - Meta line shows size/language/lines/updated age; compact mode hides some metadata below 600 height.
 - Binary, invalid UTF-8, over-2-MiB, missing, unreadable, and empty states use safe cards/messages; no raw binary is rendered and there is no write path.
 - The hidden shell keeps running and consuming bounded output. Hidden preview input never reaches it. A root change clears the preview, invalidates stale reads, and returns to terminal.
 
-![Full-left read-only preview](../assets/screenshots/preview-1280.png)
-
 ## Picker
 
-- The picker is an explicit card surface: `MADE` brand and version, icon-only Close X with tooltip, `Back` for add-workspace, path/toolbar, list, and primary/secondary folder actions.
-- The selected row uses one rounded `BG_SELECTED` background with no left accent bar. Rows are virtualized for large folders.
-- Up/Down moves selection, Backspace/Left goes up, Enter opens/enters, Cmd/Ctrl+Enter confirms, double-click enters, Escape/Close returns.
-- Escape/Close return to the live workspace when one exists, otherwise to the default home/terminal fallback. Back preserves the add-workspace return flow.
+- The picker is an explicit card surface: `MADE` brand and version, icon-only Close X with tooltip, `Back` for add-workspace, path/toolbar, inline tree, and primary/secondary folder actions.
+- Toolbar: Up/Refresh, then a borderless inset `BG_SELECTED` path chip at radius 4 with primary mono 10.5 text and a full-path tooltip. The chip follows the selected tree row, or the root when nothing is selected.
+- The list is an inline expandable tree rooted at the start directory. Root children are depth 0; expanding inserts children below the parent and keeps every ancestor visible; collapsing removes only that subtree. Rows are 32px high with a 4px horizontal inset, radius-6 fills, and 14px depth; app-drawn triangles share the label’s optical center.
+- There is one flattened selected row. Hover uses a borderless radius-6 `BG_HOVER` fill; selection uses only the inset `BG_SELECTED` fill plus primary text, with no row/container focus outline, border, or accent side bar. The tree scrollbar is hidden at rest. The picker card and its buttons keep their focus rings.
+- Clicking a row selects it and toggles expansion; an expanded folder collapses and stays selected, and a collapsed folder expands. The path chip and “Use current folder” target follow the selected row path, or the root when nothing is selected. A double-click toggles once and never starts a workspace.
+- Keyboard: Up/Down move visible rows; Right expands the selected folder or selects its first child when already expanded; Left collapses the selected folder or selects its parent when collapsed; Enter toggles expansion; Cmd/Ctrl+Enter confirms; Backspace or Up re-roots to the parent directory and clears expansion/selection. Refresh re-reads the root and expanded directories, preserving valid expansion and selection by path; each directory keeps the 1000-entry cap, and an unreadable expanded child stays collapsed with a non-blocking error.
+- Expanding or moving selection reveals the row with minimal scrolling: it bottom-aligns only when needed, keeps the selected row and visible ancestor chain on screen when they fit, and does not center the row.
+- Both footer actions remain: “Open selected folder” is a borderless secondary action (`BG_ELEVATED` rest, `BG_HOVER` hover, `BG_SELECTED` pressed) and “Use current folder” stays accent-filled. Escape/Close returns to the live workspace when one exists, otherwise to the default home/terminal fallback; Back preserves the add-workspace return flow.
 - No shell or explorer process starts before confirmation. Confirming an add-workspace flow opens a new tab without disturbing the existing shell.
 
-![Explicit folder picker](../assets/screenshots/picker-1280.png)
+## Scrollbars
+
+- Explorer tree, picker list, preview code, diagnostics body/log, and session-map overflow use floating overlay scrollbars: hidden at rest, thumb-only fade-in over about 120–160 ms when the area is hovered, expand to the 8px bar with a faint track only on bar hover/drag, and fade out on leave. They allocate zero width and never shift layout.
+- The terminal scrollback bar is custom-painted with the same rest/hover/fade behavior and the same `SCROLL_THUMB`/`SCROLL_THUMB_HOVER` colors. It keeps its full 8px hit area, paints only the thumb on pane hover, and paints the faint track only on bar hover/drag.
+- Fade duration and states are asserted from the scroll style/helper state; temporary Xvfb checks cover rest, pane-hover, and bar-hover states, but the captures are not stored.
 
 ## Diagnostics and optional session map
 
@@ -72,14 +76,16 @@ Panels have no separator lines; cards and gaps do the grouping. The Explorer is 
 
 ## Interaction and accessibility
 
-- Every persistent keyboard-reachable control has a visible focus ring; the pointer-only Explorer divider is skipped.
+- Every persistent keyboard-reachable control has a visible focus state; the pointer-only Explorer divider is skipped. Picker card/buttons and other controls keep focus rings. Deliberate exception: Explorer tree rows/container and picker rows paint no outline; their focus/selection is the inset `BG_SELECTED` fill plus primary text.
 - Workspace/session tabs support Tab entry, Left/Right movement, and Enter/Space activation. The terminal is one focus stop.
+- A workspace tab is selected by its opaque `BG_TAB_SELECTED` fill and the 13.0px label versus 12.5px idle; selection never relies on color alone. The close X adds an inside focus ring and uses the red glyph plus 1.0→1.15 scale only as its hover cue, with tab width unchanged.
+- Keyboard focus entering the Explorer tree with no prior selection selects the first visible row without opening a preview. The picker tree uses Up/Down, Right/Left, Enter, Cmd/Ctrl+Enter, and Backspace/Up as described above; rows have no outline and use the selection fill plus primary text.
 - Targets are at least 24×24, text at least 10px, and status never relies on color alone.
-- Motion is limited to spinners, the Explorer width transition, and standard control animation; no essential information exists only in motion.
+- Motion is limited to spinners, hover-triggered scrollbar fades, the close-glyph scale (0.13 s), the splitter fade (0.14 s), the Explorer width transition, and standard control animation; no essential information exists only in motion. Close scale stays inside the existing hit rect; splitter motion stays inside the existing 8px hit area.
 - `accesskit` is not enabled, so platform screen-reader exposure is not claimed. Tooltips and `Response::widget_info` accessible names are set for icon actions.
 
 ## Implementation state
 
-The Calm Editor layout is implemented on Linux and verified with headless/UI-model tests plus Xvfb captures at 1280×800 and 720×480. Current screenshots above were captured from the current Linux/Xvfb build. Native compositor behavior, native pointer/keyboard/screen-reader behavior, and native macOS/Windows glass rendering remain unvalidated. See [Platform matrix](../testing/platform-matrix.md) and [v1 evidence](../records/20261026-v1-evidence.md).
+The Calm Editor layout is implemented and verified on Linux with headless/UI-model tests plus temporary Xvfb checks at 1280×800 and 720×480. These checks cover the mint header accent, `+` placement, Explorer-rightmost icon order, fill-only selected/hover/idle tabs, tab close, faded splitter, expanded/selected Explorer folder, inline picker tree expansion/selection/collapse/keyboard states, preview, explorer scrollbar, and terminal scrollback. Visual captures are ad hoc validation artifacts and are not stored in the repository. The no-native fallback clear uses alpha 225/255; native clear remains 150/255, and Xvfb without a compositor cannot show blending over a light root. Native compositor behavior, native pointer/keyboard/screen-reader behavior, and native macOS/Windows glass rendering remain unvalidated. See [Platform matrix](../testing/platform-matrix.md) and [v1 evidence](../records/20261026-v1-evidence.md).
 
 Related: [Design system](design-system.md), [UI spec](../../specs/changes/made-ui-ux-v1/spec.md), [Runtime](../runtime/terminal-first.md).

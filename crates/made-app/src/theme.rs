@@ -1,12 +1,12 @@
 //! “Calm Editor” design tokens and egui theme installation.
 //!
 //! The contract is `specs/changes/made-ui-ux-v1/design.md`. Terminal, preview, and picker surfaces
-//! stay opaque; the top chrome band and the Explorer card use semi-transparent
-//! dark fills as an in-app frosted-glass approximation. A native backdrop
-//! (macOS vibrancy or Windows Mica) can be layered behind the window when the
-//! platform supports it; the in-app glass remains legible on its own and stays
-//! the default on every platform without that effect. Keep the palette and
-//! geometry here rather than scattering literals through the views.
+//! stay opaque; the Explorer card uses semi-transparent dark fills as an in-app frosted-glass
+//! approximation. A native backdrop (macOS vibrancy or Windows Mica) can be layered behind the
+//! window when the platform supports it; the in-app explorer glass remains legible on its own and
+//! stays the default on every platform without that effect. The workspace header floats directly
+//! over the clear/native backdrop with no band fill, border, shadow, or highlight. Keep the palette
+//! and geometry here rather than scattering literals through the views.
 
 use eframe::egui::style::{WidgetVisuals, Widgets};
 use eframe::egui::text::LayoutJob;
@@ -25,11 +25,12 @@ pub const TRANSLUCENT_WINDOW: bool = true;
 
 // ── Colors ──────────────────────────────────────────────────────────────────
 
-// The default clear color is deliberately darker than the glass surfaces:
-// alpha 190 keeps the window translucent without making text chase a bright
-// desktop. When a native compositor backdrop is active, alpha 150 lets the OS
-// material read through; the glass fills below carry the text contrast.
-pub const BG_CLEAR: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 190);
+// The fallback clear color is deliberately dark: alpha 225 keeps the window
+// slightly translucent without making text chase a bright desktop when no
+// native material is applied. When a native compositor backdrop is active,
+// alpha 150 lets the OS material read through; the glass fills below carry the
+// text contrast.
+pub const BG_CLEAR: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 225);
 pub const BG_CLEAR_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 150);
 pub const BG_CLEAR_SOLID: Color32 = Color32::from_rgb(10, 11, 14);
 pub const BG_CHROME: Color32 = Color32::from_rgb(20, 22, 27);
@@ -40,12 +41,17 @@ pub const BG_TERMINAL: Color32 = Color32::from_rgb(11, 13, 16);
 pub const BG_ELEVATED: Color32 = Color32::from_rgb(27, 31, 38);
 pub const BG_HOVER: Color32 = Color32::from_rgb(29, 33, 41);
 pub const BG_SELECTED: Color32 = Color32::from_rgb(34, 42, 53);
+/// Inactive workspace-tab fill: translucent black over the window backdrop.
+pub const BG_TAB_IDLE: Color32 = Color32::from_rgba_unmultiplied_const(0, 0, 0, 84);
+/// Fill-only workspace-tab hover: opaque dark green-gray.
+pub const BG_TAB_HOVER: Color32 = Color32::from_rgb(0x15, 0x1C, 0x18);
+/// Selected workspace-tab fill: opaque dark gray with a green undertone.
+pub const BG_TAB_SELECTED: Color32 = Color32::from_rgb(0x1B, 0x23, 0x1F);
 
-// Frosted-glass approximation for the top chrome band and Explorer card.
-// The RGB values preserve the opaque tonal colors. Alpha 202–208 leaves the
-// dark backdrop visible while keeping primary/secondary text contrast intact;
-// these fills are used with or without a native backdrop.
-pub const BG_CHROME_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(20, 22, 27, 205);
+// Frosted-glass approximation for the Explorer card. The RGB values preserve
+// the opaque tonal colors. Alpha 202–208 leaves the dark backdrop visible while
+// keeping primary/secondary text contrast intact; these fills are used with or
+// without a native backdrop. The header has no persistent band fill.
 pub const BG_CARD_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 202);
 pub const BG_HEADER_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 208);
 pub const GLASS_HIGHLIGHT: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 12);
@@ -61,13 +67,28 @@ pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(188, 194, 204);
 pub const TEXT_TERTIARY: Color32 = Color32::from_rgb(154, 162, 176);
 pub const TEXT_DISABLED: Color32 = Color32::from_rgb(122, 132, 148);
 
-pub const ACCENT: Color32 = Color32::from_rgb(233, 167, 106);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(242, 184, 127);
-pub const ACCENT_PRESSED: Color32 = Color32::from_rgb(216, 147, 85);
-pub const ACCENT_TEXT: Color32 = Color32::from_rgb(20, 16, 11);
-pub const ACCENT_TINT: Color32 = Color32::from_rgb(48, 43, 41);
+/// Inactive header-tab label opacity.
+pub const TAB_INACTIVE_OPACITY: f32 = 0.72;
+/// Inactive header-icon opacity.
+pub const ICON_INACTIVE_OPACITY: f32 = 0.80;
 
-pub const SUCCESS: Color32 = Color32::from_rgb(124, 199, 154);
+/// Secondary label tone for an inactive header tab.
+pub fn inactive_tab_text() -> Color32 {
+    TEXT_SECONDARY.gamma_multiply(TAB_INACTIVE_OPACITY)
+}
+
+/// Glyph tone for an inactive header action.
+pub fn inactive_icon_color() -> Color32 {
+    TEXT_TERTIARY.gamma_multiply(ICON_INACTIVE_OPACITY)
+}
+
+pub const ACCENT: Color32 = Color32::from_rgb(0x8B, 0xD5, 0xA7);
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xA3, 0xE3, 0xBA);
+pub const ACCENT_PRESSED: Color32 = Color32::from_rgb(0x72, 0xBF, 0x8E);
+pub const ACCENT_TEXT: Color32 = Color32::from_rgb(0x08, 0x14, 0x0D);
+pub const ACCENT_TINT: Color32 = Color32::from_rgb(0x26, 0x35, 0x2C);
+
+pub const SUCCESS: Color32 = Color32::from_rgb(0x4F, 0xCF, 0xA8);
 pub const SUCCESS_TINT: Color32 = Color32::from_rgb(35, 47, 47);
 pub const WARNING: Color32 = Color32::from_rgb(233, 184, 114);
 pub const WARNING_TINT: Color32 = Color32::from_rgb(48, 45, 42);
@@ -75,7 +96,7 @@ pub const ERROR: Color32 = Color32::from_rgb(229, 138, 138);
 pub const ERROR_TINT: Color32 = Color32::from_rgb(48, 39, 45);
 pub const INFO: Color32 = Color32::from_rgb(143, 184, 232);
 pub const INFO_TINT: Color32 = Color32::from_rgb(37, 45, 56);
-pub const FOCUS: Color32 = Color32::from_rgb(244, 196, 142);
+pub const FOCUS: Color32 = Color32::from_rgb(0xB8, 0xF0, 0xC9);
 
 pub const SCROLL_TRACK: Color32 = Color32::from_rgb(20, 23, 29);
 pub const SCROLL_THUMB: Color32 = Color32::from_rgb(98, 108, 125);
@@ -84,7 +105,7 @@ pub const SCROLL_THUMB_HOVER: Color32 = Color32::from_rgb(122, 132, 148);
 // Terminal palette (also exported to the grid renderer).
 pub const TERMINAL_BACKGROUND: [u8; 3] = [11, 13, 16];
 pub const TERMINAL_FOREGROUND: [u8; 3] = [215, 221, 231];
-pub const TERMINAL_CURSOR: [u8; 3] = [242, 184, 127];
+pub const TERMINAL_CURSOR: [u8; 3] = [139, 213, 167];
 pub const TERMINAL_SELECTION_BACKGROUND: [u8; 3] = [46, 58, 78];
 pub const TERMINAL_SELECTION_FOREGROUND: [u8; 3] = [255, 255, 255];
 pub const TERMINAL_BRIGHT_BLACK: [u8; 3] = [112, 123, 142];
@@ -120,6 +141,10 @@ pub const SMALL_SIZE: f32 = 10.0;
 pub const META_SIZE: f32 = 10.5;
 pub const MONO_SIZE: f32 = 13.0;
 pub const PREVIEW_LINE_HEIGHT: f32 = 18.0;
+/// Inactive workspace/session tab label size.
+pub const TAB_FONT_SIZE: f32 = 12.5;
+/// Selected tab label size; the quiet non-color selection cue.
+pub const TAB_SELECTED_FONT_SIZE: f32 = 13.0;
 
 /// Monospace wordmark shown in workspace and picker chrome.
 pub const WORDMARK: &str = "MADE";
@@ -129,6 +154,68 @@ pub const WORDMARK_TOOLTIP: &str = "Minimal Agentic Development Environment";
 pub const WORDMARK_SIZE: f32 = 14.0;
 /// Wordmark tracking in points.
 pub const WORDMARK_SPACING: f32 = 1.8;
+/// Gap between the tab strip and the right-side wordmark, and between the
+/// wordmark and the first right icon.
+pub const WORDMARK_GAP_WIDE: f32 = 24.0;
+/// Compact wordmark breathing gap on both sides.
+pub const WORDMARK_GAP_COMPACT: f32 = 18.0;
+
+/// Wordmark breathing gap for the current layout density.
+pub fn wordmark_gap(compact: bool) -> f32 {
+    if compact {
+        WORDMARK_GAP_COMPACT
+    } else {
+        WORDMARK_GAP_WIDE
+    }
+}
+
+/// Resting font size of the workspace-tab close glyph.
+pub const CLOSE_GLYPH_SIZE: f32 = 12.0;
+/// Direct-hover close glyph scale.
+pub const CLOSE_HOVER_SCALE: f32 = 1.15;
+/// Duration of the close glyph scale in seconds.
+pub const CLOSE_HOVER_SCALE_TIME: f32 = 0.13;
+
+/// Smoothly map an animation progress to the close glyph scale.
+pub fn close_glyph_scale(progress: f32) -> f32 {
+    1.0 + (CLOSE_HOVER_SCALE - 1.0) * progress.clamp(0.0, 1.0)
+}
+
+/// Explorer splitter fade duration in seconds.
+pub const SPLITTER_FADE_TIME: f32 = 0.14;
+/// Peak hover opacity of the splitter line/grip.
+pub const SPLITTER_HOVER_OPACITY: f32 = 0.55;
+/// Peak drag opacity of the accent splitter line/grip.
+pub const SPLITTER_DRAG_OPACITY: f32 = 0.70;
+
+/// Splitter opacity after `progress` of the fade.
+pub fn splitter_opacity(progress: f32, dragged: bool) -> f32 {
+    let peak = if dragged {
+        SPLITTER_DRAG_OPACITY
+    } else {
+        SPLITTER_HOVER_OPACITY
+    };
+    progress.clamp(0.0, 1.0) * peak
+}
+
+/// Splitter tone: muted control boundary while hovering, green accent while dragging.
+pub fn splitter_tone(dragged: bool) -> Color32 {
+    if dragged {
+        ACCENT
+    } else {
+        BORDER_CONTROL
+    }
+}
+
+/// Splitter line/stroke color with the fade opacity baked in.
+pub fn splitter_line_color(progress: f32, dragged: bool) -> Color32 {
+    splitter_tone(dragged).gamma_multiply(splitter_opacity(progress, dragged))
+}
+
+/// Splitter grip fill with the fade opacity baked in.
+pub fn splitter_grip_fill(progress: f32, dragged: bool) -> Color32 {
+    BG_ELEVATED.gamma_multiply(splitter_opacity(progress, dragged))
+}
 
 /// The two-tone `MADE` wordmark: accent initial, primary remainder.
 pub fn wordmark_job() -> LayoutJob {
@@ -251,6 +338,54 @@ pub fn paint_ellipsized(
     galley
 }
 
+/// Paint ellipsized text vertically centered on `center_y`.
+///
+/// Returns the laid-out galley so callers can align app-drawn markers to the
+/// same optical center.
+pub fn paint_ellipsized_centered(
+    painter: &egui::Painter,
+    left: f32,
+    center_y: f32,
+    text: impl Into<String>,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let job = ellipsized_job(text, font, color, max_width);
+    let galley = painter.layout_job(job);
+    let top = center_y - galley.size().y / 2.0;
+    painter.galley(egui::pos2(left, top), galley.clone(), color);
+    galley
+}
+
+/// Paint a small app-drawn directory disclosure triangle.
+pub fn paint_disclosure(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    expanded: bool,
+    color: Color32,
+) {
+    let points = if expanded {
+        vec![
+            center + egui::vec2(-4.0, -3.0),
+            center + egui::vec2(4.0, -3.0),
+            center + egui::vec2(0.0, 3.0),
+        ]
+    } else {
+        vec![
+            center + egui::vec2(-3.5, -4.0),
+            center + egui::vec2(3.5, 0.0),
+            center + egui::vec2(-3.5, 4.0),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+}
+
+/// Paint the quiet app-drawn file bullet.
+pub fn paint_bullet(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    painter.circle_filled(center, 2.0, color);
+}
+
 // ── Geometry ────────────────────────────────────────────────────────────────
 
 /// Narrowest usable full-height explorer card.
@@ -271,6 +406,9 @@ pub struct Layout {
     pub content_padding: f32,
     pub tab_strip_height: f32,
     pub tab_height: f32,
+    /// Session-map tabs keep their previous height when the workspace header
+    /// shrinks.
+    pub session_tab_height: f32,
     pub button_height: f32,
     pub primary_height: f32,
     pub status_pill_height: f32,
@@ -301,13 +439,14 @@ impl Layout {
             window_height: height,
             gutter,
             gap: if compact { 6.0 } else { 8.0 },
-            top_height: if compact { 36.0 } else { 40.0 },
+            top_height: if compact { 24.0 } else { 26.0 },
             card_radius: if compact { 8 } else { 10 },
             card_header_height: if compact { 30.0 } else { 34.0 },
             header_padding_x: if compact { 10.0 } else { 12.0 },
             content_padding: if compact { 10.0 } else { 12.0 },
             tab_strip_height: if compact { 34.0 } else { 36.0 },
-            tab_height: if compact { 26.0 } else { 28.0 },
+            tab_height: if compact { 24.0 } else { 26.0 },
+            session_tab_height: if compact { 26.0 } else { 28.0 },
             button_height: if compact { 24.0 } else { 26.0 },
             primary_height: if compact { 26.0 } else { 28.0 },
             status_pill_height: if compact { 18.0 } else { 20.0 },
@@ -324,6 +463,16 @@ impl Layout {
     /// Content width inside the root gutter.
     pub fn content_width(&self) -> f32 {
         (self.window_width - 2.0 * self.gutter).max(1.0)
+    }
+
+    /// Top edge of the floating workspace header: one pane gap below the window.
+    pub fn header_top(&self) -> f32 {
+        self.gap
+    }
+
+    /// Top edge of the main content cards: one pane gap below the header strip.
+    pub fn content_top(&self) -> f32 {
+        self.header_top() + self.top_height + self.gap
     }
 
     /// Toast inset from the bottom-right corner. There is no status bar.
@@ -383,14 +532,6 @@ pub fn terminal_frame(layout: &Layout) -> Frame {
         .fill(BG_TERMINAL)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(layout.card_radius))
-}
-
-/// Opaque chrome band (workspace strip).
-pub fn band_frame(layout: &Layout) -> Frame {
-    Frame::new()
-        .fill(BG_CHROME)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(if layout.compact { 7 } else { 8 }))
 }
 
 /// Floating diagnostics frame.
@@ -470,26 +611,6 @@ fn paint_glass_highlight(painter: &egui::Painter, rect: egui::Rect, radius: u8) 
     );
 }
 
-/// In-app frosted band for the top chrome strip.
-///
-/// True backdrop blur needs compositor support; the translucent tonal fill,
-/// soft shadow, and inner top highlight are the cheap approximation.
-pub fn paint_glass_band(painter: &egui::Painter, rect: egui::Rect, radius: u8) {
-    painter.rect_filled(
-        rect.translate(egui::vec2(0.0, 2.0)).expand(1.0),
-        CornerRadius::same(radius.saturating_add(1)),
-        GLASS_SHADOW,
-    );
-    painter.rect(
-        rect,
-        CornerRadius::same(radius),
-        BG_CHROME_GLASS,
-        Stroke::new(1.0, BORDER),
-        StrokeKind::Inside,
-    );
-    paint_glass_highlight(painter, rect, radius);
-}
-
 /// In-app frosted fill for the full-height Explorer card.
 ///
 /// Terminal and preview cards stay opaque; only the Explorer surface uses this.
@@ -559,11 +680,6 @@ pub fn ghost_button_with(
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if selected {
-        Stroke::new(1.0, BORDER_CONTROL)
-    } else {
-        Stroke::NONE
-    };
     let color = if !enabled {
         TEXT_DISABLED
     } else if selected || hovered {
@@ -571,13 +687,7 @@ pub fn ghost_button_with(
     } else {
         TEXT_TERTIARY
     };
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(6),
-        fill,
-        stroke,
-        StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     let mut builder = UiBuilder::new()
         .max_rect(rect)
         .layout(egui::Layout::centered_and_justified(
@@ -612,8 +722,8 @@ pub struct ActionResponse {
 /// Monochrome app-drawn glyphs used by icon-only header actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconGlyph {
-    /// Folder with a plus: open another workspace.
-    FolderPlus,
+    /// Simple app-drawn plus: open another workspace.
+    Plus,
     /// Outlined panel with a right column: show/hide the explorer.
     PanelRight,
     /// Heartbeat line: workspace and integration diagnostics.
@@ -624,9 +734,17 @@ pub enum IconGlyph {
     Close,
 }
 
+/// Widest app-drawn header glyph (Explorer panel/Diagnostics).
+pub const ICON_GLYPH_WIDTH: f32 = 14.0;
+
 /// Square hit target for an icon-only action at `height`.
 pub fn icon_action_extent(height: f32) -> f32 {
     height.max(24.0)
+}
+
+/// Optical inset from the 14px glyph edge to its square hit-target edge.
+pub fn icon_glyph_inset(height: f32) -> f32 {
+    (icon_action_extent(height) - ICON_GLYPH_WIDTH) / 2.0
 }
 
 /// Icon-only ghost action with a caller-supplied stable id.
@@ -643,6 +761,37 @@ pub fn icon_action(
     height: f32,
     gap: Color32,
 ) -> ActionResponse {
+    icon_action_impl(ui, id, glyph, label, selected, height, gap, false)
+}
+
+/// Icon-only action whose glyph is optically right-aligned inside its target.
+///
+/// The target, selected/hover fill, focus ring, tooltip, and accessibility
+/// bounds remain centered on the normal square action rect; only the painted
+/// 14px glyph shifts right so its visible edge meets the target's right edge.
+pub fn icon_action_right_aligned(
+    ui: &mut Ui,
+    id: egui::Id,
+    glyph: IconGlyph,
+    label: &str,
+    selected: bool,
+    height: f32,
+    gap: Color32,
+) -> ActionResponse {
+    icon_action_impl(ui, id, glyph, label, selected, height, gap, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn icon_action_impl(
+    ui: &mut Ui,
+    id: egui::Id,
+    glyph: IconGlyph,
+    label: &str,
+    selected: bool,
+    height: f32,
+    gap: Color32,
+    right_align_glyph: bool,
+) -> ActionResponse {
     let extent = icon_action_extent(height);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(extent, extent), egui::Sense::hover());
     let mut response = ui.interact(rect, id, egui::Sense::click());
@@ -654,24 +803,18 @@ pub fn icon_action(
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if selected {
-        Stroke::new(1.0, BORDER_CONTROL)
-    } else {
-        Stroke::NONE
-    };
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(6),
-        fill,
-        stroke,
-        StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     let color = if selected || hovered {
         TEXT_PRIMARY
     } else {
-        TEXT_TERTIARY
+        inactive_icon_color()
     };
-    paint_icon(ui.painter(), rect, glyph, color);
+    let glyph_rect = if right_align_glyph {
+        rect.translate(egui::vec2(icon_glyph_inset(height), 0.0))
+    } else {
+        rect
+    };
+    paint_icon(ui.painter(), glyph_rect, glyph, color);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -699,36 +842,26 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, glyph: IconGlyph, color
         painter.add(egui::Shape::line(points, stroke));
     };
     match glyph {
-        IconGlyph::FolderPlus => {
-            let folder = vec![
-                point(-7.0, 4.5),
-                point(-7.0, -1.5),
-                point(-3.5, -1.5),
-                point(-2.5, -3.5),
-                point(4.5, -3.5),
-                point(6.0, -1.5),
-                point(7.0, -1.5),
-                point(7.0, 4.5),
-            ];
-            painter.add(egui::epaint::PathShape::closed_line(folder, stroke));
-            line(vec![point(-2.5, 1.5), point(2.5, 1.5)]);
-            line(vec![point(0.0, -1.0), point(0.0, 4.0)]);
+        IconGlyph::Plus => {
+            line(vec![point(-6.0, 0.0), point(6.0, 0.0)]);
+            line(vec![point(0.0, -6.0), point(0.0, 6.0)]);
         }
         IconGlyph::PanelRight => {
-            let panel = egui::Rect::from_center_size(center, egui::vec2(14.0, 11.0));
+            let panel = egui::Rect::from_center_size(center, egui::vec2(ICON_GLYPH_WIDTH, 11.0));
             painter.rect_stroke(panel, CornerRadius::same(2), stroke, StrokeKind::Middle);
             line(vec![point(2.0, -5.5), point(2.0, 5.5)]);
         }
         IconGlyph::Diagnostics => {
+            let half = ICON_GLYPH_WIDTH / 2.0;
             line(vec![
-                point(-7.0, 0.0),
+                point(-half, 0.0),
                 point(-4.0, 0.0),
                 point(-3.0, -4.0),
                 point(-1.5, 4.5),
                 point(0.5, -3.0),
                 point(2.0, 1.5),
                 point(3.5, 0.0),
-                point(7.0, 0.0),
+                point(half, 0.0),
             ]);
         }
         IconGlyph::SessionList => {
@@ -793,11 +926,6 @@ pub fn ghost_action_with(
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if selected {
-        Stroke::new(1.0, BORDER_CONTROL)
-    } else {
-        Stroke::NONE
-    };
     let color = if !enabled {
         TEXT_DISABLED
     } else if selected || hovered {
@@ -805,13 +933,7 @@ pub fn ghost_action_with(
     } else {
         TEXT_TERTIARY
     };
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(6),
-        fill,
-        stroke,
-        StrokeKind::Inside,
-    );
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
@@ -947,6 +1069,36 @@ pub fn secondary_action(
                 TEXT_DISABLED
             },
             stroke: Stroke::new(1.0, if enabled { BORDER_CONTROL } else { BORDER }),
+        },
+        gap,
+        enabled,
+    )
+}
+
+/// Borderless secondary action used by the folder picker.
+pub fn quiet_secondary_action(
+    ui: &mut Ui,
+    id: egui::Id,
+    label: &str,
+    height: f32,
+    enabled: bool,
+    gap: Color32,
+) -> ActionResponse {
+    filled_action(
+        ui,
+        id,
+        label,
+        height,
+        ButtonColors {
+            rest: if enabled { BG_ELEVATED } else { BG_CARD },
+            hover: if enabled { BG_HOVER } else { BG_CARD },
+            pressed: BG_SELECTED,
+            text: if enabled {
+                TEXT_SECONDARY
+            } else {
+                TEXT_DISABLED
+            },
+            stroke: Stroke::NONE,
         },
         gap,
         enabled,
@@ -1166,7 +1318,7 @@ pub fn visuals() -> Visuals {
             expansion: 0.0,
         },
         active: WidgetVisuals {
-            bg_fill: BG_SELECTED,
+            bg_fill: SCROLL_THUMB_HOVER,
             weak_bg_fill: BG_SELECTED,
             bg_stroke: Stroke::new(2.0, FOCUS),
             corner_radius: CornerRadius::same(6),
@@ -1196,13 +1348,24 @@ pub fn text_styles() -> BTreeMap<TextStyle, FontId> {
     ])
 }
 
-/// Solid eight-pixel scrollbars with a 24px minimum handle.
+/// Floating overlay scrollbars that stay hidden at rest and fade in on hover.
+///
+/// The bars allocate zero width, so content never reflows when one appears.
 pub fn scroll_style() -> egui::style::ScrollStyle {
-    let mut scroll = egui::style::ScrollStyle::solid();
+    let mut scroll = egui::style::ScrollStyle::floating();
     scroll.bar_width = 8.0;
+    scroll.floating_width = 3.0;
+    scroll.floating_allocated_width = 0.0;
     scroll.handle_min_length = 24.0;
     scroll.bar_inner_margin = 2.0;
     scroll.bar_outer_margin = 0.0;
+    scroll.foreground_color = false;
+    scroll.dormant_background_opacity = 0.0;
+    scroll.active_background_opacity = 0.0;
+    scroll.interact_background_opacity = 0.35;
+    scroll.dormant_handle_opacity = 0.0;
+    scroll.active_handle_opacity = 0.60;
+    scroll.interact_handle_opacity = 1.0;
     scroll
 }
 
@@ -1216,9 +1379,9 @@ pub fn clear_color() -> [f32; 4] {
 
 /// Clear color for a window, accounting for a running native backdrop.
 ///
-/// With native vibrancy/Mica active the lower alpha (150 instead of 190) lets
-/// the OS material show through. Without it, the default alpha keeps the
-/// in-app glass readable even when the compositor ignores transparency.
+/// With native vibrancy/Mica active the lower alpha (150 instead of 225) lets
+/// the OS material show through. Without it, the darker fallback alpha keeps
+/// the in-app glass readable even when the compositor ignores transparency.
 pub fn clear_color_with_native(native_backdrop: bool) -> [f32; 4] {
     if !TRANSLUCENT_WINDOW {
         return BG_CLEAR_SOLID.to_normalized_gamma_f32();
@@ -1290,18 +1453,77 @@ mod tests {
     #[test]
     fn tokens_match_the_contract() {
         assert_eq!(BG_CARD, Color32::from_rgb(0x17, 0x1A, 0x20));
-        assert_eq!(ACCENT, Color32::from_rgb(0xE9, 0xA7, 0x6A));
+        assert_eq!(ACCENT, Color32::from_rgb(0x8B, 0xD5, 0xA7));
+        assert_eq!(ACCENT_HOVER, Color32::from_rgb(0xA3, 0xE3, 0xBA));
+        assert_eq!(ACCENT_PRESSED, Color32::from_rgb(0x72, 0xBF, 0x8E));
+        assert_eq!(ACCENT_TEXT, Color32::from_rgb(0x08, 0x14, 0x0D));
+        assert_eq!(ACCENT_TINT, Color32::from_rgb(0x26, 0x35, 0x2C));
+        assert_eq!(FOCUS, Color32::from_rgb(0xB8, 0xF0, 0xC9));
+        assert_eq!(SUCCESS, Color32::from_rgb(0x4F, 0xCF, 0xA8));
         assert_eq!(TERMINAL_BACKGROUND, [0x0B, 0x0D, 0x10]);
         assert_eq!(TERMINAL_BRIGHT_BLACK, [0x70, 0x7B, 0x8E]);
     }
 
     #[test]
+    fn mint_accent_stays_distinct_from_semantic_status() {
+        let accent = ACCENT.to_srgba_unmultiplied();
+        assert!(
+            accent[1] > accent[0] && accent[1] > accent[2],
+            "accent must be a calm green: {accent:?}"
+        );
+        assert_ne!(ACCENT, SUCCESS, "success must not reuse the accent tone");
+        let success = SUCCESS.to_srgba_unmultiplied();
+        assert!(
+            success[1] > success[2] && success[2] > success[0],
+            "success must stay a cool teal distinct from the mint accent: {success:?}"
+        );
+        assert_ne!(ACCENT, WARNING, "warning must not reuse the accent tone");
+        assert_ne!(ACCENT, ERROR, "error must not reuse the accent tone");
+        assert_ne!(ACCENT, INFO, "info must not reuse the accent tone");
+    }
+
+    #[test]
+    fn close_scale_and_splitter_fade_helpers_are_bounded_and_discreet() {
+        assert!((CLOSE_HOVER_SCALE - 1.15).abs() < f32::EPSILON);
+        assert!((CLOSE_HOVER_SCALE_TIME - 0.13).abs() < f32::EPSILON);
+        assert!((close_glyph_scale(0.0) - 1.0).abs() < f32::EPSILON);
+        assert!((close_glyph_scale(1.0) - CLOSE_HOVER_SCALE).abs() < f32::EPSILON);
+        assert!(close_glyph_scale(0.5) > 1.0 && close_glyph_scale(0.5) < CLOSE_HOVER_SCALE);
+        assert!((close_glyph_scale(2.0) - CLOSE_HOVER_SCALE).abs() < f32::EPSILON);
+
+        assert!((SPLITTER_FADE_TIME - 0.14).abs() < f32::EPSILON);
+        assert!(splitter_opacity(0.0, false).abs() < f32::EPSILON);
+        assert!((splitter_opacity(1.0, false) - SPLITTER_HOVER_OPACITY).abs() < f32::EPSILON);
+        assert!((splitter_opacity(1.0, true) - SPLITTER_DRAG_OPACITY).abs() < f32::EPSILON);
+        assert_eq!(splitter_tone(false), BORDER_CONTROL);
+        assert_eq!(splitter_tone(true), ACCENT);
+
+        let hover_line = splitter_line_color(1.0, false).to_srgba_unmultiplied();
+        let border = BORDER_CONTROL.to_srgba_unmultiplied();
+        assert!(hover_line[..3]
+            .iter()
+            .zip(&border[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
+        assert!(hover_line[3] > 0 && hover_line[3] < 255);
+        let drag_line = splitter_line_color(1.0, true).to_srgba_unmultiplied();
+        let accent = ACCENT.to_srgba_unmultiplied();
+        assert!(drag_line[..3]
+            .iter()
+            .zip(&accent[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
+        assert!(drag_line[3] > 0 && drag_line[3] < 255);
+        let grip = splitter_grip_fill(1.0, false).to_srgba_unmultiplied();
+        let elevated = BG_ELEVATED.to_srgba_unmultiplied();
+        assert!(grip[..3]
+            .iter()
+            .zip(&elevated[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
+        assert!(grip[3] > 0 && grip[3] < 255);
+    }
+
+    #[test]
     fn glass_tokens_are_translucent_and_tonal() {
-        for (glass, opaque) in [
-            (BG_CHROME_GLASS, BG_CHROME),
-            (BG_CARD_GLASS, BG_CARD),
-            (BG_HEADER_GLASS, BG_HEADER),
-        ] {
+        for (glass, opaque) in [(BG_CARD_GLASS, BG_CARD), (BG_HEADER_GLASS, BG_HEADER)] {
             let [r, g, b, a] = glass.to_srgba_unmultiplied();
             let [opaque_r, opaque_g, opaque_b, _] = opaque.to_srgba_unmultiplied();
             assert!(
@@ -1315,6 +1537,76 @@ mod tests {
         }
         assert!(GLASS_HIGHLIGHT.a() < 20);
         assert!(GLASS_SHADOW.a() < 80);
+    }
+
+    #[test]
+    fn inactive_header_tokens_use_the_documented_opacity() {
+        let tab = inactive_tab_text().to_srgba_unmultiplied();
+        let icon = inactive_icon_color().to_srgba_unmultiplied();
+        let tab_base = TEXT_SECONDARY.to_srgba_unmultiplied();
+        let icon_base = TEXT_TERTIARY.to_srgba_unmultiplied();
+        assert!((TAB_INACTIVE_OPACITY - 0.72).abs() < f32::EPSILON);
+        assert!((ICON_INACTIVE_OPACITY - 0.80).abs() < f32::EPSILON);
+        assert!(
+            tab[0].abs_diff(tab_base[0]) <= 1
+                && tab[1].abs_diff(tab_base[1]) <= 1
+                && tab[2].abs_diff(tab_base[2]) <= 1,
+            "inactive tab tone must preserve the secondary hue: {tab:?} vs {tab_base:?}"
+        );
+        assert!(
+            icon[0].abs_diff(icon_base[0]) <= 1
+                && icon[1].abs_diff(icon_base[1]) <= 1
+                && icon[2].abs_diff(icon_base[2]) <= 1,
+            "inactive icon tone must preserve the tertiary hue: {icon:?} vs {icon_base:?}"
+        );
+        assert!(tab[3] < tab_base[3]);
+        assert!(icon[3] < icon_base[3]);
+    }
+
+    #[test]
+    fn idle_workspace_tab_token_is_translucent_black() {
+        let [r, g, b, a] = BG_TAB_IDLE.to_srgba_unmultiplied();
+        assert_eq!([r, g, b], [0, 0, 0]);
+        assert_eq!(
+            a, 84,
+            "idle tab fill must stay the documented translucent black"
+        );
+        assert!(a > 0 && a < 255, "idle tab fill must be translucent: {a}");
+        assert_eq!(BG_TAB_HOVER, Color32::from_rgb(0x15, 0x1C, 0x18));
+        assert_eq!(BG_TAB_SELECTED, Color32::from_rgb(0x1B, 0x23, 0x1F));
+        for (name, tone) in [("hover", BG_TAB_HOVER), ("selected", BG_TAB_SELECTED)] {
+            let [r, g, b, a] = tone.to_srgba_unmultiplied();
+            assert_eq!(a, 255, "{name} workspace tab must be opaque");
+            assert!(
+                g >= r && g >= b,
+                "{name} workspace tab must keep a green-gray undertone: {tone:?}"
+            );
+        }
+        let hover: u16 =
+            BG_TAB_HOVER.r() as u16 + BG_TAB_HOVER.g() as u16 + BG_TAB_HOVER.b() as u16;
+        let selected: u16 =
+            BG_TAB_SELECTED.r() as u16 + BG_TAB_SELECTED.g() as u16 + BG_TAB_SELECTED.b() as u16;
+        assert!(
+            selected > hover,
+            "selected tab must be a luminance step above hover"
+        );
+    }
+
+    #[test]
+    fn scroll_style_is_floating_and_hidden_at_rest() {
+        let style = scroll_style();
+        assert!(style.floating);
+        assert_eq!(style.allocated_width(), 0.0);
+        assert_eq!(style.dormant_handle_opacity, 0.0);
+        assert_eq!(style.dormant_background_opacity, 0.0);
+        assert!(style.active_handle_opacity > 0.0);
+        assert!(style.interact_handle_opacity >= style.active_handle_opacity);
+        assert!(style.bar_width > style.floating_width);
+        assert!(style.handle_min_length >= 24.0);
+        assert!(!style.foreground_color);
+        assert_eq!(visuals().widgets.inactive.bg_fill, SCROLL_THUMB);
+        assert_eq!(visuals().widgets.hovered.bg_fill, SCROLL_THUMB_HOVER);
+        assert_eq!(visuals().widgets.active.bg_fill, SCROLL_THUMB_HOVER);
     }
 
     #[test]
@@ -1372,11 +1664,22 @@ mod tests {
         assert_eq!(wide.explorer_default_width(), 440.0);
         assert!(wide.explorer_max_width(wide.content_width()) > 440.0);
         assert_eq!(wide.max_tabs, 5);
+        assert_eq!(wide.top_height, 26.0);
+        assert_eq!(wide.tab_height, 26.0);
+        assert_eq!(wide.session_tab_height, 28.0);
+        assert_eq!(wide.tab_strip_height, 36.0);
+        assert_eq!(wide.header_top(), 8.0);
+        assert_eq!(wide.content_top(), 42.0);
 
         let compact = Layout::for_window(720.0, 480.0);
         assert!(compact.compact);
         assert_eq!(compact.gutter, 8.0);
-        assert_eq!(compact.top_height, 36.0);
+        assert_eq!(compact.top_height, 24.0);
+        assert_eq!(compact.tab_height, 24.0);
+        assert_eq!(compact.session_tab_height, 26.0);
+        assert_eq!(compact.tab_strip_height, 34.0);
+        assert_eq!(compact.header_top(), 6.0);
+        assert_eq!(compact.content_top(), 36.0);
         assert_eq!(compact.right_card_width, 288.0);
         assert_eq!(
             compact.explorer_width(440.0, compact.content_width()),
@@ -1384,6 +1687,13 @@ mod tests {
         );
         assert!(compact.explorer_max_width(compact.content_width()) < 440.0);
         assert!(compact.hide_preview_meta);
+    }
+
+    #[test]
+    fn icon_glyph_inset_centers_the_fourteen_pixel_glyph() {
+        assert_eq!(icon_glyph_inset(26.0), 6.0);
+        assert_eq!(icon_glyph_inset(24.0), 5.0);
+        assert_eq!(icon_glyph_inset(30.0), 8.0);
     }
 
     #[test]
@@ -1414,11 +1724,31 @@ mod tests {
 
     #[test]
     fn clear_color_respects_the_kill_switch_and_native_backdrop() {
+        let fallback = BG_CLEAR.to_srgba_unmultiplied();
+        let native_token = BG_CLEAR_NATIVE.to_srgba_unmultiplied();
+        assert!(
+            fallback[0].abs_diff(10) <= 1
+                && fallback[1].abs_diff(11) <= 1
+                && fallback[2].abs_diff(14) <= 1
+        );
+        assert_eq!(fallback[3], 225);
+        assert!(
+            native_token[0].abs_diff(10) <= 1
+                && native_token[1].abs_diff(11) <= 1
+                && native_token[2].abs_diff(14) <= 1
+        );
+        assert_eq!(native_token[3], 150);
+        assert!(
+            fallback[3] > native_token[3],
+            "the no-native fallback must be darker than the native clear"
+        );
+        assert_eq!(BG_CLEAR_SOLID, Color32::from_rgb(10, 11, 14));
+
         let in_app = clear_color();
         assert_eq!(in_app, clear_color_with_native(false));
 
         let expected_in_app_alpha = if TRANSLUCENT_WINDOW {
-            190.0 / 255.0
+            225.0 / 255.0
         } else {
             1.0
         };
@@ -1492,7 +1822,7 @@ mod tests {
         let palette = terminal_palette();
         assert_eq!(palette.background, [11, 13, 16]);
         assert_eq!(palette.foreground, [215, 221, 231]);
-        assert_eq!(palette.cursor, [242, 184, 127]);
+        assert_eq!(palette.cursor, [139, 213, 167]);
         assert_eq!(palette.ansi[8], [112, 123, 142]);
         assert_eq!(palette.selection_background, [46, 58, 78]);
     }

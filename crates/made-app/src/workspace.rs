@@ -578,7 +578,7 @@ impl WorkspaceLaunch {
         *self = Self::Ready(plan);
     }
 
-    /// Confirm the picker's current folder and open both surfaces.
+    /// Confirm the picker's selected row path (or root) and open both surfaces.
     ///
     /// On failure the picker stays visible, the error is stored, and the
     /// terminal is not created because no workspace has been confirmed.
@@ -610,10 +610,58 @@ impl WorkspaceLaunch {
         Ok(())
     }
 
-    /// Navigate the picker to a child directory.
-    pub fn picker_enter(&mut self, index: usize) -> Result<(), PickerError> {
+    /// Toggle expansion of one visible picker row.
+    pub fn picker_toggle(&mut self, index: usize) -> Result<(), PickerError> {
         let result = match self {
-            Self::Picker { picker, .. } => picker.enter(index),
+            Self::Picker { picker, .. } => picker.toggle(index),
+            _ => return Ok(()),
+        };
+        if let Err(error) = &result {
+            if let Self::Picker { picker, .. } = self {
+                picker.set_error(error.clone());
+            }
+        } else if let Self::Picker { error, .. } = self {
+            *error = None;
+        }
+        result
+    }
+
+    /// Toggle expansion of the selected picker row.
+    pub fn picker_toggle_selected(&mut self) -> Result<(), PickerError> {
+        let result = match self {
+            Self::Picker { picker, .. } => picker.toggle_selected(),
+            _ => return Ok(()),
+        };
+        if let Err(error) = &result {
+            if let Self::Picker { picker, .. } = self {
+                picker.set_error(error.clone());
+            }
+        } else if let Self::Picker { error, .. } = self {
+            *error = None;
+        }
+        result
+    }
+
+    /// Expand the selected picker folder, or select its first child.
+    pub fn picker_expand_selected(&mut self) -> Result<(), PickerError> {
+        let result = match self {
+            Self::Picker { picker, .. } => picker.expand_selected(),
+            _ => return Ok(()),
+        };
+        if let Err(error) = &result {
+            if let Self::Picker { picker, .. } = self {
+                picker.set_error(error.clone());
+            }
+        } else if let Self::Picker { error, .. } = self {
+            *error = None;
+        }
+        result
+    }
+
+    /// Collapse the selected picker folder, or select its parent row.
+    pub fn picker_collapse_selected(&mut self) -> Result<(), PickerError> {
+        let result = match self {
+            Self::Picker { picker, .. } => picker.collapse_selected(),
             _ => return Ok(()),
         };
         if let Err(error) = &result {
@@ -650,7 +698,7 @@ impl WorkspaceLaunch {
         }
     }
 
-    /// Select one picker entry by index.
+    /// Select one visible picker row by index.
     pub fn picker_select(&mut self, index: usize) -> Result<(), PickerError> {
         let result = match self {
             Self::Picker { picker, .. } => picker.select(index),

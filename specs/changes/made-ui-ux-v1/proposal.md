@@ -8,11 +8,11 @@ Made's active, undelivered v1 bundle currently mixes product/runtime/integration
 
 In scope:
 
-- Calm Editor visual system: tokens, typography, glass chrome, native backdrop `auto`/`off` fallback, opaque reading surfaces, contrast, and status cues.
+- Calm Editor visual system: tokens, typography, floating header, explorer glass, native backdrop `auto`/`off` fallback, opaque reading surfaces, contrast, and status cues.
 - Minimal workspace layout: quiet terminal-first chrome, icon-only header actions, full-height hideable/resizable explorer, hover-only divider, and no routine manual refresh or technical chrome.
 - Brand and workspace tabs: two-tone `MADE` wordmark, editor-like workspace tabs, close affordances, active treatment, overflow, and distinction from OpenCode session tabs.
 - Optional session-map presentation: initially hidden, selected-workspace scoped, activity indicators, empty/overflow behavior, and focus-error presentation.
-- Explicit folder picker UX: card layout, Close/Escape/Back, selected-row treatment, keyboard navigation, and preservation of a live workspace when adding another folder.
+- Explicit folder picker UX: card layout, Close/Escape/Back, inline expandable folder tree, single selected-row/path target, tree keyboard navigation, refresh/re-root state, and preservation of a live workspace when adding another folder.
 - Full-left preview presentation: full-left surface, header/actions/return, meta/gutter/code styling, syntax highlighting, and safe-state styling.
 - Diagnostics presentation: opaque floating card, sections, metrics/log block, copy actions, responsive sizing.
 - Responsive layout and motion: 1280×800/720×480 breakpoints, labeled overflow, explorer hide/show transition, and motion that carries no essential information.
@@ -21,16 +21,16 @@ In scope:
 
 ## Non-goals
 
-- Any new feature, redesign, visual refresh, or behavior not already implemented/discussed in the active v1.
+- Any new product feature or redesign beyond the documented Calm Editor refinements in tasks 6.x–12.x.
 - Product/runtime/integration/security/performance ownership: terminal fidelity, session follow, bridge, config immutability, path guards, preview read-only/safety, watcher behavior, home resolution, workspace isolation, diagnostics data, and performance budgets remain in the core change.
 - File editing, saving, LSP, diff, AI/chat UI, other agents, remote/WSL, worktree lifecycle management, terminal splits, multi-window, restart persistence, installers, signing, or auto-update.
 - Archiving, versioning, or declaring v1 delivered. Native macOS/Windows, native Linux X11/Wayland, native pointer/keyboard, native compositor/backdrop rendering, and hardware-GPU evidence remain pending.
-- Editing code, wiki, or implementation behavior.
+- Editing code or wiki as part of the original split. This proposal records that split; the later 6.x–12.x refinement tasks in the same active change do update UI code, tests, and the UI contract.
 - Rewriting README or the broader documentation set; only cross-spec references are updated.
 
 ## Approach
 
-Extract the durable visual contract into this change's `spec.md` (normative UI outcomes) and `design.md` (non-normative tokens, layout, components, motion, accessibility, and evidence rationale). The core change keeps its requirements but removes duplicated UI scenarios, replacing them with explicit cross-references. Moved scenarios retain their exact titles where possible; derived scenarios cover presentation surfaces that were previously implicit in a single mixed requirement. UI tasks carry the existing checked UI implementation/evidence items and add explicit unchecked native/manual checkpoints. No code changes are made.
+Extract the durable visual contract into this change's `spec.md` (normative UI outcomes) and `design.md` (non-normative tokens, layout, components, motion, accessibility, and evidence rationale). The core change keeps its requirements but removes duplicated UI scenarios, replacing them with explicit cross-references. Moved scenarios retain their exact titles where possible; derived scenarios cover presentation surfaces that were previously implicit in a single mixed requirement. UI tasks carry the existing checked UI implementation/evidence items and add explicit unchecked native/manual checkpoints. The original split made no code changes; the later 6.x–12.x refinement tasks in this active change implement and test the documented UI adjustments.
 
 ## Decision index
 
@@ -50,8 +50,10 @@ Extract the durable visual contract into this change's `spec.md` (normative UI o
 - **Q:** Which spec is normative for a UI behavior that also touches runtime behavior?
   **A:** The core spec owns the observable behavior/data/security outcome; this spec owns the observable presentation/interaction outcome. Requirements cross-reference rather than duplicate each other.
 - **Q:** Are the UI requirements implemented?
-  **A:** Yes on Linux: 602 tests pass, with Xvfb/headless captures and visual checks recorded in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
+  **A:** Yes on Linux: 631 tests pass, with Xvfb/headless test evidence summarized in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Visual captures are ad hoc validation artifacts and are not committed. Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
 - **Q:** Does this change add scope beyond the active v1?
-  **A:** No. It extracts already implemented/discussed UI behavior; derived scenarios only make implicit presentation guarantees explicit.
+  **A:** No. It extracts already implemented/discussed UI behavior; derived scenarios only make implicit presentation guarantees explicit. The 6.x–12.x refinements stay inside this UI contract and do not add runtime/product scope.
+- **Q:** Does the proposal's “no code changes” statement still apply?
+  **A:** It describes the original contract split only. The later 6.x (scrollbars/header/tabs), 7.x (tab glass, focus exception, picker navigation), 8.x (mint accent, brand spacing, header order, close scale, splitter fade), 9.x (inline picker tree, path target, keyboard tree navigation, refresh/re-root state), 10.x (darker fallback clear, opaque fill-only selected/hover workspace tabs), 11.x (tabs-left header, right-side wordmark with 24/18 breathing gaps, reserved right cluster, 34/30 strip (Phase 11; superseded by Phase 12) and 26/24 workspace tabs with session-map metrics preserved), and 12.x (gutter-to-gutter header row, card-edge-aligned tabs/icons, 26/24 strip and tabs, 42/36 card top with equal outer pane gaps) refinement tasks in this same active change do change UI code and tests; those changes are recorded in `tasks.md`, not retroactively in the original split rationale.
 - **Q:** Is the legacy UI design document replaced?
   **A:** Yes. This change's [`design.md`](design.md) is now the durable non-normative contract and implementation reference; the legacy document was removed after migration.

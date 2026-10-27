@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use made_app::app::{AppModel, AppOptions, WorkspaceId};
 use made_app::cli::LaunchArgs;
-use made_app::explorer_view::PreviewAction;
+use made_app::explorer_view::{ExplorerPane, PreviewAction};
 use made_app::ui::{
     diagnostics_copy_id, explorer_splitter_id, left_surface_action_id, picker_control_id,
-    picker_current_target, picker_list_id, top_action_id, top_workspace_action_id,
+    picker_current_target, picker_list_id, picker_path_id, top_action_id, top_workspace_action_id,
     workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
@@ -149,12 +149,12 @@ fn picker_selection_transitions_to_workspace_surfaces_without_a_display() {
         .launch()
         .picker()
         .unwrap()
-        .selected_entry()
+        .selected_row()
         .unwrap()
         .name()
         .to_owned();
     assert_eq!(selected_name, "alpha");
-    let plan = model.launch().picker().unwrap().confirm_entry(0).unwrap();
+    let plan = model.launch().picker().unwrap().confirm_row(0).unwrap();
     let expected_root = plan.explorer_root.clone();
     model.open_plan(plan);
 
@@ -225,6 +225,7 @@ struct Headless {
     height: f32,
     started: Instant,
     frame: u64,
+    last_time: f64,
 }
 
 impl Headless {
@@ -238,17 +239,21 @@ impl Headless {
             height,
             started: Instant::now(),
             frame: 0,
+            last_time: 0.0,
         }
     }
 
     fn raw(&mut self, events: Vec<egui::Event>) -> egui::RawInput {
         self.frame = self.frame.saturating_add(1);
+        let wall = self.started.elapsed().as_secs_f64();
+        let time = wall.max(self.last_time);
+        self.last_time = time;
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(self.width, self.height),
             )),
-            time: Some(self.started.elapsed().as_secs_f64()),
+            time: Some(time),
             events,
             ..Default::default()
         }
@@ -265,6 +270,17 @@ impl Headless {
     fn render_events(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
         self.model.logic(&self.ctx);
         let raw = self.raw(events);
+        let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn render_events_at(&mut self, events: Vec<egui::Event>, time: f64) -> egui::FullOutput {
+        self.model.logic(&self.ctx);
+        let mut raw = self.raw(events);
+        let time = time.max(self.last_time + 1.0 / 60.0);
+        self.last_time = time;
+        raw.time = Some(time);
         let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
         output.textures_delta.clear();
         output
@@ -324,13 +340,37 @@ impl Headless {
         self.render()
     }
 
+    fn press_hold(&mut self, id: egui::Id) -> egui::FullOutput {
+        self.render();
+        self.render();
+        let position = self.response(id).rect.center();
+        self.render_events(vec![egui::Event::PointerMoved(position)]);
+        self.render_events(vec![pointer_button(position, true)])
+    }
+
+    fn release(&mut self, id: egui::Id) {
+        let position = self.response(id).rect.center();
+        self.render_events(vec![pointer_button(position, false)]);
+    }
+
     fn press_key(&mut self, key: egui::Key) {
+        self.press_key_with_modifiers(key, egui::Modifiers::NONE);
+    }
+
+    fn press_key_with_modifiers(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
         self.render_events(vec![egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
+        }]);
+        self.render_events(vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
         }]);
     }
 
@@ -338,6 +378,16 @@ impl Headless {
         for _ in 0..12 {
             self.render();
             std::thread::sleep(Duration::from_millis(16));
+        }
+    }
+
+    /// Advance realtime-driven egui animations by rendering fixed 1/60s frames.
+    /// `stable_dt` clamps a single large jump, so fade tests need several frames.
+    fn advance(&mut self, seconds: f64) {
+        let base = self.last_time;
+        let frames = ((seconds / (1.0 / 60.0)).ceil() as usize).max(1);
+        for frame in 1..=frames {
+            self.render_events_at(Vec::new(), base + frame as f64 / 60.0);
         }
     }
 
@@ -351,6 +401,27 @@ impl Headless {
             predicate(&self.model),
             "runtime did not reach expected state"
         );
+    }
+
+    fn pump_until_rows(&mut self, id: WorkspaceId, rows: usize) {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            self.render();
+            let visible = self
+                .model
+                .workspace_mut(id)
+                .and_then(Workbench::explorer_mut)
+                .map(ExplorerPane::visible_row_count)
+                .unwrap_or(0);
+            if visible >= rows {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "explorer did not reach {rows} rows"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -609,6 +680,155 @@ fn rects_with_fill(output: &egui::FullOutput, fill: egui::Color32) -> Vec<egui::
     rects
 }
 
+fn rect_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::RectShape> {
+    fn visit(shape: &egui::Shape, rects: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Rect(rect) => rects.push(rect.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, &mut rects);
+    }
+    rects
+}
+
+fn path_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::PathShape> {
+    fn visit(shape: &egui::Shape, paths: &mut Vec<egui::epaint::PathShape>) {
+        match shape {
+            egui::Shape::Path(path) => paths.push(path.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, &mut paths);
+    }
+    paths
+}
+
+fn circle_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::CircleShape> {
+    fn visit(shape: &egui::Shape, circles: &mut Vec<egui::epaint::CircleShape>) {
+        match shape {
+            egui::Shape::Circle(circle) => circles.push(*circle),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, circles);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut circles = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, &mut circles);
+    }
+    circles
+}
+
+fn path_center(path: &egui::epaint::PathShape) -> egui::Pos2 {
+    egui::Rect::from_points(&path.points).center()
+}
+
+fn focus_ring_rects(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<egui::Rect> {
+    rect_shapes(output)
+        .into_iter()
+        .filter(|shape| {
+            shape.stroke.color == made_app::theme::FOCUS && shape.rect.intersects(bounds)
+        })
+        .map(|shape| shape.rect)
+        .collect()
+}
+
+fn text_colors(output: &egui::FullOutput, needle: &str, max_y: f32) -> Vec<egui::Color32> {
+    fn visit(shape: &egui::Shape, needle: &str, max_y: f32, colors: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Text(text)
+                if text.pos.y <= max_y && text.galley.job.text.contains(needle) =>
+            {
+                for section in &text.galley.job.sections {
+                    let color = if section.format.color == egui::Color32::PLACEHOLDER {
+                        text.fallback_color
+                    } else {
+                        section.format.color
+                    };
+                    colors.push(color);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, needle, max_y, colors);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut colors = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, needle, max_y, &mut colors);
+    }
+    colors
+}
+
+fn text_font_sizes(output: &egui::FullOutput, needle: &str, max_y: f32) -> Vec<f32> {
+    fn visit(shape: &egui::Shape, needle: &str, max_y: f32, sizes: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Text(text)
+                if text.pos.y <= max_y && text.galley.job.text.contains(needle) =>
+            {
+                for section in &text.galley.job.sections {
+                    sizes.push(section.format.font_id.size);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, needle, max_y, sizes);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut sizes = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, needle, max_y, &mut sizes);
+    }
+    sizes
+}
+
+fn text_rects(output: &egui::FullOutput, needle: &str, max_y: f32) -> Vec<egui::Rect> {
+    fn visit(shape: &egui::Shape, needle: &str, max_y: f32, rects: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Text(text)
+                if text.pos.y <= max_y && text.galley.job.text.contains(needle) =>
+            {
+                rects.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, needle, max_y, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, needle, max_y, &mut rects);
+    }
+    rects
+}
+
 fn isolated(name: &str) -> bool {
     if std::env::var_os("MADE_UI_MODEL_CHILD").is_some() {
         return false;
@@ -736,16 +956,26 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     assert!(workbench.explorer().unwrap().preview_path().is_none());
     assert_eq!(workbench.explorer().unwrap().root(), Some(root.as_path()));
 
-    let active_tab = rects_with_fill(&output, made_app::theme::BG_CARD)
-        .into_iter()
-        .find(|rect| rect.top() < 70.0)
-        .expect("active workspace tab must use a full-opacity background");
+    let active_tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        rect_shapes(&output)
+            .iter()
+            .any(|shape| shape.rect == active_tab
+                && shape.fill == made_app::theme::BG_TAB_SELECTED
+                && shape.stroke == egui::Stroke::NONE),
+        "active workspace tab must use the opaque selected fill with no border"
+    );
     assert!(active_tab.width() > 40.0);
+    assert!(
+        text_colors(&output, "alpha", 55.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "selected workspace tab label must use TEXT_PRIMARY"
+    );
     assert!(
         !output.shapes.iter().any(|clipped| match &clipped.shape {
             egui::Shape::Circle(circle) => {
-                (circle.fill == made_app::theme::ACCENT
-                    || circle.fill == made_app::theme::TEXT_TERTIARY)
+                circle.center.y < 70.0
+                    && (circle.fill == made_app::theme::ACCENT
+                        || circle.fill == made_app::theme::TEXT_TERTIARY)
                     && circle.radius <= 4.0
             }
             _ => false,
@@ -753,27 +983,62 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
         "workspace tabs must not paint dot markers"
     );
     assert!(
-        rects_with_fill(&output, made_app::theme::ACCENT)
+        !rects_with_fill(&output, made_app::theme::ACCENT)
             .iter()
-            .any(|rect| rect.height() <= 3.0 && rect.width() > 20.0),
-        "active workspace tab must keep its underline"
+            .any(|rect| rect.top() < 70.0 && rect.height() <= 3.0 && rect.width() > 20.0),
+        "workspace tabs must not paint an accent underline"
+    );
+    let header_bottom = made_app::theme::Layout::for_window(1280.0, 800.0).gutter
+        + made_app::theme::Layout::for_window(1280.0, 800.0).top_height;
+    assert!(
+        !rect_shapes(&output).iter().any(|rect| {
+            rect.rect.top() < header_bottom
+                && rect.fill != egui::Color32::TRANSPARENT
+                && rect.rect.width() > 500.0
+        }),
+        "floating header must not paint a persistent band fill"
+    );
+    assert!(
+        !rect_shapes(&output).iter().any(|rect| {
+            rect.rect.top() < header_bottom
+                && (rect.fill == made_app::theme::GLASS_HIGHLIGHT
+                    || rect.fill == made_app::theme::GLASS_SHADOW)
+        }),
+        "floating header must not paint glass highlight or shadow"
+    );
+    assert!(
+        !rect_shapes(&output).iter().any(|rect| {
+            rect.rect.top() < header_bottom
+                && rect.fill == made_app::theme::BORDER
+                && rect.rect.width() <= 1.5
+                && rect.rect.height() >= 12.0
+        }),
+        "wordmark must not paint a divider in the header"
+    );
+    assert!(
+        !rect_shapes(&output).iter().any(|rect| {
+            rect.rect.top() < header_bottom
+                && rect.stroke.color == made_app::theme::BORDER
+                && rect.rect.width() > 500.0
+        }),
+        "floating header must not paint a band border"
     );
 
-    let band = rects_with_fill(&output, made_app::theme::BG_CHROME_GLASS)
-        .into_iter()
-        .max_by(|left, right| left.area().total_cmp(&right.area()))
-        .expect("glass top band must paint");
+    let explorer_action = headless
+        .response(top_workspace_action_id(id, "explorer"))
+        .rect;
     assert!(
-        (band.height() - 40.0).abs() < 2.0 && band.width() > 1200.0,
-        "top glass band geometry: {band:?}"
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.contains_rect(explorer_action)),
+        "selected Explorer toggle must use the selected background"
     );
     assert!(
-        !rects_with_fill(&output, made_app::theme::GLASS_HIGHLIGHT).is_empty(),
-        "glass band must paint an inner top highlight"
-    );
-    assert!(
-        !rects_with_fill(&output, made_app::theme::GLASS_SHADOW).is_empty(),
-        "glass band must paint a soft shadow"
+        !rect_shapes(&output).iter().any(|rect| {
+            rect.rect.expand(1.0).contains_rect(explorer_action)
+                && rect.stroke.color == made_app::theme::BORDER_CONTROL
+        }),
+        "selected Explorer toggle must not paint a border"
     );
     assert!(
         !rects_with_fill(&output, made_app::theme::BG_HEADER_GLASS).is_empty(),
@@ -782,7 +1047,7 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     let explorer_card =
         largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card must paint");
     assert!(
-        (explorer_card.height() - 732.0).abs() < 2.0,
+        (explorer_card.height() - 748.0).abs() < 2.0,
         "explorer must fill the main content height: {explorer_card:?}"
     );
 
@@ -790,6 +1055,563 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     assert!(
         wordmark.contains(made_app::theme::WORDMARK_TOOLTIP),
         "wordmark tooltip missing: {wordmark}"
+    );
+}
+
+#[test]
+fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
+    if isolated("workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = fixture_workspace(temp.path(), "alpha", "a.txt");
+    let beta = fixture_workspace(temp.path(), "beta", "b.txt");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let alpha_id = open_workspace(&mut model, &alpha);
+    let beta_id = open_workspace(&mut model, &beta);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, alpha_id);
+    wait_explorer_ready(&mut headless, beta_id);
+    let output = headless.render();
+
+    let active_tab = headless.response(workspace_tab_id(beta_id)).rect;
+    let selected_shape = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| shape.rect == active_tab && shape.fill == made_app::theme::BG_TAB_SELECTED)
+        .expect("selected workspace tab must use the opaque selected fill");
+    assert_eq!(
+        selected_shape.stroke,
+        egui::Stroke::NONE,
+        "selected workspace tab must not paint a border"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.contains_rect(active_tab)),
+        "selected workspace tab must not use the row BG_SELECTED fill"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::BG_CARD_GLASS)
+            .iter()
+            .any(|rect| rect.intersects(active_tab)),
+        "selected workspace tab must not use the Explorer glass fill"
+    );
+    assert!(
+        !rect_shapes(&output)
+            .iter()
+            .any(|shape| { shape.rect == active_tab && shape.stroke != egui::Stroke::NONE }),
+        "selected workspace tab must not paint any stroke"
+    );
+    assert!(
+        text_colors(&output, "beta", 55.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "selected workspace tab label must be primary"
+    );
+    assert!(
+        text_font_sizes(&output, "beta", 55.0).contains(&made_app::theme::TAB_SELECTED_FONT_SIZE),
+        "selected workspace tab must use the 13px non-color cue"
+    );
+
+    let inactive_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let idle_shape = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| shape.rect == inactive_tab && shape.fill == made_app::theme::BG_TAB_IDLE)
+        .expect("inactive workspace tab must use the translucent black idle fill");
+    assert_eq!(
+        idle_shape.stroke,
+        egui::Stroke::NONE,
+        "inactive workspace tab must have no rest border"
+    );
+    assert!(
+        text_colors(&output, "alpha", 55.0).contains(&made_app::theme::inactive_tab_text()),
+        "inactive workspace tab label must use the reduced-opacity token"
+    );
+    assert!(
+        text_font_sizes(&output, "alpha", 55.0).contains(&made_app::theme::TAB_FONT_SIZE),
+        "inactive workspace tab must keep the 12.5px label"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.contains_rect(inactive_tab)),
+        "inactive workspace tab must not use the selected fill"
+    );
+
+    let hovered = headless.hover(workspace_tab_id(alpha_id));
+    assert!(
+        !rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(inactive_tab)),
+        "hovered workspace tab must keep its idle fill instead of BG_HOVER"
+    );
+    let hover_shape = rect_shapes(&hovered)
+        .into_iter()
+        .find(|shape| shape.rect == inactive_tab && shape.fill == made_app::theme::BG_TAB_HOVER)
+        .expect("hovered workspace tab must use the opaque hover fill");
+    assert_eq!(
+        hover_shape.stroke,
+        egui::Stroke::NONE,
+        "hovered workspace tab must not paint a border"
+    );
+    let hovered_colors = text_colors(&hovered, "alpha", 55.0);
+    assert!(
+        hovered_colors.contains(&made_app::theme::TEXT_PRIMARY),
+        "hover must restore the workspace-tab label to full opacity"
+    );
+    assert!(
+        !hovered_colors.contains(&made_app::theme::inactive_tab_text()),
+        "hover must not keep the reduced-opacity label token"
+    );
+    assert!(
+        !rect_shapes(&hovered).iter().any(|shape| {
+            shape.rect == inactive_tab
+                && (shape.stroke == egui::Stroke::new(1.0, made_app::theme::ACCENT)
+                    || shape.stroke == egui::Stroke::new(1.0, made_app::theme::BORDER))
+        }),
+        "hovered workspace tab must not paint an accent or neutral border"
+    );
+
+    let selected_hover = headless.hover(workspace_tab_id(beta_id));
+    let selected_hover_shape = rect_shapes(&selected_hover)
+        .into_iter()
+        .find(|shape| shape.rect == active_tab && shape.fill == made_app::theme::BG_TAB_SELECTED)
+        .expect("hovered selected workspace tab must keep the selected fill");
+    assert_eq!(
+        selected_hover_shape.stroke,
+        egui::Stroke::NONE,
+        "hovered selected workspace tab must not paint a border"
+    );
+}
+
+#[test]
+fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
+    if isolated("workspace_tab_close_hover_lights_parent_and_reddens_icon") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = fixture_workspace(temp.path(), "alpha", "a.txt");
+    let beta = fixture_workspace(temp.path(), "beta", "b.txt");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let alpha_id = open_workspace(&mut model, &alpha);
+    let beta_id = open_workspace(&mut model, &beta);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, alpha_id);
+    wait_explorer_ready(&mut headless, beta_id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+
+    let inactive_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let full_path = fs::canonicalize(&alpha).unwrap().display().to_string();
+    let output = headless.hover(workspace_tab_close_id(alpha_id));
+    assert!(
+        output_text(&output).contains("Close workspace"),
+        "close affordance must keep its tooltip"
+    );
+    assert!(
+        !output_text(&output).contains(&full_path),
+        "close hover must suppress the parent full-path tooltip"
+    );
+    assert!(
+        text_colors(&output, "×", 55.0).contains(&made_app::theme::ERROR),
+        "close icon hover must use the soft ERROR color"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(inactive_tab)),
+        "close-icon hover must not paint a hover fill"
+    );
+    let parent = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| shape.rect == inactive_tab && shape.fill == made_app::theme::BG_TAB_HOVER)
+        .expect("close hover must apply the parent tab hover fill");
+    assert_eq!(
+        parent.stroke,
+        egui::Stroke::NONE,
+        "close hover must not paint a parent tab border"
+    );
+    assert!(
+        text_colors(&output, "alpha", 55.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "close-icon hover must also light the parent tab label"
+    );
+
+    // Hovering the close X on the already-selected tab must keep the selected
+    // fill, not switch to the hover fill or paint any border/X background.
+    let active_tab = headless.response(workspace_tab_id(beta_id)).rect;
+    let active_path = fs::canonicalize(&beta).unwrap().display().to_string();
+    let active_close = headless.response(workspace_tab_close_id(beta_id)).rect;
+    let active_output = headless.hover(workspace_tab_close_id(beta_id));
+    let active_text = output_text(&active_output);
+    assert!(
+        active_text.contains("Close workspace"),
+        "selected-tab close hover must keep the close tooltip"
+    );
+    assert!(
+        !active_text.lines().any(|line| line.trim() == active_path),
+        "selected-tab close hover must suppress the parent path tooltip"
+    );
+    assert!(
+        text_colors(&active_output, "×", 55.0).contains(&made_app::theme::ERROR),
+        "selected-tab close hover must use the red ERROR glyph"
+    );
+    assert!(
+        !rects_with_fill(&active_output, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(active_tab) || rect.intersects(active_close)),
+        "selected-tab close hover must not paint an X background"
+    );
+    let active_parent = rect_shapes(&active_output)
+        .into_iter()
+        .find(|shape| shape.rect == active_tab && shape.fill == made_app::theme::BG_TAB_SELECTED)
+        .expect("selected-tab close hover must keep BG_TAB_SELECTED");
+    assert_eq!(
+        active_parent.stroke,
+        egui::Stroke::NONE,
+        "selected-tab close hover must not paint a border"
+    );
+    assert!(
+        !rect_shapes(&active_output).iter().any(|shape| {
+            shape.rect == active_tab && shape.fill == made_app::theme::BG_TAB_HOVER
+        }),
+        "selected-tab close hover must not switch to BG_TAB_HOVER"
+    );
+
+    headless.advance(0.18);
+    let active_scaled = headless.render();
+    let close_target = made_app::theme::CLOSE_GLYPH_SIZE * made_app::theme::CLOSE_HOVER_SCALE;
+    assert!(
+        text_font_sizes(&active_scaled, "×", 55.0)
+            .iter()
+            .any(|size| (size - close_target).abs() < 0.2),
+        "selected-tab close hover must reach the scaled glyph target"
+    );
+    assert!(
+        text_colors(&active_scaled, "×", 55.0).contains(&made_app::theme::ERROR),
+        "selected-tab close hover must keep the red glyph after settling"
+    );
+}
+
+#[test]
+fn explorer_rows_use_unified_metrics_and_open_folder_treatment() {
+    if isolated("explorer_rows_use_unified_metrics_and_open_folder_treatment") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("rows");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    headless.click(
+        headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .explorer()
+            .unwrap()
+            .row_widget_id(0),
+    );
+    headless.pump_until_rows(id, 2);
+    headless.render();
+    headless.click(
+        headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .explorer()
+            .unwrap()
+            .row_widget_id(1),
+    );
+    let output = headless.render();
+    let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
+    let explorer_left = 1280.0 - layout.gutter - layout.right_card_width;
+    let body_top = layout.gap + layout.top_height + layout.gap + layout.card_header_height;
+    let selected = rects_with_fill(&output, made_app::theme::BG_SELECTED)
+        .into_iter()
+        .find(|rect| rect.left() > explorer_left && rect.top() > body_top)
+        .expect("selected explorer row fill");
+    assert!((selected.height() - 24.0).abs() < 0.5);
+    let selected_shape = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| shape.fill == made_app::theme::BG_SELECTED && shape.rect == selected)
+        .expect("selected explorer row shape");
+    assert_eq!(selected_shape.corner_radius, egui::CornerRadius::same(6));
+    assert!(
+        (selected.left() - (explorer_left + 12.0)).abs() < 1.0,
+        "tree row must inset 4px inside the 8px body padding: {selected:?}"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::ACCENT)
+            .iter()
+            .any(|rect| rect.left() > explorer_left
+                && rect.top() > body_top
+                && rect.width() <= 3.0
+                && (20.0..=25.0).contains(&rect.height())),
+        "selected explorer row must not paint an accent side bar"
+    );
+    let expanded_colors = text_colors(&output, "src", body_top + 24.0);
+    assert!(
+        expanded_colors.contains(&made_app::theme::TEXT_PRIMARY),
+        "expanded folder label must be brighter: {expanded_colors:?}"
+    );
+
+    let folder_row = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .row_widget_id(0);
+    let file_row = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .row_widget_id(1);
+    let folder_rect = headless.response(folder_row).rect;
+    let file_rect = headless.response(file_row).rect;
+    assert!(
+        !rect_shapes(&output).iter().any(|shape| {
+            (shape.fill == made_app::theme::BG_SELECTED || shape.fill == made_app::theme::BG_HOVER)
+                && shape.rect.intersect(folder_rect).height() > 0.5
+        }),
+        "an expanded but unselected folder must paint no row fill"
+    );
+
+    let folder_text = text_rects(&output, "src", body_top + 24.0)
+        .into_iter()
+        .find(|rect| rect.top() > body_top)
+        .expect("expanded folder label");
+    assert!(
+        (folder_text.left() - (explorer_left + 32.0)).abs() < 1.0,
+        "depth-0 text must start 24px from the row edge: {folder_text:?}"
+    );
+    assert!(
+        (folder_text.center().y - folder_rect.center().y).abs() < 0.75,
+        "folder label must be vertically centered in the row: {folder_text:?} vs {folder_rect:?}"
+    );
+    let file_text = text_rects(&output, "main.rs", body_top + 48.0)
+        .into_iter()
+        .find(|rect| rect.top() > body_top)
+        .expect("child file label");
+    assert!(
+        (file_text.left() - (folder_text.left() + 14.0)).abs() < 1.0,
+        "depth must add exactly 14px: {file_text:?} vs {folder_text:?}"
+    );
+    assert!(
+        (file_text.center().y - file_rect.center().y).abs() < 0.75,
+        "file label must be vertically centered in the row: {file_text:?} vs {file_rect:?}"
+    );
+    assert!(
+        !output_text(&output).contains('▾') && !output_text(&output).contains('▸'),
+        "folder disclosure must be an app-drawn shape, not a font glyph"
+    );
+    assert!(
+        !output_text(&output).contains('·'),
+        "file bullet must be an app-drawn shape, not a font glyph"
+    );
+    let folder_marker = path_shapes(&output)
+        .into_iter()
+        .filter(|path| path.points.len() == 3 && path.fill == made_app::theme::TEXT_PRIMARY)
+        .find(|path| {
+            let center = path_center(path);
+            folder_rect.contains(center) && (center.x - (folder_rect.left() + 12.0)).abs() < 1.5
+        })
+        .expect("expanded folder app-drawn disclosure triangle");
+    let folder_marker_rect = egui::Rect::from_points(&folder_marker.points);
+    assert!(
+        (folder_marker_rect.center().y - folder_text.center().y).abs() < 0.75,
+        "disclosure must share the label's optical center: {folder_marker_rect:?} vs {folder_text:?}"
+    );
+    let file_marker = circle_shapes(&output)
+        .into_iter()
+        .filter(|circle| circle.radius <= 3.0 && file_rect.contains(circle.center))
+        .find(|circle| (circle.center.x - (folder_marker_rect.center().x + 14.0)).abs() < 1.5)
+        .expect("file app-drawn bullet");
+    assert!(
+        (file_marker.center.y - file_text.center().y).abs() < 0.75,
+        "file bullet must share the label's optical center: {file_marker:?} vs {file_text:?}"
+    );
+    assert!(
+        (file_marker.center.x - (folder_marker_rect.center().x + 14.0)).abs() < 1.5,
+        "depth must shift the icon slot by 14px: {file_marker:?} vs {folder_marker_rect:?}"
+    );
+
+    let hovered = headless.hover(folder_row);
+    let hover_fill = rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+        .into_iter()
+        .find(|rect| rect.left() > explorer_left && rect.top() > body_top)
+        .expect("hovered explorer row fill");
+    assert!((hover_fill.height() - 24.0).abs() < 0.5);
+    assert_eq!(
+        rect_shapes(&hovered)
+            .into_iter()
+            .find(|shape| shape.fill == made_app::theme::BG_HOVER && shape.rect == hover_fill)
+            .expect("hovered explorer row shape")
+            .corner_radius,
+        egui::CornerRadius::same(6)
+    );
+}
+
+#[test]
+fn explorer_selection_and_tree_focus_paint_no_outline() {
+    if isolated("explorer_selection_and_tree_focus_paint_no_outline") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("outline");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    let folder_row = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .row_widget_id(0);
+    headless.click(folder_row);
+    headless.pump_until_rows(id, 2);
+    let tree_id = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .tree_focus_id();
+    assert!(
+        headless.ctx.memory(|memory| memory.has_focus(tree_id)),
+        "clicking a tree row must focus the tree container"
+    );
+    let output = headless.render();
+
+    let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
+    let explorer_left = 1280.0 - layout.gutter - layout.right_card_width;
+    let explorer = egui::Rect::from_min_max(
+        egui::pos2(explorer_left, layout.gap + layout.top_height + layout.gap),
+        egui::pos2(1280.0, 800.0),
+    );
+    let folder_rect = headless.response(folder_row).rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(folder_rect)),
+        "pointer selection must keep the inset BG_SELECTED fill"
+    );
+    assert!(
+        text_colors(&output, "src", 250.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "pointer selection must keep the primary label"
+    );
+    assert!(
+        focus_ring_rects(&output, explorer).is_empty(),
+        "pointer focus must not paint a row or container outline: {:?}",
+        focus_ring_rects(&output, explorer)
+    );
+
+    headless.focus(tree_id);
+    let focused = headless.render();
+    assert!(
+        headless.ctx.memory(|memory| memory.has_focus(tree_id)),
+        "tree must still own keyboard focus"
+    );
+    assert!(
+        focus_ring_rects(&focused, explorer).is_empty(),
+        "keyboard tree focus must not paint a row or container outline: {:?}",
+        focus_ring_rects(&focused, explorer)
+    );
+    assert!(
+        rects_with_fill(&focused, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(folder_rect)),
+        "keyboard focus must keep the selection fill"
+    );
+}
+
+#[test]
+fn tree_focus_with_no_selection_selects_first_row_without_preview() {
+    if isolated("tree_focus_with_no_selection_selects_first_row_without_preview") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tree-focus");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("alpha.txt"), "a\n").unwrap();
+    fs::write(root.join("beta.txt"), "b\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    assert_eq!(
+        headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .explorer()
+            .unwrap()
+            .selected_path(),
+        None,
+        "the tree must start without a selection"
+    );
+
+    let tree_id = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .tree_focus_id();
+    let first_row = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .row_widget_id(0);
+    // This is the Tab/programmatic focus path; no pointer click occurs.
+    headless.focus(tree_id);
+    let output = headless.render();
+
+    let workbench = headless.model.workspace(id).unwrap();
+    let explorer = workbench.explorer().unwrap();
+    assert_eq!(
+        explorer.selected_path(),
+        Some(fs::canonicalize(root.join("alpha.txt")).unwrap().as_path()),
+        "focusing the tree must select its first visible row"
+    );
+    assert!(
+        explorer.preview_path().is_none(),
+        "focus must not auto-open a first-row file"
+    );
+    let row_rect = headless.response(first_row).rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(row_rect)),
+        "first-row focus selection must use the inset BG_SELECTED fill"
+    );
+    assert!(
+        text_colors(&output, "alpha.txt", 250.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "first-row focus selection must use primary text"
+    );
+    let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
+    let explorer_rect = egui::Rect::from_min_max(
+        egui::pos2(1280.0 - layout.gutter - layout.right_card_width, 0.0),
+        egui::pos2(1280.0, 800.0),
+    );
+    assert!(
+        focus_ring_rects(&output, explorer_rect).is_empty(),
+        "first-row focus must not paint a container/row outline: {:?}",
+        focus_ring_rects(&output, explorer_rect)
     );
 }
 
@@ -820,10 +1642,18 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
             response.rect
         );
     }
-    let hovered = output_text(&headless.hover(top_action_id("open-folder")));
+    let open_folder_rect = headless.response(top_action_id("open-folder")).rect;
+    let hovered_output = headless.hover(top_action_id("open-folder"));
+    let hovered = output_text(&hovered_output);
     assert!(
         hovered.contains("Open folder"),
         "Open folder tooltip missing: {hovered}"
+    );
+    assert!(
+        rects_with_fill(&hovered_output, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.contains_rect(open_folder_rect)),
+        "hovered header icon must use BG_HOVER"
     );
     let hovered = output_text(&headless.hover(top_workspace_action_id(id, "explorer")));
     assert!(
@@ -840,6 +1670,382 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
     assert!(
         has_stroke_color(&focused, made_app::theme::FOCUS),
         "focused header icon must paint a visible focus ring"
+    );
+}
+
+#[test]
+fn header_places_tabs_left_and_wordmark_before_icons() {
+    if isolated("header_places_tabs_left_and_wordmark_before_icons") {
+        return;
+    }
+    for (width, height, gap, top_height, tab_height) in [
+        (1280.0, 800.0, 24.0, 26.0, 26.0),
+        (720.0, 480.0, 18.0, 24.0, 24.0),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let alpha = fixture_workspace(temp.path(), "alpha", "a.txt");
+        let beta = fixture_workspace(temp.path(), "beta", "b.txt");
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let alpha_id = open_workspace(&mut model, &alpha);
+        let beta_id = open_workspace(&mut model, &beta);
+        let mut headless = Headless::new(model, width, height);
+        headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0
+        });
+        wait_explorer_ready(&mut headless, alpha_id);
+        wait_explorer_ready(&mut headless, beta_id);
+        let output = headless.render();
+        let layout = made_app::theme::Layout::for_window(width, height);
+
+        let wordmark = headless.response(made_app::theme::wordmark_id()).rect;
+        let first_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+        let last_tab = headless.response(workspace_tab_id(beta_id)).rect;
+        let plus = headless.response(top_action_id("open-folder")).rect;
+        let diagnostics = headless.response(top_action_id("diagnostics")).rect;
+        let explorer = headless
+            .response(top_workspace_action_id(beta_id, "explorer"))
+            .rect;
+        let content_left = layout.gutter;
+        let content_right = width - layout.gutter;
+
+        assert_eq!(layout.top_height, top_height);
+        assert_eq!(layout.tab_height, tab_height);
+        assert!(
+            (first_tab.left() - content_left).abs() < 0.75,
+            "{width}px: the first tab must start at the card left edge: {first_tab:?} vs {content_left}"
+        );
+        assert!(
+            (first_tab.height() - tab_height).abs() < 0.5,
+            "{width}px: tab height must be {tab_height}: {first_tab:?}"
+        );
+        assert!(
+            (first_tab.top() - layout.gap).abs() < 0.5,
+            "{width}px: header top must be one pane gap below the window edge: {first_tab:?}"
+        );
+        assert!(
+            (explorer.right() - content_right).abs() < 0.75,
+            "{width}px: the last icon target must end at the card right edge: explorer {explorer:?}, content right {content_right}"
+        );
+        assert!(
+            explorer.right() <= width,
+            "{width}px: the last icon target must remain inside the window: {explorer:?}"
+        );
+        let explorer_glyph = rect_shapes(&output)
+            .into_iter()
+            .find(|shape| {
+                (shape.rect.width() - 14.0).abs() < 1.0
+                    && (shape.rect.height() - 11.0).abs() < 1.0
+                    && shape.rect.top() < layout.gap + layout.top_height
+            })
+            .map(|shape| shape.rect)
+            .expect("Explorer panel glyph");
+        assert!(
+            (explorer_glyph.right() - content_right).abs() < 0.75,
+            "{width}px: the last visible glyph edge must align with the card right edge: {explorer_glyph:?} vs {content_right}"
+        );
+        assert!(
+            explorer.contains_rect(explorer_glyph),
+            "{width}px: the glyph must stay inside its hit target: glyph {explorer_glyph:?}, target {explorer:?}"
+        );
+        let is_explorer_fill = |rect: &egui::Rect| {
+            (rect.width() - tab_height).abs() < 0.75
+                && (rect.height() - tab_height).abs() < 0.75
+                && rect.intersects(explorer)
+        };
+        let explorer_fill = rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .into_iter()
+            .find(is_explorer_fill)
+            .expect("selected Explorer fill");
+        assert!(
+            (explorer_fill.right() - content_right).abs() < 0.75,
+            "{width}px: the selected Explorer fill must end at the card right edge: {explorer_fill:?}"
+        );
+        assert!(
+            plus.left() >= last_tab.right() - 0.5 && plus.left() - last_tab.right() <= 8.0,
+            "{width}px: Open folder plus must sit immediately after the last tab: tab {last_tab:?}, plus {plus:?}"
+        );
+        assert!(
+            wordmark.left() - plus.right() >= gap - 0.75,
+            "{width}px: tab strip must leave a {gap}px gap before the wordmark: plus {plus:?}, wordmark {wordmark:?}"
+        );
+        assert!(
+            (diagnostics.left() - wordmark.right() - gap).abs() < 0.75,
+            "{width}px: wordmark-to-icon gap must be {gap}px: wordmark {wordmark:?}, diagnostics {diagnostics:?}"
+        );
+        assert!(
+            explorer.left() > diagnostics.left() && explorer.right() > diagnostics.right(),
+            "{width}px: Explorer toggle must be rightmost: diagnostics {diagnostics:?}, explorer {explorer:?}"
+        );
+        assert!(
+            plus.width() >= 24.0 && plus.height() >= 24.0,
+            "{width}px: Open folder target below 24px: {plus:?}"
+        );
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+        for (name, rect) in [
+            ("wordmark", wordmark),
+            ("plus", plus),
+            ("diagnostics", diagnostics),
+            ("explorer", explorer),
+            (
+                "active tab",
+                headless.response(workspace_tab_id(beta_id)).rect,
+            ),
+        ] {
+            assert!(
+                screen.contains_rect(rect),
+                "{width}px: {name} is clipped: {rect:?}"
+            );
+        }
+        assert!(
+            !rects_with_fill(&output, made_app::theme::BG_TAB_SELECTED)
+                .iter()
+                .any(|rect| rect.intersects(wordmark))
+                && !rects_with_fill(&output, made_app::theme::BG_TAB_HOVER)
+                    .iter()
+                    .any(|rect| rect.intersects(wordmark)),
+            "{width}px: the wordmark must not paint a tab fill"
+        );
+        let icon_cluster_left = diagnostics.left();
+        assert!(
+            wordmark.right() < icon_cluster_left,
+            "{width}px: wordmark must sit before the icon group"
+        );
+        let card = largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card");
+        let panel_bottom = layout.gap + layout.top_height + layout.gap;
+        assert!(
+            (card.top() - panel_bottom).abs() < 1.0,
+            "{width}px: compact header must move card top to {panel_bottom}px: {card:?}"
+        );
+        assert!(
+            (card.top() - first_tab.bottom() - layout.gap).abs() < 1.0,
+            "{width}px: the space above and below the strip must both equal the pane gap"
+        );
+
+        let wordmark_hover = headless.hover(made_app::theme::wordmark_id());
+        assert!(
+            output_text(&wordmark_hover).contains(made_app::theme::WORDMARK_TOOLTIP),
+            "{width}px: wordmark tooltip missing"
+        );
+        assert!(
+            !rects_with_fill(&wordmark_hover, made_app::theme::BG_TAB_HOVER)
+                .iter()
+                .any(|rect| rect.intersects(wordmark)),
+            "{width}px: hovering the wordmark must not paint a tab fill"
+        );
+
+        // The selected Explorer keeps BG_SELECTED on hover; hide it to exercise
+        // the unselected BG_HOVER fill on the same flush target.
+        let explorer_id = top_workspace_action_id(beta_id, "explorer");
+        headless.click(explorer_id);
+        headless.render();
+        let hover_output = headless.hover(explorer_id);
+        let hover_fill = rects_with_fill(&hover_output, made_app::theme::BG_HOVER)
+            .into_iter()
+            .find(is_explorer_fill)
+            .expect("hovered Explorer fill");
+        assert!(
+            (hover_fill.right() - content_right).abs() < 0.75,
+            "{width}px: the hovered Explorer fill must end at the card right edge: {hover_fill:?}"
+        );
+
+        headless.focus(top_action_id("open-folder"));
+        headless.press_key(egui::Key::Enter);
+        headless.render();
+        assert!(
+            headless.model.is_picker(),
+            "{width}px: Enter on the focused Open folder plus must activate the picker"
+        );
+    }
+}
+
+#[test]
+fn header_plus_precedes_overflow_and_both_stay_reachable() {
+    if isolated("header_plus_precedes_overflow_and_both_stay_reachable") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let mut ids = Vec::new();
+    for index in 0..4 {
+        let root = fixture_workspace(
+            temp.path(),
+            &format!("workspace-with-a-long-name-{index}"),
+            "main.rs",
+        );
+        ids.push(open_workspace(&mut model, &root));
+    }
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    for id in &ids {
+        wait_explorer_ready(&mut headless, *id);
+    }
+    headless.render();
+
+    let plus = headless.response(top_action_id("open-folder")).rect;
+    let overflow = headless.response(top_action_id("workspace-overflow")).rect;
+    let wordmark = headless.response(made_app::theme::wordmark_id()).rect;
+    let layout = made_app::theme::Layout::for_window(720.0, 480.0);
+    let gap = made_app::theme::wordmark_gap(true);
+    let active = headless
+        .model
+        .active_workspace_id()
+        .expect("active workspace");
+    assert!(
+        headless
+            .ctx
+            .read_response(workspace_tab_id(active))
+            .is_some(),
+        "the active workspace tab must remain visible under overflow"
+    );
+    assert!(
+        plus.right() <= overflow.left() + 0.5,
+        "the plus must precede the overflow trigger: plus {plus:?}, overflow {overflow:?}"
+    );
+    assert!(
+        overflow.right() <= wordmark.left() - gap + 0.75,
+        "overflow trigger must leave the wordmark breathing gap: overflow {overflow:?}, wordmark {wordmark:?}, gap {gap}"
+    );
+    let first_visible = ids
+        .iter()
+        .filter_map(|id| {
+            headless
+                .ctx
+                .read_response(workspace_tab_id(*id))
+                .map(|response| response.rect)
+        })
+        .min_by(|left, right| left.left().total_cmp(&right.left()))
+        .expect("visible tab");
+    assert!(
+        (first_visible.left() - layout.gutter).abs() < 0.75,
+        "first visible tab must start at the header content left: {first_visible:?}"
+    );
+    let visible_tabs: Vec<egui::Rect> = ids
+        .iter()
+        .filter_map(|id| {
+            headless
+                .ctx
+                .read_response(workspace_tab_id(*id))
+                .map(|response| response.rect)
+        })
+        .collect();
+    assert!(!visible_tabs.is_empty());
+    assert!(
+        visible_tabs
+            .iter()
+            .all(|tab| tab.right() <= plus.left() + 0.5),
+        "no visible tab may overlap the plus: tabs {visible_tabs:?}, plus {plus:?}"
+    );
+    for (name, rect) in [("plus", plus), ("overflow", overflow)] {
+        assert!(
+            rect.width() >= 24.0 && rect.height() >= 24.0,
+            "{name} target below 24px or clipped: {rect:?}"
+        );
+    }
+    for (name, rect) in [
+        ("plus", plus),
+        ("overflow", overflow),
+        ("wordmark", wordmark),
+    ] {
+        assert!(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0))
+                .contains_rect(rect),
+            "{name} must remain inside the compact window: {rect:?}"
+        );
+    }
+}
+
+#[test]
+fn workspace_tab_close_hover_scales_glyph_without_layout_growth() {
+    if isolated("workspace_tab_close_hover_scales_glyph_without_layout_growth") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = fixture_workspace(temp.path(), "alpha", "a.txt");
+    let beta = fixture_workspace(temp.path(), "beta", "b.txt");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let alpha_id = open_workspace(&mut model, &alpha);
+    let beta_id = open_workspace(&mut model, &beta);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, alpha_id);
+    wait_explorer_ready(&mut headless, beta_id);
+    let close_id = workspace_tab_close_id(alpha_id);
+    let rest = headless.render();
+    let close_rect = headless.response(close_id).rect;
+    let tab_rect = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        close_rect.width() >= 24.0 && close_rect.height() >= 24.0,
+        "close hit area must stay at least 24×24: {close_rect:?}"
+    );
+    assert!(
+        text_font_sizes(&rest, "×", 55.0)
+            .iter()
+            .any(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "close glyph must start at the rest size"
+    );
+    let rest_glyph = text_rects(&rest, "×", 55.0)
+        .into_iter()
+        .find(|rect| close_rect.contains_rect(*rect))
+        .expect("rest close glyph");
+
+    headless.hover(close_id);
+    headless.advance(0.18);
+    let scaled = headless.render();
+    let target = made_app::theme::CLOSE_GLYPH_SIZE * made_app::theme::CLOSE_HOVER_SCALE;
+    assert!(
+        text_font_sizes(&scaled, "×", 55.0)
+            .iter()
+            .any(|size| (size - target).abs() < 0.2),
+        "hovered close glyph must reach the ~1.15 scale target"
+    );
+    let scaled_glyph = text_rects(&scaled, "×", 55.0)
+        .into_iter()
+        .find(|rect| close_rect.contains_rect(*rect))
+        .expect("scaled close glyph");
+    assert!(
+        scaled_glyph.center().distance(rest_glyph.center()) < 0.5,
+        "scaling must stay centered in the same rect"
+    );
+    assert_eq!(
+        headless.response(close_id).rect,
+        close_rect,
+        "close hit area must not grow"
+    );
+    assert_eq!(
+        headless.response(workspace_tab_id(alpha_id)).rect,
+        tab_rect,
+        "tab width and layout must not change"
+    );
+    assert!(
+        !rects_with_fill(&scaled, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(close_rect)),
+        "close hover must not paint a background fill"
+    );
+    assert!(
+        text_colors(&scaled, "×", 55.0).contains(&made_app::theme::ERROR),
+        "scaled close glyph must keep the ERROR tone"
+    );
+    let close_parent = rect_shapes(&scaled)
+        .into_iter()
+        .find(|shape| shape.rect == tab_rect && shape.fill == made_app::theme::BG_TAB_HOVER)
+        .expect("close hover must apply the parent tab hover fill");
+    assert_eq!(
+        close_parent.stroke,
+        egui::Stroke::NONE,
+        "close hover must keep the parent tab borderless"
+    );
+
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.advance(0.18);
+    let rested = headless.render();
+    assert!(
+        text_font_sizes(&rested, "×", 55.0)
+            .iter()
+            .any(|size| (size - made_app::theme::CLOSE_GLYPH_SIZE).abs() < 0.1),
+        "close glyph must animate back to its rest size"
     );
 }
 
@@ -1491,6 +2697,9 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1280.0, 800.0);
     wait_explorer_ready(&mut headless, id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
     let output = headless.render();
     let splitter = explorer_splitter_id(headless.model.workspace(id).unwrap().pane_id());
     let splitter_response = headless.response(splitter);
@@ -1509,10 +2718,67 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     );
 
     let before_hover = headless.model.workspace(id).unwrap().explorer_width();
-    let hovered = headless.render_events(vec![egui::Event::PointerMoved(position)]);
+    let hover_start = headless.render_events(vec![egui::Event::PointerMoved(position)]);
+    let early_alpha = rect_shapes(&hover_start)
+        .into_iter()
+        .find(|shape| {
+            shape.rect.contains(position)
+                && (shape.rect.width() - 1.0).abs() < 0.01
+                && shape.rect.height() > 100.0
+        })
+        .map(|shape| shape.fill.to_srgba_unmultiplied()[3])
+        .unwrap_or(0);
+    headless.advance(0.20);
+    let hovered = headless.render();
+    let line = rect_shapes(&hovered)
+        .into_iter()
+        .find(|shape| {
+            shape.rect.contains(position)
+                && (shape.rect.width() - 1.0).abs() < 0.01
+                && shape.rect.height() > 100.0
+        })
+        .expect("hovered splitter must fade in a 1px line");
+    let line_rgba = line.fill.to_srgba_unmultiplied();
+    let border_rgba = made_app::theme::BORDER_CONTROL.to_srgba_unmultiplied();
     assert!(
-        has_stroke_color(&hovered, made_app::theme::BORDER_CONTROL_HOVER),
-        "hovered splitter must reveal a thin line and grip"
+        line_rgba[..3]
+            .iter()
+            .zip(&border_rgba[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+        "hover line must use muted BORDER_CONTROL"
+    );
+    assert!(
+        line_rgba[3] > 0 && line_rgba[3] < 255,
+        "hover line must be partial opacity, not a bright permanent line: {line_rgba:?}"
+    );
+    assert!(
+        line_rgba[3] > early_alpha,
+        "splitter must fade in rather than snap: early {early_alpha}, settled {}",
+        line_rgba[3]
+    );
+    let grip = rect_shapes(&hovered)
+        .into_iter()
+        .find(|shape| {
+            shape.rect.contains(position)
+                && (shape.rect.width() - 6.0).abs() < 0.01
+                && (shape.rect.height() - 32.0).abs() < 0.01
+        })
+        .expect("hovered splitter must fade in a 6×32 grip");
+    let grip_stroke = grip.stroke.color.to_srgba_unmultiplied();
+    assert!(
+        grip_stroke[..3]
+            .iter()
+            .zip(&border_rgba[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+        "hover grip must use muted BORDER_CONTROL"
+    );
+    assert!(
+        grip_stroke[3] > 0 && grip_stroke[3] < 255,
+        "hover grip must be partial opacity: {grip_stroke:?}"
+    );
+    assert!(
+        output_text(&hovered).contains("Drag to resize explorer"),
+        "splitter tooltip missing"
     );
     assert!(
         shape_hits_point(&hovered, position),
@@ -1529,28 +2795,64 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     headless.render_events(vec![egui::Event::PointerMoved(start)]);
     headless.render_events(vec![pointer_button(start, true)]);
     headless.render_events(vec![egui::Event::PointerMoved(end)]);
+    headless.advance(0.20);
     let dragged = headless.render();
+    let dragged_center = headless.response(splitter).rect.center();
+    let drag_line = rect_shapes(&dragged)
+        .into_iter()
+        .find(|shape| {
+            shape.rect.contains(dragged_center)
+                && (shape.rect.width() - 1.0).abs() < 0.01
+                && shape.rect.height() > 100.0
+        })
+        .expect("dragging splitter must keep the faded line");
+    let drag_rgba = drag_line.fill.to_srgba_unmultiplied();
+    let accent_rgba = made_app::theme::ACCENT.to_srgba_unmultiplied();
     assert!(
-        has_stroke_color(&dragged, made_app::theme::ACCENT),
-        "dragging the splitter must reveal an accent grip"
+        drag_rgba[..3]
+            .iter()
+            .zip(&accent_rgba[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+        "dragging splitter must use the green accent"
+    );
+    assert!(
+        drag_rgba[3] > 0 && drag_rgba[3] < 255,
+        "dragging accent must stay restrained: {drag_rgba:?}"
     );
     assert!(
         headless.model.workspace(id).unwrap().explorer_width() > before_hover,
         "dragging left must widen the explorer"
     );
 
-    headless.render_events(vec![pointer_button(end, false)]);
+    headless.render_events(vec![pointer_button(dragged_center, false)]);
     let away = egui::pos2(100.0, 400.0);
     headless.render_events(vec![egui::Event::PointerMoved(away)]);
+    let leaving_center = headless.response(splitter).rect.center();
+    let leaving = headless.render();
+    assert!(
+        shape_hits_point(&leaving, leaving_center),
+        "leaving the splitter must fade out rather than vanish instantly"
+    );
+    headless.advance(0.20);
     let rest = headless.render();
     let rested_center = headless.response(splitter).rect.center();
     assert!(
         !shape_hits_point(&rest, rested_center),
-        "the splitter paint must disappear when the pointer leaves"
+        "the splitter paint must disappear after the fade-out"
     );
     assert!(
         !has_stroke_color(&rest, made_app::theme::BORDER_CONTROL_HOVER),
         "no permanent hover line may remain at rest"
+    );
+    assert!(
+        !rect_shapes(&rest).iter().any(|shape| {
+            shape.rect.contains(rested_center)
+                && ((shape.rect.width() - 1.0).abs() < 0.01
+                    || (shape.rect.width() - 6.0).abs() < 0.01)
+                && (shape.fill.to_srgba_unmultiplied()[3] > 0
+                    && shape.fill.to_srgba_unmultiplied()[3] < 255)
+        }),
+        "no faded splitter line or grip may remain at rest"
     );
 }
 
@@ -1591,7 +2893,7 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
         );
         let expected_left = layout.content_width() - layout.gap - explorer_width;
         let expected_height =
-            height - (layout.gutter + layout.top_height + layout.gap) - layout.gutter;
+            height - (layout.gap + layout.top_height + layout.gap) - layout.gutter;
         let cards = rects_with_fill(&output, made_app::theme::BG_CARD);
         let left_card = cards
             .iter()
@@ -1854,6 +3156,7 @@ fn workspace_strip_budget_keeps_controls_inside_and_non_overlapping() {
                 .response(top_workspace_action_id(active, "explorer"))
                 .rect,
             headless.response(top_action_id("diagnostics")).rect,
+            headless.response(made_app::theme::wordmark_id()).rect,
         ];
         if let Some(response) = &overflow {
             controls.push(response.rect);
@@ -2036,7 +3339,7 @@ fn file_control_sits_below_session_strip_and_path() {
         .response(left_surface_action_id(&pane_id, "file"))
         .rect;
     let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
-    let card_top = layout.gutter + layout.top_height + layout.gap;
+    let card_top = layout.gap + layout.top_height + layout.gap;
     let path_line = 22.0;
     assert!(
         file_rect.top() >= card_top + layout.tab_strip_height + path_line - 1.0,
@@ -2076,6 +3379,619 @@ fn add_workspace_picker_keeps_context_and_back_or_escape_returns() {
 }
 
 #[test]
+fn picker_rows_and_secondary_action_use_unified_states() {
+    if isolated("picker_rows_and_secondary_action_use_unified_states") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("alpha")).unwrap();
+    fs::create_dir(temp.path().join("beta")).unwrap();
+    let mut picker = picker_headless(temp.path(), 900.0, 620.0);
+    picker.model.picker_select(0).unwrap();
+    let output = picker.render();
+    let secondary = picker.response(picker_control_id("selected")).rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_ELEVATED)
+            .iter()
+            .any(|rect| rect.contains_rect(secondary)),
+        "secondary action rest fill must be BG_ELEVATED"
+    );
+
+    let row_id = egui::Id::unique(("made-picker-row", 1));
+    let row_rect = picker.response(row_id).rect;
+    let hovered = picker.hover(row_id);
+    assert!(
+        rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(row_rect)),
+        "hovered picker row must use BG_HOVER"
+    );
+
+    let hovered = picker.hover(picker_control_id("selected"));
+    assert!(
+        rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.contains_rect(secondary)),
+        "hovered secondary action must use BG_HOVER"
+    );
+    let pressed = picker.press_hold(picker_control_id("selected"));
+    assert!(
+        rects_with_fill(&pressed, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.contains_rect(secondary)),
+        "pressed secondary action must use BG_SELECTED"
+    );
+    picker.release(picker_control_id("selected"));
+}
+
+#[test]
+fn picker_rows_have_no_focus_outline_but_picker_controls_keep_focus_rings() {
+    if isolated("picker_rows_have_no_focus_outline_but_picker_controls_keep_focus_rings") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta"] {
+        fs::create_dir(temp.path().join(name)).unwrap();
+    }
+    let mut picker = picker_headless(temp.path(), 900.0, 620.0);
+    picker.model.picker_select(0).unwrap();
+    picker.render();
+    let row_id = egui::Id::unique(("made-picker-row", 0));
+    let selected_row = picker.response(row_id).rect;
+    assert!(
+        rects_with_fill(&picker.render(), made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(selected_row)),
+        "selected picker row must keep the inset BG_SELECTED fill"
+    );
+
+    picker.focus(picker_list_id());
+    let focused = picker.render();
+    assert!(
+        focus_ring_rects(&focused, selected_row).is_empty(),
+        "selected picker row must not paint a focus outline: {:?}",
+        focus_ring_rects(&focused, selected_row)
+    );
+    assert!(
+        text_colors(&focused, "alpha", 400.0).contains(&made_app::theme::TEXT_PRIMARY),
+        "selected picker row must keep primary text"
+    );
+    let row_rect = picker.response(row_id).rect;
+    let label = text_rects(&focused, "alpha", 400.0)
+        .into_iter()
+        .find(|rect| rect.intersects(row_rect))
+        .expect("selected picker label");
+    assert!(
+        (label.left() - (row_rect.left() + 24.0)).abs() < 1.0,
+        "picker text must start 24px from the row edge: {label:?}"
+    );
+    assert!(
+        (label.center().y - row_rect.center().y).abs() < 0.75,
+        "picker label must be vertically centered: {label:?} vs {row_rect:?}"
+    );
+    let marker = path_shapes(&focused)
+        .into_iter()
+        .filter(|path| path.points.len() == 3 && path.fill == made_app::theme::TEXT_PRIMARY)
+        .find(|path| row_rect.contains(path_center(path)))
+        .expect("picker app-drawn disclosure triangle");
+    let marker_rect = egui::Rect::from_points(&marker.points);
+    assert!(
+        (marker_rect.center().x - (row_rect.left() + 12.0)).abs() < 1.5,
+        "picker 16px icon slot center must sit 12px from the row edge: {marker_rect:?}"
+    );
+    assert!(
+        (marker_rect.center().y - label.center().y).abs() < 0.75,
+        "picker triangle must share the label's optical center: {marker_rect:?} vs {label:?}"
+    );
+
+    let current = picker.response(picker_control_id("current")).rect;
+    picker.focus(picker_control_id("current"));
+    let button_focused = picker.render();
+    assert!(
+        !focus_ring_rects(&button_focused, current).is_empty(),
+        "picker buttons must keep their visible focus ring"
+    );
+}
+
+#[test]
+fn picker_click_expands_tree_keeps_ancestors_and_updates_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("alpha/nested")).unwrap();
+    fs::create_dir(root.join("beta")).unwrap();
+    fs::write(root.join("not-a-folder.txt"), "x").unwrap();
+    let alpha = fs::canonicalize(root.join("alpha")).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+    let mut picker = picker_headless(&root, 900.0, 620.0);
+    picker.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    picker.render();
+    let row_id = egui::Id::unique(("made-picker-row", 0));
+    picker.click(row_id);
+
+    let current = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(
+        current.current_dir(),
+        root,
+        "expanding must not replace the root rows"
+    );
+    assert_eq!(current.selection(), Some(0));
+    assert_eq!(current.path_target(), alpha);
+    assert_eq!(
+        current
+            .rows()
+            .iter()
+            .map(|row| (row.name(), row.depth(), row.expanded()))
+            .collect::<Vec<_>>(),
+        vec![("alpha", 0, true), ("nested", 1, false), ("beta", 0, false)]
+    );
+    assert!(picker.model.is_picker());
+    assert_eq!(picker.model.surfaces(), Surfaces::Picker);
+    assert!(picker.model.workbench().is_none());
+    assert_eq!(picker.model.workspace_count(), 0);
+    assert!(!picker.model.start_pending());
+    assert_eq!(
+        picker_current_target(&picker.model),
+        Some(alpha.display().to_string()),
+        "the clicked folder must be the current target"
+    );
+
+    let output = picker.render();
+    let text = output_text(&output);
+    assert!(
+        text.contains("Click a folder to expand or collapse it"),
+        "picker help must describe tree expansion: {text}"
+    );
+    assert!(
+        !text.contains("Click a folder to enter it"),
+        "stale enter-to-replace help must be removed: {text}"
+    );
+    assert!(text.contains("nested"), "child rows must be listed: {text}");
+    let nested_row = picker
+        .response(egui::Id::unique(("made-picker-row", 1)))
+        .rect;
+    let nested_label = text_rects(&output, "nested", 500.0)
+        .into_iter()
+        .find(|rect| rect.intersects(nested_row))
+        .expect("nested label");
+    assert!(
+        (nested_label.left() - (nested_row.left() + 24.0 + 14.0)).abs() < 1.0,
+        "depth-1 label must indent 14px: {nested_label:?} vs {nested_row:?}"
+    );
+    let nested_marker = path_shapes(&output)
+        .into_iter()
+        .filter(|path| path.points.len() == 3)
+        .find(|path| nested_row.contains(path_center(path)))
+        .expect("nested disclosure marker");
+    assert!(
+        (path_center(&nested_marker).x - (nested_row.left() + 12.0 + 14.0)).abs() < 1.5,
+        "depth-1 marker must indent 14px"
+    );
+    let selected_row = picker.response(row_id).rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(selected_row)),
+        "the clicked folder row must stay selected"
+    );
+    let list_rect = picker.response(picker_list_id()).rect;
+    assert!(
+        focus_ring_rects(&output, list_rect).is_empty(),
+        "pointer focus in the picker must not paint a row or container outline: {:?}",
+        focus_ring_rects(&output, list_rect)
+    );
+    let chip = picker.response(picker_path_id()).rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(chip)),
+        "the path chip must use the selected row target: {chip:?}"
+    );
+    let hovered = output_text(&picker.hover(picker_path_id()));
+    assert!(
+        hovered.contains(&alpha.display().to_string()),
+        "the path chip tooltip must expose the selected row path: {hovered}"
+    );
+
+    picker.advance(0.4);
+    picker.click(egui::Id::unique(("made-picker-row", 1)));
+    let nested_target = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(nested_target.selection(), Some(1));
+    assert_eq!(
+        nested_target.path_target(),
+        fs::canonicalize(root.join("alpha/nested")).unwrap()
+    );
+    let hovered = output_text(&picker.hover(picker_path_id()));
+    assert!(
+        hovered.contains(
+            &fs::canonicalize(root.join("alpha/nested"))
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "the path chip must follow the selected child row: {hovered}"
+    );
+
+    picker.advance(0.4);
+    picker.click(row_id);
+    let collapsed = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(
+        collapsed.current_dir(),
+        root,
+        "collapsing must not re-root the picker"
+    );
+    assert_eq!(collapsed.selection(), Some(0));
+    assert!(!collapsed.rows()[0].expanded());
+    assert_eq!(
+        collapsed
+            .rows()
+            .iter()
+            .map(|row| row.name())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta"],
+        "collapsing removes only the expanded subtree"
+    );
+    assert_eq!(collapsed.path_target(), alpha);
+}
+
+#[test]
+fn picker_keyboard_tree_navigation_and_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("alpha/nested/deep")).unwrap();
+    fs::create_dir(root.join("beta")).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+
+    let mut confirm_root = picker_headless(&root, 900.0, 620.0);
+    confirm_root.focus(picker_list_id());
+    confirm_root.press_key_with_modifiers(egui::Key::Enter, egui::Modifiers::COMMAND);
+    assert!(
+        !confirm_root.model.is_picker(),
+        "Ctrl/Cmd+Enter with no selection must confirm the root"
+    );
+    assert_eq!(
+        confirm_root.model.launch().explorer_root(),
+        Some(root.as_path())
+    );
+
+    let mut tree = picker_headless(&root, 900.0, 620.0);
+    tree.focus(picker_list_id());
+    tree.press_key(egui::Key::ArrowDown);
+    assert_eq!(
+        tree.model.launch().picker().unwrap().selection(),
+        Some(0),
+        "the first Down from no selection must select the first row"
+    );
+    tree.press_key(egui::Key::ArrowRight);
+    let expanded = tree.model.launch().picker().unwrap();
+    assert!(expanded.rows()[0].expanded());
+    assert_eq!(expanded.path_target(), root.join("alpha"));
+    tree.press_key(egui::Key::ArrowDown);
+    assert_eq!(
+        tree.model.launch().picker().unwrap().path_target(),
+        root.join("alpha/nested")
+    );
+    let keyboard_selected = tree.render();
+    let selected_rect = tree.response(egui::Id::unique(("made-picker-row", 1))).rect;
+    assert!(
+        rects_with_fill(&keyboard_selected, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(selected_rect)),
+        "keyboard selection must be visible on the child row"
+    );
+    tree.press_key(egui::Key::ArrowLeft);
+    assert_eq!(
+        tree.model.launch().picker().unwrap().path_target(),
+        root.join("alpha"),
+        "Left on a collapsed child selects its parent row"
+    );
+    tree.press_key(egui::Key::ArrowRight);
+    assert_eq!(
+        tree.model.launch().picker().unwrap().path_target(),
+        root.join("alpha/nested"),
+        "Right on an expanded folder selects its first child"
+    );
+    tree.press_key(egui::Key::Enter);
+    assert!(
+        tree.model
+            .launch()
+            .picker()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|row| row.name() == "deep"),
+        "Enter expands the selected folder"
+    );
+    tree.press_key(egui::Key::Enter);
+    assert!(
+        !tree
+            .model
+            .launch()
+            .picker()
+            .unwrap()
+            .rows()
+            .iter()
+            .any(|row| row.name() == "deep"),
+        "Enter collapses the selected folder"
+    );
+    tree.press_key(egui::Key::ArrowRight);
+    tree.press_key(egui::Key::ArrowRight);
+    assert_eq!(
+        tree.model.launch().picker().unwrap().path_target(),
+        root.join("alpha/nested/deep"),
+        "Right expands then selects the first child"
+    );
+    tree.press_key_with_modifiers(egui::Key::Enter, egui::Modifiers::COMMAND);
+    assert!(
+        !tree.model.is_picker(),
+        "Ctrl/Cmd+Enter must confirm the selected tree row"
+    );
+    assert_eq!(
+        tree.model.launch().explorer_root(),
+        Some(root.join("alpha/nested/deep").as_path())
+    );
+
+    let mut enter = picker_headless(&root, 900.0, 620.0);
+    enter.focus(picker_list_id());
+    enter.press_key(egui::Key::ArrowDown);
+    enter.press_key(egui::Key::Enter);
+    assert!(enter.model.is_picker(), "Enter must only toggle expansion");
+    assert!(enter
+        .model
+        .launch()
+        .picker()
+        .unwrap()
+        .rows()
+        .iter()
+        .any(|row| row.name() == "nested"));
+    enter.press_key(egui::Key::Enter);
+    assert!(!enter
+        .model
+        .launch()
+        .picker()
+        .unwrap()
+        .rows()
+        .iter()
+        .any(|row| row.name() == "nested"));
+    assert_eq!(
+        enter.model.launch().picker().unwrap().current_dir(),
+        root,
+        "Enter must not re-root or start a workspace"
+    );
+
+    let mut selected = picker_headless(&root, 900.0, 620.0);
+    selected.focus(picker_list_id());
+    selected.press_key(egui::Key::ArrowDown);
+    selected.press_key(egui::Key::ArrowRight);
+    selected.press_key(egui::Key::ArrowDown);
+    assert_eq!(
+        selected.model.launch().picker().unwrap().path_target(),
+        root.join("alpha/nested")
+    );
+    selected.click(picker_control_id("selected"));
+    assert!(
+        !selected.model.is_picker(),
+        "Open selected folder must open the selected row"
+    );
+    assert_eq!(
+        selected.model.launch().explorer_root(),
+        Some(root.join("alpha/nested").as_path())
+    );
+    assert!(selected.model.start_pending());
+    assert!(selected.model.workbench().is_none());
+}
+
+#[test]
+fn picker_compact_keyboard_deep_leaf_keeps_ancestor_chain_visible() {
+    if isolated("picker_compact_keyboard_deep_leaf_keeps_ancestor_chain_visible") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("alpha/nested/deep/leaf")).unwrap();
+    fs::create_dir(root.join("alpha/sibling-inside")).unwrap();
+    fs::create_dir(root.join("beta")).unwrap();
+    fs::create_dir(root.join("gamma")).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+    let mut picker = picker_headless(&root, 720.0, 480.0);
+    picker.focus(picker_list_id());
+    picker.press_key(egui::Key::ArrowDown);
+    picker.press_key(egui::Key::ArrowRight);
+    picker.press_key(egui::Key::ArrowDown);
+    picker.press_key(egui::Key::ArrowRight);
+    picker.press_key(egui::Key::ArrowDown);
+    picker.press_key(egui::Key::ArrowRight);
+    picker.press_key(egui::Key::ArrowDown);
+    picker.render();
+    let output = picker.render();
+
+    let model = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(
+        model.path_target(),
+        root.join("alpha/nested/deep/leaf"),
+        "keyboard traversal must select the deep leaf"
+    );
+    assert_eq!(model.selection(), Some(3));
+    let list_rect = picker.response(picker_list_id()).rect;
+    for (index, name) in [(0, "alpha"), (1, "nested"), (2, "deep"), (3, "leaf")] {
+        let row = picker
+            .response(egui::Id::unique(("made-picker-row", index)))
+            .rect;
+        assert!(
+            list_rect.intersects(row),
+            "{name} row must remain visible in the compact list: {row:?} vs {list_rect:?}"
+        );
+    }
+    let leaf_row = picker
+        .response(egui::Id::unique(("made-picker-row", 3)))
+        .rect;
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(leaf_row)),
+        "the selected leaf row must keep its fill"
+    );
+    assert!(
+        focus_ring_rects(&output, list_rect).is_empty(),
+        "the compact tree must not paint a row/container outline"
+    );
+}
+
+#[test]
+fn picker_double_click_toggles_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("alpha/nested")).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+    let mut picker = picker_headless(&root, 900.0, 620.0);
+    picker.render();
+    picker.render();
+    let row_id = egui::Id::unique(("made-picker-row", 0));
+    let position = picker.response(row_id).rect.center();
+
+    // First click expands/selects alpha. The second click is a genuine
+    // double-click and must not collapse the same row again.
+    picker.render_events_at(vec![egui::Event::PointerMoved(position)], 1.0);
+    picker.render_events_at(vec![pointer_button(position, true)], 1.0);
+    picker.render_events_at(vec![pointer_button(position, false)], 1.0);
+    let after_first = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(after_first.current_dir(), root);
+    assert!(after_first.rows()[0].expanded());
+    assert_eq!(after_first.selection(), Some(0));
+    assert!(after_first.rows().iter().any(|row| row.name() == "nested"));
+
+    picker.render_events_at(vec![egui::Event::PointerMoved(position)], 1.05);
+    picker.render_events_at(vec![pointer_button(position, true)], 1.1);
+    picker.render_events_at(vec![pointer_button(position, false)], 1.1);
+    let after_double = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(after_double.current_dir(), root);
+    assert!(
+        after_double.rows()[0].expanded(),
+        "a double-click must not toggle the row twice"
+    );
+    assert!(after_double.rows().iter().any(|row| row.name() == "nested"));
+    assert_eq!(after_double.selection(), Some(0));
+    assert!(picker.model.is_picker());
+    assert!(picker.model.workbench().is_none());
+}
+
+#[test]
+fn picker_current_path_chip_is_selected_and_fits() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut start = temp.path().to_path_buf();
+    for index in 0..5 {
+        start.push(format!("segment-{index}-with-a-long-name"));
+    }
+    fs::create_dir_all(&start).unwrap();
+    let full = fs::canonicalize(&start).unwrap().display().to_string();
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        let mut picker = picker_headless(&start, width, height);
+        picker.ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0
+        });
+        let output = picker.render();
+        let chip = picker.response(picker_path_id()).rect;
+        let refresh = picker.response(picker_control_id("refresh")).rect;
+        assert!(
+            chip.left() > refresh.right(),
+            "path chip must not overlap Up/Refresh at {width}x{height}: {chip:?} vs {refresh:?}"
+        );
+        let card = largest_rect(&output, made_app::theme::BG_CARD).expect("picker card");
+        assert!(
+            card.contains_rect(chip),
+            "path chip must stay inside the card at {width}x{height}: {chip:?} vs {card:?}"
+        );
+        let shape = rect_shapes(&output)
+            .into_iter()
+            .find(|shape| shape.rect == chip && shape.fill == made_app::theme::BG_SELECTED)
+            .expect("path chip must use the inset BG_SELECTED fill");
+        assert_eq!(shape.corner_radius, egui::CornerRadius::same(4));
+        assert_eq!(
+            shape.stroke,
+            egui::Stroke::NONE,
+            "path chip must not paint a border"
+        );
+        assert!(
+            text_colors(&output, "segment", 250.0).contains(&made_app::theme::TEXT_PRIMARY),
+            "path chip text must be primary at {width}x{height}"
+        );
+        let hovered = output_text(&picker.hover(picker_path_id()));
+        assert!(
+            hovered.contains(&full),
+            "path chip must keep the full-path tooltip at {width}x{height}: {hovered}"
+        );
+    }
+}
+
+#[test]
+fn picker_up_reroots_list_to_top_and_clears_tree_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    let root = parent.join("root");
+    fs::create_dir_all(&root).unwrap();
+    for index in 0..40 {
+        fs::create_dir(root.join(format!("dir-{index:02}"))).unwrap();
+        fs::create_dir(parent.join(format!("sibling-{index:02}"))).unwrap();
+    }
+    for index in 0..20 {
+        fs::create_dir(root.join(format!("dir-20/child-{index:02}"))).unwrap();
+    }
+    let root = fs::canonicalize(&root).unwrap();
+    let parent = fs::canonicalize(&parent).unwrap();
+    let mut picker = picker_headless(&root, 900.0, 620.0);
+    picker.render();
+    picker.model.picker_select(20).unwrap();
+    picker.render();
+    picker.render();
+    let target_row = egui::Id::unique(("made-picker-row", 20));
+    assert!(
+        picker.ctx.read_response(target_row).is_some(),
+        "scroll-to-selection must expose the target row"
+    );
+    picker.click(target_row);
+    let expanded = picker.model.launch().picker().expect("picker remains");
+    assert!(expanded.rows()[20].expanded());
+    assert!(expanded.rows().iter().any(|row| row.name() == "child-00"));
+    let list_rect = picker.response(picker_list_id()).rect;
+    let expanded_row = picker.response(target_row).rect;
+    assert!(
+        list_rect.intersects(expanded_row),
+        "expanding must scroll the selected row into view: {expanded_row:?} vs {list_rect:?}"
+    );
+
+    picker.click(picker_control_id("up"));
+    let rerooted = picker.model.launch().picker().expect("picker remains");
+    assert_eq!(rerooted.current_dir(), parent);
+    assert_eq!(rerooted.selection(), None);
+    assert!(rerooted.rows().iter().all(|row| row.depth() == 0));
+    assert!(rerooted.rows().iter().all(|row| !row.expanded()));
+
+    let output = picker.render();
+    let list_rect = picker.response(picker_list_id()).rect;
+    let first_row = egui::Id::unique(("made-picker-row", 0));
+    let first_rect = picker.response(first_row).rect;
+    assert!(
+        (first_rect.top() - list_rect.top()).abs() < 1.5,
+        "the re-rooted list must start at the top: {first_rect:?} vs {list_rect:?}"
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("sibling-00"),
+        "the parent's first children must be rendered: {text}"
+    );
+
+    let mut backspace = picker_headless(&root, 900.0, 620.0);
+    backspace.focus(picker_list_id());
+    backspace.press_key(egui::Key::ArrowDown);
+    backspace.press_key(egui::Key::Backspace);
+    let keyed = backspace.model.launch().picker().expect("picker remains");
+    assert_eq!(keyed.current_dir(), parent);
+    assert_eq!(keyed.selection(), None);
+    assert!(keyed.rows().iter().all(|row| row.depth() == 0));
+}
+
+#[test]
 fn picker_close_without_workspace_falls_back_to_home() {
     if isolated("picker_close_without_workspace_falls_back_to_home") {
         return;
@@ -2083,6 +3999,7 @@ fn picker_close_without_workspace_falls_back_to_home() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("alpha")).unwrap();
     let mut closed = picker_headless(temp.path(), 900.0, 620.0);
+    closed.model.picker_select(0).unwrap();
     closed.ctx.style_mut_of(egui::Theme::Dark, |style| {
         style.interaction.tooltip_delay = 0.0
     });
@@ -2091,6 +4008,32 @@ fn picker_close_without_workspace_falls_back_to_home() {
     assert!(
         !rects_with_fill(&picker_output, made_app::theme::BG_SELECTED).is_empty(),
         "selected picker row must keep its rounded background"
+    );
+    let secondary = closed.response(picker_control_id("selected")).rect;
+    assert!(
+        rects_with_fill(&picker_output, made_app::theme::BG_ELEVATED)
+            .iter()
+            .any(|rect| rect.intersects(secondary)),
+        "quiet secondary action must use the elevated background"
+    );
+    assert!(
+        !rect_shapes(&picker_output).iter().any(|rect| {
+            rect.rect.intersects(secondary) && rect.stroke.color == made_app::theme::BORDER_CONTROL
+        }),
+        "Open selected folder must be borderless"
+    );
+    let selected_row = rects_with_fill(&picker_output, made_app::theme::BG_SELECTED)
+        .into_iter()
+        .max_by(|left, right| left.area().total_cmp(&right.area()))
+        .expect("selected picker row");
+    assert!((selected_row.height() - 30.0).abs() < 1.0);
+    assert_eq!(
+        rect_shapes(&picker_output)
+            .into_iter()
+            .find(|shape| shape.rect == selected_row)
+            .expect("selected picker row shape")
+            .corner_radius,
+        egui::CornerRadius::same(6)
     );
     assert!(
         !rects_with_fill(&picker_output, made_app::theme::ACCENT)
@@ -2178,6 +4121,19 @@ fn optional_session_map_appears_only_after_session_data() {
             .is_some(),
         "Sessions control must appear when session data exists"
     );
+    let sessions = headless
+        .response(top_workspace_action_id(id, "sessions"))
+        .rect;
+    let diagnostics = headless.response(top_action_id("diagnostics")).rect;
+    let explorer = headless
+        .response(top_workspace_action_id(id, "explorer"))
+        .rect;
+    assert!(
+        sessions.right() < diagnostics.left()
+            && diagnostics.right() < explorer.left()
+            && explorer.left() > sessions.left(),
+        "right icon order must be Sessions, Diagnostics, Explorer (Explorer rightmost): sessions {sessions:?}, diagnostics {diagnostics:?}, explorer {explorer:?}"
+    );
     let hovered = output_text(&headless.hover(top_workspace_action_id(id, "sessions")));
     assert!(
         hovered.contains("Show sessions"),
@@ -2256,7 +4212,7 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
     );
     let explorer_card = largest_rect(&output, made_app::theme::BG_CARD_GLASS).unwrap();
     assert!(
-        (explorer_card.height() - 422.0).abs() < 2.0,
+        (explorer_card.height() - 436.0).abs() < 2.0,
         "compact explorer must fill main height: {explorer_card:?}"
     );
     assert!(
@@ -2269,9 +4225,7 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
 fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() {
     let temp = tempfile::tempdir().unwrap();
     let alpha = temp.path().join("alpha");
-    let beta = temp.path().join("beta");
     fs::create_dir(&alpha).unwrap();
-    fs::create_dir(&beta).unwrap();
 
     let mut up = picker_headless(&alpha, 900.0, 620.0);
     up.render();
@@ -2295,13 +4249,34 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
         "refresh did not re-list: {refreshed}"
     );
 
+    let mut backspace_button = picker_headless(&alpha, 900.0, 620.0);
+    backspace_button.render();
+    backspace_button.focus(picker_control_id("up"));
+    backspace_button.press_key(egui::Key::Backspace);
+    assert_eq!(
+        backspace_button
+            .model
+            .launch()
+            .picker()
+            .unwrap()
+            .current_dir(),
+        temp.path(),
+        "Backspace must re-root even when a picker button has focus"
+    );
+
     let mut list = picker_headless(temp.path(), 900.0, 620.0);
     list.render();
     list.focus(picker_list_id());
     list.press_key(egui::Key::ArrowDown);
-    assert_eq!(list.model.launch().picker().unwrap().selection(), Some(1));
+    assert_eq!(list.model.launch().picker().unwrap().selection(), Some(0));
     list.press_key(egui::Key::Enter);
-    assert_eq!(list.model.launch().picker().unwrap().current_dir(), beta);
+    let toggled = list.model.launch().picker().expect("picker remains");
+    assert_eq!(
+        toggled.current_dir(),
+        temp.path().canonicalize().unwrap(),
+        "Enter must not re-root the picker"
+    );
+    assert!(toggled.rows()[0].expanded());
 
     let mut button_switch = picker_headless(temp.path(), 900.0, 620.0);
     button_switch.render();
@@ -2309,11 +4284,12 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
     button_switch.press_key(egui::Key::ArrowDown);
     assert_eq!(
         button_switch.model.launch().picker().unwrap().selection(),
-        Some(0),
+        None,
         "a focused button must not let global arrows move the list"
     );
 
     let mut selected = picker_headless(temp.path(), 900.0, 620.0);
+    selected.model.picker_select(0).unwrap();
     selected.render();
     selected.focus(picker_control_id("selected"));
     selected.press_key(egui::Key::Enter);
@@ -2406,12 +4382,38 @@ fn picker_primary_names_the_current_target_and_empty_folders_confirm() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("alpha")).unwrap();
     let mut picker = picker_headless(temp.path(), 720.0, 480.0);
-    let text = output_text(&picker.render());
+    let output = picker.render();
+    let text = output_text(&output);
     assert!(text.contains("Use current folder"));
     assert!(text.contains("Open selected folder"));
     assert_eq!(
         picker_current_target(&picker.model),
         Some(temp.path().canonicalize().unwrap().display().to_string())
+    );
+    let secondary = picker.response(picker_control_id("selected")).rect;
+    assert!(
+        text_colors(&output, "Open selected folder", 400.0)
+            .contains(&made_app::theme::TEXT_DISABLED),
+        "Open selected folder must be disabled with no selected row"
+    );
+    picker.click(picker_control_id("selected"));
+    assert!(
+        picker.model.is_picker(),
+        "a disabled Open selected folder must not start a workspace"
+    );
+    picker.model.picker_select(0).unwrap();
+    picker.render_events(vec![egui::Event::PointerMoved(egui::pos2(4.0, 4.0))]);
+    let enabled = picker.render();
+    assert!(
+        rects_with_fill(&enabled, made_app::theme::BG_ELEVATED)
+            .iter()
+            .any(|rect| rect.contains_rect(secondary)),
+        "Open selected folder must use BG_ELEVATED once a row is selected"
+    );
+    assert!(
+        text_colors(&enabled, "Open selected folder", 400.0)
+            .contains(&made_app::theme::TEXT_SECONDARY),
+        "Open selected folder must leave the disabled tone when enabled"
     );
 
     let empty = tempfile::tempdir().unwrap();

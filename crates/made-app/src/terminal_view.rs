@@ -844,8 +844,7 @@ impl TerminalPane {
             log,
             &mut output,
         );
-        self.process_scrollbar(ui, pane_rect, grid_size);
-
+        let pane_hovered = response.hovered();
         let snapshot = self.core.snapshot();
         let damage = self.core.take_damage();
         let selection = self.selection;
@@ -880,6 +879,7 @@ impl TerminalPane {
             },
             &self.palette,
         );
+        self.process_scrollbar(ui, pane_rect, grid_size, pane_hovered);
         if let Some(elapsed) = self.take_painted_input_latency(&snapshot, &damage) {
             metrics.record_input_latency(elapsed);
         }
@@ -1216,22 +1216,19 @@ impl TerminalPane {
         }
     }
 
-    fn process_scrollbar(&mut self, ui: &mut Ui, pane_rect: Rect, grid_size: TerminalSize) {
+    fn process_scrollbar(
+        &mut self,
+        ui: &mut Ui,
+        pane_rect: Rect,
+        grid_size: TerminalSize,
+        pane_hovered: bool,
+    ) {
         let history = self.core.history_len();
         let total = history + grid_size.rows;
         if history == 0 {
             return;
         }
-        let track = Rect::from_min_max(
-            egui::Pos2::new(
-                pane_rect.right() - SCROLLBAR_WIDTH,
-                pane_rect.top() + TERMINAL_PADDING,
-            ),
-            egui::Pos2::new(
-                pane_rect.right() - 1.0,
-                pane_rect.bottom() - TERMINAL_PADDING,
-            ),
-        );
+        let track = scrollbar_track_rect(pane_rect);
         if track.height() <= 1.0 {
             return;
         }
@@ -1244,13 +1241,6 @@ impl TerminalPane {
             offset as f32 / history as f32
         };
         let thumb_top = track.top() + (track.height() - thumb_height) * (1.0 - progress);
-        let thumb = Rect::from_min_size(
-            egui::Pos2::new(track.left(), thumb_top),
-            Vec2::new(track.width(), thumb_height),
-        );
-        ui.painter()
-            .rect_filled(track, 2.0, crate::theme::SCROLL_TRACK);
-
         let response = ui.interact(
             track,
             ui.make_persistent_id("made-terminal-scrollbar"),
@@ -1269,11 +1259,27 @@ impl TerminalPane {
                 }
             }
         }
-        let thumb_color = if response.hovered() || response.dragged() {
-            crate::theme::SCROLL_THUMB_HOVER
-        } else {
-            crate::theme::SCROLL_THUMB
-        };
+        let bar_hot = response.hovered() || response.dragged();
+        let fade = ui
+            .ctx()
+            .animate_bool_with_time(
+                ui.make_persistent_id("made-terminal-scrollbar-fade"),
+                pane_hovered || bar_hot,
+                0.14,
+            )
+            .clamp(0.0, 1.0);
+        if fade <= 0.005 {
+            return;
+        }
+        let (track_color, thumb_color) = scrollbar_paint(fade, bar_hot);
+        if track_color.a() > 0 {
+            ui.painter().rect_filled(track, 3.0, track_color);
+        }
+        let thumb_width = scrollbar_thumb_width(track.width(), bar_hot);
+        let thumb = Rect::from_min_size(
+            egui::Pos2::new(track.right() - thumb_width, thumb_top),
+            Vec2::new(thumb_width, thumb_height),
+        );
         ui.painter().rect_filled(thumb, 3.0, thumb_color);
     }
 
@@ -1361,6 +1367,49 @@ fn local_selection_requested(mouse_mode: MouseMode, shift: bool) -> bool {
 
 fn local_scroll_requested(mouse_mode: MouseMode, shift: bool) -> bool {
     mouse_mode == MouseMode::Off || shift
+}
+
+/// Full 8px scrollbar hit area inside the terminal pane.
+/// Full 8px scrollbar hit area inside the terminal pane.
+///
+/// The rightmost pane pixel is the card border; the track ends just inside it
+/// so all eight scrollbar pixels remain visible.
+fn scrollbar_track_rect(pane_rect: Rect) -> Rect {
+    let right = pane_rect.right() - 1.0;
+    Rect::from_min_max(
+        egui::Pos2::new(right - SCROLLBAR_WIDTH, pane_rect.top() + TERMINAL_PADDING),
+        egui::Pos2::new(right, pane_rect.bottom() - TERMINAL_PADDING),
+    )
+}
+
+/// Track and thumb colors for the fading terminal scrollback bar.
+///
+/// Only the thumb appears when the terminal pane is hovered. The faint track
+/// appears only while the bar itself is hovered or dragged, matching egui's
+/// floating scrollbars.
+fn scrollbar_paint(fade: f32, bar_hot: bool) -> (egui::Color32, egui::Color32) {
+    let fade = fade.clamp(0.0, 1.0);
+    let track = if bar_hot {
+        crate::theme::SCROLL_TRACK.gamma_multiply(fade * 0.45)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let thumb = if bar_hot {
+        crate::theme::SCROLL_THUMB_HOVER
+    } else {
+        crate::theme::SCROLL_THUMB
+    }
+    .gamma_multiply(fade);
+    (track, thumb)
+}
+
+/// The visible thumb widens to the full 8px hit area on bar hover/drag.
+fn scrollbar_thumb_width(track_width: f32, bar_hot: bool) -> f32 {
+    if bar_hot {
+        track_width
+    } else {
+        (track_width * 0.65).max(4.0)
+    }
 }
 
 fn forward_mouse_report(mouse_mode: MouseMode, shift: bool) -> bool {
@@ -1902,5 +1951,60 @@ mod tests {
         assert!(pane.focus_on_next_frame);
         assert_eq!(pane.grid_paint_count(), 0);
         pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn terminal_scrollbar_fades_thumb_only_and_reveals_track_on_bar_hover() {
+        let pane = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let track = scrollbar_track_rect(pane);
+        assert_eq!(track.width(), SCROLLBAR_WIDTH);
+        assert_eq!(track.width(), 8.0);
+        assert_eq!(track.right(), pane.right() - 1.0);
+        assert_eq!(track.height(), 500.0 - 2.0 * TERMINAL_PADDING);
+
+        let (track, thumb) = scrollbar_paint(0.0, false);
+        assert_eq!(track.a(), 0);
+        assert_eq!(thumb.a(), 0);
+
+        let (track, thumb) = scrollbar_paint(0.5, false);
+        let rest = crate::theme::SCROLL_THUMB.to_srgba_unmultiplied();
+        assert_eq!(
+            track.a(),
+            0,
+            "pane hover must paint only the thumb, not a full-height track"
+        );
+        assert!(thumb.a() > 0);
+        let thumb_rgb = thumb.to_srgba_unmultiplied();
+        assert!(
+            thumb_rgb[0].abs_diff(rest[0]) <= 1
+                && thumb_rgb[1].abs_diff(rest[1]) <= 1
+                && thumb_rgb[2].abs_diff(rest[2]) <= 1,
+            "rest thumb must use SCROLL_THUMB: {thumb_rgb:?} vs {rest:?}"
+        );
+
+        let (hot_track, hot_thumb) = scrollbar_paint(1.0, true);
+        assert!(
+            hot_track.a() > 0,
+            "bar hover/drag may reveal the faint track"
+        );
+        let hover = crate::theme::SCROLL_THUMB_HOVER.to_srgba_unmultiplied();
+        let hot_rgb = hot_thumb.to_srgba_unmultiplied();
+        assert!(
+            hot_rgb[0].abs_diff(hover[0]) <= 1
+                && hot_rgb[1].abs_diff(hover[1]) <= 1
+                && hot_rgb[2].abs_diff(hover[2]) <= 1,
+            "bar hover must use SCROLL_THUMB_HOVER: {hot_rgb:?} vs {hover:?}"
+        );
+        let (_, same_fade_hot) = scrollbar_paint(0.5, true);
+        assert_eq!(same_fade_hot.a(), thumb.a());
+        assert_ne!(
+            same_fade_hot.to_srgba_unmultiplied(),
+            thumb.to_srgba_unmultiplied(),
+            "bar hover must strengthen the color at the same fade"
+        );
+        assert!(
+            scrollbar_thumb_width(SCROLLBAR_WIDTH, true)
+                > scrollbar_thumb_width(SCROLLBAR_WIDTH, false)
+        );
     }
 }

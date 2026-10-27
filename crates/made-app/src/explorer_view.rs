@@ -1477,7 +1477,15 @@ impl ExplorerPane {
         if container.clicked() {
             container.request_focus();
         }
-        let tree_focused = container.has_focus();
+        // Keyboard/programmatic entry into the tree must have a visible cue.
+        // Select the first visible row without activating it (no preview).
+        if container.has_focus()
+            && self.tree.as_ref().and_then(TreeModel::selection).is_none()
+            && !self.rows.is_empty()
+        {
+            let first = self.rows[0].path.clone();
+            self.apply_selection_path(&first);
+        }
         let rows = &self.rows;
 
         ScrollArea::vertical()
@@ -1501,53 +1509,80 @@ impl ExplorerPane {
                     } else {
                         Color32::TRANSPARENT
                     };
+                    let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
                     if fill != Color32::TRANSPARENT {
-                        ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
-                    }
-                    if row.selected {
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
-                            CornerRadius::same(2),
-                            theme::ACCENT,
-                        );
+                        ui.painter()
+                            .rect_filled(row_rect, CornerRadius::same(6), fill);
                     }
 
-                    let indent = 8.0 + row.depth as f32 * 14.0;
-                    let icon = match row.kind {
-                        EntryKind::Directory if row.expanded => "▾",
-                        EntryKind::Directory => "▸",
-                        EntryKind::File => "·",
-                        EntryKind::Symlink => "@",
-                        EntryKind::Other => "?",
-                        EntryKind::Error => "!",
-                    };
+                    let indent = 4.0 + row.depth as f32 * 14.0;
+                    let expanded = row.kind == EntryKind::Directory && row.expanded;
                     let color = if row.kind == EntryKind::Error {
                         theme::ERROR
-                    } else if row.selected {
+                    } else if row.selected || expanded {
                         theme::TEXT_PRIMARY
                     } else {
                         theme::TEXT_SECONDARY
                     };
-                    ui.painter().text(
-                        egui::pos2(rect.left() + indent, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        icon,
-                        FontId::monospace(10.0),
-                        color,
-                    );
+                    let icon_color = if row.kind == EntryKind::Error {
+                        theme::ERROR
+                    } else if row.selected || expanded {
+                        theme::TEXT_PRIMARY
+                    } else {
+                        theme::TEXT_TERTIARY
+                    };
                     let name = sanitize_display(&row.name, 200);
-                    let text_left = rect.left() + indent + 14.0;
+                    let text_left = rect.left() + 24.0 + row.depth as f32 * 14.0;
                     let width = (rect.right() - text_left - 6.0).max(1.0);
-                    theme::paint_ellipsized(
+                    theme::paint_ellipsized_centered(
                         ui.painter(),
-                        egui::pos2(text_left, rect.top() + 3.0),
+                        text_left,
+                        rect.center().y,
                         name,
                         FontId::proportional(12.5),
                         color,
                         width,
                     );
-                    if row.selected && tree_focused {
-                        theme::paint_inside_focus_ring(ui.painter(), rect, CornerRadius::same(4));
+                    // The label helper centers its galley on the row center, so
+                    // the markers use that same optical center.
+                    let marker_center = egui::pos2(rect.left() + indent + 8.0, rect.center().y);
+                    match row.kind {
+                        EntryKind::Directory => theme::paint_disclosure(
+                            ui.painter(),
+                            marker_center,
+                            row.expanded,
+                            icon_color,
+                        ),
+                        EntryKind::File => {
+                            theme::paint_bullet(ui.painter(), marker_center, icon_color)
+                        }
+                        EntryKind::Symlink => {
+                            ui.painter().text(
+                                marker_center,
+                                Align2::CENTER_CENTER,
+                                "@",
+                                FontId::monospace(10.0),
+                                icon_color,
+                            );
+                        }
+                        EntryKind::Other => {
+                            ui.painter().text(
+                                marker_center,
+                                Align2::CENTER_CENTER,
+                                "?",
+                                FontId::monospace(10.0),
+                                icon_color,
+                            );
+                        }
+                        EntryKind::Error => {
+                            ui.painter().text(
+                                marker_center,
+                                Align2::CENTER_CENTER,
+                                "!",
+                                FontId::monospace(10.0),
+                                icon_color,
+                            );
+                        }
                     }
 
                     let tooltip = if let Some(error) = &row.error {
@@ -1569,13 +1604,6 @@ impl ExplorerPane {
                     }
                 }
             });
-        if tree_focused {
-            theme::paint_inside_focus_ring(
-                ui.painter(),
-                tree_rect.shrink(1.0),
-                CornerRadius::same(4),
-            );
-        }
         self.scroll_to_selection = false;
         if clicked_tree {
             ui.memory_mut(|memory| memory.request_focus(tree_id));
@@ -2596,6 +2624,12 @@ mod tests {
             ctx.memory_mut(|memory| memory.request_focus(tree_id));
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[]);
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[]);
+            assert_eq!(
+                pane.selected_path(),
+                Some(directory.as_path()),
+                "focusing the tree must select the first row without activating it"
+            );
+            assert!(pane.preview_path().is_none());
 
             tree_key_frame(
                 &ctx,
@@ -2605,7 +2639,7 @@ mod tests {
                 height,
                 &[egui::Key::ArrowDown],
             );
-            assert_eq!(pane.selected_path(), Some(directory.as_path()));
+            assert_eq!(pane.selected_path(), Some(file.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::Home]);
             assert_eq!(pane.selected_path(), Some(directory.as_path()));

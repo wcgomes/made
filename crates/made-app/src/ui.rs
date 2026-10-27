@@ -1,11 +1,12 @@
 //! egui surfaces for the Calm Editor design.
 //!
-//! The terminal is the hero: the workspace strip, full-height explorer, and
+//! The terminal is the hero: the floating header, full-height explorer, and
 //! mutually exclusive terminal/preview surfaces are deliberately quiet. There
-//! is no routine status bar or integration banner. The top chrome band and the
-//! full-height Explorer card use the theme's in-app frosted-glass approximation;
-//! terminal, preview, and picker cards stay opaque. All display text is
-//! sanitized and every control keeps a visible focus state.
+//! is no routine status bar or integration banner and no persistent header
+//! band: wordmark, tabs, and icon actions sit on the clear/native backdrop.
+//! The full-height Explorer card uses the theme's in-app frosted-glass
+//! approximation; terminal, preview, and picker cards stay opaque. All display
+//! text is sanitized and every control keeps a visible focus state.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -71,12 +72,17 @@ pub fn picker_list_id() -> egui::Id {
     egui::Id::unique("made-picker-list-focus")
 }
 
+/// Stable id for the picker's current-path chip.
+pub fn picker_path_id() -> egui::Id {
+    egui::Id::unique("made-picker-path")
+}
+
 /// Current picker target used by the primary action and its tooltip.
 pub fn picker_current_target(model: &AppModel) -> Option<String> {
     model
         .launch()
         .picker()
-        .map(|picker| picker.current_dir().display().to_string())
+        .map(|picker| picker.path_target().display().to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -93,15 +99,17 @@ struct PickerCacheKey {
 }
 
 #[derive(Debug, Clone)]
-struct PickerDisplayEntry {
+struct PickerDisplayRow {
     index: usize,
     name: String,
     path: PathBuf,
+    depth: usize,
+    expanded: bool,
 }
 
 struct PickerEntryCache {
     key: PickerCacheKey,
-    entries: Arc<Vec<PickerDisplayEntry>>,
+    rows: Arc<Vec<PickerDisplayRow>>,
 }
 
 fn picker_cache_id() -> egui::Id {
@@ -112,10 +120,10 @@ fn invalidate_picker_cache(ctx: &egui::Context) {
     ctx.data_mut(|data| data.remove::<Arc<PickerEntryCache>>(picker_cache_id()));
 }
 
-fn picker_display_entries(
+fn picker_display_rows(
     ctx: &egui::Context,
     picker: &crate::workspace_picker::WorkspacePicker,
-) -> Arc<Vec<PickerDisplayEntry>> {
+) -> Arc<Vec<PickerDisplayRow>> {
     let key = PickerCacheKey {
         instance: picker.instance_id(),
         revision: picker.revision(),
@@ -124,18 +132,20 @@ fn picker_display_entries(
     if let Some(cache) = ctx.data(|data| data.get_temp::<Arc<PickerEntryCache>>(picker_cache_id()))
     {
         if cache.key == key {
-            return cache.entries.clone();
+            return cache.rows.clone();
         }
     }
-    let entries = Arc::new(
+    let rows = Arc::new(
         picker
-            .entries()
+            .rows()
             .iter()
             .enumerate()
-            .map(|(index, entry)| PickerDisplayEntry {
+            .map(|(index, row)| PickerDisplayRow {
                 index,
-                name: sanitize_display(entry.name(), 200),
-                path: entry.path().to_path_buf(),
+                name: sanitize_display(row.name(), 200),
+                path: row.path().to_path_buf(),
+                depth: row.depth(),
+                expanded: row.expanded(),
             })
             .collect::<Vec<_>>(),
     );
@@ -144,11 +154,11 @@ fn picker_display_entries(
             picker_cache_id(),
             Arc::new(PickerEntryCache {
                 key,
-                entries: entries.clone(),
+                rows: rows.clone(),
             }),
         );
     });
-    entries
+    rows
 }
 
 fn picker_back_context(model: &AppModel) -> Option<PickerBackContext> {
@@ -173,6 +183,9 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
     let mut command = None;
     let mut keyboard_move: Option<isize> = None;
     let mut keyboard_confirm = false;
+    let mut keyboard_toggle = false;
+    let mut keyboard_expand = false;
+    let mut keyboard_collapse = false;
     let mut keyboard_up = false;
     let back = picker_back_context(model);
 
@@ -196,9 +209,11 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
     let Some(picker) = model.launch().picker() else {
         return;
     };
-    let current = picker.current_dir().to_path_buf();
-    let entries = picker_display_entries(ui.ctx(), picker);
+    let target = picker.path_target().to_path_buf();
+    let rows = picker_display_rows(ui.ctx(), picker);
     let selection = picker.selection();
+    let picker_instance = picker.instance_id();
+    let picker_revision = picker.revision();
     let picker_error = picker
         .error()
         .map(|error| sanitize_display(&error.to_string(), 600));
@@ -229,27 +244,34 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
                 .corner_radius(CornerRadius::same(12))
                 .show(ui, |ui| {
                     ui.set_width(card_width);
-                    picker_toolbar(ui, layout, &current, &mut command);
+                    picker_toolbar(ui, layout, &target, &mut command);
                     if truncated > 0 {
                         picker_truncated_notice(ui, layout, truncated);
                     }
-                    picker_list(ui, layout, &entries, selection, list_max, &mut command);
+                    picker_list(
+                        ui,
+                        layout,
+                        &rows,
+                        selection,
+                        list_max,
+                        (picker_instance, picker_revision),
+                        &mut command,
+                    );
                     if let Some(error) = picker_error.as_deref().or(launch_error.as_deref()) {
                         notice_strip(ui, layout, theme::ERROR_TINT, theme::ERROR, error, error);
                     }
-                    picker_footer(ui, layout, selection, &current, &mut command);
+                    picker_footer(ui, layout, selection, &target, &mut command);
                 });
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
                 ui.label(theme::micro(
-                    "Double-click a folder to enter it. Enter opens the selected folder.",
+                    "Click a folder to expand or collapse it. Up/Down select, Right expands, Left collapses, Enter toggles, Ctrl/Cmd+Enter opens.",
                 ));
             });
         });
     });
 
     let focused = ui.ctx().memory(|memory| memory.focused());
-    let list_focused = focused == Some(picker_list_id());
     let button_focused = focused.is_some_and(|id| id != picker_list_id());
     let input = ui.ctx().input(|input| input.events.clone());
     for event in input {
@@ -264,6 +286,10 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
                 command = Some(PickerCommand::Close);
                 continue;
             }
+            if key == egui::Key::Backspace {
+                keyboard_up = true;
+                continue;
+            }
             if button_focused {
                 // Focused buttons own Enter/Space and arrow keys. The global
                 // list navigation must not hijack their activation.
@@ -272,20 +298,13 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
             match key {
                 egui::Key::ArrowDown => keyboard_move = Some(1),
                 egui::Key::ArrowUp => keyboard_move = Some(-1),
+                egui::Key::ArrowRight => keyboard_expand = true,
+                egui::Key::ArrowLeft => keyboard_collapse = true,
                 egui::Key::Enter if modifiers.command => keyboard_confirm = true,
-                egui::Key::Enter => {
-                    if let Some(index) = selection {
-                        command = Some(PickerCommand::Enter(index));
-                    }
-                }
-                egui::Key::Backspace | egui::Key::ArrowLeft => keyboard_up = true,
+                egui::Key::Enter => keyboard_toggle = true,
                 _ => {}
             }
         }
-    }
-    if list_focused || focused.is_none() {
-        // The match above already ignored button focus; this condition just
-        // documents that list/general shortcuts are the fallback.
     }
 
     if let Some(delta) = keyboard_move {
@@ -293,6 +312,15 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
     }
     if keyboard_up {
         let _ = model.picker_up();
+    }
+    if keyboard_toggle {
+        let _ = model.picker_toggle_selected();
+    }
+    if keyboard_expand {
+        let _ = model.picker_expand_selected();
+    }
+    if keyboard_collapse {
+        let _ = model.picker_collapse_selected();
     }
     if keyboard_confirm {
         let _ = model.confirm_picker();
@@ -305,20 +333,17 @@ fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
             let _ = model.picker_refresh();
             invalidate_picker_cache(ui.ctx());
         }
-        Some(PickerCommand::Select(index)) => {
-            let _ = model.picker_select(index);
-        }
-        Some(PickerCommand::Enter(index)) => {
-            let _ = model.picker_enter(index);
+        Some(PickerCommand::Toggle(index)) => {
+            let _ = model.picker_toggle(index);
         }
         Some(PickerCommand::ConfirmCurrent) => {
             let _ = model.confirm_picker();
         }
-        Some(PickerCommand::ConfirmEntry(index)) => {
+        Some(PickerCommand::ConfirmRow(index)) => {
             let result = model
                 .launch()
                 .picker()
-                .map(|picker| picker.confirm_entry(index));
+                .map(|picker| picker.confirm_row(index));
             match result {
                 Some(Ok(plan)) => model.open_plan(plan),
                 Some(Err(error)) => {
@@ -442,13 +467,34 @@ fn picker_toolbar(
     let (divider, _) = toolbar.allocate_exact_size(egui::vec2(1.0, 14.0), Sense::hover());
     toolbar.painter().rect_filled(divider, 0.0, theme::BORDER);
     let full = current.display().to_string();
-    toolbar
-        .label(theme::mono(
-            truncate_path(&sanitize_display(&full, 600), 200),
-            10.5,
-            theme::TEXT_SECONDARY,
-        ))
-        .on_hover_text(sanitize_display(&full, 900));
+    let available = toolbar.available_width().max(0.0);
+    if available > 24.0 {
+        let max_text = (available - 12.0).max(1.0);
+        let char_budget = (max_text / 6.3).floor().max(4.0) as usize;
+        let display = truncate_path(&sanitize_display(&full, 900), char_budget);
+        let galley = toolbar.painter().layout_job(theme::ellipsized_job(
+            display,
+            FontId::monospace(10.5),
+            theme::TEXT_PRIMARY,
+            max_text,
+        ));
+        let chip_width = (galley.size().x + 12.0).min(available).max(1.0);
+        let (chip_rect, _) =
+            toolbar.allocate_exact_size(egui::vec2(chip_width, 20.0), Sense::hover());
+        let chip = toolbar.interact(chip_rect, picker_path_id(), Sense::hover());
+        toolbar
+            .painter()
+            .rect_filled(chip_rect, CornerRadius::same(4), theme::BG_SELECTED);
+        toolbar.painter().galley(
+            egui::pos2(
+                chip_rect.left() + 6.0,
+                chip_rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            theme::TEXT_PRIMARY,
+        );
+        chip.on_hover_text(sanitize_display(&full, 900));
+    }
     ui.painter().line_segment(
         [
             egui::pos2(rect.left(), rect.bottom() - 0.5),
@@ -461,24 +507,24 @@ fn picker_toolbar(
 fn picker_list(
     ui: &mut Ui,
     _layout: &Layout,
-    entries: &[PickerDisplayEntry],
+    rows: &[PickerDisplayRow],
     selection: Option<usize>,
     list_max: f32,
+    (instance, revision): (u64, u64),
     command: &mut Option<PickerCommand>,
 ) {
     const ROW_HEIGHT: f32 = 32.0;
-    let scroll_id = egui::Id::unique("made-picker-last-selection");
-    let previous_selection = ui
+    let scroll_id = egui::Id::unique(("made-picker-last-selection", instance));
+    let previous = ui
         .ctx()
-        .data(|data| data.get_temp::<Option<usize>>(scroll_id))
-        .flatten();
-    let scroll_to_selection = previous_selection != selection;
+        .data(|data| data.get_temp::<(Option<usize>, u64)>(scroll_id));
+    let scroll_to_selection = previous != Some((selection, revision));
     if scroll_to_selection {
         ui.ctx()
-            .data_mut(|data| data.insert_temp(scroll_id, selection));
+            .data_mut(|data| data.insert_temp(scroll_id, (selection, revision)));
     }
-    let content_height = entries.len() as f32 * ROW_HEIGHT;
-    let list_height = if entries.is_empty() {
+    let content_height = rows.len() as f32 * ROW_HEIGHT;
+    let list_height = if rows.is_empty() {
         64.0
     } else {
         content_height.min(list_max).max(ROW_HEIGHT)
@@ -510,75 +556,80 @@ fn picker_list(
         egui::scroll_area::ScrollBarVisibility::AlwaysHidden
     };
     let mut scroll = egui::ScrollArea::vertical()
-        .id_salt("made-picker-list")
+        .id_salt(("made-picker-list", instance, revision))
         .auto_shrink([false, false])
         .scroll_bar_visibility(visibility)
         .max_height(list_height);
     if scroll_to_selection {
         if let Some(selected) = selection {
-            let target = (selected as f32 * ROW_HEIGHT - list_height / 2.0).max(0.0);
+            // Reveal minimally with a bottom-edge window. This shows the
+            // selected row and as many immediately preceding ancestor rows as
+            // fit, instead of centering and pushing the root ancestor away.
+            let rows_per_view = ((list_height / ROW_HEIGHT).floor() as usize).max(1);
+            let first_visible = selected.saturating_sub(rows_per_view - 1);
+            let max_offset = (content_height - list_height).max(0.0);
+            let target = (first_visible as f32 * ROW_HEIGHT).min(max_offset);
             scroll = scroll.animated(false).vertical_scroll_offset(target);
         }
     }
-    scroll.show_rows(&mut list_ui, ROW_HEIGHT, entries.len(), |ui, range| {
+    list_ui.spacing_mut().item_spacing.y = 0.0;
+    scroll.show_rows(&mut list_ui, ROW_HEIGHT, rows.len(), |ui, range| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for index in range {
-            let Some(entry) = entries.get(index) else {
+            let Some(row) = rows.get(index) else {
                 continue;
             };
             let (rect, _) = ui
                 .allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
-            let response = ui.interact(
-                rect,
-                egui::Id::unique(("made-picker-row", entry.index)),
-                Sense::CLICK,
-            );
-            let row = rect.shrink2(egui::vec2(6.0, 1.0));
-            let selected = selection == Some(entry.index);
+            let row_id = egui::Id::unique(("made-picker-row", row.index));
+            let response = ui.interact(rect, row_id, Sense::CLICK);
+            let row_rect = rect.shrink2(egui::vec2(4.0, 1.0));
+            let selected = selection == Some(row.index);
             if selected {
                 ui.painter()
-                    .rect_filled(row, CornerRadius::same(4), theme::BG_SELECTED);
+                    .rect_filled(row_rect, CornerRadius::same(6), theme::BG_SELECTED);
             } else if response.hovered() {
                 ui.painter()
-                    .rect_filled(row, CornerRadius::same(4), theme::BG_HOVER);
+                    .rect_filled(row_rect, CornerRadius::same(6), theme::BG_HOVER);
             }
-            ui.painter().text(
-                egui::pos2(row.left() + 10.0, row.center().y),
-                Align2::LEFT_CENTER,
-                "▸",
-                FontId::monospace(10.0),
-                theme::TEXT_TERTIARY,
-            );
-            theme::paint_ellipsized(
+            let indent = 4.0 + row.depth as f32 * 14.0;
+            let marker_color = if selected {
+                theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_TERTIARY
+            };
+            theme::paint_disclosure(
                 ui.painter(),
-                egui::pos2(row.left() + 26.0, row.top() + 9.0),
-                &entry.name,
+                egui::pos2(rect.left() + indent + 8.0, rect.center().y),
+                row.expanded,
+                marker_color,
+            );
+            let text_left = rect.left() + 24.0 + row.depth as f32 * 14.0;
+            theme::paint_ellipsized_centered(
+                ui.painter(),
+                text_left,
+                rect.center().y,
+                &row.name,
                 FontId::proportional(12.5),
                 if selected {
                     theme::TEXT_PRIMARY
                 } else {
                     theme::TEXT_SECONDARY
                 },
-                (row.width() - 36.0).max(20.0),
+                (rect.right() - text_left - 6.0).max(20.0),
             );
-            if selected && ui.memory(|memory| memory.has_focus(list_focus)) {
-                theme::paint_inside_focus_ring(ui.painter(), row, CornerRadius::same(4));
-            }
-            if selected && scroll_to_selection {
-                response.scroll_to_me(Some(Align::Center));
-            }
             let response =
-                response.on_hover_text(sanitize_display(&entry.path.display().to_string(), 900));
+                response.on_hover_text(sanitize_display(&row.path.display().to_string(), 900));
             if response.double_clicked() {
-                ui.memory_mut(|memory| memory.request_focus(list_focus));
-                *command = Some(PickerCommand::Enter(entry.index));
+                // The first click already selected/toggled the row.
+                // Ignore the second click so a double-click toggles once.
             } else if response.clicked() {
                 ui.memory_mut(|memory| memory.request_focus(list_focus));
-                *command = Some(PickerCommand::Select(entry.index));
+                *command = Some(PickerCommand::Toggle(row.index));
             }
         }
     });
-    if entries.is_empty() {
+    if rows.is_empty() {
         let mut empty = ui.new_child(
             UiBuilder::new()
                 .max_rect(list_rect)
@@ -623,7 +674,7 @@ fn picker_footer(
     ui: &mut Ui,
     layout: &Layout,
     selection: Option<usize>,
-    current: &std::path::Path,
+    target: &std::path::Path,
     command: &mut Option<PickerCommand>,
 ) {
     let height = if layout.compact { 48.0 } else { 52.0 };
@@ -647,13 +698,13 @@ fn picker_footer(
     );
     primary.response.on_hover_text(format!(
         "Open this folder: {}",
-        sanitize_display(&current.display().to_string(), 900)
+        sanitize_display(&target.display().to_string(), 900)
     ));
     if primary.activated {
         *command = Some(PickerCommand::ConfirmCurrent);
     }
     let enabled = selection.is_some();
-    let secondary = theme::secondary_action(
+    let secondary = theme::quiet_secondary_action(
         &mut footer,
         picker_control_id("selected"),
         "Open selected folder",
@@ -662,13 +713,13 @@ fn picker_footer(
         theme::BG_CARD,
     );
     secondary.response.on_hover_text(if enabled {
-        "Open the selected folder in a new workspace tab"
+        "Open the selected tree row in a new workspace tab"
     } else {
         "Select a folder to open it in a new tab"
     });
     if secondary.activated {
         if let Some(index) = selection {
-            *command = Some(PickerCommand::ConfirmEntry(index));
+            *command = Some(PickerCommand::ConfirmRow(index));
         }
     }
 }
@@ -681,10 +732,9 @@ pub fn picker_primary_label() -> &'static str {
 enum PickerCommand {
     Up,
     Refresh,
-    Select(usize),
-    Enter(usize),
+    Toggle(usize),
     ConfirmCurrent,
-    ConfirmEntry(usize),
+    ConfirmRow(usize),
     Back,
     Close,
 }
@@ -754,21 +804,28 @@ fn workspace_tab_width(label: &str, layout: &Layout) -> f32 {
 }
 
 /// Choose bounded visible tab indices while keeping the active tab visible.
+///
+/// `trailing_width` reserves a mandatory control immediately after the last
+/// visible tab (the header's Open folder `+`). When the tabs still overflow,
+/// the overflow trigger's width is reserved after it as well.
 fn bounded_tab_indices(
     widths: &[f32],
     active: Option<usize>,
     available: f32,
     gap: f32,
+    trailing_width: Option<f32>,
 ) -> (Vec<usize>, bool) {
     if widths.is_empty() {
         return (Vec::new(), false);
     }
     let total: f32 = widths.iter().sum::<f32>() + gap * (widths.len().saturating_sub(1) as f32);
-    if total <= available {
+    let trailing = trailing_width.unwrap_or(0.0);
+    let trailing_gap = if trailing_width.is_some() { gap } else { 0.0 };
+    if total + trailing_gap + trailing <= available {
         return ((0..widths.len()).collect(), false);
     }
     let overflow_width = 28.0 + gap;
-    let budget = (available - overflow_width).max(0.0);
+    let budget = (available - trailing_gap - trailing - overflow_width).max(0.0);
     let active = active.filter(|index| *index < widths.len());
     let mut visible = Vec::new();
     let mut used = 0.0;
@@ -851,47 +908,26 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut toggle_sessions = false;
     let mut diagnostics = false;
 
-    let panel_height = layout.gutter + layout.top_height + layout.gap;
+    let panel_height = layout.content_top();
     egui::Panel::top("made-workspaces")
         .exact_size(panel_height)
         .frame(egui::Frame::NONE)
         .show_separator_line(false)
         .show(ui, |ui| {
-            let band = egui::Rect::from_min_size(
-                egui::pos2(layout.gutter, layout.gutter),
+            let header = egui::Rect::from_min_size(
+                egui::pos2(layout.gutter, layout.header_top()),
                 egui::vec2(
                     (ui.available_width() - 2.0 * layout.gutter).max(1.0),
                     layout.top_height,
                 ),
             );
-            theme::paint_glass_band(ui.painter(), band, if layout.compact { 7 } else { 8 });
-            let pad = if layout.compact { 10.0 } else { 12.0 };
-            let content = band.shrink2(egui::vec2(pad, 0.0));
+            // No extra horizontal inset: the control row spans the card edges.
+            let content = header;
             let control_gap = if layout.compact { 4.0 } else { 6.0 };
-
-            // The wordmark is not a tab: no fill, monospace tracking, and a
-            // divider + spacing separate it from the workspace tabs.
-            let brand_width = theme::wordmark_width(ui) + 17.0;
-            let brand_rect =
-                egui::Rect::from_min_size(content.min, egui::vec2(brand_width, content.height()));
-            let mut brand = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(brand_rect)
-                    .layout(egui::Layout::left_to_right(Align::Center)),
-            );
-            brand.spacing_mut().item_spacing.x = 8.0;
-            theme::wordmark(&mut brand);
-            let (divider, _) = brand.allocate_exact_size(egui::vec2(1.0, 14.0), Sense::hover());
-            brand.painter().rect_filled(divider, 0.0, theme::BORDER);
+            let wordmark_gap = theme::wordmark_gap(layout.compact);
 
             let mut right_specs: Vec<(&'static str, theme::IconGlyph, &'static str, bool)> =
                 Vec::new();
-            right_specs.push((
-                "open-folder",
-                theme::IconGlyph::FolderPlus,
-                "Open folder",
-                false,
-            ));
             if sessions_available {
                 right_specs.push((
                     "sessions",
@@ -906,6 +942,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             }
             if has_workbench {
                 right_specs.push((
+                    "diagnostics",
+                    theme::IconGlyph::Diagnostics,
+                    "Diagnostics",
+                    false,
+                ));
+                right_specs.push((
                     "explorer",
                     theme::IconGlyph::PanelRight,
                     if explorer_visible {
@@ -915,14 +957,8 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     },
                     explorer_visible,
                 ));
-                right_specs.push((
-                    "diagnostics",
-                    theme::IconGlyph::Diagnostics,
-                    "Diagnostics",
-                    false,
-                ));
             }
-            let icon_extent = theme::icon_action_extent(layout.button_height);
+            let icon_extent = theme::icon_action_extent(layout.tab_height);
             let right_width = if right_specs.is_empty() {
                 0.0
             } else {
@@ -942,24 +978,35 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     .layout(egui::Layout::left_to_right(Align::Center)),
             );
             right.spacing_mut().item_spacing.x = control_gap;
-            for (name, glyph, label, selected) in &right_specs {
+            for (index, (name, glyph, label, selected)) in right_specs.iter().enumerate() {
                 let id = match *name {
                     "explorer" | "sessions" => active
                         .map(|active| top_workspace_action_id(active, name))
                         .unwrap_or_else(|| top_action_id(name)),
                     _ => top_action_id(name),
                 };
-                let action = theme::icon_action(
-                    &mut right,
-                    id,
-                    *glyph,
-                    label,
-                    *selected,
-                    layout.button_height,
-                    theme::BG_CHROME_GLASS,
-                );
+                let action = if index + 1 == right_specs.len() {
+                    theme::icon_action_right_aligned(
+                        &mut right,
+                        id,
+                        *glyph,
+                        label,
+                        *selected,
+                        layout.tab_height,
+                        theme::BG_CLEAR,
+                    )
+                } else {
+                    theme::icon_action(
+                        &mut right,
+                        id,
+                        *glyph,
+                        label,
+                        *selected,
+                        layout.tab_height,
+                        theme::BG_CLEAR,
+                    )
+                };
                 match *name {
-                    "open-folder" if action.activated => create = true,
                     "sessions" if action.activated => toggle_sessions = true,
                     "explorer" if action.activated => toggle_explorer = true,
                     "diagnostics" if action.activated => diagnostics = true,
@@ -967,13 +1014,28 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 }
             }
 
-            let tabs_rect = egui::Rect::from_min_max(
+            // Tabs start at the header's left edge. The cached wordmark sits to
+            // their right, immediately before the icon group, with a deliberate
+            // breathing gap on both sides. It is not a tab and paints no fill.
+            let wordmark_width = theme::wordmark_width(ui);
+            let wordmark_rect = egui::Rect::from_min_size(
                 egui::pos2(
-                    (brand_rect.right() + control_gap).min(content.right()),
+                    (right_rect.left() - wordmark_gap - wordmark_width).max(content.left()),
                     content.top(),
                 ),
+                egui::vec2(wordmark_width.min(content.width()), content.height()),
+            );
+            let mut wordmark = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(wordmark_rect)
+                    .layout(egui::Layout::left_to_right(Align::Center)),
+            );
+            theme::wordmark(&mut wordmark);
+
+            let tabs_rect = egui::Rect::from_min_max(
+                content.min,
                 egui::pos2(
-                    (right_rect.left() - control_gap).max(content.left()),
+                    (wordmark_rect.left() - wordmark_gap).max(content.left()),
                     content.bottom(),
                 ),
             );
@@ -982,9 +1044,15 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 .iter()
                 .map(|tab| workspace_tab_width(&tab.label, &layout))
                 .collect();
+            let plus_extent = theme::icon_action_extent(layout.tab_height);
             let tabs_available = tabs_rect.width().max(0.0);
-            let (visible, overflow) =
-                bounded_tab_indices(&widths, active_index, tabs_available, control_gap);
+            let (visible, overflow) = bounded_tab_indices(
+                &widths,
+                active_index,
+                tabs_available,
+                control_gap,
+                Some(plus_extent),
+            );
             let mut tab_strip = ui.new_child(
                 UiBuilder::new()
                     .max_rect(tabs_rect)
@@ -1010,6 +1078,18 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     close = Some(tab.id);
                 }
             }
+            let open_folder = theme::icon_action(
+                &mut tab_strip,
+                top_action_id("open-folder"),
+                theme::IconGlyph::Plus,
+                "Open folder",
+                false,
+                layout.tab_height,
+                theme::BG_CLEAR,
+            );
+            if open_folder.activated {
+                create = true;
+            }
             if overflow {
                 let overflow_action = theme::ghost_action(
                     &mut tab_strip,
@@ -1017,7 +1097,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     "…",
                     false,
                     layout.button_height,
-                    theme::BG_CHROME_GLASS,
+                    theme::BG_CLEAR,
                 );
                 let overflow_response = overflow_action.response;
                 egui::Popup::menu(&overflow_response).show(|ui| {
@@ -1091,75 +1171,71 @@ fn workspace_tab_ui(
     let close_response = ui
         .interact(close_rect, workspace_tab_close_id(tab.id), Sense::click())
         .on_hover_text("Close workspace");
-    let hovered = response.hovered();
+    // The close affordance is part of the tab's pointer-over state: hovering
+    // only the X still applies the parent tab hover fill and label, but the parent
+    // path tooltip is suppressed so the close tooltip is the one shown.
+    let close_hovered = close_response.hovered();
+    let hovered = response.hovered() || close_hovered;
+    let close_scale = theme::close_glyph_scale(ui.ctx().animate_bool_with_time_and_easing(
+        egui::Id::unique(("made-close-scale", tab.id.get())),
+        close_hovered,
+        theme::CLOSE_HOVER_SCALE_TIME,
+        egui::emath::easing::quadratic_out,
+    ));
     let fill = if active {
-        theme::BG_CARD
+        theme::BG_TAB_SELECTED
     } else if hovered {
-        theme::BG_HOVER
+        theme::BG_TAB_HOVER
     } else {
-        Color32::TRANSPARENT
+        theme::BG_TAB_IDLE
     };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(if layout.compact { 6 } else { 7 }),
-            fill,
-        );
-    }
-    if active {
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(
-                egui::pos2(rect.left() + 8.0, rect.bottom() - 2.0),
-                egui::vec2((rect.width() - 16.0).max(1.0), 2.0),
-            ),
-            1,
-            theme::ACCENT,
-        );
-    }
-    let label_width = (rect.width() - 36.0).max(8.0);
-    theme::paint_ellipsized(
-        ui.painter(),
-        egui::pos2(rect.left() + 10.0, rect.center().y - 7.0),
-        sanitize_display(&tab.label, 80),
-        FontId::proportional(12.5),
-        if active || hovered {
-            theme::TEXT_PRIMARY
-        } else {
-            theme::TEXT_SECONDARY
-        },
-        label_width,
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        fill,
+        Stroke::NONE,
+        StrokeKind::Inside,
     );
-    if close_response.hovered() {
-        ui.painter().rect_filled(
-            close_rect.shrink(3.0),
-            CornerRadius::same(4),
-            theme::BG_HOVER,
-        );
-    }
+    let label_width = (rect.width() - 36.0).max(8.0);
+    let color = if active || hovered {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::inactive_tab_text()
+    };
+    let font = FontId::proportional(if active {
+        theme::TAB_SELECTED_FONT_SIZE
+    } else {
+        theme::TAB_FONT_SIZE
+    });
+    let job = theme::ellipsized_job(sanitize_display(&tab.label, 80), font, color, label_width);
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
     ui.painter().text(
         close_rect.center(),
         Align2::CENTER_CENTER,
         "×",
-        FontId::proportional(12.0),
-        if close_response.hovered() {
-            theme::TEXT_PRIMARY
+        FontId::proportional(theme::CLOSE_GLYPH_SIZE * close_scale),
+        if close_hovered {
+            theme::ERROR
         } else {
-            theme::TEXT_TERTIARY
+            theme::inactive_icon_color()
         },
     );
     if response.has_focus() {
-        theme::paint_focus_ring(
-            ui,
-            rect,
-            CornerRadius::same(if layout.compact { 6 } else { 7 }),
-            theme::BG_CHROME_GLASS,
-        );
+        theme::paint_focus_ring(ui, rect, CornerRadius::same(6), theme::BG_CLEAR);
     }
     if close_response.has_focus() {
         theme::paint_inside_focus_ring(ui.painter(), close_rect.shrink(1.0), CornerRadius::same(4));
     }
-    let tab_response =
-        response.on_hover_text(sanitize_display(&tab.path.display().to_string(), 900));
+    let tab_response = if close_hovered {
+        response
+    } else {
+        response.on_hover_text(sanitize_display(&tab.path.display().to_string(), 900))
+    };
     let keyboard = tab_response.has_focus()
         && ui.input(|input| {
             input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
@@ -1387,6 +1463,12 @@ impl Workbench {
                         if response.hovered() || response.dragged() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
+                        let splitter_fade = ui.ctx().animate_bool_with_time_and_easing(
+                            egui::Id::unique(("made-splitter-fade", self.pane_id())),
+                            response.hovered() || response.dragged(),
+                            theme::SPLITTER_FADE_TIME,
+                            egui::emath::easing::quadratic_out,
+                        );
 
                         // Lay the Explorer out at its full width and clip it to
                         // the animated panel. This slides the card in/out
@@ -1414,30 +1496,30 @@ impl Workbench {
 
                         // Paint the divider after the card so the grip cannot
                         // be covered by the sliding content.
-                        if response.hovered() || response.dragged() {
-                            let line_tone = if response.dragged() {
-                                theme::ACCENT
-                            } else {
-                                theme::BORDER_CONTROL_HOVER
-                            };
-                            ui.painter().rect_filled(
-                                egui::Rect::from_center_size(
-                                    splitter.center(),
-                                    egui::vec2(1.0, splitter.height()),
-                                ),
-                                0.0,
-                                line_tone,
-                            );
-                            ui.painter().rect(
-                                egui::Rect::from_center_size(
-                                    splitter.center(),
-                                    egui::vec2(6.0, 32.0),
-                                ),
-                                CornerRadius::same(2),
-                                theme::BG_ELEVATED,
-                                Stroke::new(1.0, line_tone),
-                                StrokeKind::Inside,
-                            );
+                        if splitter_fade > 0.0 {
+                            let dragged = response.dragged();
+                            let opacity = theme::splitter_opacity(splitter_fade, dragged);
+                            if opacity > 0.001 {
+                                let tone = theme::splitter_line_color(splitter_fade, dragged);
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_center_size(
+                                        splitter.center(),
+                                        egui::vec2(1.0, splitter.height()),
+                                    ),
+                                    0.0,
+                                    tone,
+                                );
+                                ui.painter().rect(
+                                    egui::Rect::from_center_size(
+                                        splitter.center(),
+                                        egui::vec2(6.0, 32.0),
+                                    ),
+                                    CornerRadius::same(2),
+                                    theme::splitter_grip_fill(splitter_fade, dragged),
+                                    Stroke::new(1.0, tone),
+                                    StrokeKind::Inside,
+                                );
+                            }
                         }
                         response.on_hover_text("Drag to resize explorer");
                     });
@@ -2364,7 +2446,7 @@ fn tab_strip_ui(
     );
 
     let strip_padding = if layout.compact { 3.0 } else { 4.0 };
-    let tabs_height = layout.tab_height;
+    let tabs_height = layout.session_tab_height;
     let tabs_top = strip.top() + (layout.tab_strip_height - tabs_height) / 2.0;
     let inflight_width = if state.in_flight { 18.0 } else { 0.0 };
     let active_index = state
@@ -2385,8 +2467,13 @@ fn tab_strip_ui(
     let tabs_available = (tabs_right - strip.left() - 2.0 * strip_padding).max(40.0);
     let active_candidate = active_index
         .and_then(|active| candidates.iter().position(|candidate| *candidate == active));
-    let (visible_positions, _width_overflow) =
-        bounded_tab_indices(&candidate_widths, active_candidate, tabs_available, 4.0);
+    let (visible_positions, _width_overflow) = bounded_tab_indices(
+        &candidate_widths,
+        active_candidate,
+        tabs_available,
+        4.0,
+        None,
+    );
     let visible: Vec<usize> = visible_positions
         .iter()
         .filter_map(|position| candidates.get(*position).copied())
@@ -2435,27 +2522,16 @@ fn tab_strip_ui(
                     ui.allocate_exact_size(egui::vec2(tab_width, tabs_height), Sense::click());
                 let is_active = state.active == Some(row.session_id.as_str());
                 let is_selected = state.selected == Some(row.session_id.as_str());
-                let fill = if is_active {
-                    theme::BG_CARD
-                } else if is_selected {
-                    theme::BG_ELEVATED
+                let selected = is_active || is_selected;
+                let fill = if selected {
+                    theme::BG_SELECTED
                 } else if response.hovered() {
                     theme::BG_HOVER
                 } else {
                     Color32::TRANSPARENT
                 };
                 if fill != Color32::TRANSPARENT {
-                    ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
-                }
-                if is_active {
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 8.0, rect.bottom() - 3.0),
-                            egui::vec2((rect.width() - 16.0).max(1.0), 2.0),
-                        ),
-                        1,
-                        theme::ACCENT,
-                    );
+                    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
                 }
 
                 let mut reserve = 8.0;
@@ -2477,18 +2553,22 @@ fn tab_strip_ui(
                 }
                 let title = sanitize_display(&row.display_title(layout.title_chars), 200);
                 let title_width = (rect.width() - 18.0 - reserve).max(16.0);
-                let color = if is_active || is_selected || response.hovered() {
+                let color = if selected || response.hovered() {
                     theme::TEXT_PRIMARY
                 } else {
-                    theme::TEXT_SECONDARY
+                    theme::inactive_tab_text()
                 };
-                theme::paint_ellipsized(
-                    ui.painter(),
-                    egui::pos2(rect.left() + 10.0, rect.top() + 6.0),
-                    title,
-                    FontId::proportional(12.5),
+                let font = FontId::proportional(if selected {
+                    theme::TAB_SELECTED_FONT_SIZE
+                } else {
+                    theme::TAB_FONT_SIZE
+                });
+                let job = theme::ellipsized_job(title, font, color, title_width);
+                let galley = ui.painter().layout_job(job);
+                ui.painter().galley(
+                    egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+                    galley,
                     color,
-                    title_width,
                 );
 
                 let mut x = rect.right() - 8.0;
@@ -2560,7 +2640,7 @@ fn tab_strip_ui(
                 }
 
                 if response.has_focus() {
-                    theme::paint_focus_ring(ui, rect, CornerRadius::same(7), theme::BG_HEADER);
+                    theme::paint_focus_ring(ui, rect, CornerRadius::same(6), theme::BG_HEADER);
                 }
                 let response = response.on_hover_text(format!(
                     "{}\n{}",
@@ -2742,7 +2822,7 @@ fn paint_header(ui: &Ui, rect: egui::Rect, layout: &Layout, top_rounded: bool) {
     );
 }
 
-// ── Shared bands and cards ──────────────────────────────────────────────────
+// ── Shared cards ────────────────────────────────────────────────────────────
 
 fn unavailable_card(ui: &mut Ui, layout: &Layout, title: &str, message: &str) {
     let rect = ui.max_rect();
@@ -2940,6 +3020,46 @@ mod tests {
         }
     }
 
+    fn text_rect(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        fn visit(shape: &egui::Shape, needle: &str, best: &mut Option<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains(needle) => {
+                    *best = Some(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, needle, best);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut best = None;
+        for clipped in &output.shapes {
+            visit(&clipped.shape, needle, &mut best);
+        }
+        best
+    }
+
+    fn fill_rects(output: &egui::FullOutput) -> Vec<(egui::Rect, egui::Color32)> {
+        fn visit(shape: &egui::Shape, rects: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match shape {
+                egui::Shape::Rect(rect) => rects.push((rect.rect, rect.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
     #[test]
     fn unread_with_zero_pulse_renders_the_word() {
         assert_eq!(unread_label(true, 0).as_deref(), Some("unread"));
@@ -2949,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_strip_uses_background_and_underline_without_marker_circles() {
+    fn tab_strip_uses_selected_background_without_underline_or_marker_circles() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let layout = Layout::for_window(720.0, 480.0);
@@ -2992,6 +3112,16 @@ mod tests {
             }
             _ => false,
         });
+        let selected_fill = output.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Rect(rect_shape) => {
+                rect_shape.fill == theme::BG_SELECTED
+                    && (rect_shape.rect.height() - layout.session_tab_height).abs() < 1.0
+            }
+            _ => false,
+        });
+        let active_text = text_rect(&output, "Session 0").expect("active tab text");
+        let selected_text = text_rect(&output, "Session 1").expect("selected tab text");
+        let fills = fill_rects(&output);
         output.textures_delta.clear();
         assert!(!output.shapes.is_empty());
         assert!(
@@ -3003,9 +3133,21 @@ mod tests {
             "session tabs must not paint active/hollow marker circles"
         );
         assert!(
-            accent_underline,
-            "active session tab must keep its underline"
+            !accent_underline,
+            "selected session tab must not paint an underline"
         );
+        assert!(
+            selected_fill,
+            "selected session tab must use the BG_SELECTED fill"
+        );
+        for (name, text) in [("active", active_text), ("selected", selected_text)] {
+            assert!(
+                fills.iter().any(|(rect, fill)| {
+                    *fill == theme::BG_SELECTED && rect.contains_rect(text)
+                }),
+                "{name} session tab must use the BG_SELECTED fill"
+            );
+        }
         let attention_badge = output.shapes.iter().any(|clipped| match &clipped.shape {
             egui::Shape::Circle(circle) => {
                 circle.fill == theme::WARNING_TINT && circle.radius >= 6.0
@@ -3023,18 +3165,32 @@ mod tests {
     #[test]
     fn bounded_tabs_keep_the_active_tab_and_offer_overflow() {
         let widths = vec![120.0, 120.0, 120.0, 120.0];
-        let (visible, overflow) = bounded_tab_indices(&widths, Some(0), 380.0, 4.0);
+        let (visible, overflow) = bounded_tab_indices(&widths, Some(0), 380.0, 4.0, None);
         assert!(overflow);
         assert!(visible.contains(&0));
         assert!(visible.len() < widths.len());
 
-        let (visible, overflow) = bounded_tab_indices(&widths, Some(3), 380.0, 4.0);
+        let (visible, overflow) = bounded_tab_indices(&widths, Some(3), 380.0, 4.0, None);
         assert!(overflow);
         assert!(visible.contains(&3), "active tab must stay visible");
 
-        let (visible, overflow) = bounded_tab_indices(&widths, Some(3), 1_000.0, 4.0);
+        let (visible, overflow) = bounded_tab_indices(&widths, Some(3), 1_000.0, 4.0, None);
         assert!(!overflow);
         assert_eq!(visible, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn bounded_tabs_reserve_the_trailing_plus_and_overflow_trigger() {
+        let widths = vec![120.0, 120.0, 120.0];
+        // 3 tabs + gaps leave no room for the trailing plus: overflow is required
+        // and the plus width/gap must still be reserved from the tab budget.
+        let (visible, overflow) = bounded_tab_indices(&widths, Some(0), 380.0, 4.0, Some(28.0));
+        assert!(overflow);
+        assert_eq!(visible, vec![0, 1]);
+        // 3 tabs + gaps + plus fits without an overflow trigger.
+        let (visible, overflow) = bounded_tab_indices(&widths, Some(0), 420.0, 4.0, Some(28.0));
+        assert!(!overflow);
+        assert_eq!(visible, vec![0, 1, 2]);
     }
 
     #[test]
@@ -3045,32 +3201,36 @@ mod tests {
     }
 
     #[test]
-    fn picker_entries_are_cached_until_the_directory_or_refresh_changes() {
+    fn picker_rows_are_cached_until_the_tree_or_refresh_changes() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..100 {
             std::fs::create_dir(temp.path().join(format!("dir-{index:03}"))).unwrap();
         }
         let mut picker = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
         let ctx = egui::Context::default();
-        let first = picker_display_entries(&ctx, &picker);
-        let second = picker_display_entries(&ctx, &picker);
+        let first = picker_display_rows(&ctx, &picker);
+        let second = picker_display_rows(&ctx, &picker);
         assert_eq!(first.len(), 100);
         assert!(
             Arc::ptr_eq(&first, &second),
-            "unchanged directory must reuse sanitized entries"
+            "unchanged tree must reuse sanitized rows"
         );
         std::fs::rename(temp.path().join("dir-050"), temp.path().join("renamed-050")).unwrap();
         let revision = picker.revision();
         picker.refresh().unwrap();
         assert!(picker.revision() > revision);
-        let third = picker_display_entries(&ctx, &picker);
+        let third = picker_display_rows(&ctx, &picker);
         assert!(!Arc::ptr_eq(&first, &third));
-        assert!(third.iter().any(|entry| entry.name == "renamed-050"));
-        assert!(third.iter().all(|entry| entry.name != "dir-050"));
+        assert!(third.iter().any(|row| row.name == "renamed-050"));
+        assert!(third.iter().all(|row| row.name != "dir-050"));
+        picker.select(0).unwrap();
+        picker.toggle_selected().unwrap();
+        let expanded = picker_display_rows(&ctx, &picker);
+        assert!(!Arc::ptr_eq(&third, &expanded));
         let other = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
         assert_ne!(picker.instance_id(), other.instance_id());
-        let fourth = picker_display_entries(&ctx, &other);
-        assert!(!Arc::ptr_eq(&third, &fourth));
+        let fourth = picker_display_rows(&ctx, &other);
+        assert!(!Arc::ptr_eq(&expanded, &fourth));
     }
 
     #[test]

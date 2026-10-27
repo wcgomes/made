@@ -1,12 +1,12 @@
 # Platform Matrix
 
-The current implementation is verified on **Linux x64 WSL2 under Xvfb/llvmpipe software rendering**. This is not a native Linux desktop, macOS, or Windows pass. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md); current gaps are summarized below and in the [v1 evidence record](../records/20261026-v1-evidence.md).
+The current implementation is verified on **Linux x64 WSL2 under Xvfb/llvmpipe software rendering**. This is not a native Linux desktop, macOS, or Windows pass. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in the [core spec](../../specs/changes/opencode-session-follow-v1/spec.md) and [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); current gaps are summarized below and in the [v1 evidence record](../records/20261026-v1-evidence.md).
 
 ## Runtime status
 
 | Platform / display | Build and automated | Runtime evidence | Status | Notes |
 |---|---|---|---|---|
-| Linux x64 WSL2 / Xvfb X11 | 602/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop. |
+| Linux x64 WSL2 / Xvfb X11 | 631/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
 | Linux x64 native X11 | CI build defined | None | **PENDING** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass. |
 | Linux x64 native Wayland | CI build defined; headless Weston smoke | WSLg/Weston smoke only | **PENDING** | Native compositor input/IME/clipboard and real OpenCode TUI. |
 | macOS arm64 | CI build/test/smoke defined | None | **PENDING** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |
@@ -30,9 +30,9 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 
 | Capability | Linux Xvfb | Native Linux | macOS | Windows |
 |---|---|---|---|---|
-| In-app glass fallback | Verified | Pending compositor | Compile-only | Compile-only |
+| In-app glass fallback (Explorer) | Verified | Pending compositor | Compile-only | Compile-only |
 | Native backdrop | N/A (honest fallback log) | N/A | **Compile-only** | **Compile-only** (Mica only; no acrylic) |
-| Explorer animation/divider | Headless + captures | Pointer pending | Pointer pending | Pointer pending |
+| Mint header, 26/24 card-edge header, 225 fallback alpha, fill-only tab/close scale, splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
 | Preview roundtrip | Native Xvfb | Pending | Pending | Pending |
 | Native IME/clipboard/mouse/paste | Not native | Pending | Pending | Pending |
 | Hardware-GPU frame pacing | Software only | Pending | Pending | Pending |
@@ -43,7 +43,7 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 
 Workflows exist for Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
 
-At the 2026-10-26 snapshot, CI runs/artifacts had **not been observed** from this workspace, and the staged packaged layout had not been launched end-to-end. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
+At the 2026-10-26 snapshot, CI runs/artifacts had **not been observed** from this workspace, and the staged packaged layout had not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
 
 ## Release-blocking gaps
 
