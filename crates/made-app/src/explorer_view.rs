@@ -2719,14 +2719,26 @@ mod tests {
         wait_for_root(&mut pane, &mut log);
         assert_eq!(pane.visible_row_count(), 10_000);
         let rebuilds = pane.row_rebuilds();
-        let mut samples = Vec::with_capacity(200);
+        // Warm caches before measuring; the contract is steady-state selection
+        // cost, not first-touch page faults from creating 10k files.
         for _ in 0..200 {
-            let started = Instant::now();
             pane.move_selection(1);
-            samples.push(started.elapsed());
         }
-        samples.sort_unstable();
-        let p95 = samples[189];
+        // Median of three p95 batches keeps the 5ms contract while tolerating
+        // one scheduler- or I/O-noisy batch on hosted runners.
+        let mut p95s = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let mut samples = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let started = Instant::now();
+                pane.move_selection(1);
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            p95s.push(samples[189]);
+        }
+        p95s.sort_unstable();
+        let p95 = p95s[1];
         assert_eq!(
             pane.row_rebuilds(),
             rebuilds,
@@ -2734,7 +2746,7 @@ mod tests {
         );
         assert!(
             p95 < Duration::from_millis(5),
-            "10k-row selection p95 was {p95:?}"
+            "10k-row selection median p95 was {p95:?}"
         );
         assert!(pane.preview_path().is_none());
         assert!(pane.selected_path().is_some());

@@ -1,5 +1,101 @@
 use made_platform::{PtyRequest, ShellLaunchPlan};
 
+#[cfg(unix)]
+const DSR_QUERY: &[u8] = b"\x1b[6n";
+#[cfg(unix)]
+const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
+
+/// PowerShell's readline asks the terminal for a cursor-position report (DSR)
+/// and waits for the reply before painting its prompt. Answer every query so a
+/// headless PTY is a valid terminal.
+#[cfg(unix)]
+fn answer_cursor_requests(
+    output: &[u8],
+    writer: &mut dyn std::io::Write,
+    answered: &mut usize,
+) -> bool {
+    let requests = output
+        .windows(DSR_QUERY.len())
+        .filter(|window| *window == DSR_QUERY)
+        .count();
+    while *answered < requests {
+        if writer.write_all(DSR_RESPONSE).is_err() {
+            return false;
+        }
+        let _ = writer.flush();
+        *answered += 1;
+    }
+    true
+}
+
+/// Read until every report requested so far has arrived.
+#[cfg(unix)]
+fn receive_shell_report(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    output: &mut Vec<u8>,
+    writer: &mut dyn std::io::Write,
+    reports: usize,
+    answer_cursor_position: bool,
+    answered: &mut usize,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let text = String::from_utf8_lossy(output);
+        if text.matches("\x1b]7;").count() >= reports
+            && text.matches("USER_PROMPT>").count() >= reports
+        {
+            return true;
+        }
+        if let Ok(bytes) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            output.extend(bytes);
+            if answer_cursor_position && !answer_cursor_requests(output, writer, answered) {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Send input one character at a time when the shell queries the terminal.
+/// Writing the whole line first would queue the DSR replies behind the
+/// command text, where readline consumes them as literal keystrokes.
+#[cfg(unix)]
+fn send_shell_command(
+    writer: &mut dyn std::io::Write,
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    output: &mut Vec<u8>,
+    command: &str,
+    answer_cursor_position: bool,
+    answered: &mut usize,
+) {
+    if !answer_cursor_position {
+        writer.write_all(command.as_bytes()).unwrap();
+        writer.flush().unwrap();
+        return;
+    }
+    for character in command.chars() {
+        let mut encoded = [0; 4];
+        writer
+            .write_all(character.encode_utf8(&mut encoded).as_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        let mut quiet_since = std::time::Instant::now();
+        while quiet_since.elapsed() < std::time::Duration::from_millis(50) {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(bytes) => {
+                    output.extend(bytes);
+                    if !answer_cursor_requests(output, writer, answered) {
+                        return;
+                    }
+                    quiet_since = std::time::Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+}
+
 #[test]
 fn decoded_cwd_paths_reject_nonabsolute_control_and_network_paths() {
     for path in [
@@ -57,11 +153,7 @@ fn absent_shell_never_claims_reporting() {
 #[cfg(unix)]
 fn real_installed_shells_preserve_startup_files_and_emit_local_reports() {
     use made_platform::{host_platform, Platform};
-    use std::{
-        io::{Read, Write},
-        sync::mpsc,
-        time::{Duration, Instant},
-    };
+    use std::{io::Read, sync::mpsc};
     for shell in ["bash", "zsh", "fish", "pwsh", "powershell"] {
         if std::process::Command::new(shell)
             .arg("--version")
@@ -113,25 +205,42 @@ fn real_installed_shells_preserve_startup_files_and_emit_local_reports() {
             }
         });
         let mut output = Vec::new();
-        let mut receive = |reports: usize| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                let text = String::from_utf8_lossy(&output);
-                if text.matches("\x1b]7;").count() >= reports
-                    && text.matches("USER_PROMPT>").count() >= reports
-                {
-                    return true;
-                }
-                if let Ok(bytes) = rx.recv_timeout(Duration::from_millis(50)) {
-                    output.extend(bytes);
-                }
-            }
-            false
-        };
-        assert!(receive(1), "{shell} initial cwd missing");
-        writer.write_all("cd 'spaces é 日本'\n".as_bytes()).unwrap();
-        writer.flush().unwrap();
-        assert!(receive(2), "{shell} cd cwd missing");
+        let answer_cursor_position = matches!(shell, "pwsh" | "powershell");
+        let mut answered = 0;
+        let initial = receive_shell_report(
+            &rx,
+            &mut output,
+            writer.as_mut(),
+            1,
+            answer_cursor_position,
+            &mut answered,
+        );
+        assert!(
+            initial,
+            "{shell} initial cwd missing: {}",
+            String::from_utf8_lossy(&output)
+        );
+        send_shell_command(
+            writer.as_mut(),
+            &rx,
+            &mut output,
+            "cd 'spaces é 日本'\r",
+            answer_cursor_position,
+            &mut answered,
+        );
+        let changed = receive_shell_report(
+            &rx,
+            &mut output,
+            writer.as_mut(),
+            2,
+            answer_cursor_position,
+            &mut answered,
+        );
+        assert!(
+            changed,
+            "{shell} cd cwd missing: {}",
+            String::from_utf8_lossy(&output)
+        );
         let text = String::from_utf8_lossy(&output);
         assert!(
             text.contains("STARTUP_OK") && text.contains("HOOK_OK"),

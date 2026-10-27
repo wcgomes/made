@@ -860,8 +860,11 @@ fn isolated(name: &str) -> bool {
     let home = tempfile::tempdir().unwrap();
     let tmp = home.path().join("tmp");
     let runtime = home.path().join("runtime");
-    std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::create_dir_all(&runtime).unwrap();
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -878,7 +881,9 @@ fn isolated(name: &str) -> bool {
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env("TMPDIR", &tmp)
-        .env("XDG_RUNTIME_DIR", &runtime);
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     if std::path::Path::new("/bin/bash").exists() {
         command.env("SHELL", "/bin/bash");
@@ -897,6 +902,15 @@ fn open_workspace(model: &mut AppModel, path: &Path) -> WorkspaceId {
     model.open_plan(LaunchPlan::open(path, WorkspaceSource::Picker).unwrap());
     model.ensure_workbench();
     model.active_workspace_id().expect("active workspace")
+}
+
+fn isolated_log_path() -> PathBuf {
+    use made_platform::Platform;
+    made_platform::host_platform()
+        .app_paths()
+        .expect("isolated app paths")
+        .log_dir
+        .join("integration.log")
 }
 
 fn wait_explorer_ready(headless: &mut Headless, id: WorkspaceId) {
@@ -3531,11 +3545,7 @@ fn diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup() {
     if isolated("diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup") {
         return;
     }
-    let state = std::env::var_os("XDG_STATE_HOME").expect("isolated state home");
-    let log = Path::new(&state)
-        .join("made")
-        .join("log")
-        .join("integration.log");
+    let log = isolated_log_path();
     let backup = PathBuf::from(format!("{}.1", log.display()));
     let lock = PathBuf::from(format!("{}.lock", log.display()));
     fs::create_dir_all(log.parent().unwrap()).unwrap();
@@ -3590,11 +3600,7 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
     if isolated("oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown") {
         return;
     }
-    let state = std::env::var_os("XDG_STATE_HOME").expect("isolated state home");
-    let log = Path::new(&state)
-        .join("made")
-        .join("log")
-        .join("integration.log");
+    let log = isolated_log_path();
     let backup = PathBuf::from(format!("{}.1", log.display()));
     let lock = PathBuf::from(format!("{}.lock", log.display()));
     fs::create_dir_all(log.parent().unwrap()).unwrap();

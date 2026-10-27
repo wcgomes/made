@@ -20,8 +20,11 @@ fn isolated(name: &str) -> bool {
     std::fs::create_dir(&bin).unwrap();
     let tmp = home.path().join("tmp");
     let runtime = home.path().join("runtime");
-    std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::create_dir_all(&runtime).unwrap();
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -38,7 +41,9 @@ fn isolated(name: &str) -> bool {
         .env("XDG_STATE_HOME", home.path().join("state"))
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env("TMPDIR", &tmp)
-        .env("XDG_RUNTIME_DIR", &runtime);
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
         let executable = bin.join("opencode");

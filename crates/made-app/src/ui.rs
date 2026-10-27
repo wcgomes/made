@@ -3121,7 +3121,9 @@ mod tests {
             let home = temp.path().join("home");
             let tmp = temp.path().join("tmp");
             let runtime = temp.path().join("runtime");
-            for directory in [&home, &tmp, &runtime] {
+            let roaming = temp.path().join("appdata").join("roaming");
+            let local = temp.path().join("appdata").join("local");
+            for directory in [&home, &tmp, &runtime, &roaming, &local] {
                 std::fs::create_dir_all(directory).expect("isolated app-path directory");
             }
             #[cfg(unix)]
@@ -3140,6 +3142,8 @@ mod tests {
                 "XDG_CACHE_HOME",
                 "TMPDIR",
                 "XDG_RUNTIME_DIR",
+                "APPDATA",
+                "LOCALAPPDATA",
             ];
             let saved = variables
                 .iter()
@@ -3153,6 +3157,8 @@ mod tests {
             std::env::set_var("XDG_CACHE_HOME", temp.path().join("cache"));
             std::env::set_var("TMPDIR", temp.path());
             std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+            std::env::set_var("APPDATA", &roaming);
+            std::env::set_var("LOCALAPPDATA", &local);
 
             Self {
                 _guard: guard,

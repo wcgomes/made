@@ -2063,7 +2063,8 @@ mod posix_pty {
 
 #[cfg(windows)]
 mod windows_pty {
-    use std::io::Read;
+    use std::io::{self, Read};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2097,15 +2098,31 @@ mod windows_pty {
         let heartbeat = root.join("heartbeat.log");
         let child_pid = root.join("child.pid");
         let script_path = root.join("descendant.ps1");
+        let child_script = root.join("child.ps1");
+        std::fs::write(
+            &child_script,
+            r#"param(
+    [string]$Heartbeat
+)
+for (;;) {
+    Add-Content -LiteralPath $Heartbeat -Value tick
+    Start-Sleep -Milliseconds 100
+}
+"#,
+        )
+        .expect("write child script");
         std::fs::write(
             &script_path,
             r#"param(
     [string]$Heartbeat,
-    [string]$ChildPid
+    [string]$ChildPid,
+    [string]$ChildScript
 )
-$inner = "for (;;) { Add-Content -LiteralPath '$Heartbeat' -Value tick; Start-Sleep -Milliseconds 100 }"
-$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
-$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-EncodedCommand',$encoded -NoNewWindow -PassThru
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = Join-Path $PSHOME 'powershell.exe'
+$psi.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $ChildScript + '" -Heartbeat "' + $Heartbeat + '"'
+$psi.UseShellExecute = $false
+$child = [System.Diagnostics.Process]::Start($psi)
 $child.Id | Set-Content -LiteralPath $ChildPid
 while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 }
 "#,
@@ -2125,6 +2142,8 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
             heartbeat.clone().into_os_string(),
             OsString::from("-ChildPid"),
             child_pid.clone().into_os_string(),
+            OsString::from("-ChildScript"),
+            child_script.into_os_string(),
         ];
         request.env = platform.environment(&[], &[]).into_vec();
         request.size = PtySize { rows: 24, cols: 80 };
@@ -2132,16 +2151,42 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
             .spawn_pty(&request)
             .expect("spawn PowerShell in a Job Object");
 
-        // Drain output so a chatty child cannot fill the ConPTY buffer.
+        // Drain output so a chatty child cannot fill the ConPTY buffer, and
+        // retain the tail for a useful failure message.
         let mut reader = session.take_reader().expect("take reader");
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let reader_captured = Arc::clone(&captured);
         let reader_thread = thread::spawn(move || {
             let mut buffer = [0; 4096];
-            while reader.read(&mut buffer).is_ok_and(|read| read > 0) {}
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let mut output = reader_captured
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        output.extend_from_slice(&buffer[..read]);
+                        if output.len() > 8192 {
+                            let excess = output.len() - 8192;
+                            output.drain(..excess);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
         });
 
+        let heartbeat_len = wait_for_file_len(&heartbeat, 8, Duration::from_secs(10));
+        let captured_text = {
+            let output = captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            String::from_utf8_lossy(output.as_slice()).into_owned()
+        };
         assert!(
-            wait_for_file_len(&heartbeat, 8, Duration::from_secs(10)) > 0,
-            "descendant never wrote a heartbeat"
+            heartbeat_len > 0,
+            "descendant never wrote a heartbeat; PowerShell output: {captured_text}"
         );
 
         // The direct shell exits while its descendant stays in the job.
