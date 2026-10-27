@@ -6,7 +6,7 @@ The current implementation is verified on **Linux x64 WSL2 under Xvfb/llvmpipe s
 
 | Platform / display | Build and automated | Runtime evidence | Status | Notes |
 |---|---|---|---|---|
-| Linux x64 WSL2 / Xvfb X11 | 630/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
+| Linux x64 WSL2 / Xvfb X11 | 654/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, bounded diagnostics log rotation/retention, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
 | Linux x64 native X11 | CI build defined | None | **PENDING** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass. |
 | Linux x64 native Wayland | CI build defined; headless Weston smoke | WSLg/Weston smoke only | **PENDING** | Native compositor input/IME/clipboard and real OpenCode TUI. |
 | macOS arm64 | CI build/test/smoke defined | None | **PENDING** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |
@@ -34,6 +34,7 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 | Native backdrop | N/A (honest fallback log) | N/A | **Compile-only** | **Compile-only** (Mica only; no acrylic) |
 | Mint header, 26/24 card-edge header, 225 fallback alpha, fill-only tab/close scale, splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
 | Preview roundtrip | Native Xvfb | Pending | Pending | Pending |
+| Diagnostics log rotation, `.1` retention, 0600/0700, bounded lock/refusal, final-exit stderr visibility gap | Verified Linux automated | Pending native lock/reparse check | Pending native lock/reparse check | Pending native lock/reparse check |
 | Native IME/clipboard/mouse/paste | Not native | Pending | Pending | Pending |
 | Hardware-GPU frame pacing | Software only | Pending | Pending | Pending |
 | Job Object descendant cleanup | N/A | N/A | N/A | Implemented/cross-compiled; native pending |

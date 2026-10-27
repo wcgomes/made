@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use made_bridge::security::{redact_secret, Token};
-use made_platform::{Clipboard, PlatformError};
+use made_platform::{previous_private_log_path, Clipboard, PlatformError};
 
 use crate::integration_status::{IntegrationState, IntegrationStatus, StatusChange};
 use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_log_text};
@@ -24,6 +24,22 @@ use crate::worktree::{MetadataStatus, WorktreeMetadata};
 
 /// Maximum number of retained log entries.
 pub const MAX_LOG_ENTRIES: usize = 500;
+
+/// Maximum size of one written diagnostics log file.
+pub const MAX_LOG_FILE_BYTES: u64 = made_platform::DIAGNOSTICS_LOG_MAX_BYTES;
+
+/// Maximum UTF-8 byte length of one entry message before truncation.
+pub const MAX_LOG_MESSAGE_BYTES: usize = 4096;
+
+/// Maximum retained rendered log text before oldest entries are evicted.
+///
+/// Half of [`MAX_LOG_FILE_BYTES`] leaves room for the snapshot header,
+/// workspace context, and the per-record header while keeping every written
+/// record well below the rotation threshold.
+pub const MAX_LOG_TEXT_BYTES: usize = 512 * 1024;
+
+/// Marker appended to a message truncated at [`MAX_LOG_MESSAGE_BYTES`].
+pub const LOG_TRUNCATION_MARKER: &str = " [truncated]";
 
 /// Default log file name under the platform log directory.
 pub const DEFAULT_LOG_FILE: &str = "integration.log";
@@ -111,6 +127,7 @@ pub struct DiagnosticLog {
     entries: VecDeque<LogEntry>,
     capacity: usize,
     next_sequence: u64,
+    retained_text_bytes: usize,
 }
 
 impl Default for DiagnosticLog {
@@ -131,6 +148,7 @@ impl DiagnosticLog {
             entries: VecDeque::with_capacity(capacity.max(1)),
             capacity: capacity.max(1),
             next_sequence: 0,
+            retained_text_bytes: 0,
         }
     }
 
@@ -171,19 +189,35 @@ impl DiagnosticLog {
     /// Append an entry, sanitizing every untrusted field first.
     ///
     /// The caller is responsible for token redaction; this method removes
-    /// control sequences, bidi controls, and line breaks from messages.
+    /// control sequences, bidi controls, and line breaks from messages. Each
+    /// free-text field is capped at [`MAX_LOG_MESSAGE_BYTES`] on a UTF-8
+    /// boundary with [`LOG_TRUNCATION_MARKER`], and the oldest entries are
+    /// evicted until the rendered text fits [`MAX_LOG_TEXT_BYTES`].
     pub fn push(&mut self, mut entry: LogEntry) -> Option<LogEntry> {
-        entry.message = sanitize_log_text(&entry.message);
-        entry.reason = entry.reason.map(|reason| sanitize_log_text(&reason));
-        entry.session_id = entry.session_id.map(|session| sanitize_log_text(&session));
+        entry.message =
+            truncate_log_field(sanitize_log_text(&entry.message), MAX_LOG_MESSAGE_BYTES);
+        entry.reason = entry
+            .reason
+            .map(|reason| truncate_log_field(sanitize_log_text(&reason), MAX_LOG_MESSAGE_BYTES));
+        entry.session_id = entry
+            .session_id
+            .map(|session| truncate_log_field(sanitize_log_text(&session), MAX_LOG_MESSAGE_BYTES));
         self.next_sequence = self.next_sequence.saturating_add(1);
         entry.sequence = self.next_sequence;
+        let cost = rendered_entry_bytes(&entry);
         let evicted = if self.entries.len() >= self.capacity {
             self.entries.pop_front()
         } else {
             None
         };
+        if let Some(evicted) = &evicted {
+            self.retained_text_bytes = self
+                .retained_text_bytes
+                .saturating_sub(rendered_entry_bytes(evicted));
+        }
+        self.retained_text_bytes = self.retained_text_bytes.saturating_add(cost);
         self.entries.push_back(entry);
+        self.enforce_text_budget();
         evicted
     }
 
@@ -217,20 +251,48 @@ impl DiagnosticLog {
     /// launch logging.
     pub fn redact_all(&mut self, token: &Token) {
         for entry in &mut self.entries {
-            entry.message = sanitize_log_text(&redact_secret(&entry.message, token));
+            entry.message = truncate_log_field(
+                sanitize_log_text(&redact_secret(&entry.message, token)),
+                MAX_LOG_MESSAGE_BYTES,
+            );
             if let Some(reason) = &entry.reason {
-                entry.reason = Some(sanitize_log_text(&redact_secret(reason, token)));
+                entry.reason = Some(truncate_log_field(
+                    sanitize_log_text(&redact_secret(reason, token)),
+                    MAX_LOG_MESSAGE_BYTES,
+                ));
             }
             if let Some(session_id) = &entry.session_id {
-                entry.session_id = Some(sanitize_log_text(&redact_secret(session_id, token)));
+                entry.session_id = Some(truncate_log_field(
+                    sanitize_log_text(&redact_secret(session_id, token)),
+                    MAX_LOG_MESSAGE_BYTES,
+                ));
             }
         }
+        self.retained_text_bytes = self
+            .entries
+            .iter()
+            .map(rendered_entry_bytes)
+            .fold(0usize, usize::saturating_add);
+        self.enforce_text_budget();
     }
 
     /// Remove every entry.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.retained_text_bytes = 0;
         self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    /// Evict oldest entries until the rendered text fits the text budget.
+    fn enforce_text_budget(&mut self) {
+        while self.retained_text_bytes > MAX_LOG_TEXT_BYTES && self.entries.len() > 1 {
+            let Some(front) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_text_bytes = self
+                .retained_text_bytes
+                .saturating_sub(rendered_entry_bytes(&front));
+        }
     }
 }
 
@@ -240,6 +302,8 @@ pub struct Diagnostics {
     log: DiagnosticLog,
     log_location: PathBuf,
     log_location_display: String,
+    previous_log_location: PathBuf,
+    previous_log_location_display: String,
     app_version: String,
     token_fingerprint: Option<String>,
 }
@@ -250,10 +314,17 @@ impl Diagnostics {
         let log_location = log_location.into();
         let log_location_display =
             sanitize_display(&redact_hex_secrets(&log_location.to_string_lossy()), 2048);
+        let previous_log_location = previous_private_log_path(&log_location);
+        let previous_log_location_display = sanitize_display(
+            &redact_hex_secrets(&previous_log_location.to_string_lossy()),
+            2048,
+        );
         Self {
             log: DiagnosticLog::new(),
             log_location,
             log_location_display,
+            previous_log_location,
+            previous_log_location_display,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             token_fingerprint: None,
         }
@@ -270,6 +341,8 @@ impl Diagnostics {
             log: DiagnosticLog::new(),
             log_location: PathBuf::new(),
             log_location_display: sanitize_display(&message, 2048),
+            previous_log_location: PathBuf::new(),
+            previous_log_location_display: String::new(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             token_fingerprint: None,
         }
@@ -307,12 +380,39 @@ impl Diagnostics {
         &self.log_location_display
     }
 
+    /// Previous-log path derived from the active log path.
+    pub fn previous_log_location(&self) -> &Path {
+        &self.previous_log_location
+    }
+
+    /// Copyable, sanitized previous-log path.
+    pub fn copyable_previous_log_path(&self) -> &str {
+        &self.previous_log_location_display
+    }
+
+    /// Whether the previous log exists as a regular file.
+    pub fn previous_log_exists(&self) -> bool {
+        !self.previous_log_location.as_os_str().is_empty()
+            && std::fs::symlink_metadata(&self.previous_log_location)
+                .is_ok_and(|metadata| metadata.is_file())
+    }
+
     /// Copy the sanitized log path to the supplied clipboard.
     ///
     /// Token redaction is applied by the caller when it holds the bridge token;
     /// this method only guarantees control/bidi sanitization.
     pub fn copy_log_path(&self, clipboard: &mut dyn Clipboard) -> Result<(), PlatformError> {
         let path = sanitize_copy_text(&self.log_location_display, None, 2048);
+        let path = sanitize_log_text(&redact_hex_secrets(&path));
+        clipboard.set_text(&path)
+    }
+
+    /// Copy the sanitized previous-log path to the supplied clipboard.
+    pub fn copy_previous_log_path(
+        &self,
+        clipboard: &mut dyn Clipboard,
+    ) -> Result<(), PlatformError> {
+        let path = sanitize_copy_text(&self.previous_log_location_display, None, 2048);
         let path = sanitize_log_text(&redact_hex_secrets(&path));
         clipboard.set_text(&path)
     }
@@ -416,6 +516,12 @@ impl Diagnostics {
                 .map(|last| now.saturating_duration_since(last)),
             tabs_enabled: report.tabs_enabled,
             log_location: sanitize_display(&self.log_location_display, 2048),
+            previous_log_location: if self.previous_log_location.as_os_str().is_empty() {
+                None
+            } else {
+                Some(sanitize_display(&self.previous_log_location_display, 2048))
+            },
+            previous_log_exists: self.previous_log_exists(),
             token_fingerprint: self
                 .token_fingerprint
                 .clone()
@@ -429,7 +535,9 @@ impl Diagnostics {
                     if let Some(reason) = &entry.reason {
                         entry.reason = Some(sanitize_log_text(&redact_hex_secrets(reason)));
                     }
-                    entry.session_id = entry.session_id.map(|session| sanitize_log_text(&session));
+                    entry.session_id = entry
+                        .session_id
+                        .map(|session| sanitize_log_text(&redact_hex_secrets(&session)));
                     entry
                 })
                 .collect(),
@@ -523,6 +631,10 @@ pub struct DiagnosticsSnapshot {
     pub tabs_enabled: bool,
     /// Copyable log location.
     pub log_location: String,
+    /// Copyable previous-log location, when a log path is available.
+    pub previous_log_location: Option<String>,
+    /// Whether the previous log currently exists as a regular file.
+    pub previous_log_exists: bool,
     /// Safe bridge token fingerprint.
     pub token_fingerprint: Option<String>,
     /// Recent log entries, oldest to newest.
@@ -683,6 +795,9 @@ impl DiagnosticsSnapshot {
             if self.tabs_enabled { "yes" } else { "no" },
         );
         push_line(&mut text, "log location", &self.log_location);
+        if let Some(previous) = &self.previous_log_location {
+            push_line(&mut text, "previous log location", previous);
+        }
         if let Some(fingerprint) = &self.token_fingerprint {
             push_line(&mut text, "token fingerprint", fingerprint);
         }
@@ -721,9 +836,54 @@ impl DiagnosticsSnapshot {
     }
 }
 
+/// Truncate one log field to a UTF-8 boundary and append the truncation marker.
+fn truncate_log_field(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let keep = max_bytes.saturating_sub(LOG_TRUNCATION_MARKER.len());
+    let mut boundary = keep.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    text.push_str(LOG_TRUNCATION_MARKER);
+    text
+}
+
+/// Conservative rendered-byte cost of one entry in [`DiagnosticsSnapshot::to_text`].
+///
+/// Stored fields are already sanitized. Rendering sanitizes and redacts again,
+/// which can only keep or shorten these bytes, so this is a safe upper bound
+/// for the text budget.
+fn rendered_entry_bytes(entry: &LogEntry) -> usize {
+    let digits = entry
+        .sequence
+        .checked_ilog10()
+        .map_or(1, |digits| digits as usize + 1);
+    2 // leading indent
+        + 1 // '#'
+        + digits
+        + 1 // space before '['
+        + 1 // '['
+        + entry.level.label().len()
+        + 1 // ']'
+        + 1 // space before message
+        + entry.message.len()
+        + entry
+            .reason
+            .as_ref()
+            .map_or(0, |reason| " reason=".len() + reason.len())
+        + entry
+            .session_id
+            .as_ref()
+            .map_or(0, |session| " session=".len() + session.len())
+        + 1 // newline
+}
+
 /// Replace hexadecimal runs of 64 or more characters, the encoded length of a
 /// 256-bit bridge token.
-fn redact_hex_secrets(text: &str) -> String {
+pub(crate) fn redact_hex_secrets(text: &str) -> String {
     const SECRET_HEX_CHARS: usize = 64;
 
     let mut redacted = String::with_capacity(text.len());

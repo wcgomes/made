@@ -28,6 +28,7 @@ use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
 use crate::workbench::{LeftSurface, Workbench};
 use crate::APP_VERSION;
+use made_platform::{Clipboard, LogIssueSeverity, PlatformError};
 
 // ── Status tone mapping ─────────────────────────────────────────────────────
 
@@ -1295,6 +1296,10 @@ fn diagnostics_metrics_bucket(ctx: &egui::Context) -> u64 {
     (ctx.input(|input| input.time) * 4.0).floor().max(0.0) as u64
 }
 
+fn diagnostics_previous_log_bucket(ctx: &egui::Context) -> u64 {
+    ctx.input(|input| input.time).floor().max(0.0) as u64
+}
+
 fn heartbeat_age(
     last: Option<std::time::Instant>,
     now: std::time::Instant,
@@ -1305,6 +1310,34 @@ fn heartbeat_age(
 /// Stable id for the diagnostics copy action in one workspace.
 pub fn diagnostics_copy_id(pane_id: &str) -> egui::Id {
     egui::Id::unique(("made-diagnostics-copy", pane_id))
+}
+
+/// Stable id for the previous-log copy action in one workspace.
+pub fn diagnostics_previous_log_copy_id(pane_id: &str) -> egui::Id {
+    egui::Id::unique(("made-diagnostics-previous-log-copy", pane_id))
+}
+
+/// Stable id for the previous-log path label in one workspace.
+pub fn diagnostics_previous_log_path_id(pane_id: &str) -> egui::Id {
+    egui::Id::unique(("made-diagnostics-previous-log-path", pane_id))
+}
+
+/// Minimal clipboard adapter so UI copy actions use the diagnostics API.
+struct UiClipboard {
+    ctx: egui::Context,
+}
+
+impl Clipboard for UiClipboard {
+    fn get_text(&mut self) -> Result<String, PlatformError> {
+        Err(PlatformError::message(
+            "clipboard read is not available from the diagnostics window",
+        ))
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), PlatformError> {
+        self.ctx.copy_text(text.to_owned());
+        Ok(())
+    }
 }
 
 impl Workbench {
@@ -1961,6 +1994,20 @@ impl Workbench {
         cache
     }
 
+    /// Previous-log existence, statting at most once per second while open.
+    fn diagnostics_previous_log_exists(&self, ctx: &egui::Context) -> bool {
+        let bucket = diagnostics_previous_log_bucket(ctx);
+        let id = egui::Id::unique(("made-diagnostics-previous-log-exists", self.pane_id()));
+        if let Some((cached_bucket, exists)) = ctx.data(|data| data.get_temp::<(u64, bool)>(id)) {
+            if cached_bucket == bucket {
+                return exists;
+            }
+        }
+        let exists = self.diag.previous_log_exists();
+        ctx.data_mut(|data| data.insert_temp(id, (bucket, exists)));
+        exists
+    }
+
     fn diagnostics_metrics_cache(&self, ctx: &egui::Context) -> Arc<DiagnosticsMetricsCache> {
         let bucket = diagnostics_metrics_bucket(ctx);
         let id = diagnostics_metrics_cache_id(self.pane_id());
@@ -2002,6 +2049,7 @@ impl Workbench {
             });
         }
         let cache = self.diagnostics_cache(ctx);
+        let previous_log_exists = self.diagnostics_previous_log_exists(ctx);
         let metrics_cache = self.diagnostics_metrics_cache(ctx);
         let snapshot = &cache.snapshot;
         let performance = metrics_cache.text.as_str();
@@ -2009,8 +2057,9 @@ impl Workbench {
         let heartbeat_age =
             heartbeat_age(self.integration.last_heartbeat(), std::time::Instant::now());
         let config_failure = self.config_failure.clone();
-        let log_write_error = self.log_write_error.clone();
+        let log_write_issue = self.log_write_issue.clone();
         let log_path = cache.log_path.as_str();
+        let pane_id = self.pane_id().to_owned();
         let reason_full = snapshot.reason.clone();
         let reason = sanitize_display(&reason_full, 320);
         let content = ctx.content_rect();
@@ -2019,6 +2068,7 @@ impl Workbench {
         let position = content.center() - egui::vec2(width / 2.0, height / 2.0);
         let mut open = *show_diagnostics;
         let mut copy_requested = false;
+        let mut previous_copy_requested = false;
 
         egui::Window::new("Diagnostics")
             .id(egui::Id::unique((
@@ -2065,14 +2115,19 @@ impl Workbench {
                         &sanitize_display(failure, 700),
                     );
                 }
-                if let Some(error) = &log_write_error {
+                if let Some(issue) = &log_write_issue {
+                    let (fill, tone) = log_issue_tone(issue.severity);
+                    let message = crate::diagnostics::redact_hex_secrets(&sanitize_display(
+                        &issue.message,
+                        700,
+                    ));
                     notice_strip(
                         ui,
                         layout,
-                        theme::ERROR_TINT,
-                        theme::ERROR,
-                        &format!("log: {}", sanitize_display(error, 400)),
-                        &sanitize_display(error, 700),
+                        fill,
+                        tone,
+                        &format!("log: {}", sanitize_display(&message, 400)),
+                        &message,
                     );
                 }
 
@@ -2331,6 +2386,47 @@ impl Workbench {
                             });
                     });
 
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::mono("Previous log", 10.0, theme::TEXT_TERTIARY));
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let exists = previous_log_exists;
+                        let action = theme::quiet_secondary_action(
+                            ui,
+                            diagnostics_previous_log_copy_id(&pane_id),
+                            "Copy previous log path",
+                            layout.button_height,
+                            exists,
+                            theme::BG_DEEP,
+                        );
+                        action.response.on_hover_text("Copy the previous log path");
+                        if action.activated && snapshot.previous_log_location.is_some() {
+                            previous_copy_requested = true;
+                        }
+                        let path = snapshot
+                            .previous_log_location
+                            .as_deref()
+                            .unwrap_or("unavailable");
+                        let response = ui.add(
+                            egui::Label::new(theme::mono(
+                                sanitize_display(path, 512),
+                                10.0,
+                                theme::TEXT_TERTIARY,
+                            ))
+                            .truncate(),
+                        );
+                        ui.interact(
+                            response.rect,
+                            diagnostics_previous_log_path_id(&pane_id),
+                            Sense::hover(),
+                        )
+                        .on_hover_text(sanitize_display(path, 2048));
+                    });
+                });
+                if !previous_log_exists {
+                    ui.label(theme::mono("not yet rotated", 10.0, theme::TEXT_TERTIARY));
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(theme::mono(log_path, 10.0, theme::TEXT_TERTIARY));
@@ -2345,6 +2441,12 @@ impl Workbench {
             });
 
         *show_diagnostics = open;
+        if previous_copy_requested {
+            let mut clipboard = UiClipboard { ctx: ctx.clone() };
+            if let Err(error) = self.diag.copy_previous_log_path(&mut clipboard) {
+                eprintln!("made: could not copy previous log path: {error}");
+            }
+        }
         if copy_requested {
             ctx.data_mut(|data| {
                 data.remove::<Arc<DiagnosticsUiCache>>(diagnostics_cache_id(self.pane_id()));
@@ -2923,6 +3025,13 @@ fn log_level_tone(level: crate::diagnostics::LogLevel) -> (Color32, Color32) {
     }
 }
 
+fn log_issue_tone(severity: LogIssueSeverity) -> (Color32, Color32) {
+    match severity {
+        LogIssueSeverity::Warning => (theme::WARNING_TINT, theme::WARNING),
+        LogIssueSeverity::Error => (theme::ERROR_TINT, theme::ERROR),
+    }
+}
+
 fn diagnostics_section(ui: &mut Ui, label: &str) {
     ui.add_space(8.0);
     theme::section_label(ui, label);
@@ -2992,6 +3101,80 @@ pub fn unread_label(unread: bool, prompt_pulse: u32) -> Option<String> {
 mod tests {
     use super::*;
     use crate::session_map::SessionRow;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static APP_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes and restores app-path environment variables for unit tests
+    /// that must construct a real `Workbench`. `Drop` restores every variable
+    /// even if the test panics.
+    struct IsolatedAppPaths {
+        _guard: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _temp: tempfile::TempDir,
+    }
+
+    impl IsolatedAppPaths {
+        fn new() -> Self {
+            let guard = APP_PATH_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let temp = tempfile::tempdir().expect("isolated app-path tempdir");
+            let home = temp.path().join("home");
+            let tmp = temp.path().join("tmp");
+            let runtime = temp.path().join("runtime");
+            for directory in [&home, &tmp, &runtime] {
+                std::fs::create_dir_all(directory).expect("isolated app-path directory");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+                    .expect("runtime permissions");
+            }
+
+            let variables = [
+                "HOME",
+                "USERPROFILE",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "TMPDIR",
+                "XDG_RUNTIME_DIR",
+            ];
+            let saved = variables
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join("config"));
+            std::env::set_var("XDG_DATA_HOME", temp.path().join("data"));
+            std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
+            std::env::set_var("XDG_CACHE_HOME", temp.path().join("cache"));
+            std::env::set_var("TMPDIR", temp.path());
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+            Self {
+                _guard: guard,
+                saved,
+                _temp: temp,
+            }
+        }
+    }
+
+    impl Drop for IsolatedAppPaths {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     fn row(index: usize, active: bool) -> SessionRow {
         SessionRow {
@@ -3270,6 +3453,7 @@ mod tests {
 
     #[test]
     fn diagnostics_metrics_cache_refreshes_counters_while_open() {
+        let _app_paths = IsolatedAppPaths::new();
         let temp = tempfile::tempdir().unwrap();
         let mut model = AppModel::from_launch(
             crate::workspace::WorkspaceLaunch::waiting_for_picker(),
@@ -3354,6 +3538,18 @@ mod tests {
     #[test]
     fn picker_primary_action_is_the_accent_control() {
         assert_eq!(picker_primary_label(), "Use current folder");
+    }
+
+    #[test]
+    fn log_issue_severity_selects_warning_or_error_tone() {
+        assert_eq!(
+            log_issue_tone(LogIssueSeverity::Warning),
+            (theme::WARNING_TINT, theme::WARNING)
+        );
+        assert_eq!(
+            log_issue_tone(LogIssueSeverity::Error),
+            (theme::ERROR_TINT, theme::ERROR)
+        );
     }
 
     #[test]

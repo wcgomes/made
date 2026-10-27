@@ -18,6 +18,15 @@ fn isolated(name: &str) -> bool {
     let sentinel = home.path().join("unexpected-opencode-launch");
     let bin = home.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", name, "--nocapture"])
@@ -27,7 +36,9 @@ fn isolated(name: &str) -> bool {
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_DATA_HOME", home.path().join("data"))
         .env("XDG_STATE_HOME", home.path().join("state"))
-        .env("XDG_CACHE_HOME", home.path().join("cache"));
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
         let executable = bin.join("opencode");

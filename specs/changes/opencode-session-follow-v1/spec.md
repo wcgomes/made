@@ -532,6 +532,8 @@ Made MUST NOT use a webview runtime. Extreme responsiveness and fluid interactio
 
 Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session and workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible without a debugger. User-action failures MUST remain discoverable. Logs and copied diagnostics MUST NOT contain workspace-instance secrets. Diagnostics panel layout, technical-detail placement, and routine chrome are owned by the UI spec.
 
+Diagnostics logs MUST be bounded and retained as one active log plus one previous log. For current-version appends that take the app-owned lock, the active log MUST stay at most 1 MiB; Made MUST rotate before a write would exceed it. A mixed-version or non-cooperating writer can exceed this bound and is a documented residual. The previous log may exceed 1 MiB only when it preserves a legacy active file that was already oversized; its bytes MUST NOT be truncated, rewritten, or deleted. A single entry message MUST be capped at 4 KiB on a UTF-8 boundary with a visible truncation marker, retained log text MUST be capped at 512 KiB with oldest entries evicted before newer ones, at most 500 entries MUST be retained, and every record written to the active log MUST be smaller than 1 MiB. Every append MUST be serialized by an app-owned lock with a bounded wait. If the lock is unavailable or times out, or a required rotation cannot be performed safely, the append MUST be refused and the active and previous logs left untouched. Startup MUST keep a non-blocking warning for a legacy active log already above 1 MiB and for an unsafe previous-log or lock path. Write and rotation failures MUST be reported on stderr; Diagnostics shows a warning or error only while the app is still rendering (the startup warnings and any issue present before the window closes). Final-exit write failures are not visible in-app and remain a documented evidence gap.
+
 #### Scenario: Connected diagnostics
 
 - Given integration is connected
@@ -555,6 +557,36 @@ Made MUST expose optional integration status (inactive, connected, unavailable/d
 - Given integration logs are available
 - When the user inspects them
 - Then the per-instance secret is absent and the log entries identify the relevant session or connection
+
+#### Scenario: Bounded log rotation preserves history
+
+- Given the active diagnostics log is near 1 MiB and a current-version clean shutdown writes a record that takes the lock
+- When that record would exceed 1 MiB
+- Then the active log becomes the single previous log before the new record is appended, no existing bytes are truncated, rewritten, or deleted, the active log stays at most 1 MiB, and the previous log may exceed 1 MiB only when it preserves a legacy oversized file
+
+#### Scenario: Oversized log content stays bounded
+
+- Given a log entry message exceeds 4 KiB or retained log text would exceed 512 KiB
+- When entries are recorded and Diagnostics is inspected or copied
+- Then the message is truncated on a UTF-8 boundary with a marker, oldest entries are evicted before newer ones, at most 500 entries remain, and the record written to the active log stays below 1 MiB
+
+#### Scenario: Log retention failure is reported
+
+- Given the diagnostics log lock is unavailable or times out, the previous-log path is unsafe, or a required rotation fails
+- When a diagnostics log record is written, including at final shutdown
+- Then the record is refused, the active and previous logs are left untouched, the failure is reported on stderr, and Diagnostics shows an error only while the app is still rendering; final-exit failures are not visible in-app
+
+#### Scenario: Legacy oversized log warning
+
+- Given an existing active diagnostics log is above 1 MiB at startup
+- When the workspace starts and Diagnostics is opened before shutdown
+- Then a non-blocking warning states that it will be kept as the previous log on the next shutdown write, and future writes are not refused
+
+#### Scenario: Unsafe log path warning
+
+- Given the previous-log or lock path exists as a symlink or non-regular file at startup
+- When the workspace starts and Diagnostics is opened before shutdown
+- Then a non-blocking warning names the unsafe path and states that rotation or writes will be refused
 
 #### Scenario: Shell-only diagnostics
 

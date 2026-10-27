@@ -6,7 +6,6 @@
 //! performs synchronous config/PTY setup (including shell policy preflight);
 //! callers must not mistake that remaining launch cost for background work.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -21,11 +20,14 @@ use made_bridge::security::Token;
 use made_bridge::server::{self, BridgeEvent, BridgeHandle, BridgeOptions};
 use made_bridge::state::SessionSnapshot;
 use made_explorer::root_switch::RootGeneration;
-use made_platform::{host_platform, AppPaths, Platform, PlatformFamily, PtySize};
+use made_platform::{
+    host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
+};
 use made_terminal::PtyOptions;
 
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
+    MAX_LOG_FILE_BYTES,
 };
 use crate::explorer_view::ExplorerPane;
 use crate::integration_status::{IntegrationState, IntegrationStatus};
@@ -168,10 +170,6 @@ pub enum LeftSurface {
     Preview,
 }
 
-/// Maximum diagnostics log size before new entries are refused. The helper is
-/// append-only; Made never truncates or rewrites an existing log.
-const MAX_LOG_BYTES: u64 = 1024 * 1024;
-
 /// Maximum size of the user-owned OpenCode config Made is willing to read on
 /// the workspace preparation path. Larger or special files are skipped rather
 /// than read, so opening a workspace cannot stall behind an unbounded read.
@@ -229,7 +227,7 @@ pub struct Workbench {
     paint_count: u64,
     last_osc7_cwd: Option<PathBuf>,
     log_path: Option<PathBuf>,
-    pub(crate) log_write_error: Option<String>,
+    pub(crate) log_write_issue: Option<LogIssue>,
     /// Preparation start for this workspace, not the application launch.
     pub(crate) started_at: Instant,
     startup_recorded: bool,
@@ -287,6 +285,17 @@ impl Workbench {
             Err(error) => path_error = Some(format!("app paths: {error}")),
         }
         let log_path = diagnostics_log_path(app_paths.as_ref());
+        #[cfg(test)]
+        if let Some(path) = &log_path {
+            let temp = std::env::temp_dir();
+            if !path.starts_with(&temp) {
+                panic!(
+                    "unit tests must isolate app paths before Workbench::start; resolved log path {} is not under TMPDIR {}",
+                    path.display(),
+                    temp.display()
+                );
+            }
+        }
         let diag = match &log_path {
             Some(path) => Diagnostics::new(path.clone()),
             None => Diagnostics::unavailable(
@@ -352,7 +361,7 @@ impl Workbench {
             paint_count: 0,
             last_osc7_cwd: None,
             log_path,
-            log_write_error: None,
+            log_write_issue: None,
             started_at,
             startup_recorded: false,
             shutdown_done: false,
@@ -366,32 +375,82 @@ impl Workbench {
         };
 
         if let Some(error) = path_error {
-            workbench.diag.log_mut().record(
-                LogLevel::Warn,
-                format!("app path resolution failed: {error}"),
-            );
-            workbench.log_write_error = Some(format!("app path setup failed: {error}"));
+            workbench.log_write_issue = Some(LogIssue::error(format!(
+                "app path resolution failed: {error}"
+            )));
         } else if workbench.log_path.is_none() {
-            workbench.log_write_error = Some(
-                "diagnostics log unavailable: app paths are unavailable (fail-closed)".to_owned(),
-            );
+            workbench.log_write_issue = Some(LogIssue::error(
+                "diagnostics log unavailable: app paths are unavailable (fail-closed)",
+            ));
         } else if let Some(path) = &workbench.log_path {
             // Preflight the private log so a permissions/symlink failure is
-            // visible in diagnostics while the window is still open.
+            // visible in diagnostics while the window is still open. A legacy
+            // file above the threshold is not refused: the next clean shutdown
+            // keeps it as the previous log and starts a fresh active log.
             if let Err(error) = made_platform::open_private_log(path) {
-                workbench.log_write_error = Some(format!("diagnostics log unavailable: {error}"));
-            } else if std::fs::metadata(path)
-                .map(|metadata| metadata.len() > MAX_LOG_BYTES)
-                .unwrap_or(false)
-            {
-                workbench.log_write_error = Some(
-                    "diagnostics log reached its 1 MiB cap; new entries will not be written"
-                        .to_owned(),
-                );
+                workbench.log_write_issue = Some(LogIssue::error(format!(
+                    "diagnostics log unavailable: {error}"
+                )));
+            } else {
+                let mut warnings = Vec::new();
+                if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                    if metadata.len() > MAX_LOG_FILE_BYTES {
+                        warnings.push(format!(
+                            "diagnostics log is {} bytes, above the 1 MiB threshold; it will be kept as {} on the next shutdown write",
+                            metadata.len(),
+                            made_platform::previous_private_log_path(path).display()
+                        ));
+                    }
+                }
+                let backup = made_platform::previous_private_log_path(path);
+                match std::fs::symlink_metadata(&backup) {
+                    Ok(metadata) if metadata.is_file() => {
+                        if let Err(error) = made_platform::tighten_private_log_permissions(&backup)
+                        {
+                            warnings.push(format!(
+                                "previous diagnostics log permissions could not be tightened: {error}"
+                            ));
+                        }
+                    }
+                    Ok(_) => warnings.push(format!(
+                        "previous diagnostics log path is not a regular file ({}); rotation will be refused if required",
+                        backup.display()
+                    )),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => warnings.push(format!(
+                        "previous diagnostics log path could not be inspected ({}): {error}",
+                        backup.display()
+                    )),
+                }
+                let lock = made_platform::private_log_lock_path(path);
+                match std::fs::symlink_metadata(&lock) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => warnings.push(format!(
+                        "diagnostics log lock path is not a regular file ({}); writes will be refused",
+                        lock.display()
+                    )),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => warnings.push(format!(
+                        "diagnostics log lock path could not be inspected ({}): {error}",
+                        lock.display()
+                    )),
+                }
+                workbench.log_write_issue = if warnings.is_empty() {
+                    None
+                } else {
+                    Some(LogIssue::warning(warnings.join("; ")))
+                };
             }
         }
-        if let Some(error) = workbench.log_write_error.clone() {
-            workbench.diag.log_mut().record(LogLevel::Error, error);
+        if let Some(issue) = &workbench.log_write_issue {
+            let level = match issue.severity {
+                LogIssueSeverity::Warning => LogLevel::Warn,
+                LogIssueSeverity::Error => LogLevel::Error,
+            };
+            workbench
+                .diag
+                .log_mut()
+                .record(level, issue.message.clone());
         }
         workbench.log_launch_context();
         let composed_content = workbench.start_integration();
@@ -1928,51 +1987,47 @@ impl Workbench {
     fn write_diagnostics_log(&mut self) {
         let Some(path) = self.log_path.clone() else {
             let message = "diagnostics log unavailable: app paths are unavailable (fail-closed)";
-            self.log_write_error = Some(message.to_owned());
+            self.log_write_issue = Some(LogIssue::error(message));
             eprintln!("made: {message}");
             return;
         };
 
-        if std::fs::metadata(&path)
-            .map(|metadata| metadata.len() > MAX_LOG_BYTES)
-            .unwrap_or(false)
-        {
-            let message = "diagnostics log reached its 1 MiB cap; no new entries written";
-            self.log_write_error = Some(message.to_owned());
-            eprintln!("made: {message}");
-            return;
-        }
-
         let snapshot = self.diagnostics_snapshot();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        // Build and scan the exact record that is written; no second render.
+        let mut record = format!("--- made diagnostics (unix {timestamp}) ---\n");
+        record.push_str(&snapshot.to_text());
         if let Some(token) = &self.token {
-            if snapshot.contains_secret(token) {
+            let secret = token.expose_secret();
+            if !secret.is_empty() && record.contains(secret) {
                 let message = "refused to write diagnostics containing the bridge secret";
-                self.log_write_error = Some(message.to_owned());
+                self.log_write_issue = Some(LogIssue::error(message));
                 eprintln!("made: {message}");
                 return;
             }
         }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
-        match made_platform::open_private_log(&path) {
-            Ok(mut file) => {
-                let written = writeln!(file, "--- made diagnostics (unix {timestamp}) ---")
-                    .and_then(|()| file.write_all(snapshot.to_text().as_bytes()));
-                match written {
-                    Ok(()) => self.log_write_error = None,
-                    Err(error) => {
-                        let message = format!("diagnostics log write failed: {error}");
-                        self.log_write_error = Some(message.clone());
-                        eprintln!("made: {message}");
-                    }
+        match made_platform::append_private_log_rotated(
+            &path,
+            record.as_bytes(),
+            MAX_LOG_FILE_BYTES,
+        ) {
+            Ok(made_platform::LogAppendOutcome::Written { rotated: _, issue }) => {
+                self.log_write_issue = issue;
+                if let Some(issue) = &self.log_write_issue {
+                    eprintln!("made: {}", issue.message);
                 }
             }
+            Ok(made_platform::LogAppendOutcome::Refused { issue }) => {
+                eprintln!("made: {}", issue.message);
+                self.log_write_issue = Some(issue);
+            }
             Err(error) => {
-                let message = format!("could not open private diagnostics log: {error}");
-                self.log_write_error = Some(message.clone());
+                let message = format!("diagnostics log write failed: {error}");
+                self.log_write_issue = Some(LogIssue::error(message.clone()));
                 eprintln!("made: {message}");
             }
         }

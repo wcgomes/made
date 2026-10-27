@@ -229,7 +229,7 @@
 | Cross-Platform Delivery | 4.1–4.8, 10.3–10.4 | Phase 4, Phase 10 |
 | Security and Local-Only Integration | 2.5–2.6, 2.11, 3.5–3.6, 3.19–3.20, 5.3–5.4, 10.4–10.6 | Phase 2, Phase 3, Phase 5, Phase 10 |
 | Responsiveness and Lightness | 5.5–5.8, 9.1–9.4 | Phase 5, Phase 9 |
-| Diagnostics | 5.1–5.4, 8.3–8.4 | Phase 5, Phase 8 (presentation in `made-ui-ux-v1`) |
+| Diagnostics | 5.1–5.4, 8.3–8.4, 12.1–12.7 | Phase 5, Phase 8, Phase 12 (presentation in `made-ui-ux-v1`) |
 | V1 Scope Boundary | 0.7–0.8, 3.15–3.16, 5.9–5.11 | Phase 0, Phase 3, Phase 5 |
 
 UI requirements and their task coverage live in `specs/changes/made-ui-ux-v1/tasks.md`; this table covers core scenarios only.
@@ -330,6 +330,24 @@ Depends on the retained launch/workspace tests and Phase 6 startup wiring. Phase
 
 Former Phase 11 icon-only header and quiet explorer tasks 11.1–11.8 moved to `made-ui-ux-v1` tasks 1.x and 2.x. Their checked Linux/headless evidence moved with them; native/manual checkpoints remain open there. This core change retains no UI implementation tasks.
 
+## 12. Revision — Bounded diagnostics log retention (2026-10-27)
+
+Spec-first retention of the active log plus one previous log, with record-atomic serialized appends and a hard 1 MiB ceiling for current-version appends that take the lock. Execute each test first (12.1–12.3) before implementation (12.4–12.6).
+
+- [x] 12.1 Add failing platform contract tests for the exact rotation threshold (equal does not rotate, one byte over rotates), direct backup replacement, byte-identical `.1`, 0600/0700 modes for active/previous/lock, Unix inode preservation, missing current, symlink current refusal, unsafe backup (symlink/directory) refusal without append, lock symlink/directory/permission refusal, bounded lock contention/timeout refusal, public-API rename-failure refusal without touching either log, oversized legacy rotation, barrier-synchronized 8-thread record-atomic appends, exactly-one 2-thread rotation retention, and record-at-threshold refusal (path: `crates/made-platform/tests/contract.rs`, `crates/made-platform/src/lib.rs`)
+- [x] 12.2 Add failing diagnostics tests for 4 KiB UTF-8-boundary message truncation (exact 4096, 4097, and 3-/4-byte crossings), 500 × 4 KiB worst-case text below 1 MiB, newest-first eviction, previous-log path/existence/copy data, and unavailable/degraded previous-log data (path: `crates/made-app/tests/diagnostics.rs`)
+- [x] 12.3 Add failing UI-model tests for the Previous log row, disabled not-yet-rotated action, copy action, full-path tooltip, 720×480 warning/card/footer/path/copy containment, warning-versus-error tone selection, degraded Diagnostics/unavailable data, startup `.1` permission tightening, startup unsafe `.1`/lock warnings, and a legacy oversized log warning followed by successful shutdown rotation (path: `crates/made-app/tests/ui_model.rs`, `crates/made-app/src/ui.rs`, `crates/made-app/tests/diagnostics.rs`)
+- [x] 12.4 Implement `append_private_log_rotated` with a persistent read+write lock, a bounded `try_lock` wait (public injectable timeout capped at 5 s), symlink/non-regular validation for current/backup/lock, POSIX-atomic direct rename rotation (Windows unverified), single `write_all` (not failure-atomic on partial I/O), refusal/error outcomes, 0600 enforcement for `.1`, and no append fallback, truncation/copy, or temp path (path: `crates/made-platform/src/lib.rs`)
+- [x] 12.5 Implement per-message 4 KiB truncation, 512 KiB total text eviction, retained previous-log data, and copyable previous-log path while keeping 500 entries and newest-first retention (path: `crates/made-app/src/diagnostics.rs`)
+- [x] 12.6 Wire one-record build/scan/write at clean shutdown, startup legacy-size and previous-log-permission warnings, warning/error issue tone, `.1` cache invalidation, a copy action using `Diagnostics::copy_previous_log_path`, and the previous-log path/copy row under LOG (path: `crates/made-app/src/workbench.rs`, `crates/made-app/src/ui.rs`)
+- [x] 12.7 Update core spec/design/proposal/tasks, UI Diagnostics Presentation, UX checklist, security/testing docs, and the evidence record only where current claims changed; state the final-exit visibility gap; manually verify a `/tmp` scratch copy of the real 1,049,644-byte log rotates with an identical `.1` (manual evidence, no committed artifact); run isolated workspace tests, fmt, clippy, and diff checks (path: `specs/changes/`, `tests/e2e/ux_validation.md`, `wiki/security.md`, `wiki/testing/strategy.md`, `wiki/testing/platform-matrix.md`, `wiki/records/20261026-v1-evidence.md`)
+
+## Checkpoint — Phase 12
+
+- [x] Automated Linux evidence covers threshold/legacy rotation, byte-identical `.1`, inode/mode preservation (active/`.1`/lock), unsafe backup and lock symlink/dir refusal, lock timeout refusal, public rename-failure refusal, barrier-synchronized atomic appends, exactly-one concurrent rotation, bounded worst-case text, previous-log UI/copy/disabled/tooltip/720 states, startup `.1` tightening, and warning/error tones
+- [ ] Record native macOS/Windows rotation, lock-handle, and reparse-point behavior; Linux automated tests do not certify those platforms
+- [ ] Final-exit write/rotation failure visibility: stderr only; Diagnostics cannot show an issue raised after the last UI frame. This is an accepted evidence/visibility gap, not a passing in-app notice.
+
 ## Analyze — Home-default startup and icon-only chrome revision (historical planning analysis)
 
 **Pre-split historical record.** UI requirements and tasks now live in `made-ui-ux-v1`; Phase 11 moved there. The counts and references below describe the pre-split bundle and are retained for history, not as the current ownership map.
@@ -413,7 +431,7 @@ All new/modified scenarios are listed below. Requirement-wide policy changes als
 | Degraded diagnostics | 8.3 → 8.4–8.5 | 8 |
 | Shell follow diagnostics without chrome noise | 8.3, 8.1 → 8.4–8.5 | 8 |
 
-Additional requirement-wide coverage: Active Session Follow 6.6–6.7; optional Session Map 8.1/8.8–8.9 plus retained Phase 3 focus tests; Security and Local-Only Integration 6.1/6.4, 7.1–7.2 and retained path/immutability/redaction tests; Minimal Workspace Layout 8.1–8.7; Responsiveness and Lightness 7.8–7.9/9.1–9.4; Diagnostics 8.3–8.4. Unchanged scenario checkpoints in Phases 0–5 remain required under the new lifecycle.
+Additional requirement-wide coverage: Active Session Follow 6.6–6.7; optional Session Map 8.1/8.8–8.9 plus retained Phase 3 focus tests; Security and Local-Only Integration 6.1/6.4, 7.1–7.2 and retained path/immutability/redaction tests; Minimal Workspace Layout 8.1–8.7; Responsiveness and Lightness 7.8–7.9/9.1–9.4; Diagnostics 8.3–8.4 and 12.1–12.7. Unchanged scenario checkpoints in Phases 0–5 remain required under the new lifecycle.
 
 | Analyze gate | Result | Basis |
 |---|---|---|
@@ -445,7 +463,34 @@ Readiness analysis found and corrected missing requirement-summary coverage for 
 
 The split adds no runtime code, no new feature, no archive, and no delivery claim. Every moved UI task is now owned by `made-ui-ux-v1`; core checkpoints for moved scenarios explicitly rely on that change. Native/cross-platform conformance must be rerun for both changes before any archive request.
 
+## Analyze — Bounded diagnostics log retention (2026-10-27)
+
+**Readiness assessment:** PASS for implementation planning and Linux automated delivery; native macOS/Windows rotation evidence remains pending.
+
+| Analyze gate | Result | Basis |
+|---|---|---|
+| In-place scope and live-contract consistency | PASS | Existing active v1 only; diagnostics/log retention is the sole behavior change; no new requirement number, module, process, thread, or persistence surface |
+| Outcome versus implementation separation | PASS | Spec states observable retention/bounding/failure outcomes; constants, rename/lock mechanics, and budget rationale live in design/tasks |
+| Scenario/test-first coverage | PASS | Five added Diagnostics scenarios map to 12.1–12.7; every implementation task follows its failing test listed above |
+| Historical completion integrity | PASS | Prior checked tasks/checkpoints are unchanged; Phase 12 is new and checked only for Linux automated evidence |
+| Security and privacy | PASS | 0600 active/previous/lock files, 0700 parent, symlink/non-regular rejection for all three paths, token scan on the exact written record, and startup `.1` tightening; Windows reparse-point check/open race remains documented |
+| Bounded resources and failure behavior | PASS | Active log ≤1 MiB, 4 KiB message cap, 512 KiB text budget, 500-entry cap, record-at-threshold refusal, bounded one-second lock wait, refusal without append on lock/backup/rename failure, no truncation or temp fallback |
+| Failure visibility | PASS with documented gap | Startup legacy warning is rendered; final-exit write/rotation failures are stderr-only because the window closes first. This gap is explicit in the spec, tasks, UX checklist, and wiki. |
+| Delivery/verification readiness | PASS in Linux scope / native pending | Isolated `cargo test --workspace`, fmt, clippy and diff checks pass; old-version instances that do not take the lock and native lock/reparse behavior remain honest residuals |
+
+| New/modified scenario (exact spec title) | Test-first tasks → implementation | Evidence checkpoint |
+|---|---|---|
+| Bounded log rotation preserves history | 12.1, 12.3 → 12.4, 12.6 | 12 |
+| Oversized log content stays bounded | 12.2 → 12.5 | 12 |
+| Log retention failure is reported | 12.1, 12.3 → 12.4, 12.6 | 12 |
+| Legacy oversized log warning | 12.3 → 12.6 | 12 |
+| Unsafe log path warning | 12.3 → 12.6 | 12 |
+
+Additional diagnostics-wide coverage: "Logs redact token" and "Shell-only diagnostics" are retained and rerun with the new record-once scan and previous-log data. No UI requirement is added to the core change; the previous-log presentation is owned by `made-ui-ux-v1` Phase 13. Final-exit failure visibility is a documented gap, not a passing Diagnostics claim.
+
 ## Implementation handoff and ownership
+
+
 
 Spec ref: `specs/changes/opencode-session-follow-v1/`
 

@@ -16,7 +16,7 @@ In scope:
 - Shell-directory follow through safe per-launch integration; a connected active OpenCode session directory takes precedence, including OpenCode-managed worktrees, and disconnect resumes the latest shell cwd.
 - Session-map data for open root-session tabs, with focus-from-Made as a SHOULD.
 - A per-workspace explorer and read-only preview state, with layout/presentation delegated to `made-ui-ux-v1`.
-- Read-only preview guards, diagnostics data, security boundaries, and measured performance/fluidity targets for the complete workflow.
+- Read-only preview guards, diagnostics data and bounded active-plus-previous log retention, security boundaries, and measured performance/fluidity targets for the complete workflow.
 - CI builds and development artifacts for every supported target.
 
 ## Non-goals
@@ -33,7 +33,7 @@ In scope:
 
 ## Approach
 
-Made opens a shell and explorer per workspace tab in one native window. With no launch path it opens the current user's home directory; the picker is an explicit action or `--picker`, and an explicit path takes precedence. Safe launch-local shell hooks report cwd without rewriting user configuration; shell capability and fallback are explicit. The user may run OpenCode normally; the app-owned plugin and authenticated tab-local loopback bridge then supply active-session state. Directory arbitration, tab isolation, root generations, read-only preview safety, integration state, diagnostics data, and bounded hidden-workspace processing preserve the terminal-first runtime. Normal shell use is not a degraded state; technical integration detail lives in Diagnostics. UI presentation is owned by `made-ui-ux-v1` and its design. Expanded core decisions are in `design.md`.
+Made opens a shell and explorer per workspace tab in one native window. With no launch path it opens the current user's home directory; the picker is an explicit action or `--picker`, and an explicit path takes precedence. Safe launch-local shell hooks report cwd without rewriting user configuration; shell capability and fallback are explicit. The user may run OpenCode normally; the app-owned plugin and authenticated tab-local loopback bridge then supply active-session state. Directory arbitration, tab isolation, root generations, read-only preview safety, integration state, diagnostics data with bounded active-plus-previous log retention, and bounded hidden-workspace processing preserve the terminal-first runtime. Normal shell use is not a degraded state; technical integration detail lives in Diagnostics. UI presentation is owned by `made-ui-ux-v1` and its design. Expanded core decisions are in `design.md`.
 
 ## Decision index
 

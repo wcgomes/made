@@ -14,7 +14,7 @@ In scope:
 - Optional session-map presentation: initially hidden, selected-workspace scoped, activity indicators, empty/overflow behavior, and focus-error presentation.
 - Explicit folder picker UX: card layout, Close/Escape/Back, inline expandable folder tree, single selected-row/path target, tree keyboard navigation, refresh/re-root state, and preservation of a live workspace when adding another folder.
 - Full-left preview presentation: full-left surface, header/actions/return, meta/gutter/code styling, syntax highlighting, and safe-state styling.
-- Diagnostics presentation: opaque floating card, sections, metrics/log block, copy actions, responsive sizing.
+- Diagnostics presentation: opaque floating card, sections, metrics/log block, previous-log path/copy row, retention notices present while the card renders, copy actions, responsive sizing.
 - Responsive layout and motion: 1280×800/720×480 breakpoints, labeled overflow, explorer hide/show transition, and motion that carries no essential information.
 - Keyboard focus and accessibility presentation: visible focus, accessible names for icon actions, workspace/session navigation, target sizes, non-color status cues, and the screen-reader caveat.
 - Moving the UI-owned task/evidence checkpoints from the core change while preserving their truthful Linux/Xvfb/headless status and leaving native/manual checkpoints open.
@@ -50,7 +50,7 @@ Extract the durable visual contract into this change's `spec.md` (normative UI o
 - **Q:** Which spec is normative for a UI behavior that also touches runtime behavior?
   **A:** The core spec owns the observable behavior/data/security outcome; this spec owns the observable presentation/interaction outcome. Requirements cross-reference rather than duplicate each other.
 - **Q:** Are the UI requirements implemented?
-  **A:** Yes on Linux: 630 tests pass, with Xvfb/headless test evidence summarized in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Visual captures are ad hoc validation artifacts and are not committed. Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
+  **A:** Yes on Linux: 654 tests pass, with Xvfb/headless test evidence summarized in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Visual captures are ad hoc validation artifacts and are not committed. Native macOS/Windows, native Linux desktop, native pointer/keyboard, native compositor/backdrop, and hardware-GPU evidence remain pending.
 - **Q:** Does this change add scope beyond the active v1?
   **A:** No. It extracts already implemented/discussed UI behavior; derived scenarios only make implicit presentation guarantees explicit. The 6.x–12.x refinements stay inside this UI contract and do not add runtime/product scope.
 - **Q:** Does the proposal's “no code changes” statement still apply?

@@ -9,13 +9,16 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use made_platform::{
-    host_platform, install_root_for_executable, is_sensitive_env_key, open_private_log,
+    append_private_log_rotated, append_private_log_rotated_with_rename,
+    append_private_log_rotated_with_timeout, host_platform, install_root_for_executable,
+    is_sensitive_env_key, open_private_log, previous_private_log_path, private_log_lock_path,
     repository_plugin_dir, repository_root, resolve_user_home, validate_user_home, AppPaths,
     Clipboard, Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard,
-    PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest, PtySize, REDACTED_VALUE,
+    LogAppendOutcome, LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily,
+    PluginDirSource, PtyRequest, PtySize, REDACTED_VALUE,
 };
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -743,6 +746,520 @@ fn private_log_is_owner_only_and_rejects_symlinks_and_directories() {
         open_private_log(&directory).is_err(),
         "a directory must be rejected as a log file"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn seed_private_log(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut file = open_private_log(path).expect("seed private log");
+    file.write_all(bytes).expect("seed append");
+}
+
+fn written(outcome: LogAppendOutcome) -> (bool, Option<LogIssue>) {
+    match outcome {
+        LogAppendOutcome::Written { rotated, issue } => (rotated, issue),
+        LogAppendOutcome::Refused { issue } => {
+            panic!("append was refused: {issue:?}")
+        }
+    }
+}
+
+fn refused(outcome: LogAppendOutcome) -> LogIssue {
+    match outcome {
+        LogAppendOutcome::Refused { issue } => {
+            assert_eq!(issue.severity, LogIssueSeverity::Error, "{issue:?}");
+            issue
+        }
+        LogAppendOutcome::Written { rotated, issue } => {
+            panic!("append unexpectedly succeeded (rotated={rotated}, issue={issue:?})")
+        }
+    }
+}
+
+#[test]
+fn private_log_rotation_respects_exact_threshold_and_replaces_only_backup() {
+    let root = unique_temp("private-log-threshold");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    let lock = private_log_lock_path(&log);
+    seed_private_log(&log, &[b'a'; 44]);
+    std::fs::write(&backup, b"older").expect("seed backup");
+
+    let at_limit = append_private_log_rotated(&log, &[b'b'; 20], 64).expect("append at limit");
+    let (rotated, issue) = written(at_limit);
+    assert!(!rotated, "equal to the limit must not rotate");
+    assert!(issue.is_none());
+    assert_eq!(std::fs::read(&log).expect("read current").len(), 64);
+    assert_eq!(std::fs::read(&backup).expect("read backup"), b"older");
+
+    let previous_current = std::fs::read(&log).expect("read current before rotation");
+    #[cfg(unix)]
+    let previous_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&log).expect("current metadata").ino()
+    };
+
+    let over_limit =
+        append_private_log_rotated(&log, b"c", 64).expect("append one byte over the limit");
+    let (rotated, issue) = written(over_limit);
+    assert!(rotated, "one byte over the limit must rotate");
+    assert!(issue.is_none());
+    assert_eq!(std::fs::read(&log).expect("read new current"), b"c");
+    assert_eq!(
+        std::fs::read(&backup).expect("read rotated backup"),
+        previous_current,
+        "the previous log must be byte-identical to the former current log"
+    );
+    assert!(lock.is_file(), "the persistent lock file must exist");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let backup_metadata = std::fs::metadata(&backup).expect("backup metadata");
+        assert_eq!(
+            backup_metadata.ino(),
+            previous_inode,
+            "Unix rename must preserve the current log's inode as the previous log"
+        );
+        assert_eq!(backup_metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&log)
+                .expect("current metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&lock)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(lock.parent().expect("lock parent"))
+                .expect("lock dir metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_append_tightens_an_existing_previous_log_without_rotation() {
+    let root = unique_temp("private-log-tighten-previous");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    seed_private_log(&log, b"current");
+    std::fs::write(&backup, b"previous record\n").expect("seed previous");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen previous mode");
+    }
+
+    let outcome = append_private_log_rotated(&log, b"next", 1024).expect("append");
+    let (rotated, issue) = written(outcome);
+    assert!(!rotated, "the record must fit without rotation");
+    assert!(issue.is_none(), "{issue:?}");
+    assert_eq!(std::fs::read(&log).expect("read current"), b"currentnext");
+    assert_eq!(
+        std::fs::read(&backup).expect("read previous"),
+        b"previous record\n",
+        "tightening must not rewrite previous content"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("previous metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_log_append_ignores_unsafe_previous_when_no_rotation_is_needed() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp("private-log-unsafe-previous-no-rotation");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    seed_private_log(&log, b"current");
+    let target = root.join("previous-target");
+    std::fs::write(&target, b"target").expect("seed target");
+    symlink(&target, &backup).expect("create previous symlink");
+
+    let outcome = append_private_log_rotated(&log, b"next", 1024).expect("append");
+    let (rotated, issue) = written(outcome);
+    assert!(!rotated);
+    assert!(issue.is_none(), "{issue:?}");
+    assert_eq!(std::fs::read(&log).expect("read current"), b"currentnext");
+    assert!(std::fs::symlink_metadata(&backup)
+        .expect("previous metadata")
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&target).expect("read target"), b"target");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_rotation_creates_a_missing_current_log() {
+    let root = unique_temp("private-log-missing");
+    let log = root.join("logs").join("integration.log");
+
+    let outcome = append_private_log_rotated(&log, b"first\n", 64).expect("append");
+    let (rotated, issue) = written(outcome);
+    assert!(!rotated);
+    assert!(issue.is_none());
+    assert_eq!(std::fs::read(&log).expect("read current"), b"first\n");
+    assert!(!previous_private_log_path(&log).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_rotation_rotates_an_oversized_legacy_log() {
+    let root = unique_temp("private-log-legacy");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    std::fs::create_dir_all(log.parent().expect("log parent")).expect("create log parent");
+    {
+        let file = std::fs::File::create(&log).expect("create legacy log");
+        file.set_len(made_platform::DIAGNOSTICS_LOG_MAX_BYTES + 1)
+            .expect("size legacy log");
+    }
+
+    let outcome = append_private_log_rotated(
+        &log,
+        b"new record\n",
+        made_platform::DIAGNOSTICS_LOG_MAX_BYTES,
+    )
+    .expect("append after legacy log");
+    let (rotated, issue) = written(outcome);
+    assert!(rotated, "a legacy log above 1 MiB must rotate");
+    assert!(issue.is_none());
+    assert_eq!(
+        std::fs::metadata(&backup).expect("backup metadata").len(),
+        made_platform::DIAGNOSTICS_LOG_MAX_BYTES + 1,
+        "a legacy oversized active file may survive as .1 without truncation"
+    );
+    assert!(
+        std::fs::metadata(&log).expect("active metadata").len()
+            < made_platform::DIAGNOSTICS_LOG_MAX_BYTES
+    );
+    assert_eq!(std::fs::read(&log).expect("read current"), b"new record\n");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&log, &backup, &private_log_lock_path(&log)] {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("log metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{} must be 0600",
+                path.display()
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_log_rotation_rejects_a_symlink_current_log() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp("private-log-rotation-symlink");
+    let log = root.join("logs").join("integration.log");
+    std::fs::create_dir_all(log.parent().expect("log parent")).expect("create log parent");
+    let target = root.join("target.log");
+    std::fs::write(&target, b"target").expect("seed target");
+    symlink(&target, &log).expect("create log symlink");
+
+    let issue =
+        refused(append_private_log_rotated(&log, b"record", 64).expect("symlink current append"));
+    assert!(issue.message.contains("symlink"), "{issue:?}");
+    assert_eq!(std::fs::read(&target).expect("read target"), b"target");
+    assert!(!previous_private_log_path(&log).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_log_rotation_refuses_an_unsafe_backup_without_appending() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp("private-log-unsafe-backup");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    seed_private_log(&log, &[b'a'; 61]);
+    let target = root.join("backup-target.log");
+    std::fs::write(&target, b"target").expect("seed target");
+    symlink(&target, &backup).expect("create backup symlink");
+
+    let issue =
+        refused(append_private_log_rotated(&log, b"next", 64).expect("unsafe backup append"));
+    assert!(issue.message.contains("not a regular file"), "{issue:?}");
+    assert_eq!(std::fs::read(&target).expect("read target"), b"target");
+    assert_eq!(
+        std::fs::read(&log).expect("read current"),
+        vec![b'a'; 61],
+        "a refused rotation must not append"
+    );
+    assert!(std::fs::symlink_metadata(&backup)
+        .expect("backup metadata")
+        .file_type()
+        .is_symlink());
+
+    std::fs::remove_file(&backup).expect("remove backup symlink");
+    std::fs::create_dir(&backup).expect("create backup directory");
+    let issue =
+        refused(append_private_log_rotated(&log, b"more", 64).expect("backup directory append"));
+    assert!(issue.message.contains("not a regular file"), "{issue:?}");
+    assert_eq!(
+        std::fs::read(&log).expect("read current"),
+        vec![b'a'; 61],
+        "a refused rotation must not append"
+    );
+    assert!(
+        backup.is_dir(),
+        "the backup directory must be left untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_refuses_a_failing_rename_without_touching_either_log() {
+    let root = unique_temp("private-log-rename-failure");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    seed_private_log(&log, &[b'a'; 61]);
+
+    let outcome = append_private_log_rotated_with_rename(
+        &log,
+        b"next",
+        64,
+        Duration::from_secs(1),
+        |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rename failure",
+            ))
+        },
+    )
+    .expect("public rename-failure append");
+
+    let issue = refused(outcome);
+    assert!(issue.message.contains("rotation refused"), "{issue:?}");
+    assert_eq!(
+        std::fs::read(&log).expect("read current"),
+        vec![b'a'; 61],
+        "a refused rename must leave the active log byte-identical"
+    );
+    assert!(!backup.exists(), "a refused rename must not create .1");
+    assert!(!std::fs::read_dir(log.parent().unwrap())
+        .unwrap()
+        .any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".1")));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_log_refuses_unsafe_or_unreadable_lock_paths() {
+    use std::os::unix::fs::symlink;
+
+    let root = unique_temp("private-log-lock-unsafe");
+    let log = root.join("logs").join("integration.log");
+    let lock = private_log_lock_path(&log);
+    seed_private_log(&log, b"unchanged");
+    let target = root.join("lock-target");
+    std::fs::write(&target, b"target").expect("seed lock target");
+    symlink(&target, &lock).expect("create lock symlink");
+
+    let issue =
+        refused(append_private_log_rotated(&log, b"record", 1024).expect("symlink lock append"));
+    assert!(issue.message.contains("lock"), "{issue:?}");
+    assert_eq!(std::fs::read(&target).expect("read target"), b"target");
+    assert_eq!(std::fs::read(&log).expect("read current"), b"unchanged");
+
+    std::fs::remove_file(&lock).expect("remove lock symlink");
+    std::fs::create_dir(&lock).expect("create lock directory");
+    let issue =
+        refused(append_private_log_rotated(&log, b"record", 1024).expect("directory lock append"));
+    assert!(issue.message.contains("lock"), "{issue:?}");
+    assert_eq!(std::fs::read(&log).expect("read current"), b"unchanged");
+
+    if unsafe { libc::geteuid() } != 0 {
+        std::fs::remove_dir(&lock).expect("remove lock directory");
+        std::fs::write(&lock, b"").expect("create lock file");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000))
+            .expect("make lock unreadable");
+        let issue = refused(
+            append_private_log_rotated(&log, b"record", 1024).expect("permission lock append"),
+        );
+        assert!(issue.message.contains("lock"), "{issue:?}");
+        assert_eq!(std::fs::read(&log).expect("read current"), b"unchanged");
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+            .expect("restore lock mode");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_lock_contention_times_out_without_appending() {
+    let root = unique_temp("private-log-lock-timeout");
+    let log = root.join("logs").join("integration.log");
+    let lock = private_log_lock_path(&log);
+    seed_private_log(&log, b"unchanged");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .expect("open held lock");
+    held.lock().expect("hold lock");
+
+    let started = std::time::Instant::now();
+    let issue = refused(
+        append_private_log_rotated_with_timeout(&log, b"record", 1024, Duration::from_millis(20))
+            .expect("contended append"),
+    );
+    let waited = started.elapsed();
+    assert!(issue.message.contains("lock"), "{issue:?}");
+    assert!(waited >= Duration::from_millis(20), "waited {waited:?}");
+    assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    assert_eq!(std::fs::read(&log).expect("read current"), b"unchanged");
+
+    held.unlock().expect("unlock held lock");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_concurrent_appends_are_record_atomic() {
+    use std::sync::{Arc, Barrier};
+
+    let root = unique_temp("private-log-concurrent");
+    let log = root.join("logs").join("integration.log");
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for thread in 0..8 {
+        let log = log.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            let record = format!("record-{thread}-{}\n", "x".repeat(64));
+            barrier.wait();
+            let outcome = append_private_log_rotated(&log, record.as_bytes(), 1024 * 1024)
+                .expect("concurrent append");
+            let (rotated, issue) = written(outcome);
+            assert!(!rotated);
+            assert!(issue.is_none());
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("append thread");
+    }
+
+    let text = std::fs::read_to_string(&log).expect("read concurrent log");
+    for thread in 0..8 {
+        let record = format!("record-{thread}-{}\n", "x".repeat(64));
+        assert_eq!(
+            text.matches(&record).count(),
+            1,
+            "record for thread {thread} must appear exactly once"
+        );
+    }
+    assert_eq!(
+        text.lines().count(),
+        8,
+        "no partial or interleaved lines: {text:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_concurrent_rotation_keeps_both_records_and_rotates_once() {
+    use std::sync::{Arc, Barrier};
+
+    let root = unique_temp("private-log-concurrent-rotation");
+    let log = root.join("logs").join("integration.log");
+    let backup = previous_private_log_path(&log);
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for marker in ["thread-a\n", "thread-b\n"] {
+        let log = log.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let outcome =
+                append_private_log_rotated(&log, marker.as_bytes(), 12).expect("rotating append");
+            let (rotated, issue) = written(outcome);
+            assert!(issue.is_none());
+            rotated
+        }));
+    }
+    let rotations: usize = handles
+        .into_iter()
+        .map(|handle| usize::from(handle.join().expect("rotation thread")))
+        .sum();
+
+    assert_eq!(rotations, 1, "exactly one append must rotate");
+    assert!(backup.is_file(), "rotation must create the previous log");
+    let current = std::fs::read_to_string(&log).expect("read current");
+    let previous = std::fs::read_to_string(&backup).expect("read previous");
+    let combined = format!("{current}{previous}");
+    assert_eq!(combined.matches("thread-a\n").count(), 1, "{combined:?}");
+    assert_eq!(combined.matches("thread-b\n").count(), 1, "{combined:?}");
+    let mut lines: Vec<&str> = combined.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        ["thread-a", "thread-b"],
+        "no partial or interleaved lines: {combined:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn private_log_refuses_a_record_at_the_threshold() {
+    let root = unique_temp("private-log-record-threshold");
+    let log = root.join("logs").join("integration.log");
+    let issue = refused(
+        append_private_log_rotated(&log, &[b'x'; 64], 64).expect("record-at-threshold append"),
+    );
+    assert!(issue.message.contains("refusing"), "{issue:?}");
+    assert!(!log.exists());
+    assert!(!previous_private_log_path(&log).exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }

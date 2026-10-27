@@ -11,9 +11,10 @@ use made_app::app::{AppModel, AppOptions, WorkspaceId};
 use made_app::cli::LaunchArgs;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
 use made_app::ui::{
-    diagnostics_copy_id, explorer_splitter_id, left_surface_action_id, picker_control_id,
-    picker_current_target, picker_list_id, picker_path_id, top_action_id, top_workspace_action_id,
-    workspace_tab_close_id, workspace_tab_id,
+    diagnostics_copy_id, diagnostics_previous_log_copy_id, diagnostics_previous_log_path_id,
+    explorer_splitter_id, left_surface_action_id, picker_control_id, picker_current_target,
+    picker_list_id, picker_path_id, top_action_id, top_workspace_action_id, workspace_tab_close_id,
+    workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
@@ -567,6 +568,28 @@ fn send_state(socket: &mut WebSocket<TcpStream>, revision: u64, directory: &Path
     );
 }
 
+fn assert_text_clipped_inside(output: &egui::FullOutput, screen: egui::Rect) {
+    fn visit(shape: &egui::Shape, clip: egui::Rect, screen: egui::Rect) {
+        match shape {
+            egui::Shape::Text(_) => {
+                assert!(
+                    screen.contains_rect(clip),
+                    "text clip outside screen: {clip:?}"
+                );
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, clip, screen);
+                }
+            }
+            _ => {}
+        }
+    }
+    for clipped in &output.shapes {
+        visit(&clipped.shape, clipped.clip_rect, screen);
+    }
+}
+
 fn output_text(output: &egui::FullOutput) -> String {
     fn visit(shape: &egui::Shape, text: &mut String) {
         match shape {
@@ -834,6 +857,15 @@ fn isolated(name: &str) -> bool {
         return false;
     }
     let home = tempfile::tempdir().unwrap();
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::create_dir_all(&runtime).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", name, "--nocapture"])
@@ -843,7 +875,9 @@ fn isolated(name: &str) -> bool {
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_DATA_HOME", home.path().join("data"))
         .env("XDG_STATE_HOME", home.path().join("state"))
-        .env("XDG_CACHE_HOME", home.path().join("cache"));
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     if std::path::Path::new("/bin/bash").exists() {
         command.env("SHELL", "/bin/bash");
@@ -3313,6 +3347,341 @@ fn diagnostics_expose_workspace_shell_and_inactive_integration() {
     assert!(copied_text.contains("cwd reporting"));
     if let Some(token) = token {
         assert!(!copied_text.contains(token.as_str()));
+    }
+}
+
+#[test]
+fn diagnostics_previous_log_row_reflects_existence_and_copies() {
+    if isolated("diagnostics_previous_log_row_reflects_existence_and_copies") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "previous-log", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    wait_explorer_ready(&mut headless, id);
+    let snapshot = headless.model.workspace(id).unwrap().diagnostics_snapshot();
+    let previous = snapshot
+        .previous_log_location
+        .clone()
+        .expect("previous log path");
+    assert!(!snapshot.previous_log_exists);
+    headless.render();
+    headless.click(top_action_id("diagnostics"));
+    let text = output_text(&headless.render());
+    for expected in ["Previous log", "Copy previous log path", "not yet rotated"] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let previous_copy_id = diagnostics_previous_log_copy_id(pane_id);
+    let response = headless.response(previous_copy_id);
+    assert!(
+        !response.enabled(),
+        "copy action must be disabled without a previous log"
+    );
+    assert!(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0))
+            .contains_rect(response.rect),
+        "previous-log action clipped at 720x480: {:?}",
+        response.rect
+    );
+
+    std::fs::write(&previous, b"previous record\n").unwrap();
+    // The `.1` existence probe is bucketed to at most once per second.
+    headless.render_events_at(Vec::new(), headless.last_time + 1.1);
+    let text = output_text(&headless.render());
+    assert!(!text.contains("not yet rotated"), "{text}");
+    assert!(headless.response(previous_copy_id).enabled());
+
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let path_id = diagnostics_previous_log_path_id(pane_id);
+    let window_id = egui::Id::unique(("made-diagnostics-window", pane_id));
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("diagnostics window rect");
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+    assert!(screen.contains_rect(window), "window clipped: {window:?}");
+    assert!(window.contains_rect(headless.response(path_id).rect));
+    assert!(window.contains_rect(headless.response(previous_copy_id).rect));
+
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render_events_at(Vec::new(), headless.last_time + 1.0);
+    let before_tooltip = output_text(&headless.render()).matches(&previous).count();
+    let hovered = headless.hover(path_id);
+    let after_tooltip = output_text(&hovered).matches(&previous).count();
+    assert!(
+        after_tooltip > before_tooltip,
+        "previous-log full-path tooltip did not appear: {before_tooltip} -> {after_tooltip}"
+    );
+
+    let output = headless.click(previous_copy_id);
+    let copied = output
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("copy previous log command");
+    assert_eq!(copied, previous);
+}
+
+#[test]
+fn diagnostics_degraded_state_keeps_previous_log_row_at_720() {
+    if isolated("diagnostics_degraded_state_keeps_previous_log_row_at_720") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "degraded-diagnostics", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    wait_explorer_ready(&mut headless, id);
+    let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
+    let mut socket = connect(&options);
+    send(
+        &mut socket,
+        json!({"type":"state", "revision":1, "activeSessionID":"ui-session", "tabsEnabled":false,
+        "sessions":[{"sessionID":"ui-session", "title":"Owned session", "active":true, "busy":false, "attention":false, "unread":false,
+        "promptPulse":0, "renaming":false, "directory":root, "subpath":null, "projectID":null}]}),
+    );
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .is_some_and(|workspace| workspace.diagnostics_snapshot().status_label == "degraded")
+    });
+
+    headless.render();
+    headless.click(top_action_id("diagnostics"));
+    let output = headless.render();
+    let text = output_text(&output);
+    for expected in ["degraded", "Previous log", "not yet rotated"] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let copy_id = diagnostics_previous_log_copy_id(pane_id);
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-diagnostics-window", pane_id))))
+        .expect("diagnostics window rect");
+    assert!(window.contains_rect(headless.response(copy_id).rect));
+    assert_text_clipped_inside(
+        &output,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0)),
+    );
+}
+
+#[test]
+fn diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup() {
+    if isolated("diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup") {
+        return;
+    }
+    let state = std::env::var_os("XDG_STATE_HOME").expect("isolated state home");
+    let log = Path::new(&state)
+        .join("made")
+        .join("log")
+        .join("integration.log");
+    let backup = PathBuf::from(format!("{}.1", log.display()));
+    let lock = PathBuf::from(format!("{}.lock", log.display()));
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, b"active record\n").unwrap();
+    fs::create_dir(&backup).unwrap();
+    fs::create_dir(&lock).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "unsafe-log-paths", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    wait_explorer_ready(&mut headless, id);
+
+    let warnings: Vec<String> = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .diagnostics_snapshot()
+        .entries
+        .iter()
+        .filter(|entry| entry.level == made_app::LogLevel::Warn)
+        .map(|entry| entry.message.clone())
+        .collect();
+    let joined = warnings.join("\n");
+    assert!(
+        joined.contains("previous diagnostics log path is not a regular file"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("diagnostics log lock path is not a regular file"),
+        "{joined}"
+    );
+
+    headless.render();
+    headless.click(top_action_id("diagnostics"));
+    let text = output_text(&headless.render());
+    assert!(text.contains("previous diagnostics log path is not a regular file"));
+    assert!(text.contains("diagnostics log lock path is not a regular file"));
+
+    headless.model.shutdown();
+    assert_eq!(
+        fs::read(&log).expect("active log must be untouched by a refused append"),
+        b"active record\n"
+    );
+    assert!(backup.is_dir(), "unsafe previous path must be untouched");
+    assert!(lock.is_dir(), "unsafe lock path must be untouched");
+}
+
+#[test]
+fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown() {
+    if isolated("oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown") {
+        return;
+    }
+    let state = std::env::var_os("XDG_STATE_HOME").expect("isolated state home");
+    let log = Path::new(&state)
+        .join("made")
+        .join("log")
+        .join("integration.log");
+    let backup = PathBuf::from(format!("{}.1", log.display()));
+    let lock = PathBuf::from(format!("{}.lock", log.display()));
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&backup, b"previous record\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    {
+        let file = fs::File::create(&log).unwrap();
+        file.set_len(made_app::diagnostics::MAX_LOG_FILE_BYTES + 1)
+            .unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "legacy-log", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let active_mode = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        let previous_mode = fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(active_mode, 0o600, "active log mode after preflight");
+        assert_eq!(
+            previous_mode, 0o600,
+            "existing previous log must be tightened at startup"
+        );
+    }
+
+    let snapshot = headless.model.workspace(id).unwrap().diagnostics_snapshot();
+    assert!(
+        !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.level == made_app::LogLevel::Error
+                && entry.message.contains("will not be written")),
+        "legacy size must not refuse future writes: {:?}",
+        snapshot.entries
+    );
+    assert!(
+        snapshot.entries.iter().any(|entry| {
+            entry.level == made_app::LogLevel::Warn
+                && entry.message.contains("above the 1 MiB threshold")
+        }),
+        "missing legacy warning: {:?}",
+        snapshot.entries
+    );
+
+    headless.render();
+    headless.click(top_action_id("diagnostics"));
+    let output = headless.render();
+    let text = output_text(&output);
+    for expected in [
+        "above the 1 MiB threshold",
+        "Previous log",
+        "Copy previous log path",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    assert!(!text.contains("not yet rotated"), "{text}");
+    assert!(!text.contains("will not be written"), "{text}");
+
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let path_id = diagnostics_previous_log_path_id(pane_id);
+    let copy_id = diagnostics_previous_log_copy_id(pane_id);
+    let window_id = egui::Id::unique(("made-diagnostics-window", pane_id));
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("diagnostics window rect");
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+    assert!(window.contains_rect(headless.response(path_id).rect));
+    assert!(window.contains_rect(headless.response(copy_id).rect));
+    assert_text_clipped_inside(&output, screen);
+    assert!(
+        screen.expand(16.0).contains_rect(window),
+        "diagnostics window shadow/content clipped: {window:?}"
+    );
+
+    headless.render_events_at(Vec::new(), headless.last_time + 1.0);
+    let previous = backup.to_string_lossy();
+    let before_tooltip = output_text(&headless.render())
+        .matches(previous.as_ref())
+        .count();
+    let hovered = headless.hover(path_id);
+    let after_tooltip = output_text(&hovered).matches(previous.as_ref()).count();
+    assert!(
+        after_tooltip > before_tooltip,
+        "previous-log full-path tooltip did not appear: {before_tooltip} -> {after_tooltip}"
+    );
+
+    let copied = headless.click(copy_id);
+    let copied_path = copied
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("copy previous log command");
+    assert_eq!(copied_path, backup.to_string_lossy());
+
+    headless.model.shutdown();
+
+    assert_eq!(
+        fs::metadata(&backup).expect("rotated previous log").len(),
+        made_app::diagnostics::MAX_LOG_FILE_BYTES + 1
+    );
+    assert!(
+        fs::metadata(&log).expect("new active log").len()
+            < made_app::diagnostics::MAX_LOG_FILE_BYTES
+    );
+    assert!(lock.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&log, &backup, &lock] {
+            assert_eq!(
+                fs::metadata(path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{} must be 0600",
+                path.display()
+            );
+        }
     }
 }
 

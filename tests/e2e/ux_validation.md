@@ -5,7 +5,8 @@ This checklist retains the pre-split v1 scenario evidence plan. The normative co
 for behavior and [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md)
 for UI/UX. Rows below preserve the original 97 scenario evidence plan; supplemental UP rows record the
 2026-10-26 UI polish and follow-up workspace-tab/row-focus/picker refinement plus the 2026-10-27
-mint-accent/header, inline picker-tree, and fill-only-tab/fallback corrections, and are tracked
+mint-accent/header, inline picker-tree, and fill-only-tab/fallback corrections, and the later DIAG-06–11
+rows cover bounded log retention and the Diagnostics previous-log presentation; these are tracked
 in [made-ui-ux-v1 tasks](../../specs/changes/made-ui-ux-v1/tasks.md)
 and [v1 evidence](../../wiki/records/20261026-v1-evidence.md).
 
@@ -21,7 +22,7 @@ and [v1 evidence](../../wiki/records/20261026-v1-evidence.md).
 
 The `Expected` column is the spec `Then` clause verbatim. Do not weaken it. Manual rows need a recorded platform run with command/log and screenshot/recording. Final performance detail: [Performance](../../wiki/performance.md).
 
-Commands use `cargo test` from the repository root. Current Linux baseline: **630 passed, 0 failed,
+Commands use `cargo test` from the repository root. Current Linux baseline: **654 passed, 0 failed,
 2 ignored**; final software performance is in
 [Performance](../../wiki/performance.md). Every scenario remains
 pending for native Linux/macOS/Windows input unless marked otherwise.
@@ -245,7 +246,7 @@ Visual validation used temporary Linux/Xvfb/llvmpipe captures at 1280×800 and 7
 
 ## Diagnostics
 
-> Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session and workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible there rather than occupying routine chrome. User-action failures MUST remain discoverable without a debugger. Logs and copied diagnostics MUST NOT contain workspace-instance secrets.
+> Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session and workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible there rather than occupying routine chrome. User-action failures MUST remain discoverable without a debugger. Logs and copied diagnostics MUST NOT contain workspace-instance secrets. For current-version appends that take the lock, the active log stays at most 1 MiB; mixed-version writers can exceed it. One previous log is retained, and a legacy oversized active file may survive as `.1` without being truncated or rewritten. Appends are serialized by a bounded lock; unsafe lock/rotation conditions refuse the append and leave both logs untouched. Final-exit write/rotation failures are stderr-only, not in-card notices.
 
 | ID | Scenario | Method | Command / step | Expected (spec `Then`) | Evidence |
 |---|---|---|---|---|---|
@@ -254,6 +255,14 @@ Visual validation used temporary Linux/Xvfb/llvmpipe captures at 1280×800 and 7
 | DIAG-03 | Unsupported integration | Automated | unsupported diagnostics test | Made shows an unsupported or unavailable status with an actionable reason | crates/made-app/tests/diagnostics.rs |
 | DIAG-04 | Logs redact token | Automated | token/log redaction tests | the per-instance secret is absent and the log entries identify the relevant session or connection | crates/made-app/tests/diagnostics.rs; bridge security |
 | DIAG-05 | Shell follow diagnostics without chrome noise | Automated + Xvfb | workspace shell/capability diagnostics test and capture | its workspace identity, reporting capability/reason, latest shell cwd, effective root/source and inactive optional integration are inspectable, secrets are absent from displayed/copied logs, and routine technical chrome remains hidden outside Diagnostics | diagnostics_expose_workspace_shell_and_inactive_integration; ui_model.rs |
+| DIAG-06 | Bounded log rotation preserves history | Automated + manual scratch check | exact-threshold, legacy-log and safety tests; manual `/tmp` scratch rotation (no committed artifact) | the active log becomes the single previous log before the new record is appended, no existing bytes are truncated, rewritten, or deleted, the active log stays at most 1 MiB, and the previous log may exceed 1 MiB only when it preserves a legacy oversized file | crates/made-platform/tests/contract.rs; `ui_model::oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown`; manual scratch copy rotated with identical `.1` hash (not committed) |
+| DIAG-07 | Oversized log content stays bounded | Automated | 4 KiB boundary and 500 × 4 KiB budget tests | the message is truncated on a UTF-8 boundary with a marker, oldest entries are evicted before newer ones, at most 500 entries remain, and the record written to the active log stays below 1 MiB | crates/made-app/tests/diagnostics.rs |
+| DIAG-08 | Log retention failure is reported | Automated refusal tests; stderr path not captured | lock symlink/dir/permission/timeout, unsafe-backup, rename-failure, symlink-current tests; final-exit gap documented | the record is refused, the active and previous logs are left untouched, the failure is reported on stderr, and Diagnostics shows an error only while the app is still rendering; final-exit failures are not visible in-app | crates/made-platform/tests/contract.rs; `ui_model` warning/tone tests; stderr is code-reviewed, not captured; no in-card final-exit claim |
+| DIAG-09 | Previous log path and retention notice | Automated | previous-log absent/present/copy/tooltip, 720×480 warning containment, degraded state and tone tests | the full previous-log path is available (truncation-safe with a tooltip), copying it works only when the file exists, an absent file shows a quiet "not yet rotated" state with the action disabled, a retention warning or error present while the card is rendering uses the warning or error tone inside the card, and final-exit failures are stderr-only rather than claimed in-card | `ui_model::diagnostics_previous_log_row_reflects_existence_and_copies`; `ui_model::diagnostics_degraded_state_keeps_previous_log_row_at_720`; `ui_model::oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown`; `ui` tone unit test |
+| DIAG-10 | Legacy oversized log warning | Automated | startup oversized-log warning and `.1` permission test | a non-blocking warning states that it will be kept as the previous log on the next shutdown write, and future writes are not refused | `ui_model::oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown` |
+| DIAG-11 | Unsafe log path warning | Automated | startup unsafe `.1`/lock warning and refused-shutdown test | a non-blocking warning names the unsafe path and states that rotation or writes will be refused | `ui_model::diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup` |
+
+Final-exit failure visibility is a known gap: the shutdown write happens after the last UI frame, so only stderr can report a refusal or I/O failure there. The startup legacy warning is the one user-visible retention warning covered by automated UI evidence.
 
 ## V1 Scope Boundary
 

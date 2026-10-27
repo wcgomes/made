@@ -1,6 +1,6 @@
 # Change Spec: made-ui-ux-v1
 
-> **Scope:** This active change owns the UI/UX/visual/presentation contract for the undelivered v1, split from `opencode-session-follow-v1`. Product/runtime/integration/security/performance behavior remains in the core change (`specs/changes/opencode-session-follow-v1/spec.md`). This is not a new version, release, or archive. The UI is implemented on Linux with 630 passing tests and Xvfb/headless evidence; native platform, pointer, keyboard, compositor, and manual visual evidence remain pending.
+> **Scope:** This active change owns the UI/UX/visual/presentation contract for the undelivered v1, split from `opencode-session-follow-v1`. Product/runtime/integration/security/performance behavior remains in the core change (`specs/changes/opencode-session-follow-v1/spec.md`). This is not a new version, release, or archive. The UI is implemented on Linux with 654 passing tests and Xvfb/headless evidence; native platform, pointer, keyboard, compositor, and manual visual evidence remain pending.
 
 ## ADDED Requirements
 
@@ -234,7 +234,7 @@ Made MUST present an opened file as a read-only preview occupying the entire lef
 
 ### Requirement: Diagnostics Presentation
 
-Made MUST present Diagnostics as an opaque floating card with a status pill, reason, copy actions, sectioned connection/session/worktree/version/metrics/log detail, bounded log block, and a path/copy footer. The card MUST remain usable at the documented responsive sizes and MUST NOT turn technical details into routine chrome outside the card. Shell-follow diagnostics MUST expose workspace identity, reporting capability/reason, latest shell cwd, effective root/source, and inactive optional integration without treating shell-only use as degraded. Data fields, status semantics, redaction, and log content are owned by the core spec.
+Made MUST present Diagnostics as an opaque floating card with a status pill, reason, copy actions, sectioned connection/session/worktree/version/metrics/log detail, bounded log block, and a path/copy footer. Under `LOG`, the card MUST show a compact Previous log path row. When the previous log exists, the row MUST offer a "Copy previous log path" action, show the full path in a tooltip, and remain truncation-safe at 720×480; when it does not exist, the row MUST show a quiet "not yet rotated" state with that action disabled. The existing active-log path and copy row MUST remain. A retention warning or error present while the card is rendering (for example the startup legacy-size warning) MUST use the warning or error tone inside the card. Final-exit write/rotation failures are stderr-only and MUST NOT be claimed as in-card notices. The card MUST remain usable at the documented responsive sizes and MUST NOT turn technical details into routine chrome outside the card. Shell-follow diagnostics MUST expose workspace identity, reporting capability/reason, latest shell cwd, effective root/source, and inactive optional integration without treating shell-only use as degraded. Data fields, status semantics, redaction, retention, and log content are owned by the core spec.
 
 #### Scenario: Shell follow diagnostics without chrome noise
 
@@ -247,6 +247,12 @@ Made MUST present Diagnostics as an opaque floating card with a status pill, rea
 - Given Diagnostics is open at 1280×800 or 720×480
 - When the card is inspected or resized
 - Then it uses the opaque card, documented width/height clamps, section labels, monospace values, bounded log block, copy actions, and no clipped essential detail
+
+#### Scenario: Previous log path and retention notice
+
+- Given Diagnostics is open and the previous diagnostics log exists, or has not yet been rotated
+- When the user inspects or copies the Previous log row
+- Then the full previous-log path is available (truncation-safe with a tooltip), copying it works only when the file exists, an absent file shows a quiet "not yet rotated" state with the action disabled, a retention warning or error present while the card is rendering uses the warning or error tone inside the card, and final-exit failures are stderr-only rather than claimed in-card
 
 ### Requirement: Responsive and Motion
 

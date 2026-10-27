@@ -45,6 +45,18 @@
 //! helper exists so diagnostics cannot accidentally follow a symlink or create a
 //! world-readable log.
 //!
+//! [`append_private_log_rotated`] serializes one record under a persistent
+//! `<log>.lock` (0600, read+write so Windows whole-file locking works) with a
+//! bounded one-second lock wait, rotates the active file directly over `<log>.1`
+//! when the record would exceed the caller's byte threshold, and never
+//! truncates, rewrites, copies, or deletes existing log content. If the lock is
+//! unavailable/times out, or a needed rotation cannot be performed, the append
+//! is refused and both logs are left untouched. Current-version cooperative
+//! appends keep the active log at most the threshold; mixed-version writers can
+//! exceed it, and a legacy oversized active file may survive as `.1` without
+//! being rewritten. POSIX replacement is atomic; Windows lock/rename behavior is
+//! cross-compiled but unverified.
+//!
 //! [`AppPaths::opencode_config_path`] is the user's OpenCode `cli.json`:
 //! `$XDG_CONFIG_HOME/opencode/cli.json` on Linux,
 //! `~/Library/Application Support/opencode/cli.json` on macOS, and
@@ -1204,6 +1216,447 @@ fn ensure_private_temp_dir(path: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Maximum size of the active diagnostics log.
+///
+/// The previous log may exceed this only when it preserves a legacy active file
+/// that was already oversized; that content is never truncated or rewritten.
+pub const DIAGNOSTICS_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Default maximum time to wait for the diagnostics log lock.
+pub const DIAGNOSTICS_LOG_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Upper bound for a caller-supplied log-lock wait.
+pub const DIAGNOSTICS_LOG_MAX_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Suffix of the single retained previous diagnostics log.
+pub const DIAGNOSTICS_LOG_BACKUP_SUFFIX: &str = ".1";
+
+/// Suffix of the persistent diagnostics log lock file.
+pub const DIAGNOSTICS_LOG_LOCK_SUFFIX: &str = ".lock";
+
+/// Severity of a diagnostics-log retention or write issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogIssueSeverity {
+    /// Retention may be weakened, but the operation continues.
+    Warning,
+    /// The operation was refused or failed.
+    Error,
+}
+
+/// A bounded, user-visible diagnostics-log issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogIssue {
+    /// Warning or error.
+    pub severity: LogIssueSeverity,
+    /// Sanitized, user-readable explanation.
+    pub message: String,
+}
+
+impl LogIssue {
+    /// Build a warning issue.
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: LogIssueSeverity::Warning,
+            message: message.into(),
+        }
+    }
+
+    /// Build an error issue.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: LogIssueSeverity::Error,
+            message: message.into(),
+        }
+    }
+}
+
+/// Result of one serialized, rotation-aware log append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogAppendOutcome {
+    /// The record was appended while the lock was held.
+    Written {
+        /// Whether the active log was renamed to the previous-log path first.
+        rotated: bool,
+        /// A non-fatal retention issue (for example a previous-log mode that
+        /// could not be tightened).
+        issue: Option<LogIssue>,
+    },
+    /// The record and both logs were left untouched.
+    Refused {
+        /// Error explaining why the append was refused.
+        issue: LogIssue,
+    },
+}
+
+impl LogAppendOutcome {
+    fn refused(message: impl Into<String>) -> Self {
+        Self::Refused {
+            issue: LogIssue::error(message),
+        }
+    }
+}
+
+/// Previous-log path derived from the active log path (`<log>.1`).
+pub fn previous_private_log_path(path: impl AsRef<Path>) -> PathBuf {
+    let mut name = path.as_ref().as_os_str().to_owned();
+    name.push(DIAGNOSTICS_LOG_BACKUP_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Lock path derived from the active log path (`<log>.lock`).
+pub fn private_log_lock_path(path: impl AsRef<Path>) -> PathBuf {
+    let mut name = path.as_ref().as_os_str().to_owned();
+    name.push(DIAGNOSTICS_LOG_LOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Append one record under a bounded lock wait, rotating first when needed.
+///
+/// Every append holds the app-owned lock. The lock is acquired with `try_lock`
+/// for at most [`DIAGNOSTICS_LOG_LOCK_TIMEOUT`] (caller-supplied waits are
+/// capped at [`DIAGNOSTICS_LOG_MAX_LOCK_TIMEOUT`]), so a stuck peer can delay
+/// one workspace's cleanup by at most that bound. The record is written as one
+/// `write_all` call; that call is not failure-atomic on a partial I/O error.
+/// When `current_len + record.len() > max_bytes`, the active log is renamed
+/// directly over the previous log (`<path>.1`); the previous log is never
+/// removed first and existing bytes are never truncated, rewritten, or copied.
+/// A missing active log is created. On POSIX the replacement rename is atomic;
+/// Windows replacement and whole-file lock behavior are cross-compiled but
+/// unverified.
+///
+/// For current-version appends that take the lock, the active log is at most
+/// `max_bytes`. A mixed-version or non-cooperating writer can exceed it. The
+/// previous log may exceed `max_bytes` only when it preserves a legacy active
+/// file that was already oversized; that content is preserved byte-for-byte.
+/// Every successful append tightens an existing regular `.1` to 0600.
+///
+/// Refusal behavior (both logs untouched, no append):
+/// - the lock path is unsafe/unavailable, or lock acquisition times out;
+/// - the active log is a symlink or non-regular file;
+/// - rotation is needed but the previous-log path is unsafe/uninspectable;
+/// - rotation is needed but the rename fails;
+/// - the record itself is at or above the threshold.
+///
+/// An unsafe `.1` is irrelevant when no rotation is needed. An unexpected
+/// open/write failure after a successful rotation returns an error naming the
+/// previous log, which still holds the earlier content. The lock file is
+/// persistent and is never deleted. No `fsync` is issued.
+pub fn append_private_log_rotated(
+    path: impl AsRef<Path>,
+    record: &[u8],
+    max_bytes: u64,
+) -> Result<LogAppendOutcome, PlatformError> {
+    append_private_log_rotated_with_rename(
+        path,
+        record,
+        max_bytes,
+        DIAGNOSTICS_LOG_LOCK_TIMEOUT,
+        |from: &Path, to: &Path| std::fs::rename(from, to),
+    )
+}
+
+/// Append with an explicit bounded lock wait. Intended for tests; the wait is
+/// capped at [`DIAGNOSTICS_LOG_MAX_LOCK_TIMEOUT`].
+pub fn append_private_log_rotated_with_timeout(
+    path: impl AsRef<Path>,
+    record: &[u8],
+    max_bytes: u64,
+    lock_timeout: Duration,
+) -> Result<LogAppendOutcome, PlatformError> {
+    append_private_log_rotated_with_rename(
+        path,
+        record,
+        max_bytes,
+        lock_timeout,
+        |from: &Path, to: &Path| std::fs::rename(from, to),
+    )
+}
+
+/// Append with an injected rename operation.
+///
+/// This is a public seam for deterministic rotation-failure tests; production
+/// callers use [`append_private_log_rotated`]. The rename closure is only called
+/// after the previous-log path has been validated.
+#[doc(hidden)]
+pub fn append_private_log_rotated_with_rename<F>(
+    path: impl AsRef<Path>,
+    record: &[u8],
+    max_bytes: u64,
+    lock_timeout: Duration,
+    rename: F,
+) -> Result<LogAppendOutcome, PlatformError>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let path = path.as_ref();
+    let lock_timeout = lock_timeout.min(DIAGNOSTICS_LOG_MAX_LOCK_TIMEOUT);
+    if record.len() as u64 >= max_bytes {
+        return Ok(LogAppendOutcome::refused(format!(
+            "refusing to write a {}-byte diagnostics record at the {max_bytes}-byte log threshold",
+            record.len()
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_private_dir_all(parent)?;
+        }
+    }
+
+    let lock = match open_private_log_lock(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Ok(LogAppendOutcome::refused(format!(
+                "diagnostics log lock unavailable ({error}); refusing to append"
+            )));
+        }
+    };
+    if let Err(error) = acquire_log_lock(&lock, lock_timeout) {
+        return Ok(LogAppendOutcome::refused(format!(
+            "diagnostics log lock unavailable ({error}); refusing to append"
+        )));
+    }
+
+    let (current_len, current_exists) = match inspect_current_log(path) {
+        Ok(inspected) => inspected,
+        Err(error) => return Ok(LogAppendOutcome::refused(error.to_string())),
+    };
+    let mut rotated = false;
+    let mut issue = None;
+    if current_exists && current_len.saturating_add(record.len() as u64) > max_bytes {
+        match rotate_current_log_with(path, rename) {
+            Ok(()) => {
+                rotated = true;
+                issue = tighten_existing_previous_log(path);
+            }
+            Err(refusal) => return Ok(LogAppendOutcome::Refused { issue: refusal }),
+        }
+    }
+
+    if !rotated {
+        issue = tighten_existing_previous_log(path);
+    }
+
+    let backup = previous_private_log_path(path);
+    let mut file = open_private_log(path).map_err(|error| {
+        if rotated {
+            PlatformError::message(format!(
+                "diagnostics log append failed after rotation; previous log preserved at {}: {error}",
+                backup.display()
+            ))
+        } else {
+            error
+        }
+    })?;
+    file.write_all(record).map_err(|error| {
+        if rotated {
+            PlatformError::message(format!(
+                "diagnostics log append failed after rotation; previous log preserved at {}: {error}",
+                backup.display()
+            ))
+        } else {
+            PlatformError::io("append private log record", error)
+        }
+    })?;
+    let _ = lock.unlock();
+
+    Ok(LogAppendOutcome::Written { rotated, issue })
+}
+
+/// Tighten an existing regular previous log under the lock.
+fn tighten_existing_previous_log(path: &Path) -> Option<LogIssue> {
+    let backup = previous_private_log_path(path);
+    if !std::fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_file()) {
+        return None;
+    }
+    tighten_private_log_permissions(&backup).err().map(|error| {
+        LogIssue::warning(format!(
+            "previous diagnostics log permissions could not be tightened: {error}"
+        ))
+    })
+}
+
+/// Wait for the log lock with a bounded `try_lock` retry loop.
+fn acquire_log_lock(file: &std::fs::File, timeout: Duration) -> Result<(), io::Error> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let elapsed = started.elapsed();
+                if elapsed >= timeout {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("lock wait exceeded {} ms", timeout.as_millis()),
+                    ));
+                }
+                let remaining = timeout.saturating_sub(elapsed);
+                thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// Validate the active path and return its length when it exists.
+fn inspect_current_log(path: &Path) -> Result<(u64, bool), PlatformError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(PlatformError::message(format!(
+                    "refusing to use symlink as a private log: {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_file() {
+                return Err(PlatformError::message(format!(
+                    "refusing to use non-regular private log path: {}",
+                    path.display()
+                )));
+            }
+            Ok((metadata.len(), true))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((0, false)),
+        Err(error) => Err(PlatformError::io("inspect private log path", error)),
+    }
+}
+
+/// Refuse to replace an unsafe previous-log path.
+fn inspect_backup_log(path: &Path) -> Result<(), LogIssue> {
+    let backup = previous_private_log_path(path);
+    match std::fs::symlink_metadata(&backup) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LogIssue::error(format!(
+                    "diagnostics log rotation refused: previous log path is not a regular file: {}",
+                    backup.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LogIssue::error(format!(
+            "diagnostics log rotation refused: could not inspect previous log {}: {error}",
+            backup.display()
+        ))),
+    }
+}
+
+/// Rotate the active log over the previous log, or return an error issue.
+fn rotate_current_log_with(
+    path: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), LogIssue> {
+    inspect_backup_log(path)?;
+    rename(path, &previous_private_log_path(path)).map_err(|error| {
+        LogIssue::error(format!(
+            "diagnostics log rotation refused ({error}); active and previous logs left untouched"
+        ))
+    })
+}
+
+/// Tighten a regular private log file to 0600 on Unix.
+///
+/// A missing path is accepted. Symlinks and non-regular files are refused; the
+/// caller decides whether that is fatal for its operation.
+pub fn tighten_private_log_permissions(path: impl AsRef<Path>) -> Result<(), PlatformError> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(PlatformError::message(format!(
+                    "refusing to tighten symlink as a private log: {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_file() {
+                return Err(PlatformError::message(format!(
+                    "refusing to tighten non-regular private log path: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PlatformError::io("inspect private log path", error)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| PlatformError::io("set private log permissions", error))?;
+    }
+    Ok(())
+}
+
+/// Open or create the persistent lock file with read/write access.
+///
+/// Windows whole-file locks require a read+write handle; an append-only handle
+/// is not sufficient. The file is mode 0600 on Unix, rejects symlinks through
+/// `O_NOFOLLOW`, and is never removed by the diagnostics path.
+fn open_private_log_lock(path: &Path) -> Result<std::fs::File, PlatformError> {
+    let lock_path = private_log_lock_path(path);
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(PlatformError::message(format!(
+                    "refusing to open symlink as a private log lock: {}",
+                    lock_path.display()
+                )));
+            }
+            if !file_type.is_file() {
+                return Err(PlatformError::message(format!(
+                    "refusing to open non-regular private log lock: {}",
+                    lock_path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PlatformError::io("inspect private log lock", error)),
+    }
+
+    let file = open_lock_private(&lock_path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| PlatformError::io("inspect private log lock", error))?;
+    if !metadata.is_file() {
+        return Err(PlatformError::message(format!(
+            "refusing to open non-regular private log lock: {}",
+            lock_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| PlatformError::io("set private log lock permissions", error))?;
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_lock_private(path: &Path) -> Result<std::fs::File, PlatformError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| PlatformError::io("open private log lock", error))
+}
+
+#[cfg(not(unix))]
+fn open_lock_private(path: &Path) -> Result<std::fs::File, PlatformError> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| PlatformError::io("open private log lock", error))
+}
+
 /// Open or create an append-only private log file.
 ///
 /// The file is created with mode 0600 on Unix and existing files are tightened
@@ -2007,3 +2460,38 @@ pub fn in_memory_clipboard() -> InMemoryClipboard {
 }
 mod shell_integration;
 pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
+
+#[cfg(test)]
+mod diagnostics_log_tests {
+    use super::*;
+
+    #[test]
+    fn rotation_failure_leaves_the_active_log_untouched() {
+        let root = std::env::temp_dir().join(format!(
+            "made-platform-rotation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let log = root.join("logs").join("integration.log");
+        {
+            let mut file = open_private_log(&log).expect("seed log");
+            file.write_all(b"existing").expect("seed append");
+        }
+        let before = std::fs::read(&log).expect("read before");
+
+        let result = rotate_current_log_with(&log, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected rename failure",
+            ))
+        });
+
+        assert!(result.is_err(), "rename failure must surface an error");
+        assert_eq!(std::fs::read(&log).expect("read after"), before);
+        assert!(!previous_private_log_path(&log).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

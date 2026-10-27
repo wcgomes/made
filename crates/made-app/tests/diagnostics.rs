@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use made_app::diagnostics::{
-    DiagnosticLog, Diagnostics, LogEntry, LogLevel, WorkspaceDiagnostics, MAX_LOG_ENTRIES,
+    DiagnosticLog, Diagnostics, LogEntry, LogLevel, WorkspaceDiagnostics, LOG_TRUNCATION_MARKER,
+    MAX_LOG_ENTRIES, MAX_LOG_FILE_BYTES, MAX_LOG_MESSAGE_BYTES, MAX_LOG_TEXT_BYTES,
 };
 use made_app::integration_status::IntegrationState;
 use made_app::session_follow::FollowedSession;
@@ -311,6 +312,148 @@ fn the_log_is_bounded_and_keeps_the_newest_entries() {
     assert_eq!(MAX_LOG_ENTRIES, 500);
 }
 
+fn stored_and_rendered(message: &str) -> (String, String) {
+    let mut diagnostics = Diagnostics::new("/tmp/made/truncation.log");
+    diagnostics
+        .log_mut()
+        .push(LogEntry::new(LogLevel::Info, message));
+    let integration = IntegrationState::new(None, "/workspace");
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    let stored = view.entries.last().expect("stored entry").message.clone();
+    let text = view.to_text();
+    let rendered = text
+        .lines()
+        .find(|line| line.starts_with("  #1 [info] "))
+        .expect("rendered entry")
+        .to_owned();
+    (stored, rendered)
+}
+
+#[test]
+fn message_truncation_boundaries_are_utf8_safe_for_stored_and_rendered_text() {
+    let exact = "x".repeat(MAX_LOG_MESSAGE_BYTES);
+    let (stored, rendered) = stored_and_rendered(&exact);
+    assert_eq!(stored.len(), MAX_LOG_MESSAGE_BYTES);
+    assert!(!stored.contains(LOG_TRUNCATION_MARKER));
+    assert_eq!(rendered.len(), 12 + stored.len());
+
+    let over = "x".repeat(MAX_LOG_MESSAGE_BYTES + 1);
+    let (stored, rendered) = stored_and_rendered(&over);
+    assert_eq!(stored.len(), MAX_LOG_MESSAGE_BYTES);
+    assert!(stored.ends_with(LOG_TRUNCATION_MARKER), "{stored:?}");
+    assert_eq!(rendered.len(), 12 + stored.len());
+
+    let three_byte = "€".repeat(4098 / 3 + 1);
+    let (stored, rendered) = stored_and_rendered(&three_byte);
+    assert_eq!(
+        stored.len(),
+        4095,
+        "3-byte code point must back up to a boundary"
+    );
+    let keep = stored
+        .strip_suffix(LOG_TRUNCATION_MARKER)
+        .expect("truncation marker");
+    assert!(keep.chars().all(|character| character == '€'));
+    assert!(std::str::from_utf8(stored.as_bytes()).is_ok());
+    assert_eq!(rendered.len(), 12 + stored.len());
+
+    let four_byte = format!("a{}", "😀".repeat(1025));
+    let (stored, rendered) = stored_and_rendered(&four_byte);
+    assert_eq!(
+        stored.len(),
+        4093,
+        "4-byte code point must back up to a boundary"
+    );
+    let keep = stored
+        .strip_suffix(LOG_TRUNCATION_MARKER)
+        .expect("truncation marker");
+    assert!(keep.starts_with('a'));
+    assert!(keep[1..].chars().all(|character| character == '😀'));
+    assert!(!stored.contains('\u{FFFD}'));
+    assert_eq!(rendered.len(), 12 + stored.len());
+}
+
+#[test]
+fn a_worst_case_log_stays_below_the_file_threshold_and_keeps_newest() {
+    let mut diagnostics = Diagnostics::new("/tmp/made/worst-case.log");
+    for index in 0..MAX_LOG_ENTRIES {
+        diagnostics.log_mut().push(LogEntry::new(
+            LogLevel::Info,
+            format!("{index:04}{}", "x".repeat(MAX_LOG_MESSAGE_BYTES)),
+        ));
+    }
+    let integration = IntegrationState::new(None, "/workspace");
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    let text = view.to_text();
+
+    assert!(
+        text.len() < MAX_LOG_FILE_BYTES as usize,
+        "worst-case snapshot is {} bytes",
+        text.len()
+    );
+    assert!(
+        text.len() <= MAX_LOG_TEXT_BYTES + 64 * 1024,
+        "log text exceeded its budget: {} bytes",
+        text.len()
+    );
+    assert!(
+        view.entries.len() < MAX_LOG_ENTRIES,
+        "entries were not evicted"
+    );
+    let newest = view.entries.last().expect("newest entry");
+    assert!(newest.message.starts_with("0499"), "{}", newest.message);
+    assert!(
+        view.entries.iter().all(|entry| entry.sequence > 1),
+        "oldest entries must be evicted first"
+    );
+}
+
+#[test]
+fn snapshot_redacts_hex_session_ids_for_ui() {
+    let secret = "0123456789abcdef".repeat(4);
+    let mut diagnostics = Diagnostics::new("/tmp/made/session-redaction.log");
+    diagnostics
+        .log_mut()
+        .push(LogEntry::new(LogLevel::Info, "session event").with_session(&secret));
+    let integration = IntegrationState::new(None, "/workspace");
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    let session = view.entries[0].session_id.as_deref().expect("session id");
+    assert!(session.contains("[redacted]"), "{session}");
+    assert!(!session.contains(&secret), "{session}");
+    assert!(!view.to_text().contains(&secret));
+}
+
+#[test]
+fn previous_log_path_exists_and_is_copyable() {
+    let temp = tempfile::tempdir().unwrap();
+    let active = temp.path().join("integration.log");
+    let previous = temp.path().join("integration.log.1");
+    let diagnostics = Diagnostics::new(&active);
+
+    assert_eq!(diagnostics.previous_log_location(), previous.as_path());
+    assert!(!diagnostics.previous_log_exists());
+    let integration = IntegrationState::new(None, "/workspace");
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    assert_eq!(
+        view.previous_log_location.as_deref(),
+        Some(previous.to_string_lossy().as_ref())
+    );
+    assert!(!view.previous_log_exists);
+
+    std::fs::write(&previous, b"previous record\n").unwrap();
+    assert!(diagnostics.previous_log_exists());
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    assert!(view.previous_log_exists);
+    assert!(view.to_text().contains("previous log location"));
+
+    let mut clipboard = InMemoryClipboard::new();
+    diagnostics.copy_previous_log_path(&mut clipboard).unwrap();
+    assert_eq!(
+        clipboard.get_text().unwrap(),
+        previous.to_string_lossy().as_ref()
+    );
+}
+
 #[test]
 fn degraded_diagnostics_show_reason_and_last_known_root() {
     let token = token();
@@ -335,7 +478,24 @@ fn degraded_diagnostics_show_reason_and_last_known_root() {
     assert_eq!(view.reason_code, "bridge_closed");
     assert!(view.reason.contains("connection closed"));
     assert_eq!(view.active_root, Some(PathBuf::from("/workspace/linked")));
+    assert_eq!(
+        view.previous_log_location.as_deref(),
+        Some("/tmp/made-integration.log.1")
+    );
+    assert!(!view.previous_log_exists);
     assert!(!view.contains_secret(&token));
+}
+
+#[test]
+fn unavailable_diagnostics_have_no_previous_log_state() {
+    let diagnostics = Diagnostics::unavailable("app paths unavailable");
+    let integration = IntegrationState::new(None, "/workspace");
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    assert_eq!(view.previous_log_location, None);
+    assert!(!view.previous_log_exists);
+    assert!(view
+        .to_text()
+        .contains("unavailable: app paths unavailable"));
 }
 
 #[test]
