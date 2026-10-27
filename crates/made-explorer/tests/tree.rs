@@ -13,7 +13,7 @@ const GENERATION: RootGeneration = RootGeneration::new(1);
 fn fixture_root(temp: &tempfile::TempDir) -> std::path::PathBuf {
     let root = temp.path().join("root");
     fs::create_dir_all(&root).unwrap();
-    root
+    root.canonicalize().unwrap()
 }
 
 fn names(entries: &[made_explorer::tree::TreeEntry]) -> Vec<&str> {

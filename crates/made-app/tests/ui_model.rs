@@ -278,8 +278,9 @@ impl Headless {
 
     fn render_events_at(&mut self, events: Vec<egui::Event>, time: f64) -> egui::FullOutput {
         self.model.logic(&self.ctx);
+        let min_time = self.last_time + 1.0 / 60.0;
         let mut raw = self.raw(events);
-        let time = time.max(self.last_time + 1.0 / 60.0);
+        let time = time.max(min_time);
         self.last_time = time;
         raw.time = Some(time);
         let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
@@ -911,7 +912,7 @@ fn fixture_workspace(temp: &Path, name: &str, file: &str) -> PathBuf {
     let path = temp.join(name);
     fs::create_dir(&path).unwrap();
     fs::write(path.join(file), "fixture contents\n").unwrap();
-    path
+    path.canonicalize().unwrap()
 }
 
 #[test]
@@ -2690,8 +2691,10 @@ fn explorer_animation_slides_without_reflow_and_stops_capturing_when_closed() {
         .unwrap()
         .set_explorer_visible(false);
     let mut closing = None;
+    let mut frame_time = headless.last_time;
     for _ in 0..40 {
-        let output = headless.render();
+        frame_time += 1.0 / 60.0;
+        let output = headless.render_events_at(Vec::new(), frame_time);
         if let Some(response) = headless.ctx.read_response(splitter) {
             let left = response.rect.left();
             if left > full_left + 4.0 && left < 1270.0 {
@@ -2701,7 +2704,6 @@ fn explorer_animation_slides_without_reflow_and_stops_capturing_when_closed() {
         } else {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
     let closing = closing.expect("closing panel should expose an intermediate width frame");
     let closing_card =
@@ -2731,8 +2733,10 @@ fn explorer_animation_slides_without_reflow_and_stops_capturing_when_closed() {
         .unwrap()
         .set_explorer_visible(true);
     let mut opening = None;
+    let mut frame_time = headless.last_time;
     for _ in 0..60 {
-        let output = headless.render();
+        frame_time += 1.0 / 60.0;
+        let output = headless.render_events_at(Vec::new(), frame_time);
         if let Some(response) = headless.ctx.read_response(splitter) {
             let left = response.rect.left();
             if left > full_left + 4.0 && left < 1270.0 {
@@ -2740,7 +2744,6 @@ fn explorer_animation_slides_without_reflow_and_stops_capturing_when_closed() {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
     let opening = opening.expect("opening panel should expose an intermediate width frame");
     let opening_card =
@@ -4677,22 +4680,20 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
 #[test]
 fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() {
     let temp = tempfile::tempdir().unwrap();
-    let alpha = temp.path().join("alpha");
+    let temp_root = temp.path().canonicalize().unwrap();
+    let alpha = temp_root.join("alpha");
     fs::create_dir(&alpha).unwrap();
 
     let mut up = picker_headless(&alpha, 900.0, 620.0);
     up.render();
     up.focus(picker_control_id("up"));
     up.press_key(egui::Key::Enter);
-    assert_eq!(
-        up.model.launch().picker().unwrap().current_dir(),
-        temp.path()
-    );
+    assert_eq!(up.model.launch().picker().unwrap().current_dir(), temp_root);
     assert!(up.model.is_picker());
 
-    let mut refresh = picker_headless(temp.path(), 900.0, 620.0);
+    let mut refresh = picker_headless(&temp_root, 900.0, 620.0);
     refresh.render();
-    let gamma = temp.path().join("gamma");
+    let gamma = temp_root.join("gamma");
     fs::create_dir(&gamma).unwrap();
     refresh.focus(picker_control_id("refresh"));
     refresh.press_key(egui::Key::Enter);
@@ -4713,11 +4714,11 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
             .picker()
             .unwrap()
             .current_dir(),
-        temp.path(),
+        temp_root,
         "Backspace must re-root even when a picker button has focus"
     );
 
-    let mut list = picker_headless(temp.path(), 900.0, 620.0);
+    let mut list = picker_headless(&temp_root, 900.0, 620.0);
     list.render();
     list.focus(picker_list_id());
     list.press_key(egui::Key::ArrowDown);
@@ -4726,12 +4727,12 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
     let toggled = list.model.launch().picker().expect("picker remains");
     assert_eq!(
         toggled.current_dir(),
-        temp.path().canonicalize().unwrap(),
+        temp_root,
         "Enter must not re-root the picker"
     );
     assert!(toggled.rows()[0].expanded());
 
-    let mut button_switch = picker_headless(temp.path(), 900.0, 620.0);
+    let mut button_switch = picker_headless(&temp_root, 900.0, 620.0);
     button_switch.render();
     button_switch.focus(picker_control_id("up"));
     button_switch.press_key(egui::Key::ArrowDown);
@@ -4741,7 +4742,7 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
         "a focused button must not let global arrows move the list"
     );
 
-    let mut selected = picker_headless(temp.path(), 900.0, 620.0);
+    let mut selected = picker_headless(&temp_root, 900.0, 620.0);
     selected.model.picker_select(0).unwrap();
     selected.render();
     selected.focus(picker_control_id("selected"));
@@ -4752,14 +4753,14 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
         Some(alpha.as_path())
     );
 
-    let mut current = picker_headless(temp.path(), 900.0, 620.0);
+    let mut current = picker_headless(&temp_root, 900.0, 620.0);
     current.render();
     current.focus(picker_control_id("current"));
     current.press_key(egui::Key::Enter);
     assert!(!current.model.is_picker());
     assert_eq!(
         current.model.launch().explorer_root(),
-        Some(temp.path().canonicalize().unwrap().as_path())
+        Some(temp_root.as_path())
     );
 }
 

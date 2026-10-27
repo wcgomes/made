@@ -32,11 +32,15 @@ fn unique_temp(label: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "made-pty-test-{label}-{}-{nanos}-{}",
         std::process::id(),
         UNIQUE.fetch_add(1, Ordering::Relaxed)
-    ))
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    #[cfg(unix)]
+    let path = path.canonicalize().unwrap();
+    path
 }
 
 fn options(cwd: &std::path::Path) -> PtyOptions {

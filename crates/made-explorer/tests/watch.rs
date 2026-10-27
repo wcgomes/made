@@ -12,7 +12,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 fn fixture_root(temp: &tempfile::TempDir) -> PathBuf {
     let root = temp.path().join("root");
     fs::create_dir_all(&root).unwrap();
-    root
+    root.canonicalize().unwrap()
 }
 
 fn wait_for<F>(watcher: &mut FsWatcher, timeout: Duration, mut predicate: F) -> Option<WatchEvent>

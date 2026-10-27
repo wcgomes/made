@@ -2604,6 +2604,8 @@ mod tests {
             fs::write(directory.join("nested.txt"), "nested").unwrap();
             let file = temp.path().join("b.txt");
             fs::write(&file, "file").unwrap();
+            let expected_directory = directory.canonicalize().unwrap();
+            let expected_file = file.canonicalize().unwrap();
             let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
             let mut log = DiagnosticLog::new();
             wait_for_root(&mut pane, &mut log);
@@ -2626,7 +2628,7 @@ mod tests {
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[]);
             assert_eq!(
                 pane.selected_path(),
-                Some(directory.as_path()),
+                Some(expected_directory.as_path()),
                 "focusing the tree must select the first row without activating it"
             );
             assert!(pane.preview_path().is_none());
@@ -2639,16 +2641,16 @@ mod tests {
                 height,
                 &[egui::Key::ArrowDown],
             );
-            assert_eq!(pane.selected_path(), Some(file.as_path()));
+            assert_eq!(pane.selected_path(), Some(expected_file.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::Home]);
-            assert_eq!(pane.selected_path(), Some(directory.as_path()));
+            assert_eq!(pane.selected_path(), Some(expected_directory.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::End]);
-            assert_eq!(pane.selected_path(), Some(file.as_path()));
+            assert_eq!(pane.selected_path(), Some(expected_file.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::Home]);
-            assert_eq!(pane.selected_path(), Some(directory.as_path()));
+            assert_eq!(pane.selected_path(), Some(expected_directory.as_path()));
             assert!(pane.preview_path().is_none());
 
             tree_key_frame(
@@ -2678,8 +2680,8 @@ mod tests {
                 height,
                 &[egui::Key::ArrowDown],
             );
-            let nested = directory.join("nested.txt");
-            assert_eq!(pane.selected_path(), Some(nested.as_path()));
+            let expected_nested = expected_directory.join("nested.txt");
+            assert_eq!(pane.selected_path(), Some(expected_nested.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(
                 &ctx,
@@ -2689,7 +2691,7 @@ mod tests {
                 height,
                 &[egui::Key::PageDown],
             );
-            assert_eq!(pane.selected_path(), Some(file.as_path()));
+            assert_eq!(pane.selected_path(), Some(expected_file.as_path()));
             assert!(pane.preview_path().is_none());
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::Home]);
             tree_key_frame(&ctx, &mut pane, &mut log, width, height, &[egui::Key::End]);
@@ -2702,7 +2704,7 @@ mod tests {
                 height,
                 &[egui::Key::Enter],
             );
-            assert_eq!(pane.preview_path(), Some(file.as_path()));
+            assert_eq!(pane.preview_path(), Some(expected_file.as_path()));
         }
     }
 

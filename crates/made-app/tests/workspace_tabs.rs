@@ -185,12 +185,13 @@ fn real_bridges_keep_state_focus_epochs_and_late_deliveries_tab_local() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
     let mut options = AppOptions::new();
     options.started_at = Instant::now() - Duration::from_secs(30);
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), options);
     let ctx = egui::Context::default();
     for _ in 0..3 {
-        open(&mut model, temp.path());
+        open(&mut model, &root);
     }
     let ids: Vec<_> = model.workspace_ids().collect();
     let configs: Vec<_> = ids
@@ -203,7 +204,7 @@ fn real_bridges_keep_state_focus_epochs_and_late_deliveries_tab_local() {
     let dirs: Vec<_> = ["agent-a", "agent-b", "agent-c"]
         .iter()
         .map(|name| {
-            let path = temp.path().join(name);
+            let path = root.join(name);
             std::fs::create_dir(&path).unwrap();
             path
         })
@@ -280,7 +281,7 @@ fn real_bridges_keep_state_focus_epochs_and_late_deliveries_tab_local() {
             .to_string()
             .into(),
     ));
-    open(&mut model, temp.path());
+    open(&mut model, &root);
     assert!(model.active_workspace_id().unwrap() > ids[2]);
     model.logic(&ctx);
     assert!(model
@@ -310,7 +311,7 @@ fn real_bridges_keep_state_focus_epochs_and_late_deliveries_tab_local() {
         if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
             dirs[2].as_path()
         } else {
-            temp.path()
+            root.as_path()
         };
     pump_until(&mut model, &ctx, |model| {
         model.workspace(ids[1]).unwrap().explorer_root() == Some(fallback)
@@ -338,6 +339,7 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
     let mut options = AppOptions::new();
     options.started_at = Instant::now() - Duration::from_secs(30);
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), options);
@@ -348,7 +350,7 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
     let mut bootstraps = Vec::new();
     let mut configs = Vec::new();
     for name in ["one", "two", "three"] {
-        let path = temp.path().join(name);
+        let path = root.join(name);
         std::fs::create_dir(&path).unwrap();
         open(&mut model, &path);
         ids.push(model.active_workspace_id().unwrap());
@@ -435,7 +437,7 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         .terminal()
         .unwrap()
         .is_running());
-    open(&mut model, temp.path());
+    open(&mut model, &root);
     let newest = model.active_workspace_id().unwrap();
     assert!(newest > ids[2]);
     model.begin_new_workspace();
@@ -462,11 +464,12 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("space café");
+    let root = temp.path().canonicalize().unwrap();
+    let target = root.join("space café");
     std::fs::create_dir(&target).unwrap();
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     for _ in 0..3 {
-        open(&mut model, temp.path());
+        open(&mut model, &root);
     }
     let ids: Vec<_> = model.workspace_ids().collect();
     for id in &ids {
@@ -530,7 +533,7 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
     );
     assert_eq!(
         model.workspace(ids[1]).unwrap().explorer_root(),
-        Some(temp.path())
+        Some(root.as_path())
     );
     let old_pid = model.workspace(ids[0]).unwrap().terminal().unwrap().pid();
     model.switch_workspace(ids[0]);
@@ -566,7 +569,7 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
     assert!(!model.workbench().unwrap().terminal().unwrap().is_focused());
     model.workbench_mut().unwrap().close_preview();
     model.close_workspace(ids[2]);
-    let marker = temp.path().join("sibling-alive");
+    let marker = root.join("sibling-alive");
     type_command(
         model.workbench_mut().unwrap(),
         &format!("printf alive > '{}'", marker.display()),
@@ -585,9 +588,10 @@ fn rejected_bridge_clients_cannot_reset_a_healthy_workspace() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let agent = temp.path().join("agent-root");
+    let agent = root.join("agent-root");
     std::fs::create_dir(&agent).unwrap();
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let ctx = egui::Context::default();
@@ -651,11 +655,12 @@ fn unavailable_authoritative_root_invalidates_preview_and_recovers() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let preview_file = workspace.join("preview.txt");
     std::fs::write(&preview_file, "previewed content\n").unwrap();
-    let missing = temp.path().join("removed-agent-root");
+    let missing = root.join("removed-agent-root");
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let ctx = egui::Context::default();
     open(&mut model, &workspace);
@@ -775,13 +780,14 @@ fn deleting_the_last_usable_agent_root_clears_an_open_preview() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let agent = temp.path().join("last-usable-agent-root");
+    let agent = root.join("last-usable-agent-root");
     std::fs::create_dir(&agent).unwrap();
     let preview_file = agent.join("preview.txt");
     std::fs::write(&preview_file, "agent preview\n").unwrap();
-    let missing = temp.path().join("removed-agent-root");
+    let missing = root.join("removed-agent-root");
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let ctx = egui::Context::default();
     open(&mut model, &workspace);
@@ -880,9 +886,10 @@ fn releasing_an_agent_root_with_no_usable_fallback_clears_the_preview() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let agent = temp.path().join("agent-root");
+    let agent = root.join("agent-root");
     std::fs::create_dir(&agent).unwrap();
     let preview_file = agent.join("preview.txt");
     std::fs::write(&preview_file, "preview\n").unwrap();
@@ -982,11 +989,12 @@ fn bad_shell_cwd_does_not_mark_an_authoritative_agent_root_unavailable() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let agent = temp.path().join("agent-root");
+    let agent = root.join("agent-root");
     std::fs::create_dir(&agent).unwrap();
-    let bad_shell = temp.path().join("missing-shell-cwd");
+    let bad_shell = root.join("missing-shell-cwd");
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let ctx = egui::Context::default();
     open(&mut model, &workspace);
@@ -1132,7 +1140,8 @@ fn deleted_in_place_shell_root_is_marked_unavailable_once_and_recovers() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     let target = workspace.join("deleted-in-place");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("kept.txt"), "tree row\n").unwrap();
@@ -1492,9 +1501,10 @@ fn deleted_shell_root_does_not_mark_an_agent_authoritative_root_unavailable() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let agent = temp.path().join("agent-root");
+    let agent = root.join("agent-root");
     std::fs::create_dir(&agent).unwrap();
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let ctx = egui::Context::default();

@@ -28,11 +28,15 @@ fn unique_temp(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "made-contract-{label}-{}-{nanos}-{}",
         std::process::id(),
         UNIQUE.fetch_add(1, Ordering::Relaxed)
-    ))
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    #[cfg(unix)]
+    let path = path.canonicalize().unwrap();
+    path
 }
 
 fn path_inputs(family: PlatformFamily) -> PathsInputs {
@@ -1473,14 +1477,31 @@ fn ime_cancel_and_empty_commit_emit_nothing() {
 
 #[cfg(unix)]
 mod posix_pty {
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use made_platform::{PtyRequest, PtySize};
+    use made_platform::{PtyRequest, PtySession, PtySize};
 
     use super::*;
+
+    /// Keep the PTY output drained so a blocking write cannot wedge a shell
+    /// that produces prompts, echoes, or job-control notices.
+    fn drain_output(session: &dyn PtySession) {
+        let mut reader = session.take_reader().expect("take reader");
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    }
 
     fn shell_request(cwd: PathBuf) -> PtyRequest {
         let platform = host_platform();
@@ -1665,6 +1686,7 @@ mod posix_pty {
         let session = platform
             .spawn_pty(&request)
             .expect("spawn interactive bash");
+        drain_output(session.as_ref());
         let mut writer = session.take_writer().expect("take writer");
 
         // Let interactive bash initialize job control and readline. Job control
@@ -1720,6 +1742,7 @@ mod posix_pty {
         let session = platform
             .spawn_pty(&request)
             .expect("spawn interactive bash");
+        drain_output(session.as_ref());
         let mut writer = session.take_writer().expect("take writer");
 
         thread::sleep(Duration::from_millis(250));
@@ -1824,6 +1847,7 @@ mod posix_pty {
         let session = platform
             .spawn_pty(&bash_request(root.clone()))
             .expect("spawn interactive bash");
+        drain_output(session.as_ref());
         let mut writer = session.take_writer().expect("take writer");
 
         thread::sleep(Duration::from_millis(250));
@@ -1897,6 +1921,8 @@ mod posix_pty {
         let session_b = platform
             .spawn_pty(&bash_request(root.clone()))
             .expect("spawn sibling interactive bash");
+        drain_output(session_a.as_ref());
+        drain_output(session_b.as_ref());
         let mut writer_a = session_a.take_writer().expect("take first writer");
         let mut writer_b = session_b.take_writer().expect("take second writer");
 
@@ -2070,24 +2096,35 @@ mod windows_pty {
         std::fs::create_dir_all(&root).expect("create cwd");
         let heartbeat = root.join("heartbeat.log");
         let child_pid = root.join("child.pid");
-        let script = format!(
-            "$script = \"for(;;){{Add-Content -LiteralPath '{}' -Value tick; Start-Sleep -Milliseconds 100}}\"; \
-             $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); \
-             $child = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoLogo','-NoProfile','-EncodedCommand',$encoded -NoNewWindow -PassThru; \
-             $child.Id | Set-Content -LiteralPath '{}'; \
-             while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 50 }}",
-            heartbeat.display(),
-            child_pid.display(),
-            heartbeat.display()
-        );
+        let script_path = root.join("descendant.ps1");
+        std::fs::write(
+            &script_path,
+            r#"param(
+    [string]$Heartbeat,
+    [string]$ChildPid
+)
+$inner = "for (;;) { Add-Content -LiteralPath '$Heartbeat' -Value tick; Start-Sleep -Milliseconds 100 }"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($inner))
+$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-EncodedCommand',$encoded -NoNewWindow -PassThru
+$child.Id | Set-Content -LiteralPath $ChildPid
+while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 }
+"#,
+        )
+        .expect("write descendant script");
 
         let platform = host_platform();
         let mut request = PtyRequest::new("powershell.exe", root.clone());
         request.args = vec![
             OsString::from("-NoLogo"),
             OsString::from("-NoProfile"),
-            OsString::from("-Command"),
-            OsString::from(script),
+            OsString::from("-ExecutionPolicy"),
+            OsString::from("Bypass"),
+            OsString::from("-File"),
+            script_path.into_os_string(),
+            OsString::from("-Heartbeat"),
+            heartbeat.clone().into_os_string(),
+            OsString::from("-ChildPid"),
+            child_pid.clone().into_os_string(),
         ];
         request.env = platform.environment(&[], &[]).into_vec();
         request.size = PtySize { rows: 24, cols: 80 };

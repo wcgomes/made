@@ -13,7 +13,7 @@ fn fixture_dir(temp: &tempfile::TempDir, name: &str) -> PathBuf {
     let dir = temp.path().join(name);
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("marker.txt"), name).unwrap();
-    dir
+    dir.canonicalize().unwrap()
 }
 
 fn session(id: &str, title: &str, directory: &Path, subpath: Option<&str>) -> SessionInfo {
