@@ -32,6 +32,54 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **OpenCode v2** is optional. Install the native distribution for your OS if you want session follow. Made never launches it for you.
 - **Node.js 24** is only needed for the OpenCode plugin tests.
 
+### Platform setup
+
+Made is built natively on each supported OS; there is no supported cross-compilation step.
+
+#### Linux (x64, X11 or Wayland)
+
+The wgpu renderer and the PTY layer need X11/Wayland/EGL/Vulkan development packages before the first build.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  libxkbcommon-dev \
+  libwayland-dev \
+  libx11-dev \
+  libegl1-mesa-dev \
+  libgl1-mesa-dev \
+  libvulkan-dev
+```
+
+Other distributions need the equivalent X11/Wayland/EGL/Vulkan development packages.
+
+Build with Rust from [rustup](https://rustup.rs); `rust-toolchain.toml` selects stable with clippy and rustfmt, and rustup installs that toolchain on first use.
+
+WSL2 with WSLg counts as a Linux host: install the packages inside the distribution and the window opens on the Windows desktop. Machines without a usable GPU fall back to software rendering with `LIBGL_ALWAYS_SOFTWARE=1`. CI produces the Linux artifacts on Ubuntu 24.04, so building on a newer distribution links a newer glibc than older targets can run.
+
+#### macOS (arm64 or x64)
+
+```bash
+xcode-select --install
+```
+
+That provides the linker. Build with Rust from [rustup](https://rustup.rs); `rust-toolchain.toml` selects stable, which rustup installs on first use.
+
+No extra system libraries are needed: Metal, CoreText, and the clipboard come from the OS.
+
+#### Windows (x64)
+
+Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload; the MSVC linker is required because `x86_64-pc-windows-msvc` is the only supported Windows target.
+
+Install Rust from [rustup](https://rustup.rs), then confirm the host toolchain and build:
+
+```powershell
+rustup show   # expect x86_64-pc-windows-msvc
+cargo build -p made-app
+```
+
+The binary lands at `target\debug\made-app.exe`.
+
 ### Build and run
 
 ```bash
