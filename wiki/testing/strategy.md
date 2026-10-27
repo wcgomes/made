@@ -6,7 +6,7 @@ Made's tests are layered: fast domain/model tests, real PTY/bridge integration t
 
 | Layer | Command | What it covers |
 |---|---|---|
-| Rust workspace | `cargo test --workspace` | Unit, model, PTY, bridge, explorer, platform and app tests across all crates. Current Linux baseline: 631 passed, 0 failed, 2 ignored. |
+| Rust workspace | `cargo test --workspace` | Unit, model, PTY, bridge, explorer, platform and app tests across all crates. Current Linux baseline: 630 passed, 0 failed, 2 ignored. |
 | Format/lint | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | House style and warnings-as-errors. |
 | App UI model | `cargo test -p made-app --test ui_model` | Mint header accent, fallback clear alpha 225, 26/24 card-edge header geometry and wordmark gaps, `+` placement, right icon order, fill-only idle/hover/selected tabs and scaled red close, faded splitter, no-outline Explorer/picker rows, picker tree expansion/keyboard/path chip/minimal scroll, Explorer animation, preview roundtrip, scrollbars, quiet chrome. |
 | Workspace tabs | `cargo test -p made-app --test workspace_tabs` | Independent PTYs/roots/bridges, close-owner, hidden output, deleted-cwd recovery. |
@@ -59,7 +59,7 @@ TMPDIR="$root/tmp" \
 
 ## Current status
 
-- Rust: 631 passed, 0 failed, 2 ignored on Linux x64 WSL2; fmt/clippy clean.
+- Rust: 630 passed, 0 failed, 2 ignored on Linux x64 WSL2; fmt/clippy clean.
 - Plugin: 29/29 and typecheck pass.
 - Phase 0: 19/19 gate plus 5/5 supporting against OpenCode v2.1.4.
 - UI/behavior: Linux Xvfb + headless evidence for launch, tabs, preview, Explorer, glass fallback, picker, bash cwd, deleted-cwd recovery, 10k startup, final software performance, and the 2026-10-26/27 refinements (mint accent, darker 225 fallback clear, card-edge 26/24 header with 42/36 content top, right-side wordmark with 24/18 gaps, `+` after tabs, Sessions/Diagnostics/Explorer order, fill-only idle/hover/selected tabs, scaled red close, faded splitter, no-outline rows, inline picker tree expansion/keyboard/path chip/minimal scroll, fading scrollbars).

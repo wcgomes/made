@@ -391,6 +391,18 @@ pub fn paint_bullet(painter: &egui::Painter, center: egui::Pos2, color: Color32)
 /// Narrowest usable full-height explorer card.
 pub const EXPLORER_MIN_WIDTH: f32 = 200.0;
 
+/// Wide-layout default explorer card width.
+pub const EXPLORER_DEFAULT_WIDTH_WIDE: f32 = 360.0;
+
+/// Compact-layout default explorer card width.
+pub const EXPLORER_DEFAULT_WIDTH_COMPACT: f32 = 288.0;
+
+/// Pre-2026-10-27 wide default retained for stored-width migration.
+pub const EXPLORER_LEGACY_DEFAULT_WIDTH: f32 = 440.0;
+
+/// Interim Phase 12 wide default retained for stored-width migration.
+pub const EXPLORER_INTERIM_DEFAULT_WIDTH: f32 = 400.0;
+
 /// Responsive layout metrics from the design contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
@@ -428,9 +440,12 @@ impl Layout {
         let gutter = if compact { 8.0 } else { 10.0 };
         let content_width = (width - 2.0 * gutter).max(1.0);
         let right_card_width = if width >= 1100.0 {
-            440.0
+            EXPLORER_DEFAULT_WIDTH_WIDE
+        } else if width >= 900.0 {
+            (content_width * 0.35)
+                .clamp(EXPLORER_DEFAULT_WIDTH_COMPACT, EXPLORER_DEFAULT_WIDTH_WIDE)
         } else {
-            (content_width * 0.35).clamp(288.0, 440.0)
+            EXPLORER_DEFAULT_WIDTH_COMPACT
         };
         let narrow_right = right_card_width < 360.0;
         Self {
@@ -500,8 +515,17 @@ impl Layout {
     }
 
     /// Apply compact defaults and viewport bounds to a stored explorer width.
+    ///
+    /// `440` is the pre-2026-10-27 wide default, `400` is the interim Phase 12
+    /// default, and `360` is the current constructor default. All three mean
+    /// the splitter has not been dragged, so they resolve to the responsive
+    /// default (360 wide, 35% at mid widths, 288 compact). Other stored widths
+    /// are deliberate and only clamp.
     pub fn explorer_width(&self, stored: f32, available_width: f32) -> f32 {
-        let stored = if (stored - 440.0).abs() < 0.5 {
+        let stored = if (stored - EXPLORER_LEGACY_DEFAULT_WIDTH).abs() < 0.5
+            || (stored - EXPLORER_INTERIM_DEFAULT_WIDTH).abs() < 0.5
+            || (stored - EXPLORER_DEFAULT_WIDTH_WIDE).abs() < 0.5
+        {
             self.explorer_default_width()
         } else {
             stored
@@ -1619,9 +1643,18 @@ mod tests {
         let wide = Layout::for_window(1280.0, 800.0);
         assert!(!wide.compact);
         assert_eq!(wide.gutter, 10.0);
-        assert_eq!(wide.right_card_width, 440.0);
-        assert_eq!(wide.explorer_default_width(), 440.0);
-        assert!(wide.explorer_max_width(wide.content_width()) > 440.0);
+        assert_eq!(wide.right_card_width, 360.0);
+        assert_eq!(wide.explorer_default_width(), 360.0);
+        assert!(wide.explorer_max_width(wide.content_width()) > 360.0);
+        let mid = Layout::for_window(1000.0, 800.0);
+        assert!(
+            (mid.right_card_width - mid.content_width() * 0.35).abs() < 0.01,
+            "900–1099 explorer default must stay at 35% of content width"
+        );
+        let compact_edge = Layout::for_window(899.0, 800.0);
+        assert_eq!(compact_edge.right_card_width, 288.0);
+        let mid_edge = Layout::for_window(1099.0, 800.0);
+        assert_eq!(mid_edge.right_card_width, 360.0);
         assert_eq!(wide.max_tabs, 5);
         assert_eq!(wide.top_height, 26.0);
         assert_eq!(wide.tab_height, 26.0);
@@ -1644,7 +1677,15 @@ mod tests {
             compact.explorer_width(440.0, compact.content_width()),
             288.0
         );
-        assert!(compact.explorer_max_width(compact.content_width()) < 440.0);
+        assert_eq!(
+            compact.explorer_width(400.0, compact.content_width()),
+            288.0
+        );
+        assert_eq!(
+            compact.explorer_width(360.0, compact.content_width()),
+            288.0
+        );
+        assert!(compact.explorer_max_width(compact.content_width()) > compact.right_card_width);
         assert!(compact.hide_preview_meta);
     }
 
@@ -1667,6 +1708,26 @@ mod tests {
         );
 
         let wide = Layout::for_window(1280.0, 800.0);
+        assert_eq!(wide.explorer_default_width(), 360.0);
+        assert_eq!(
+            wide.explorer_width(440.0, wide.content_width()),
+            360.0,
+            "the pre-Phase-12 440 default must migrate to the new 360 default"
+        );
+        assert_eq!(
+            wide.explorer_width(400.0, wide.content_width()),
+            360.0,
+            "the interim Phase 12 400 default must migrate to the new 360 default"
+        );
+        assert_eq!(wide.explorer_width(360.0, wide.content_width()), 360.0);
+        assert_eq!(wide.explorer_width(300.0, wide.content_width()), 300.0);
+        assert_eq!(wide.explorer_width(320.0, wide.content_width()), 320.0);
+        assert_eq!(wide.explorer_width(380.0, wide.content_width()), 380.0);
+        assert_eq!(wide.explorer_width(420.0, wide.content_width()), 420.0);
+        assert_eq!(
+            compact.explorer_width(420.0, compact.content_width()),
+            compact.explorer_max_width(compact.content_width())
+        );
         let max = wide.explorer_max_width(wide.content_width());
         assert!(
             wide.content_width() - wide.gap - max >= wide.min_left_width(),

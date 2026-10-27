@@ -6,7 +6,7 @@ The current implementation is verified on **Linux x64 WSL2 under Xvfb/llvmpipe s
 
 | Platform / display | Build and automated | Runtime evidence | Status | Notes |
 |---|---|---|---|---|
-| Linux x64 WSL2 / Xvfb X11 | 631/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
+| Linux x64 WSL2 / Xvfb X11 | 630/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
 | Linux x64 native X11 | CI build defined | None | **PENDING** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass. |
 | Linux x64 native Wayland | CI build defined; headless Weston smoke | WSLg/Weston smoke only | **PENDING** | Native compositor input/IME/clipboard and real OpenCode TUI. |
 | macOS arm64 | CI build/test/smoke defined | None | **PENDING** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |

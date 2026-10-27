@@ -35,6 +35,7 @@ use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFoc
 use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
 use crate::session_map::SessionMap;
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
 use crate::worktree::{GitRunner, MetadataStatus, WorktreeMetadata};
 use crate::{APP_NAME, APP_VERSION};
@@ -345,7 +346,7 @@ impl Workbench {
             visible: true,
             left_surface: LeftSurface::Terminal,
             explorer_visible: true,
-            explorer_width: 440.0,
+            explorer_width: EXPLORER_DEFAULT_WIDTH_WIDE,
             sessions_visible: false,
             tick_count: 0,
             paint_count: 0,

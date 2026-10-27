@@ -3301,7 +3301,7 @@ mod tests {
         let first = workbench.diagnostics_metrics_cache(&ctx);
         assert!(first.text.contains("counters:"));
 
-        model.workspace_mut(id).unwrap().set_explorer_width(360.0);
+        model.workspace_mut(id).unwrap().set_explorer_width(380.0);
         let mut output = ctx.run_ui(raw(1.3), |ui| model.ui(ui));
         output.textures_delta.clear();
         model.logic(&ctx);

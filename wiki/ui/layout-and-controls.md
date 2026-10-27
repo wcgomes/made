@@ -10,11 +10,11 @@ Made uses one native window with workspace tabs above a content area, a selected
 | Floating header | 1260×26 at `(10,8)` | 704×24 at `(8,6)` |
 | Gap below strip | 8 | 6 |
 | Main content | 1260×748 at `y=42` | 704×436 at `y=36` |
-| Explorer column | 448 total: 8 gap + 440 card | 294 total: 6 gap + 288 card |
-| Left terminal/preview | 812×748 | 410×436 |
+| Explorer column | 368 total: 8 gap + 360 card | 294 total: 6 gap + 288 card |
+| Left terminal/preview | 892×748 | 410×436 |
 | Explorer hidden | Left surface gets full 1260×748 | Full 704×436 |
 
-Panels have no separator lines; cards and gaps do the grouping. The Explorer is always full content height, never reduced by preview. At 900–1099 width the Explorer defaults to 35% of usable content width; below 900 it uses compact gutter/header/radii and a 288px default. Essential controls must fit or move to labeled overflow, never clip.
+Panels have no separator lines; cards and gaps do the grouping. The Explorer is always full content height, never reduced by preview. At 1100+ width the Explorer defaults to 360px. At 900–1099 it defaults to 35% of usable content width, clamped to 288–360px; below 900 it uses compact gutter/header/radii and a 288px default. `min_left_width` is unchanged. Essential controls must fit or move to labeled overflow, never clip.
 
 ## Header and workspace tabs
 
@@ -23,7 +23,7 @@ Panels have no separator lines; cards and gaps do the grouping. The Explorer is 
 - Workspace tabs are fill-only. Selected uses opaque `BG_TAB_SELECTED` dark green-gray with a `TEXT_PRIMARY` 13.0px label and no stroke; idle uses translucent black `BG_TAB_IDLE` with secondary 12.5px text at 0.72 opacity and no rest stroke; hover uses opaque `BG_TAB_HOVER` with a primary label and no stroke, while a selected tab keeps its own fill on hover. There is no `ACCENT`/`BORDER` outline, underline, dot/hollow marker, or width animation. Tabs use stable workspace-scoped ids and an overflow list when needed.
 - Close “×”: no hover fill. Hovering the X turns only the close glyph `ERROR` and scales it 1.0→1.15 over 0.13 s inside the same 24×24 hit rect; tab width/layout do not change. The parent tab uses `BG_TAB_HOVER` (or keeps `BG_TAB_SELECTED` when selected) and a primary label; there is no tab stroke. The parent path tooltip is suppressed so “Close workspace” is the tooltip shown.
 - Tab-strip tail: the app-drawn `+` Open folder action sits immediately after the last visible workspace tab and before the overflow trigger. It keeps the same tooltip/ID/target/keyboard activation as the other icon actions and is reserved in the tab-fitting budget.
-- Right: icon-only Sessions (when shown), Diagnostics, Explorer, left-to-right so Explorer is rightmost. The last icon’s 26/24 target, 14px glyph, selected/hover fill, and focus ring all end exactly at the card right border (`content.right`) with no gutter overhang; the 14px glyph is optically right-aligned inside its target. Each has a monochrome app-drawn glyph at 0.80 opacity when inactive, at least 24×24 target, matching tooltip, accessible name, and visible focus; hover is `BG_HOVER` and selection is `BG_SELECTED` without a border or accent bar. No persistent action text labels; no version row. Session-map strip/tabs remain 36/34 and 28/26.
+- Right: icon-only Sessions (when shown), Diagnostics, Explorer, left-to-right so Explorer is rightmost. The last icon’s 26/24 target, selected/hover fill, and focus ring all end exactly at the card right border (`content.right`) with no gutter overhang; the 14px glyph stays centered in its target with normal optical padding. Each has a monochrome app-drawn glyph at 0.80 opacity when inactive, at least 24×24 target, matching tooltip, accessible name, and visible focus; hover is `BG_HOVER` and selection is `BG_SELECTED` without a border or accent bar. No persistent action text labels; no version row. Session-map strip/tabs remain 36/34 and 28/26.
 - The Explorer toggle is the only hide/restore action and remains keyboard reachable.
 
 ## Explorer

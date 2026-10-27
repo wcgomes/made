@@ -192,7 +192,7 @@ Base 4pt, practical rhythm 8pt.
 | Buttons | 26 ghost / 28 primary-secondary | 24 / 26 |
 | Status pill | 20 | 18 |
 | Badge | 14 | 14 |
-| Right explorer default | 440 | 288, constrained by usable left width |
+| Right explorer default | 360 | 288, constrained by usable left width |
 | Explorer height | full content | full content |
 | Tree indent | 14/depth | 14 |
 | Preview code line | 18 | 18 |
@@ -256,9 +256,9 @@ Content after 10px gutter: 1260×780.
 | Floating header | 1260×26 at `(10,8)` |
 | Gap | 8 |
 | Main content | 1260×748 at `y=42` |
-| Right column | 448 total: 8 gap + 440 card at `x=822` |
-| Left terminal OR preview | 812×748 at `(10,42)` |
-| Full-height explorer | 440×748 at `(830,42)` |
+| Right column | 368 total: 8 gap + 360 card at `x=902` |
+| Left terminal OR preview | 892×748 at `(10,42)` |
+| Full-height explorer | 360×748 at `(910,42)` |
 | Explorer hidden | left surface 1260×748 |
 
 No empty session strip, terminal path row, shell-running pill, preview placeholder, or bottom status bar. Preview owns the full left region. Terminal column/row count derives from measured font/grid metrics.
@@ -283,8 +283,8 @@ Keep the open-folder `+` immediately after the visible tabs (before overflow), t
 
 | Width | Behavior |
 |---|---|
-| ≥1100 | Folder context may show truncated path; explorer defaults to 440 |
-| 900–1099 | Truncated folder context; explorer default 35% within usable bounds |
+| ≥1100 | Folder context may show truncated path; explorer defaults to 360 |
+| 900–1099 | Truncated folder context; explorer default 35% of usable content, clamped to 288–360 |
 | <900 | Compact labels, gutter 8, top strip 24, radius 8; explorer default 288 with accessible hide/resize |
 | <820 | Optional Sessions may move to labeled overflow; workspace/Explorer/Diagnostics remain reachable |
 | Height <600 | Hide preview meta; picker list max 160; diagnostics clamps |

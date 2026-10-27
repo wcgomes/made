@@ -1365,7 +1365,7 @@ fn runtime_instrumentation_records_activation_layout_preview_and_hidden_work() {
         "a single visible terminal must not report a transition frame as hidden work"
     );
 
-    model.workspace_mut(id).unwrap().set_explorer_width(360.0);
+    model.workspace_mut(id).unwrap().set_explorer_width(380.0);
     paint(&mut model, &ctx);
     assert!(model
         .workspace(id)

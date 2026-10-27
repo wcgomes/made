@@ -2458,11 +2458,15 @@ fn explorer_hide_restore_and_resize_keep_state_and_reclaim_width() {
 
     let splitter = explorer_splitter_id(headless.model.workspace(id).unwrap().pane_id());
     let before_drag = headless.model.workspace(id).unwrap().explorer_width();
-    headless.drag(splitter, egui::vec2(-40.0, 0.0));
+    headless.drag(splitter, egui::vec2(-20.0, 0.0));
     let after_drag = headless.model.workspace(id).unwrap().explorer_width();
     assert!(
         after_drag > before_drag,
         "dragging the splitter left must widen the explorer"
+    );
+    assert!(
+        (after_drag - 380.0).abs() < 1.0,
+        "the deliberate 380px drag width must survive away from the default sentinels: {after_drag}"
     );
     headless.render();
     headless.click(top_workspace_action_id(id, "explorer"));
@@ -2896,14 +2900,37 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
                 .is_some()
         });
         let output = headless.render();
+        assert_eq!(
+            headless.model.workspace(id).unwrap().explorer_width(),
+            360.0,
+            "the workbench must initialize at the new wide default"
+        );
         let layout = made_app::theme::Layout::for_window(width, height);
         let explorer_width = layout.explorer_width(
             headless.model.workspace(id).unwrap().explorer_width(),
             layout.content_width(),
         );
+        let (expected_explorer_width, expected_left_width) = if width >= 1100.0 {
+            (360.0, 892.0)
+        } else {
+            (288.0, 410.0)
+        };
+        assert_eq!(layout.right_card_width, expected_explorer_width);
+        assert_eq!(explorer_width, expected_explorer_width);
+        assert!((layout.explorer_default_width() - expected_explorer_width).abs() < 0.01);
         let expected_left = layout.content_width() - layout.gap - explorer_width;
+        assert!((expected_left - expected_left_width).abs() < 2.0);
         let expected_height =
             height - (layout.gap + layout.top_height + layout.gap) - layout.gutter;
+        let explorer_card =
+            largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card");
+        let expected_explorer_left = width - layout.gutter - expected_explorer_width;
+        assert!(
+            (explorer_card.width() - expected_explorer_width).abs() < 2.0
+                && (explorer_card.left() - expected_explorer_left).abs() < 2.0
+                && (explorer_card.right() - (width - layout.gutter)).abs() < 2.0,
+            "{width}x{height} explorer card {explorer_card:?} expected {expected_explorer_width} at {expected_explorer_left}"
+        );
         let cards = rects_with_fill(&output, made_app::theme::BG_CARD);
         let left_card = cards
             .iter()
