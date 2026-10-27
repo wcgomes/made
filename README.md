@@ -55,7 +55,11 @@ Other distributions need the equivalent X11/Wayland/EGL/Vulkan development packa
 
 Build with Rust from [rustup](https://rustup.rs); `rust-toolchain.toml` selects stable with clippy and rustfmt, and rustup installs that toolchain on first use.
 
-WSL2 with WSLg counts as a Linux host: install the packages inside the distribution and the window opens on the Windows desktop. Machines without a usable GPU fall back to software rendering with `LIBGL_ALWAYS_SOFTWARE=1`. CI produces the Linux artifacts on Ubuntu 24.04, so building on a newer distribution links a newer glibc than older targets can run.
+**Native Linux:** a working X11 or Wayland session is required; `wgpu` selects a hardware Vulkan or GL adapter when one is available.
+
+**WSL2 with WSLg:** install the same packages inside the distribution and the window opens on the Windows desktop. GPU support depends on the WSL version and its Vulkan stack, so a machine without a usable adapter falls back to software rendering with `LIBGL_ALWAYS_SOFTWARE=1`. WSL2 is a Linux host, not a native Linux desktop, and it does not stand in for the Windows build.
+
+CI produces the Linux artifacts on Ubuntu 24.04, so building on a newer distribution links a newer glibc than older targets can run.
 
 #### macOS (arm64 or x64)
 
@@ -68,6 +72,8 @@ That provides the linker. Build with Rust from [rustup](https://rustup.rs); `rus
 No extra system libraries are needed: Metal, CoreText, and the clipboard come from the OS.
 
 #### Windows (x64)
+
+Build the Windows target natively, or run the Linux build under WSL2 (see [Linux](#linux-x64-x11-or-wayland)) — WSL2 is a Linux host and does not exercise the Windows-specific paths: ConPTY, Mica, native clipboard, and IME.
 
 Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload; the MSVC linker is required because `x86_64-pc-windows-msvc` is the only supported Windows target.
 
