@@ -1500,6 +1500,7 @@ impl ExplorerPane {
         }
         let rows = &self.rows;
 
+        ui.spacing_mut().item_spacing.y = 0.0;
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, 24.0, rows.len(), |ui, range| {
@@ -2805,6 +2806,54 @@ mod tests {
         assert_eq!(
             pane.root(),
             Some(other.path().canonicalize().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn virtualized_tree_rows_fill_the_explorer_body() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..60 {
+            fs::write(temp.path().join(format!("file-{index:03}.txt")), "x").unwrap();
+        }
+        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let total = pane.visible_row_count();
+        assert!(
+            total > 40,
+            "need more rows than the body can show, got {total}"
+        );
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        pane.set_ui_scope(egui::Id::unique("explorer-row-fill"));
+        tree_key_frame(&ctx, &mut pane, &mut log, 1280.0, 800.0, &[]);
+
+        let body = ctx
+            .read_response(pane.tree_focus_id())
+            .expect("tree container");
+        let mut painted = 0usize;
+        let mut lowest = f32::NEG_INFINITY;
+        let mut row_height = None;
+        for index in 0..total {
+            if let Some(response) = ctx.read_response(pane.row_widget_id(index)) {
+                painted += 1;
+                lowest = lowest.max(response.rect.bottom());
+                row_height = Some(response.rect.height());
+            }
+        }
+        assert!(painted > 0, "no tree rows were painted");
+        assert!(
+            painted < total,
+            "expected a virtual window, painted {painted} of {total}"
+        );
+        assert_eq!(row_height, Some(24.0), "row height must stay 24px");
+        let gap = body.rect.bottom() - lowest;
+        assert!(
+            gap < 1.0,
+            "virtual row window stops short of the explorer body by {gap}px \
+             (lowest={lowest}, body_bottom={}, painted={painted}/{total})",
+            body.rect.bottom()
         );
     }
 }
