@@ -351,7 +351,7 @@ fn real_zsh_zdotdir_unset_and_reassignment_follow_user_startup_files() {
     .unwrap();
     std::fs::write(
         home.join(".zshrc"),
-        "print 'home-rc' >> \"$HOME/startup.txt\"\n",
+        "print 'home-rc' >> \"$HOME/startup.txt\"\nPROMPT='USER_PROMPT> '\n",
     )
     .unwrap();
     std::fs::write(
@@ -393,6 +393,17 @@ fn real_zsh_zdotdir_unset_and_reassignment_follow_user_startup_files() {
         while Instant::now() < deadline && !home.join("startup.txt").is_file() {
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Startup files can exist before zsh installs its line editor and
+        // prints the first prompt. Wait for the prompt (and the cwd report)
+        // before injecting the final command, otherwise the input can be lost
+        // on slower runners such as macOS arm64.
+        let mut output = Vec::new();
+        let mut answered = 0;
+        assert!(
+            receive_shell_report(&rx, &mut output, writer.as_mut(), 1, false, &mut answered),
+            "zsh prompt did not become ready: {}",
+            String::from_utf8_lossy(&output)
+        );
         writer
             .write_all(b"print -r -- \"${ZDOTDIR-unset}\" > \"$HOME/final.txt\"\n")
             .unwrap();
@@ -430,7 +441,7 @@ fn real_zsh_zdotdir_unset_and_reassignment_follow_user_startup_files() {
     .unwrap();
     std::fs::write(
         alt.join(".zshrc"),
-        "print 'alt-rc' >> \"$HOME/startup.txt\"\n",
+        "print 'alt-rc' >> \"$HOME/startup.txt\"\nPROMPT='USER_PROMPT> '\n",
     )
     .unwrap();
     std::fs::write(

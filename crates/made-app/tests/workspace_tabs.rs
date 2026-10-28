@@ -845,8 +845,18 @@ fn deleting_the_last_usable_agent_root_clears_an_open_preview() {
         LeftSurface::Preview
     );
 
-    // The loaded preview's root is the last usable tree. Delete it before the
+    // The loaded preview's root is the last usable tree. Remove it before the
     // active session reports a different unavailable directory.
+    #[cfg(windows)]
+    {
+        // Windows can refuse recursive deletion while a handle under the
+        // watched root is still open, even though notify opens the directory
+        // watch with delete sharing. Renaming removes the root from its watched
+        // path without losing the unavailable-root scenario; the tempdir owns
+        // cleanup.
+        std::fs::rename(&agent, root.join("deleted-agent-root")).unwrap();
+    }
+    #[cfg(not(windows))]
     std::fs::remove_dir_all(&agent).unwrap();
     state(&mut healthy, 2, &missing);
     pump_until(&mut model, &ctx, |model| {

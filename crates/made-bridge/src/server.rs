@@ -84,6 +84,8 @@ const REPLACEMENT_WAIT: Duration = Duration::from_millis(500);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const CLOSE_DRAIN_TOTAL: Duration = Duration::from_millis(250);
+const REPLACEMENT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const REPLACEMENT_CLOSE_DRAIN_TOTAL: Duration = Duration::from_millis(750);
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 const AUTH_READ_SLICE: Duration = Duration::from_millis(100);
 const HANDSHAKE_POLL: Duration = Duration::from_millis(2);
@@ -855,9 +857,12 @@ fn connection_thread(
         }
     }
 
+    // Let the replacement proceed only after Disconnected is queued, but keep
+    // this socket alive for the close drain so a late peer write is still read
+    // and the flushed close frame is not replaced by a reset.
+    let _ = done_sender.send(());
     session.finish_close();
     drop(session);
-    let _ = done_sender.send(());
 }
 
 /// A TCP stream that bounds every read and write by the absolute
@@ -1893,31 +1898,41 @@ impl Session {
     }
 
     /// Finish a close without letting the operating system replace the close
-    /// frame with a TCP reset. Flush the queued frame, half-close the write
-    /// side, then drain unread input for a bounded time. Windows resets a
-    /// socket that is dropped with unread receive data; draining lets the peer
-    /// read the close frame first. The timeout bounds a silent peer.
+    /// frame with a TCP reset. Flush the queued frame, drain unread input for a
+    /// bounded time, then half-close the write side. Windows resets a socket
+    /// that is dropped with unread receive data; draining lets the peer read the
+    /// close frame first. A replaced connection keeps the socket readable a
+    /// little longer so the peer's late write is drained instead of aborting.
     fn finish_close(&mut self) {
         self.socket.get_mut().clear_auth_deadline();
         let _ = self.socket.flush();
-        let _ = self.socket.get_mut().shutdown_write();
-        let _ = self
-            .socket
-            .get_mut()
-            .set_read_timeout(Some(CLOSE_DRAIN_TIMEOUT));
-        let deadline = Instant::now() + CLOSE_DRAIN_TOTAL;
+        let replacement = self.replaced || self.close_code == Some(4409);
+        let read_timeout = if replacement {
+            REPLACEMENT_CLOSE_DRAIN_TIMEOUT
+        } else {
+            CLOSE_DRAIN_TIMEOUT
+        };
+        let total = if replacement {
+            REPLACEMENT_CLOSE_DRAIN_TOTAL
+        } else {
+            CLOSE_DRAIN_TOTAL
+        };
+        let _ = self.socket.get_mut().set_read_timeout(Some(read_timeout));
+        let deadline = Instant::now() + total;
         let mut buffer = [0u8; 4096];
         loop {
             match self.socket.get_mut().read(&mut buffer) {
                 Ok(0) => break,
                 Ok(_) => {}
-                Err(error) if is_would_block(&error) => break,
+                Err(error) if is_would_block(&error) && !replacement => break,
+                Err(error) if is_would_block(&error) => {}
                 Err(_) => break,
             }
             if Instant::now() >= deadline {
                 break;
             }
         }
+        let _ = self.socket.get_mut().shutdown_write();
     }
 }
 
