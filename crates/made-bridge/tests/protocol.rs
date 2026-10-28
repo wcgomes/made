@@ -474,7 +474,27 @@ fn final_state_and_lifecycle_survive_event_queue_pressure() {
     );
     assert_eq!(read_close_code(&mut socket), Some(1000));
 
-    let events = handle.drain_events();
+    // The close frame can become readable before the connection thread has
+    // queued Disconnected. Wait for that lifecycle event instead of assuming
+    // it is already present in the drain.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut events = handle.drain_events();
+    while !events
+        .iter()
+        .any(|event| matches!(event, BridgeEvent::Disconnected(_)))
+    {
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "Disconnected event was not queued after close: {} events: {events:?}",
+            events.len()
+        );
+        events.push(
+            handle
+                .recv_timeout(deadline - now)
+                .expect("wait for Disconnected"),
+        );
+    }
     assert!(
         events
             .iter()
