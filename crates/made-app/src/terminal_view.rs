@@ -21,8 +21,8 @@ use made_terminal::{
 use crate::diagnostics::{DiagnosticLog, LogLevel};
 use crate::metrics::Metrics;
 use crate::render::{
-    paint_grid, CellMetrics, CellPoint, GridPalette, GridRenderer, PaintOptions, SelectionRange,
-    SCROLLBAR_WIDTH, TERMINAL_PADDING,
+    paint_grid, terminal_content_layout, CellMetrics, CellPoint, GridPalette, GridRenderer,
+    PaintOptions, SelectionRange, SCROLLBAR_WIDTH, TERMINAL_PADDING,
 };
 
 /// Maximum PTY events drained per frame.
@@ -147,6 +147,8 @@ pub struct TerminalPane {
     focused: bool,
     selecting: bool,
     selection: Option<SelectionRange>,
+    /// Cell where the current local-selection press began, before it is committed.
+    selection_anchor: Option<CellPoint>,
     mouse_button_down: Option<MouseButton>,
     ime: ImeComposition,
     ime_preedit: String,
@@ -205,6 +207,7 @@ impl TerminalPane {
             focused: false,
             selecting: false,
             selection: None,
+            selection_anchor: None,
             mouse_button_down: None,
             ime: ImeComposition::new(),
             ime_preedit: String::new(),
@@ -325,6 +328,7 @@ impl TerminalPane {
         self.reset_focus = true;
         self.focus_on_next_frame = visible;
         self.selecting = false;
+        self.selection_anchor = None;
         self.mouse_button_down = None;
         self.ime.reset();
         self.ime_preedit.clear();
@@ -609,6 +613,7 @@ impl TerminalPane {
             ));
             return false;
         }
+        self.clear_selection_for_input();
         let bytes = self.encoder.encode_paste(text);
         self.note_user_input(text);
         self.write(&bytes, log)
@@ -624,6 +629,7 @@ impl TerminalPane {
         if let TerminalKey::Char(character) = key {
             self.note_user_input(&character.to_string());
         }
+        self.clear_selection_for_input();
         let bytes = self.encoder.encode_key(key, modifiers);
         self.write(&bytes, log);
     }
@@ -725,6 +731,7 @@ impl TerminalPane {
         self.eof = false;
         self.selection = None;
         self.selecting = false;
+        self.selection_anchor = None;
         self.mouse_button_down = None;
         self.focused = false;
         self.ime.reset();
@@ -770,14 +777,18 @@ impl TerminalPane {
             return output;
         }
 
-        let grid_rect = Rect::from_min_max(
-            pane_rect.min + Vec2::splat(TERMINAL_PADDING),
-            (pane_rect.max - Vec2::splat(TERMINAL_PADDING) - Vec2::new(SCROLLBAR_WIDTH, 0.0))
-                .max(pane_rect.min + Vec2::splat(TERMINAL_PADDING)),
+        let screen = ui.ctx().content_rect();
+        let card_radius =
+            crate::theme::Layout::for_window(screen.width(), screen.height()).card_radius as f32;
+        let content = terminal_content_layout(
+            pane_rect,
+            cell_metrics,
+            self.core.alternate_screen(),
+            card_radius,
         );
-        let grid_size = cell_metrics.grid_size(grid_rect.size());
-        self.resize(grid_size.rows, grid_size.cols, log);
+        self.resize(content.size.rows, content.size.cols, log);
         let grid_size = self.core.size();
+        let grid_rect = content.grid_rect;
 
         // Focus reporting and keyboard input.
         if std::mem::take(&mut self.focus_on_next_frame) {
@@ -843,7 +854,7 @@ impl TerminalPane {
         self.process_pointer(
             &ctx,
             &response,
-            grid_rect,
+            content.grid_rect,
             cell_metrics,
             platform,
             log,
@@ -856,23 +867,16 @@ impl TerminalPane {
         let rows = self
             .renderer
             .frame(&snapshot, &damage, selection, &self.palette);
+        // The card already paints opaque BG_TERMINAL with the radius in
+        // alternate-screen mode. A square body fill would cover the corner
+        // cutouts that should show the backdrop.
         let painter = ui.painter_at(pane_rect);
-        let background_rect = grid_rect.union(Rect::from_min_max(
-            egui::Pos2::new(grid_rect.right(), grid_rect.top()),
-            egui::Pos2::new(
-                pane_rect.right() - 1.0,
-                pane_rect.bottom() - TERMINAL_PADDING,
-            ),
-        ));
-        if let Some(fill) = crate::theme::terminal_overlay_surface(snapshot.alternate_screen) {
-            painter.rect_filled(background_rect, 0.0, fill);
-        }
         self.grid_paint_count = self.grid_paint_count.saturating_add(1);
         self.last_grid_paint_visible = self.visible;
         paint_grid(
             &painter,
-            grid_rect.min,
-            grid_rect,
+            content.origin,
+            content.grid_rect,
             rows,
             snapshot.cursor,
             PaintOptions {
@@ -889,7 +893,7 @@ impl TerminalPane {
 
         if !self.ime_preedit.is_empty() {
             let cursor = snapshot.cursor;
-            let position = grid_rect.min
+            let position = content.origin
                 + Vec2::new(
                     cursor.col as f32 * cell_metrics.width,
                     cursor.row as f32 * cell_metrics.height,
@@ -953,6 +957,7 @@ impl TerminalPane {
                     {
                         continue;
                     }
+                    self.clear_selection_for_input();
                     let bytes = self.encoder.encode_text(&text);
                     self.note_user_input(&text);
                     self.write(&bytes, log);
@@ -1004,6 +1009,7 @@ impl TerminalPane {
                         if let Some(committed) =
                             platform.normalize_ime(&mut self.ime, ImeEvent::Commit(text.clone()))
                         {
+                            self.clear_selection_for_input();
                             let bytes = self.encoder.encode_text(&committed);
                             self.note_user_input(&committed);
                             self.write(&bytes, log);
@@ -1044,6 +1050,7 @@ impl TerminalPane {
             }
             KeyRoute::Ignore => {}
             KeyRoute::Write(bytes) => {
+                self.clear_selection_for_input();
                 self.write(&bytes, log);
             }
         }
@@ -1096,11 +1103,7 @@ impl TerminalPane {
                     }
                     let Some(point) = cell_at(pos) else {
                         if !pressed && self.selecting {
-                            self.selecting = false;
-                            if let Some(text) = self.copy_selection(platform, ctx, log) {
-                                output.notice =
-                                    Some(format!("copied {} characters", text.chars().count()));
-                            }
+                            self.finish_local_selection_outside(platform, ctx, log, output);
                         }
                         continue;
                     };
@@ -1113,23 +1116,14 @@ impl TerminalPane {
                         && local_selection_requested(mouse_mode, shift);
                     if local_selection {
                         if pressed {
+                            // A click clears any existing mark. The highlight and
+                            // core selection wait until the pointer reaches another cell.
                             self.selecting = true;
-                            self.selection = Some(SelectionRange::new(point, point));
-                            self.core.select_start(point.row, point.col);
+                            self.selection_anchor = Some(point);
+                            self.selection = None;
+                            self.core.clear_selection();
                         } else if self.selecting {
-                            self.selecting = false;
-                            self.selection = Some(
-                                SelectionRange::new(
-                                    self.selection.map(|range| range.start).unwrap_or(point),
-                                    point,
-                                )
-                                .normalized(),
-                            );
-                            self.core.select_update(point.row, point.col);
-                            if let Some(text) = self.copy_selection(platform, ctx, log) {
-                                output.notice =
-                                    Some(format!("copied {} characters", text.chars().count()));
-                            }
+                            self.finish_local_selection(point, platform, ctx, log, output);
                         }
                     } else if forward_mouse_report(mouse_mode, shift) {
                         let kind = if pressed {
@@ -1154,9 +1148,11 @@ impl TerminalPane {
                     let shift = ctx.input(|input| input.modifiers.shift);
                     if self.selecting {
                         if let Some(point) = cell_at(pos) {
-                            let start = self.selection.map(|range| range.start).unwrap_or(point);
-                            self.selection = Some(SelectionRange::new(start, point).normalized());
-                            self.core.select_update(point.row, point.col);
+                            let anchor = self.selection_anchor.unwrap_or(point);
+                            if local_selection_left_anchor(self.selection.is_some(), anchor, point)
+                            {
+                                self.show_local_selection(anchor, point);
+                            }
                         }
                     } else if forward_mouse_report(mouse_mode, shift) {
                         if let Some(point) = cell_at(pos) {
@@ -1358,6 +1354,62 @@ impl TerminalPane {
             output.restart_requested = true;
         }
     }
+
+    fn clear_selection_for_input(&mut self) {
+        self.selection = None;
+        self.selection_anchor = None;
+        self.selecting = false;
+        self.core.clear_selection();
+    }
+
+    fn show_local_selection(&mut self, anchor: CellPoint, point: CellPoint) {
+        if self.selection.is_none() {
+            self.core.select_start(anchor.row, anchor.col);
+        }
+        self.selection = Some(SelectionRange::new(anchor, point).normalized());
+        self.core.select_update(point.row, point.col);
+    }
+
+    fn finish_local_selection(
+        &mut self,
+        point: CellPoint,
+        platform: &dyn Platform,
+        ctx: &egui::Context,
+        log: &mut DiagnosticLog,
+        output: &mut TerminalUiOutput,
+    ) {
+        let anchor = self.selection_anchor.take().unwrap_or(point);
+        let committed = self.selection.is_some();
+        self.selecting = false;
+        if local_selection_left_anchor(committed, anchor, point) {
+            self.show_local_selection(anchor, point);
+            if let Some(text) = self.copy_selection(platform, ctx, log) {
+                output.notice = Some(format!("copied {} characters", text.chars().count()));
+            }
+        } else {
+            self.selection = None;
+            self.core.clear_selection();
+        }
+    }
+
+    fn finish_local_selection_outside(
+        &mut self,
+        platform: &dyn Platform,
+        ctx: &egui::Context,
+        log: &mut DiagnosticLog,
+        output: &mut TerminalUiOutput,
+    ) {
+        self.selecting = false;
+        self.selection_anchor = None;
+        if self.selection.is_some() {
+            if let Some(text) = self.copy_selection(platform, ctx, log) {
+                output.notice = Some(format!("copied {} characters", text.chars().count()));
+            }
+        } else {
+            self.selection = None;
+            self.core.clear_selection();
+        }
+    }
 }
 
 fn paste_allowed(byte_len: usize) -> bool {
@@ -1368,17 +1420,28 @@ fn local_selection_requested(mouse_mode: MouseMode, shift: bool) -> bool {
     mouse_mode == MouseMode::Off || shift
 }
 
+/// Whether the pointer has left the press cell, or a selection is already committed.
+fn local_selection_left_anchor(committed: bool, anchor: CellPoint, point: CellPoint) -> bool {
+    committed || point != anchor
+}
+
 fn local_scroll_requested(mouse_mode: MouseMode, shift: bool) -> bool {
     mouse_mode == MouseMode::Off || shift
 }
 
-/// Full 8px scrollbar hit area inside the terminal pane.
+/// Gap between the scrollbar's right edge and the card's 1px inside border.
+///
+/// Four points is the spacing-scale step. The 8px hit area stays; only its
+/// right edge moves off the border.
+const SCROLLBAR_EDGE_GAP: f32 = 4.0;
+
 /// Full 8px scrollbar hit area inside the terminal pane.
 ///
-/// The rightmost pane pixel is the card border; the track ends just inside it
-/// so all eight scrollbar pixels remain visible.
+/// The rightmost pane pixel is the card border. The track ends one border
+/// pixel plus [`SCROLLBAR_EDGE_GAP`] inside that edge so the thumb is not
+/// flush with the card.
 fn scrollbar_track_rect(pane_rect: Rect) -> Rect {
-    let right = pane_rect.right() - 1.0;
+    let right = pane_rect.right() - 1.0 - SCROLLBAR_EDGE_GAP;
     Rect::from_min_max(
         egui::Pos2::new(right - SCROLLBAR_WIDTH, pane_rect.top() + TERMINAL_PADDING),
         egui::Pos2::new(right, pane_rect.bottom() - TERMINAL_PADDING),
@@ -1828,6 +1891,337 @@ mod tests {
         assert!(!forward_mouse_report(MouseMode::Off, false));
     }
 
+    #[test]
+    fn local_selection_commits_only_after_the_pointer_reaches_another_cell() {
+        let anchor = CellPoint::new(1, 2);
+        let other = CellPoint::new(1, 5);
+        assert!(
+            !local_selection_left_anchor(false, anchor, anchor),
+            "a click without leaving the cell must not highlight or copy"
+        );
+        assert!(local_selection_left_anchor(false, anchor, other));
+        assert!(
+            local_selection_left_anchor(true, anchor, anchor),
+            "returning to the anchor after a drag still counts as a selection"
+        );
+    }
+
+    #[test]
+    fn click_does_not_select_or_copy_and_a_drag_to_another_cell_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
+        )
+        .unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = egui::Context::default();
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        pane.core.feed(b"hello world");
+        let metrics_cells = pane.renderer.metrics();
+        let origin = egui::pos2(TERMINAL_PADDING + 1.0, TERMINAL_PADDING + 1.0);
+        let other = origin + egui::vec2(metrics_cells.width * 3.0, 0.0);
+        let press = |pos: egui::Pos2, pressed: bool, shift: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers {
+                shift,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        let clicked = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(origin, true, false)],
+        );
+        assert!(
+            pane.selection.is_none(),
+            "a press must not highlight a cell"
+        );
+        assert!(!pane.core.has_selection());
+        assert!(clicked.notice.is_none());
+        let released = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(origin, false, false)],
+        );
+        assert!(pane.selection.is_none());
+        assert!(!pane.core.has_selection());
+        assert!(released.notice.is_none(), "a click must not copy");
+
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(origin, true, false)],
+        );
+        let dragged = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::PointerMoved(other)],
+        );
+        assert!(
+            pane.selection.is_some(),
+            "a drag to another cell must select"
+        );
+        assert!(pane.core.has_selection());
+        assert!(dragged.notice.is_none(), "copy waits for release");
+        let copied = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(other, false, false)],
+        );
+        assert!(
+            copied.notice.as_deref().unwrap_or("").contains("copied"),
+            "releasing a drag must still copy: {:?}",
+            copied.notice
+        );
+
+        // A later click clears the selection and does not copy it again.
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(other, true, false)],
+        );
+        assert!(pane.selection.is_none());
+        assert!(!pane.core.has_selection());
+        let cleared = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(other, false, false)],
+        );
+        assert!(cleared.notice.is_none());
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn typing_clears_an_existing_terminal_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
+        )
+        .unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = egui::Context::default();
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        pane.core.feed(b"hello world");
+        let mark = |pane: &mut TerminalPane| {
+            pane.core.select_start(0, 0);
+            pane.core.select_update(0, 4);
+            pane.selection = Some(SelectionRange::new(
+                CellPoint::new(0, 0),
+                CellPoint::new(0, 4),
+            ));
+            assert!(
+                pane.selection.is_some() && pane.core.has_selection(),
+                "the mark must exist before input"
+            );
+        };
+        let assert_cleared = |pane: &TerminalPane, kind: &str| {
+            assert!(
+                pane.selection.is_none() && !pane.core.has_selection(),
+                "{kind} must clear the selection mark"
+            );
+        };
+
+        mark(&mut pane);
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::Text("x".to_owned())],
+        );
+        assert_cleared(&pane, "typed text");
+
+        mark(&mut pane);
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_cleared(&pane, "a writing key");
+
+        mark(&mut pane);
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::Ime(egui::ImeEvent::Commit("ime".to_owned()))],
+        );
+        assert_cleared(&pane, "an IME commit");
+
+        mark(&mut pane);
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::Paste("pasted".to_owned())],
+        );
+        assert_cleared(&pane, "a paste");
+
+        mark(&mut pane);
+        let copied = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..egui::Modifiers::NONE
+                },
+            }],
+        );
+        assert!(
+            pane.selection.is_some() && pane.core.has_selection(),
+            "copy must keep the selection mark"
+        );
+        assert!(
+            copied.notice.as_deref().unwrap_or("").contains("copied"),
+            "copy must still copy: {:?}",
+            copied.notice
+        );
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn shift_drag_in_a_mouse_reporting_tui_selects_locally() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
+        )
+        .unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = egui::Context::default();
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        pane.core.feed(b"\x1b[?1000hhello");
+        assert_eq!(pane.core.input_modes().mouse_mode, MouseMode::Click);
+        let cell = pane.renderer.metrics();
+        let origin = egui::pos2(TERMINAL_PADDING + 1.0, TERMINAL_PADDING + 1.0);
+        let other = origin + egui::vec2(cell.width * 3.0, 0.0);
+        let press = |pos: egui::Pos2, pressed: bool, shift: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers {
+                shift,
+                ..egui::Modifiers::NONE
+            },
+        };
+
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(origin, true, false), press(origin, false, false)],
+        );
+        assert!(
+            pane.selection.is_none() && !pane.core.has_selection(),
+            "a click without Shift must stay a mouse report, not a local selection"
+        );
+
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(origin, true, true)],
+        );
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![egui::Event::PointerMoved(other)],
+        );
+        assert!(pane.core.has_selection(), "Shift+drag must select locally");
+        let copied = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            vec![press(other, false, true)],
+        );
+        assert!(copied.notice.as_deref().unwrap_or("").contains("copied"));
+        pane.terminate(&mut log);
+    }
+
     fn run_terminal_frame(
         ctx: &egui::Context,
         pane: &mut TerminalPane,
@@ -1935,8 +2329,8 @@ mod tests {
             "alternate-screen body must not paint the glass fill"
         );
         assert!(
-            has_large_rect_fill(&alternate, crate::theme::BG_TERMINAL),
-            "alternate-screen body must paint opaque BG_TERMINAL"
+            !has_large_rect_fill(&alternate, crate::theme::BG_TERMINAL),
+            "alternate-screen body must not paint a square over the rounded card fill"
         );
 
         pane.core.feed(b"\x1b[?1049l");
@@ -2074,7 +2468,11 @@ mod tests {
         let track = scrollbar_track_rect(pane);
         assert_eq!(track.width(), SCROLLBAR_WIDTH);
         assert_eq!(track.width(), 8.0);
-        assert_eq!(track.right(), pane.right() - 1.0);
+        assert_eq!(track.right(), pane.right() - 1.0 - SCROLLBAR_EDGE_GAP);
+        assert!(
+            pane.right() - track.right() > 1.0,
+            "scrollbar must not sit flush with the card border"
+        );
         assert_eq!(track.height(), 500.0 - 2.0 * TERMINAL_PADDING);
 
         let (track, thumb) = scrollbar_paint(0.0, false);
@@ -2121,5 +2519,58 @@ mod tests {
             scrollbar_thumb_width(SCROLLBAR_WIDTH, true)
                 > scrollbar_thumb_width(SCROLLBAR_WIDTH, false)
         );
+    }
+
+    #[test]
+    fn alternate_screen_inset_is_uniform_and_drops_the_scrollbar_reservation() {
+        let pane = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 500.0));
+        let metrics = CellMetrics::new(7.8, 16.0);
+        for radius in [8.0_f32, 10.0] {
+            let inset = crate::render::alternate_screen_inset(radius);
+            assert!(
+                inset < TERMINAL_PADDING,
+                "alternate inset {inset} must be smaller than primary padding"
+            );
+            let inner = radius - 1.0;
+            let corner_distance = (radius - inset) * std::f32::consts::SQRT_2;
+            assert!(
+                corner_distance < inner,
+                "cell corner must clear the inside stroke at radius {radius}"
+            );
+            let alternate = crate::render::terminal_content_layout(pane, metrics, true, radius);
+            let primary = crate::render::terminal_content_layout(pane, metrics, false, radius);
+            assert!(
+                (alternate.content.left() - inset).abs() < 0.01,
+                "left inset must be the uniform minimum"
+            );
+            assert!(
+                (pane.right() - alternate.content.right() - inset).abs() < 0.01,
+                "right inset must match the left inset, with no scrollbar reservation"
+            );
+            assert!(
+                (alternate.content.top() - inset).abs() < 0.01
+                    && (pane.bottom() - alternate.content.bottom() - inset).abs() < 0.01
+            );
+            let used = metrics.pixel_size(alternate.size);
+            let left_spare = alternate.origin.x - alternate.content.left();
+            let right_spare = alternate.content.right() - (alternate.origin.x + used.x);
+            let top_spare = alternate.origin.y - alternate.content.top();
+            let bottom_spare = alternate.content.bottom() - (alternate.origin.y + used.y);
+            assert!((left_spare - right_spare).abs() < 0.01);
+            assert!((top_spare - bottom_spare).abs() < 0.01);
+            assert!(left_spare >= 0.0 && top_spare >= 0.0);
+            assert!(
+                (primary.content.left() - TERMINAL_PADDING).abs() < 0.01
+                    && (pane.right()
+                        - primary.content.right()
+                        - TERMINAL_PADDING
+                        - SCROLLBAR_WIDTH)
+                        .abs()
+                        < 0.01,
+                "primary screen must keep the 8px padding and scrollbar reservation"
+            );
+            assert!(alternate.size.cols >= primary.size.cols);
+            assert_eq!(primary.origin, primary.content.min);
+        }
     }
 }

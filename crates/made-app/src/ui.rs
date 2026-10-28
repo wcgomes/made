@@ -1174,11 +1174,16 @@ fn workspace_tab_ui(
     } else {
         theme::BG_TAB_IDLE
     };
+    let stroke = if active {
+        theme::workspace_tab_stroke()
+    } else {
+        Stroke::NONE
+    };
     ui.painter().rect(
         rect,
         CornerRadius::same(6),
         fill,
-        Stroke::NONE,
+        stroke,
         StrokeKind::Inside,
     );
     let label_width = (rect.width() - 36.0).max(8.0);

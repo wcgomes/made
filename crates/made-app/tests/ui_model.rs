@@ -1036,8 +1036,8 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
             .iter()
             .any(|shape| shape.rect == active_tab
                 && shape.fill == made_app::theme::BG_TAB_SELECTED
-                && shape.stroke == egui::Stroke::NONE),
-        "active workspace tab must use the opaque selected fill with no border"
+                && shape.stroke == made_app::theme::workspace_tab_stroke()),
+        "active workspace tab must use the opaque selected fill and the shared inside stroke"
     );
     assert!(active_tab.width() > 40.0);
     assert!(
@@ -1158,9 +1158,11 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
         .expect("selected workspace tab must use the opaque selected fill");
     assert_eq!(
         selected_shape.stroke,
-        egui::Stroke::NONE,
-        "selected workspace tab must not paint a border"
+        made_app::theme::workspace_tab_stroke(),
+        "selected workspace tab must paint the shared discreet inside stroke"
     );
+    assert_ne!(selected_shape.stroke.color, made_app::theme::ACCENT);
+    assert_ne!(selected_shape.stroke.color, made_app::theme::FOCUS);
     assert!(
         !rects_with_fill(&output, made_app::theme::BG_SELECTED)
             .iter()
@@ -1174,10 +1176,10 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
         "selected workspace tab must not use the Explorer glass fill"
     );
     assert!(
-        !rect_shapes(&output)
-            .iter()
-            .any(|shape| { shape.rect == active_tab && shape.stroke != egui::Stroke::NONE }),
-        "selected workspace tab must not paint any stroke"
+        rect_shapes(&output).iter().any(|shape| {
+            shape.rect == active_tab && shape.stroke == made_app::theme::workspace_tab_stroke()
+        }),
+        "selected workspace tab must paint the shared inside stroke"
     );
     assert!(
         text_colors(&output, "beta", 55.0).contains(&made_app::theme::TEXT_PRIMARY),
@@ -1196,7 +1198,7 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
     assert_eq!(
         idle_shape.stroke,
         egui::Stroke::NONE,
-        "inactive workspace tab must have no rest border"
+        "inactive workspace tab must paint no stroke at rest"
     );
     assert!(
         text_colors(&output, "alpha", 55.0).contains(&made_app::theme::inactive_tab_text()),
@@ -1227,7 +1229,7 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
     assert_eq!(
         hover_shape.stroke,
         egui::Stroke::NONE,
-        "hovered workspace tab must not paint a border"
+        "hovered inactive workspace tab must paint no stroke"
     );
     let hovered_colors = text_colors(&hovered, "alpha", 55.0);
     assert!(
@@ -1241,10 +1243,10 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
     assert!(
         !rect_shapes(&hovered).iter().any(|shape| {
             shape.rect == inactive_tab
-                && (shape.stroke == egui::Stroke::new(1.0, made_app::theme::ACCENT)
-                    || shape.stroke == egui::Stroke::new(1.0, made_app::theme::BORDER))
+                && (shape.stroke.color == made_app::theme::ACCENT
+                    || shape.stroke.color == made_app::theme::FOCUS)
         }),
-        "hovered workspace tab must not paint an accent or neutral border"
+        "hovered workspace tab must not paint an accent or focus stroke"
     );
 
     let selected_hover = headless.hover(workspace_tab_id(beta_id));
@@ -1254,8 +1256,8 @@ fn workspace_tabs_use_non_color_selection_and_reduced_inactive_opacity() {
         .expect("hovered selected workspace tab must keep the selected fill");
     assert_eq!(
         selected_hover_shape.stroke,
-        egui::Stroke::NONE,
-        "hovered selected workspace tab must not paint a border"
+        made_app::theme::workspace_tab_stroke(),
+        "hovered selected workspace tab must keep the faint inside stroke"
     );
 }
 
@@ -1306,7 +1308,7 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
     assert_eq!(
         parent.stroke,
         egui::Stroke::NONE,
-        "close hover must not paint a parent tab border"
+        "close hover on an inactive tab must not paint a stroke"
     );
     assert!(
         text_colors(&output, "alpha", 55.0).contains(&made_app::theme::TEXT_PRIMARY),
@@ -1345,8 +1347,8 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
         .expect("selected-tab close hover must keep BG_TAB_SELECTED");
     assert_eq!(
         active_parent.stroke,
-        egui::Stroke::NONE,
-        "selected-tab close hover must not paint a border"
+        made_app::theme::workspace_tab_stroke(),
+        "selected-tab close hover must keep the faint inside stroke"
     );
     assert!(
         !rect_shapes(&active_output).iter().any(|shape| {

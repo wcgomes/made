@@ -100,6 +100,83 @@ impl Default for CellMetrics {
     }
 }
 
+/// Content rect, paint origin, and hit rect for one terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalContentLayout {
+    /// Area available for whole cells after the mode's inset.
+    pub content: Rect,
+    /// Top-left of cell (0, 0).
+    pub origin: Pos2,
+    /// Hit-test and clip rect. Primary screen keeps the padded content rect;
+    /// alternate screen is the exact centered cell grid.
+    pub grid_rect: Rect,
+    /// Columns and rows that fit in `content`.
+    pub size: TerminalSize,
+}
+
+/// Minimum uniform inset that keeps a cell corner inside a 1px inside stroke
+/// on a rounded card.
+///
+/// The corner must sit inside the inner edge of the stroke. A half pixel keeps
+/// antialiased stroke coverage off the glyph.
+pub fn alternate_screen_inset(card_radius: f32) -> f32 {
+    let radius = if card_radius.is_finite() {
+        card_radius.max(1.0)
+    } else {
+        1.0
+    };
+    let inner = (radius - 1.0).max(0.0);
+    let corner = radius - inner / std::f32::consts::SQRT_2;
+    (corner + 0.5).max(1.0)
+}
+
+/// Lay out the cell grid for primary-screen padding or alternate-screen TUI mode.
+///
+/// Primary screen keeps the 8px padding and the extra scrollbar reservation on
+/// the right, and paints from the top-left so leftover pixels stay on the right
+/// and bottom. Alternate-screen mode drops that reservation, uses a uniform
+/// minimum inset, and splits leftover pixels evenly.
+pub fn terminal_content_layout(
+    pane: Rect,
+    metrics: CellMetrics,
+    alternate_screen: bool,
+    card_radius: f32,
+) -> TerminalContentLayout {
+    let content = if alternate_screen {
+        let inset = alternate_screen_inset(card_radius);
+        Rect::from_min_max(
+            pane.min + Vec2::splat(inset),
+            (pane.max - Vec2::splat(inset)).max(pane.min + Vec2::splat(inset)),
+        )
+    } else {
+        Rect::from_min_max(
+            pane.min + Vec2::splat(TERMINAL_PADDING),
+            (pane.max - Vec2::splat(TERMINAL_PADDING) - Vec2::new(SCROLLBAR_WIDTH, 0.0))
+                .max(pane.min + Vec2::splat(TERMINAL_PADDING)),
+        )
+    };
+    let size = metrics.grid_size(content.size());
+    let used = metrics.pixel_size(size);
+    let origin = if alternate_screen {
+        let spare_x = (content.width() - used.x).max(0.0);
+        let spare_y = (content.height() - used.y).max(0.0);
+        content.min + Vec2::new(spare_x * 0.5, spare_y * 0.5)
+    } else {
+        content.min
+    };
+    let grid_rect = if alternate_screen {
+        Rect::from_min_size(origin, used)
+    } else {
+        content
+    };
+    TerminalContentLayout {
+        content,
+        origin,
+        grid_rect,
+        size,
+    }
+}
+
 /// A viewport cell coordinate used for selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord)]
 pub struct CellPoint {

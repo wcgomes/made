@@ -47,7 +47,7 @@ pub const BG_HOVER: Color32 = Color32::from_rgb(29, 33, 41);
 pub const BG_SELECTED: Color32 = Color32::from_rgb(34, 42, 53);
 /// Inactive workspace-tab fill: translucent black over the window backdrop.
 pub const BG_TAB_IDLE: Color32 = Color32::from_rgba_unmultiplied_const(0, 0, 0, 84);
-/// Fill-only workspace-tab hover: opaque dark green-gray.
+/// Workspace-tab hover fill: opaque dark green-gray. Inactive hover paints no stroke.
 pub const BG_TAB_HOVER: Color32 = Color32::from_rgb(0x15, 0x1C, 0x18);
 /// Selected workspace-tab fill: opaque dark gray with a green undertone.
 pub const BG_TAB_SELECTED: Color32 = Color32::from_rgb(0x1B, 0x23, 0x1F);
@@ -180,6 +180,31 @@ pub fn wordmark_gap(compact: bool) -> f32 {
 
 /// Fixed font size of the workspace-tab close glyph.
 pub const CLOSE_GLYPH_SIZE: f32 = 14.0;
+
+/// How far the workspace-tab stroke sits below `BG_TAB_SELECTED`.
+///
+/// Twelve is the same strength as the previous lighter step, in the darker
+/// direction. The selected fill is (27, 35, 31), so this does not clamp to black.
+pub const WORKSPACE_TAB_STROKE_DARKEN: u8 = 12;
+
+/// Alpha of the selected workspace-tab stroke.
+///
+/// 128 keeps the previous strength: a partial mark, not an opaque outline.
+pub const WORKSPACE_TAB_STROKE_ALPHA: u8 = 128;
+
+/// Faint 1px inside stroke painted only on the selected workspace tab.
+pub fn workspace_tab_stroke() -> Stroke {
+    let [r, g, b, _] = BG_TAB_SELECTED.to_srgba_unmultiplied();
+    Stroke::new(
+        1.0,
+        Color32::from_rgba_unmultiplied(
+            r.saturating_sub(WORKSPACE_TAB_STROKE_DARKEN),
+            g.saturating_sub(WORKSPACE_TAB_STROKE_DARKEN),
+            b.saturating_sub(WORKSPACE_TAB_STROKE_DARKEN),
+            WORKSPACE_TAB_STROKE_ALPHA,
+        ),
+    )
+}
 
 /// Explorer splitter fade duration in seconds.
 pub const SPLITTER_FADE_TIME: f32 = 0.14;
@@ -1731,6 +1756,45 @@ mod tests {
             selected > hover,
             "selected tab must be a luminance step above hover"
         );
+        let stroke = workspace_tab_stroke();
+        assert_eq!(stroke.width, 1.0);
+        let [r, g, b, a] = stroke.color.to_srgba_unmultiplied();
+        let selected = BG_TAB_SELECTED.to_srgba_unmultiplied();
+        assert!(
+            a > 64 && a < 255,
+            "workspace-tab stroke must be stronger than alpha 64 and still not opaque"
+        );
+        assert_eq!(a, WORKSPACE_TAB_STROKE_ALPHA);
+        assert!(
+            selected[0] > WORKSPACE_TAB_STROKE_DARKEN
+                && selected[1] > WORKSPACE_TAB_STROKE_DARKEN
+                && selected[2] > WORKSPACE_TAB_STROKE_DARKEN,
+            "darkening the selected fill must not clamp to black"
+        );
+        assert_eq!(
+            stroke.color,
+            Color32::from_rgba_unmultiplied(
+                selected[0] - WORKSPACE_TAB_STROKE_DARKEN,
+                selected[1] - WORKSPACE_TAB_STROKE_DARKEN,
+                selected[2] - WORKSPACE_TAB_STROKE_DARKEN,
+                WORKSPACE_TAB_STROKE_ALPHA,
+            )
+        );
+        assert_ne!(
+            (r, g, b),
+            (39, 47, 43),
+            "the previous lighter stroke must not return"
+        );
+        assert_ne!(stroke.color, Color32::from_rgb(0x2B, 0x33, 0x2F));
+        assert!(
+            g >= r && g >= b,
+            "workspace-tab stroke must keep the tab green-gray family: {stroke:?}"
+        );
+        assert!(r.abs_diff(selected[0] - WORKSPACE_TAB_STROKE_DARKEN) <= 1);
+        assert_ne!(stroke.color, ACCENT);
+        assert_ne!(stroke.color, FOCUS);
+        assert_ne!(stroke.color, BORDER);
+        assert_ne!(stroke.color, BORDER_CONTROL);
     }
 
     #[test]

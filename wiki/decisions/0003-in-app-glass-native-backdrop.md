@@ -4,14 +4,14 @@
 
 ## Context
 
-Made wants a quiet, layered dark UI with a frosted Explorer card, fill-only workspace tabs, and a transparent floating header. Native blur is not portable: Linux X11/Wayland compositors differ, macOS exposes `NSVisualEffectView`, and Windows 11 offers Mica but acrylic/blur can add resize/drag lag. The UI must remain readable if the OS ignores window alpha.
+Made wants a quiet, layered dark UI with a frosted Explorer card and a transparent floating header. Native blur is not portable: Linux X11/Wayland compositors differ, macOS exposes `NSVisualEffectView`, and Windows 11 offers Mica but acrylic/blur can add resize/drag lag. The UI must remain readable if the OS ignores window alpha.
 
 ## Decision
 
 Use an always-present **in-app glass approximation** on the Explorer, and treat a native material as an optional layer behind the window.
 
 - In-app glass: conditional Explorer fills using the same RGB pairs: `BG_CARD_GLASS` 188 / `BG_HEADER_GLASS` 194 without a native backdrop (off, unsupported, or failed), or `BG_CARD_GLASS_NATIVE` 24 / `BG_HEADER_GLASS_NATIVE` 32 when macOS HudWindow or Windows 11 Mica is actually applied; border, shadow, and 1px top highlight stay unchanged. Windows uses the same applied/fallback selection; Windows native runtime is not claimed.
-- Workspace tabs are fill-only and do not use Explorer glass: idle uses translucent black `BG_TAB_IDLE` (84), hover uses opaque `BG_TAB_HOVER` `#151C18`, and selected uses opaque `BG_TAB_SELECTED` `#1B231F`, all with no stroke. The selected/hover fills replace the earlier glass-plus-accent-border treatment.
+- Workspace tabs do not use Explorer glass. Fills follow the [UI spec](../../specs/changes/made-ui-ux-v1/spec.md). Selected-tab stroke follows the same spec. The earlier glass-plus-accent-border treatment stays retired.
 - The workspace header is transparent and floats directly on the clear/native backdrop; it paints no band fill, border, shadow, or highlight. The wordmark, tabs, and icon actions sit directly over that backdrop.
 - Optional native material: macOS `NSVisualEffectView` HudWindow vibrancy; Windows 11 Mica only. No Windows acrylic/blur. No Linux native blur attempt.
 - The attempt runs once on the first UI frame and never retries or switches materials.
@@ -24,7 +24,7 @@ Use an always-present **in-app glass approximation** on the Explorer, and treat 
 
 - Linux and unsupported compositors get a successful, honest fallback rather than a degraded UI.
 - Explorer glass is conditional: the native 24/32 pair lets macOS HudWindow or Windows 11 Mica read through, while the 188/194 fallback preserves legibility without blur; Windows uses the same selection without a native-runtime claim.
-- The transparent floating header avoids a second competing glass slab against the terminal while keeping the Explorer and primary-screen terminal card as the in-app glass surfaces; workspace tabs use their own fill-only states. One surface owns each glass layer, and overlays are opaque or absent; stacking the same 160 fill would composite to ~219 and show a seam.
+- The transparent floating header avoids a second competing glass slab against the terminal while keeping the Explorer and primary-screen terminal card as the in-app glass surfaces; workspace tabs are not a glass surface, and selected-tab stroke follows the [UI spec](../../specs/changes/made-ui-ux-v1/spec.md). One surface owns each glass layer, and overlays are opaque or absent; stacking the same 160 fill would composite to ~219 and show a seam.
 - macOS arm64 HudWindow vibrancy and UI rendering were manually verified natively on 2026-10-28 in windowed, resized, and fullscreen states; Phase 15 glass alphas and Phase 16 conditional Explorer tokens are headless/token-verified. The 1280×800 native Explorer tint was visually approved by the user on 2026-10-28; post-fix native terminal pixel parity and native contrast certification remain pending (the display was locked for the post-fix capture). Full native macOS UX remains pending, and Windows/macOS x64 remain compile-checked only.
 - The macOS effect view must sit in the content view's superview directly below the content view; a content-view subview composites above the parent view's layer, covers the wgpu `CAMetalLayer`, and hides the UI.
 - The UI has no OS branch; selection stays in [`made-platform`](../../crates/made-platform/src/native_backdrop.rs).
