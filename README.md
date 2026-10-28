@@ -121,9 +121,9 @@ npm run typecheck
 
 ## Status
 
-Made is a **v1 UX validation build**, not a production-ready release.
+Made is an **initial UX validation build**, not a production-ready release.
 
-Linux automated and Xvfb checks verify the core workspace flows. Native Linux desktop, macOS, and Windows runs remain pending, as do real zsh/fish/PowerShell runs, native IME/clipboard/pointer behavior, hardware-GPU pacing, and CI artifacts. Native macOS vibrancy and Windows 11 Mica are compile-checked only; no native-effect runtime claim is made.
+Automated tests and smoke checks pass in CI across the supported targets, and development artifacts are produced. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, and launching the packaged artifacts. Native macOS vibrancy and Windows 11 Mica have not been validated interactively.
 
 The file preview is read-only: no editing, saving, LSP, or diff view. Builds are unsigned; there are no installers, signing, notarization, or auto-update channels.
 

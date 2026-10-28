@@ -1,6 +1,6 @@
 # Release and CI
 
-Made v1 produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -46,6 +46,6 @@ DISPLAY=127.0.0.1:99 LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
 
 ## Release-blocking boundary
 
-Do not treat a green CI build as v1 UX validation. The exit test is every spec scenario with passing evidence summarized in the [v1 evidence record](../records/20261026-v1-evidence.md); native Linux, macOS, Windows, real shells, live OpenCode switching, native input, and packaged launch remain open. See [Platform matrix](../testing/platform-matrix.md) and [CI platform quirks](../testing/ci-platform-quirks.md).
+Do not treat a green CI build as UX validation. The exit test is every spec scenario with passing evidence summarized in the [evidence record](../records/20261026-v1-evidence.md); native Linux, macOS, Windows, real shells, live OpenCode switching, native input, and packaged launch remain open. See [Platform matrix](../testing/platform-matrix.md) and [CI platform quirks](../testing/ci-platform-quirks.md).
 
 Related: [Build and test](build-and-test.md), [Testing strategy](../testing/strategy.md), [CI platform quirks](../testing/ci-platform-quirks.md), [v1 evidence](../records/20261026-v1-evidence.md).

@@ -23,10 +23,10 @@
 
 ## Checkpoint
 
-- [ ] Gate: "Plugin loads on first OpenCode launch" is validated at spike level; the plugin loads from injected config and connects.
-- [ ] Gate: active-tab tracking and "Switch to a session in a different worktree" location changes are validated at spike level.
-- [ ] Gate: "Click focuses session" is validated at spike level; the plugin receives focus and OpenCode changes the active session.
-- [ ] Gate: "User config unchanged" is validated at spike level; the fixture config hash is identical before and after.
+- [x] Gate: "Plugin loads on first OpenCode launch" is validated at spike level; the plugin loads from injected config and connects.
+- [x] Gate: active-tab tracking and "Switch to a session in a different worktree" location changes are validated at spike level.
+- [x] Gate: "Click focuses session" is validated at spike level; the plugin receives focus and OpenCode changes the active session.
+- [x] Gate: "User config unchanged" is validated at spike level; the fixture config hash is identical before and after.
 - [ ] Gate: no app UI work starts until all Phase 0 checks pass; failures and unresolved risks are recorded in `wiki/records/20261025-phase-0-gate.md`.
 
 ## 1. Phase 1 — Native shell, terminal, and workspace launch
@@ -67,7 +67,7 @@
 - [ ] verify "IME composition"
 - [ ] verify "Scrollback and copy"
 - [ ] verify "Title and focus reporting"
-- [ ] verify the platform contract test passes for the Linux, macOS, and Windows backends; runtime parity is validated in Phase 4.
+- [x] verify the platform contract test passes for the Linux, macOS, and Windows backends; runtime parity is validated in Phase 4. CI run 40610516888 passed the workspace tests on all three platforms; native UX remains pending.
 
 ## 2. Phase 2 — Explorer and read-only preview
 
@@ -169,7 +169,7 @@
 
 ## Checkpoint
 
-- [ ] verify "CI builds all targets"
+- [x] verify "CI builds all targets" — CI run 40607353792 produced development artifacts for all four targets; see `wiki/testing/platform-matrix.md`.
 - [ ] verify "Linux X11 and Wayland"
 - [ ] verify "Windows native OpenCode"
 - [ ] verify "macOS"
