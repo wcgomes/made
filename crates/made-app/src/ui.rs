@@ -5,8 +5,9 @@
 //! is no routine status bar or integration banner and no persistent header
 //! band: wordmark, tabs, and icon actions sit on the clear/native backdrop.
 //! The full-height Explorer card uses the theme's in-app frosted-glass
-//! approximation; terminal, preview, and picker cards stay opaque. All display
-//! text is sanitized and every control keeps a visible focus state.
+//! approximation; the terminal is glass on its primary screen and opaque for
+//! alternate-screen TUIs, while preview and picker cards stay opaque. All
+//! display text is sanitized and every control keeps a visible focus state.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1339,7 +1340,13 @@ impl Clipboard for UiClipboard {
 
 impl Workbench {
     /// Draw the complete workspace surface.
-    pub fn ui(&mut self, ui: &mut Ui, show_sessions: &mut bool, show_diagnostics: &mut bool) {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        show_sessions: &mut bool,
+        show_diagnostics: &mut bool,
+        native_backdrop_applied: bool,
+    ) {
         if !self.is_visible() {
             return;
         }
@@ -1353,14 +1360,20 @@ impl Workbench {
             bottom: layout.gutter as i8,
         };
         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-            self.workspace_ui(ui, &layout, show_diagnostics);
+            self.workspace_ui(ui, &layout, show_diagnostics, native_backdrop_applied);
         });
         self.set_sessions_visible(*show_sessions);
     }
 
-    fn workspace_ui(&mut self, ui: &mut Ui, layout: &Layout, show_diagnostics: &mut bool) {
+    fn workspace_ui(
+        &mut self,
+        ui: &mut Ui,
+        layout: &Layout,
+        show_diagnostics: &mut bool,
+        native_backdrop_applied: bool,
+    ) {
         self.sync_terminal_visibility(ui.ctx());
-        self.main_panels(ui, layout);
+        self.main_panels(ui, layout, native_backdrop_applied);
         self.apply_terminal_focus_boost(ui.ctx());
         let ctx = ui.ctx().clone();
         self.toast(&ctx, layout);
@@ -1409,7 +1422,7 @@ impl Workbench {
         ctx.data_mut(|data| data.insert_temp(boost_id, boost));
     }
 
-    fn main_panels(&mut self, ui: &mut Ui, layout: &Layout) {
+    fn main_panels(&mut self, ui: &mut Ui, layout: &Layout, native_backdrop_applied: bool) {
         let mut explorer = self.explorer.take();
         if let Some(pane) = explorer.as_mut() {
             pane.set_ui_scope(egui::Id::unique(("made-explorer", self.pane_id())));
@@ -1502,6 +1515,7 @@ impl Workbench {
                         );
                         content_ui.set_clip_rect(rect.intersect(ui.clip_rect()));
                         if let Some(explorer) = explorer.as_mut() {
+                            explorer.set_native_backdrop_applied(native_backdrop_applied);
                             explorer.tree_ui(&mut content_ui, self.diag.log_mut(), layout);
                         } else if let Some(error) = self.workspace_error.clone() {
                             unavailable_card(
@@ -1611,6 +1625,12 @@ impl Workbench {
 
     fn terminal_card(&mut self, ui: &mut Ui, layout: &Layout, preview_loaded: bool) -> bool {
         let card_rect = ui.available_rect_before_wrap();
+        let alternate_screen = self
+            .terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal.alternate_screen());
+        let terminal_fill = theme::terminal_surface(alternate_screen);
+        let chrome_fill = theme::terminal_overlay_surface(alternate_screen);
         let mut card_ui = ui.new_child(
             UiBuilder::new()
                 .max_rect(card_rect)
@@ -1620,7 +1640,7 @@ impl Workbench {
         ui.painter().rect_filled(
             card_rect,
             CornerRadius::same(layout.card_radius),
-            theme::BG_TERMINAL,
+            terminal_fill,
         );
         let mut top = card_rect.top();
         let focus_error = self
@@ -1667,7 +1687,7 @@ impl Workbench {
                     egui::pos2(card_rect.left(), top),
                     egui::vec2(card_rect.width(), if layout.compact { 20.0 } else { 22.0 }),
                 );
-                self.terminal_path_line(ui, path_rect, row, layout);
+                self.terminal_path_line(ui, path_rect, row, layout, chrome_fill);
                 top += path_rect.height();
             }
         }
@@ -1679,7 +1699,9 @@ impl Workbench {
                 egui::pos2(card_rect.left(), top),
                 egui::vec2(card_rect.width(), slot_height),
             );
-            ui.painter().rect_filled(slot_rect, 0.0, theme::BG_TERMINAL);
+            if let Some(fill) = chrome_fill {
+                ui.painter().rect_filled(slot_rect, 0.0, fill);
+            }
             ui.painter().line_segment(
                 [
                     egui::pos2(slot_rect.left(), slot_rect.bottom() - 0.5),
@@ -1698,7 +1720,7 @@ impl Workbench {
                 "File",
                 false,
                 layout.button_height,
-                theme::BG_TERMINAL,
+                chrome_fill.unwrap_or(Color32::TRANSPARENT),
             );
             action
                 .response
@@ -1813,8 +1835,17 @@ impl Workbench {
         })
     }
 
-    fn terminal_path_line(&self, ui: &mut Ui, rect: egui::Rect, row: &SessionRow, layout: &Layout) {
-        ui.painter().rect_filled(rect, 0.0, theme::BG_TERMINAL);
+    fn terminal_path_line(
+        &self,
+        ui: &mut Ui,
+        rect: egui::Rect,
+        row: &SessionRow,
+        layout: &Layout,
+        fill: Option<Color32>,
+    ) {
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(rect, 0.0, fill);
+        }
         ui.painter().line_segment(
             [
                 egui::pos2(rect.left(), rect.bottom() - 0.5),

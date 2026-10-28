@@ -8,7 +8,8 @@
 //!
 //! - macOS: `NSVisualEffectView` vibrancy with
 //!   [`NSVisualEffectMaterial::HudWindow`](https://developer.apple.com/documentation/appkit/nsvisualeffectmaterial/hudwindow)
-//!   in the active state.
+//!   in the active state, placed below the content view so the egui surface
+//!   stays visible (see the `macos` module).
 //! - Windows 11: Mica (`DWMSBT_MAINWINDOW` or the older Mica attribute
 //!   fallback used by `window-vibrancy`).
 //! - Linux and other compositors: no effect is attempted. Native backdrop blur
@@ -172,19 +173,75 @@ fn apply_with_mode(window: impl HasWindowHandle, mode: RequestedMode) -> NativeB
 
 #[cfg(target_os = "macos")]
 fn apply_platform(window: impl HasWindowHandle) -> NativeBackdropStatus {
-    match window_vibrancy::apply_vibrancy(
-        window,
-        window_vibrancy::NSVisualEffectMaterial::HudWindow,
-        Some(window_vibrancy::NSVisualEffectState::Active),
-        None,
-    ) {
+    match macos::apply_vibrancy_behind_content(&window) {
         Ok(()) => NativeBackdropStatus::applied(
             NativeBackdropKind::MacosVibrancy,
-            "macOS HudWindow vibrancy applied",
+            "macOS HudWindow vibrancy applied behind the content view",
         ),
         Err(error) => NativeBackdropStatus::fallback(format!(
             "macOS vibrancy unavailable: {error}; using in-app glass"
         )),
+    }
+}
+
+/// macOS `NSVisualEffectView` placement.
+///
+/// `window-vibrancy` adds the effect view as a subview of the window's content
+/// view. eframe renders the app into that same content view's `CAMetalLayer`,
+/// and AppKit composites subviews above the parent view's own layer, so the
+/// effect view hides the whole UI.
+///
+/// The effect view therefore goes into the content view's superview, directly
+/// below the content view: the native material stays behind the window content
+/// and shows through the translucent clear color, while egui draws on top.
+#[cfg(target_os = "macos")]
+mod macos {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+        NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
+    };
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    pub(super) fn apply_vibrancy_behind_content(
+        window: &impl HasWindowHandle,
+    ) -> Result<(), String> {
+        let handle = window.window_handle().map_err(|error| error.to_string())?;
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return Err("window handle is not AppKit".into());
+        };
+        let mtm = MainThreadMarker::new().ok_or("not running on the main thread")?;
+        // SAFETY: the AppKit handle comes from the live eframe window and this
+        // one-shot call runs on the UI thread. `NSView::superview` is unsafe
+        // because AppKit returns the parent view without transferring
+        // ownership, so the caller must keep the hierarchy alive; `content`
+        // belongs to that live window, and binding the result to `superview`
+        // retains it for the duration of the insertion. The effect view is
+        // retained by `superview`; no AppKit reference escapes this call.
+        unsafe {
+            let content: &NSView = handle.ns_view.cast::<NSView>().as_ref();
+            let superview = content
+                .superview()
+                .ok_or("window content view has no superview")?;
+            // Cover the superview, not the content view. Native fullscreen
+            // gives the content view the titlebar height in addition to the
+            // superview's own resize, so a content-view frame ends up one
+            // titlebar short at the top.
+            let effect = NSVisualEffectView::initWithFrame(mtm.alloc(), superview.bounds());
+            effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            effect.setState(NSVisualEffectState::Active);
+            effect.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+            superview.addSubview_positioned_relativeTo(
+                &effect,
+                NSWindowOrderingMode::Below,
+                Some(content),
+            );
+        }
+        Ok(())
     }
 }
 

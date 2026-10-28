@@ -261,6 +261,11 @@ impl TerminalPane {
         self.title.as_deref()
     }
 
+    /// Whether the child is currently using the VT alternate screen.
+    pub fn alternate_screen(&self) -> bool {
+        self.core.alternate_screen()
+    }
+
     /// Shell working directory reported by OSC 7, when available.
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
@@ -859,11 +864,9 @@ impl TerminalPane {
                 pane_rect.bottom() - TERMINAL_PADDING,
             ),
         ));
-        painter.rect_filled(
-            background_rect,
-            0.0,
-            super::render::rgb(self.palette.background),
-        );
+        if let Some(fill) = crate::theme::terminal_overlay_surface(snapshot.alternate_screen) {
+            painter.rect_filled(background_rect, 0.0, fill);
+        }
         self.grid_paint_count = self.grid_paint_count.saturating_add(1);
         self.last_grid_paint_visible = self.visible;
         paint_grid(
@@ -1833,6 +1836,17 @@ mod tests {
         log: &mut DiagnosticLog,
         events: Vec<egui::Event>,
     ) -> TerminalUiOutput {
+        run_terminal_frame_capture(ctx, pane, platform, metrics, log, events).0
+    }
+
+    fn run_terminal_frame_capture(
+        ctx: &egui::Context,
+        pane: &mut TerminalPane,
+        platform: &dyn made_platform::Platform,
+        metrics: &mut Metrics,
+        log: &mut DiagnosticLog,
+        events: Vec<egui::Event>,
+    ) -> (TerminalUiOutput, egui::FullOutput) {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1846,7 +1860,108 @@ mod tests {
             output = Some(pane.ui(ui, platform, metrics, log));
         });
         frame.textures_delta.clear();
-        output.expect("terminal rendered")
+        (output.expect("terminal rendered"), frame)
+    }
+
+    fn has_large_rect_fill(output: &egui::FullOutput, fill: egui::Color32) -> bool {
+        fn visit(shape: &egui::Shape, fill: egui::Color32, found: &mut bool) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill == fill => {
+                    if rect.rect.width() * rect.rect.height() > 100_000.0 {
+                        *found = true;
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, fill, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut found = false;
+        for clipped in &output.shapes {
+            visit(&clipped.shape, fill, &mut found);
+        }
+        found
+    }
+
+    #[test]
+    fn terminal_body_surface_switches_with_alternate_screen() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
+        )
+        .unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = egui::Context::default();
+
+        let (_, primary) = run_terminal_frame_capture(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        assert!(
+            !pane.alternate_screen(),
+            "shell starts on the primary screen"
+        );
+        assert!(
+            !has_large_rect_fill(&primary, crate::theme::BG_TERMINAL_GLASS),
+            "primary-screen body must not add a second glass layer"
+        );
+        assert!(
+            !has_large_rect_fill(&primary, crate::theme::BG_TERMINAL),
+            "primary-screen body must not paint the opaque terminal fill"
+        );
+
+        pane.core.feed(b"\x1b[?1049h");
+        assert!(pane.alternate_screen(), "ALT_SCREEN must be active");
+        let (_, alternate) = run_terminal_frame_capture(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        assert!(
+            !has_large_rect_fill(&alternate, crate::theme::BG_TERMINAL_GLASS),
+            "alternate-screen body must not paint the glass fill"
+        );
+        assert!(
+            has_large_rect_fill(&alternate, crate::theme::BG_TERMINAL),
+            "alternate-screen body must paint opaque BG_TERMINAL"
+        );
+
+        pane.core.feed(b"\x1b[?1049l");
+        assert!(
+            !pane.alternate_screen(),
+            "leaving ALT_SCREEN restores the primary screen"
+        );
+        let (_, restored) = run_terminal_frame_capture(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        assert!(
+            !has_large_rect_fill(&restored, crate::theme::BG_TERMINAL_GLASS),
+            "the restored primary body must not add a glass layer"
+        );
+        assert!(
+            !has_large_rect_fill(&restored, crate::theme::BG_TERMINAL),
+            "the restored primary body must not paint the opaque terminal fill"
+        );
+
+        pane.terminate(&mut log);
     }
 
     #[test]

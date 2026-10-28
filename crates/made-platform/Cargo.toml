@@ -18,7 +18,16 @@ raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Optional NSVisualEffectView vibrancy; the in-app glass remains the fallback.
-window-vibrancy = "0.8.1"
+# The effect view is inserted behind the eframe content view, so this crate
+# talks to AppKit directly instead of using window-vibrancy's subview helper.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSGraphics",
+    "NSResponder",
+    "NSView",
+    "NSVisualEffectView",
+] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Mica only: window-vibrancy documents resize lag for Windows acrylic/blur.

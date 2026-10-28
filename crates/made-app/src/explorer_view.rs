@@ -567,6 +567,7 @@ pub struct ExplorerPane {
     switch_latency: Option<Duration>,
     root_ready: bool,
     scroll_to_selection: bool,
+    native_backdrop_applied: bool,
 }
 
 impl std::fmt::Debug for ExplorerPane {
@@ -611,6 +612,7 @@ impl ExplorerPane {
             switch_latency: None,
             root_ready: false,
             scroll_to_selection: false,
+            native_backdrop_applied: false,
         };
         pane.install_root(root.as_ref());
         pane
@@ -1361,6 +1363,11 @@ impl ExplorerPane {
         self.explorer_card(ui, log, layout);
     }
 
+    /// Select the native-backdrop Explorer tint for the next paint.
+    pub fn set_native_backdrop_applied(&mut self, applied: bool) {
+        self.native_backdrop_applied = applied;
+    }
+
     /// Selected preview path, including loading and guarded error states.
     pub fn preview_path(&self) -> Option<&Path> {
         self.preview.path.as_deref()
@@ -1380,12 +1387,17 @@ impl ExplorerPane {
         // Allocate the whole card so the resizable split panel does not
         // shrink-wrap to the tree content on the second frame.
         let (card_rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-        theme::paint_glass_card(ui.painter(), card_rect, layout);
+        theme::paint_glass_card(
+            ui.painter(),
+            card_rect,
+            layout,
+            self.native_backdrop_applied,
+        );
         let header_rect = egui::Rect::from_min_size(
             card_rect.min,
             egui::vec2(card_rect.width(), layout.card_header_height),
         );
-        theme::paint_glass_card_header(ui, header_rect, layout);
+        theme::paint_glass_card_header(ui, header_rect, layout, self.native_backdrop_applied);
         let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
         let mut left = ui.new_child(
             UiBuilder::new()

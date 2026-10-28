@@ -30,13 +30,13 @@ Consequence: some requirements have a deliberate seam. The core spec states that
 
 ### U2: Calm Editor as the visual source of truth
 
-The implemented theme is retained rather than redesigned. The palette is dark with one calm mint-green accent; semantic success (cool teal), warning (amber), error (red), and info (blue) remain reserved for status and are shape/text-backed, so the accent never doubles as status. Depth comes from layered surfaces, 1px borders, 8–10px gaps, and one soft painted shadow on the explorer card/header, not gradients or glows; the workspace header floats directly on the clear/native backdrop without a persistent band. Terminal and all reading surfaces stay opaque and high-contrast.
+The implemented theme is retained rather than redesigned. The palette is dark with one calm mint-green accent; semantic success (cool teal), warning (amber), error (red), and info (blue) remain reserved for status and are shape/text-backed, so the accent never doubles as status. Depth comes from layered surfaces, 1px borders, 8–10px gaps, and one soft painted shadow on the explorer card/header, not gradients or glows; the workspace header floats directly on the clear/native backdrop without a persistent band. The terminal uses the documented conditional glass only on its primary screen and becomes fully opaque for alternate-screen TUIs; preview and all other reading surfaces stay opaque and high-contrast.
 
 Why: the terminal is the hero. Chrome that competes with terminal content reduces legibility and makes the product feel like a dashboard rather than a workspace. A single accent keeps selection, focus, and primary action coherent.
 
 ### U3: In-app glass is the portable fallback; native backdrop is optional
 
-The in-app glass approximation is present on the full-height explorer card/header: translucent tonal fill, a painted soft shadow on the explorer card, and a 1px top highlight on the explorer header. The workspace header has no persistent fill, border, shadow, or highlight; its wordmark, tabs, and icon actions float directly on the clear/native backdrop. Inactive tabs use the translucent black idle fill; hover uses the opaque `BG_TAB_HOVER` fill; selected uses the opaque dark green-gray `BG_TAB_SELECTED` fill, with no tab stroke. On macOS, `made_platform::native_backdrop` may request `NSVisualEffectView` HudWindow vibrancy; on Windows 11 it may request Mica only. Linux, unsupported compositors, `MADE_NATIVE_BACKDROP=off`, and failures keep `InAppGlass` for the explorer with `applied=false` and an honest reason. The fallback clear alpha is 225/255 and drops to 150/255 only when the native effect was applied.
+The in-app glass approximation is present on the full-height explorer card/header: translucent tonal fill, a painted soft shadow on the explorer card, and a 1px top highlight on the explorer header. The workspace header has no persistent fill, border, shadow, or highlight; its wordmark, tabs, and icon actions float directly on the clear/native backdrop. Inactive tabs use the translucent black idle fill; hover uses the opaque `BG_TAB_HOVER` fill; selected uses the opaque dark green-gray `BG_TAB_SELECTED` fill, with no tab stroke. On macOS, `made_platform::native_backdrop` may request `NSVisualEffectView` HudWindow vibrancy; on Windows 11 it may request Mica only. Linux, unsupported compositors, `MADE_NATIVE_BACKDROP=off`, and failures keep `InAppGlass` for the explorer with `applied=false` and an honest reason. The fallback clear alpha is 215/255 and drops to 135/255 only when the native effect was applied. The Explorer card/header use `BG_CARD_GLASS_NATIVE` 24/255 and `BG_HEADER_GLASS_NATIVE` 32/255 only when the recorded native backdrop status reports applied; otherwise they use the darker `BG_CARD_GLASS` 188/255 and `BG_HEADER_GLASS` 194/255 fallback for legibility without blur. Windows Mica follows the same applied/fallback selection, and native Explorer tint text contrast is not separately certified. The fallback pair keeps the documented fallback order (terminal glass < card < header < fallback clear). Preview, picker, diagnostics, tooltip, toast, and alternate-screen terminal surfaces stay opaque. The terminal card is the one conditional glass surface: `BG_TERMINAL_GLASS` 160/255 on the primary screen, switching to opaque `BG_TERMINAL` 255/255 whenever the terminal core reports alternate-screen mode, so OpenCode/vim/less cells never composite over the clear/native backdrop. The card fill is the sole primary-screen glass layer; body and terminal-owned chrome add no second translucent fill.
 
 Why: native blur is compositor-dependent and cannot be promised from a compile check. The portable explorer fallback keeps the UI readable and allows the native effect to improve depth where it is validated. A floating header avoids a second competing glass slab against the terminal. Windows acrylic/blur are excluded because `window-vibrancy` documents resize/drag lag.
 
@@ -87,21 +87,24 @@ Interaction flows:
 
 | Token | Value | Use |
 |---|---|---|
-| `BG_CLEAR` | `rgba(10,11,14,225)` | Default/fallback window clear (no native effect) |
-| `BG_CLEAR_NATIVE` | `rgba(10,11,14,150)` | Clear when a native backdrop is applied |
+| `BG_CLEAR` | `rgba(10,11,14,215)` | Default/fallback window clear (no native effect) |
+| `BG_CLEAR_NATIVE` | `rgba(10,11,14,135)` | Clear when a native backdrop is applied |
 | `BG_CHROME` | `#14161B` | Opaque chrome fallback, focus gap |
 | `BG_CARD` | `#171A20` | Preview/diagnostics cards and opaque fallback |
 | `BG_HEADER` | `#14171C` | Opaque session strip/non-glass headers |
 | `BG_DEEP` | `#12151A` | Diagnostics log, preview gutter |
-| `BG_TERMINAL` | `#0B0D10` | Terminal canvas/card |
+| `BG_TERMINAL` | `#0B0D10` | Opaque terminal canvas/card and alternate-screen surface |
+| `BG_TERMINAL_GLASS` | `rgba(11,13,16,160)` | Primary-screen terminal card fill (sole glass layer) |
 | `BG_ELEVATED` | `#1B1F26` | Secondary buttons, chips, tooltips |
 | `BG_HOVER` | `#1D2129` | Unified row/button/session-tab hover (not workspace tabs) |
 | `BG_SELECTED` | `#222A35` | Unified selected row/icon/session-tab fill |
 | `BG_TAB_IDLE` | `rgba(0,0,0,84)` | Inactive workspace-tab fill at rest |
 | `BG_TAB_HOVER` | `#151C18` | Opaque fill-only workspace-tab hover |
 | `BG_TAB_SELECTED` | `#1B231F` | Opaque dark green-gray selected workspace-tab fill |
-| `BG_CARD_GLASS` | `rgba(23,26,32,202)` | Frosted explorer card |
-| `BG_HEADER_GLASS` | `rgba(20,23,28,208)` | Frosted explorer header |
+| `BG_CARD_GLASS` | `rgba(23,26,32,188)` | Explorer card fallback glass (no native effect) |
+| `BG_HEADER_GLASS` | `rgba(20,23,28,194)` | Explorer header fallback glass (no native effect) |
+| `BG_CARD_GLASS_NATIVE` | `rgba(23,26,32,24)` | Explorer card tint when a native backdrop is applied |
+| `BG_HEADER_GLASS_NATIVE` | `rgba(20,23,28,32)` | Explorer header tint when a native backdrop is applied |
 | `GLASS_HIGHLIGHT` | `rgba(255,255,255,12)` | 1px inner top highlight |
 | `GLASS_SHADOW` | `rgba(0,0,0,58)` | Painted soft glass shadow |
 | `BORDER` | `#262B34` | Card borders; decorative separators |
@@ -130,22 +133,28 @@ Interaction flows:
 | `SCROLL_THUMB` | `#626C7D` | Scrollbar thumb at rest opacity |
 | `SCROLL_THUMB_HOVER` | `#7A8494` | Scrollbar thumb on bar hover/drag |
 
-Tints are precomposited opaque colors, not alpha fills. The explorer card/header are the persistent alpha fills; inactive workspace tabs use the translucent black idle fill, while selected/hover tabs use opaque green-gray fills. `BORDER` is decorative for cards and is never the sole boundary of a button-like control; use `BORDER_CONTROL` or `ACCENT`. Workspace tabs MUST NOT use an accent or border outline; close-X hover uses `ERROR`; the dragging splitter uses `ACCENT`. Inactive header tabs use `TEXT_SECONDARY` at 0.72 opacity; inactive header icons use `TEXT_TERTIARY` at 0.80 opacity; hover/selection restores full opacity. These are text/fill opacities, not reading-surface transparency.
+Tints are precomposited opaque colors, not alpha fills. The explorer card/header and the primary-screen terminal are the persistent alpha fills; the Explorer selects the native 24/32 tint pair only when the one-shot backdrop status reports applied, and otherwise uses the fallback 188/194 pair. The terminal switches to opaque `BG_TERMINAL` in alternate-screen mode. Inactive workspace tabs use the translucent black idle fill, while selected/hover tabs use opaque green-gray fills. `BORDER` is decorative for cards and is never the sole boundary of a button-like control; use `BORDER_CONTROL` or `ACCENT`. Workspace tabs MUST NOT use an accent or border outline; close-X hover uses `ERROR`; the dragging splitter uses `ACCENT`. Inactive header tabs use `TEXT_SECONDARY` at 0.72 opacity; inactive header icons use `TEXT_TERTIARY` at 0.80 opacity; hover/selection restores full opacity. These are text/fill opacities, not general reading-surface transparency; the documented primary-screen terminal glass and conditional Explorer fills are the only reading-surface alphas.
 
 ### Alpha and glass layering
 
 | Surface | Alpha |
 |---|---:|
-| Window backdrop/gutter, no native effect | `225/255` |
-| Window backdrop/gutter, native effect applied | `150/255` |
+| Window backdrop/gutter, no native effect | `215/255` |
+| Window backdrop/gutter, native effect applied | `135/255` |
 | Floating header | `0` (no fill) |
-| Explorer card | `202/255` |
-| Explorer card header | `208/255` |
+| Explorer card, native effect applied | `24/255` (`BG_CARD_GLASS_NATIVE`) |
+| Explorer card header, native effect applied | `32/255` (`BG_HEADER_GLASS_NATIVE`) |
+| Explorer card, no native effect | `188/255` (`BG_CARD_GLASS`) |
+| Explorer card header, no native effect | `194/255` (`BG_HEADER_GLASS`) |
 | Selected workspace tab | `255` (opaque `BG_TAB_SELECTED`) |
 | Inactive workspace tab | black `84/255`; hover `255` (opaque `BG_TAB_HOVER`) |
-| Terminal, preview, picker, diagnostics, tooltip, toast | `255` |
+| Terminal card, primary screen (no alternate-screen TUI) | `160/255` (`BG_TERMINAL_GLASS`; sole glass layer) |
+| Terminal surface, alternate screen (OpenCode/vim/less TUI) | `255/255` (opaque `BG_TERMINAL` card, chrome, and body) |
+| Preview, picker, diagnostics, tooltip, toast | `255` |
 
-`MADE_NATIVE_BACKDROP=auto` (default, including unset/unrecognized) attempts the native effect; `off` skips it. macOS requests HudWindow vibrancy; Windows 11 requests Mica only. Linux, unsupported compositors and failures use the in-app explorer glass. The native macOS/Windows effect is compile-checked but not runtime-validated in this repository; no live-blur claim is made for those targets. If the compositor ignores alpha, the RGB clear renders as a solid dark backdrop and the UI is otherwise unchanged. `TRANSLUCENT_WINDOW` is the kill switch; `false` requests no transparency and uses opaque clear.
+The native-applied order is `BG_CARD_GLASS_NATIVE` 24 < `BG_HEADER_GLASS_NATIVE` 32 < `BG_CLEAR_NATIVE` 135 < `BG_TERMINAL_GLASS` 160. The fallback order is `BG_TERMINAL_GLASS` 160 < `BG_CARD_GLASS` 188 < `BG_HEADER_GLASS` 194 < `BG_CLEAR` 215. The native Explorer tint pair is deliberately more transparent so the OS material reads through; the fallback pair stays darker for legibility without blur.
+
+`MADE_NATIVE_BACKDROP=auto` (default, including unset/unrecognized) attempts the native effect; `off` skips it. macOS requests HudWindow vibrancy; Windows 11 requests Mica only. The Explorer card/header use the `*_NATIVE` tint pair only when the recorded status reports applied; otherwise they use the fallback pair. Windows Mica follows the same applied/fallback selection. Linux, unsupported compositors and failures use the fallback Explorer glass. macOS arm64 HudWindow vibrancy and UI rendering were manually verified natively on 2026-10-28 (windowed, resized, and fullscreen); Windows and macOS x64 remain compile-checked, no live-blur claim is made for them, and full native UX/native contrast certification remains pending. If the compositor ignores alpha, the RGB clear renders as a solid dark backdrop and the UI is otherwise unchanged. `TRANSLUCENT_WINDOW` is the kill switch; `false` requests no transparency and uses opaque clear.
 
 ### Typography
 
@@ -320,18 +329,18 @@ Initially hidden, scoped to the selected workspace, visually separate from works
 
 ### Terminal card
 
-- Fill `BG_TERMINAL`, 1px `BORDER`, radius 10/8, no card padding.
+- Fill `BG_TERMINAL_GLASS` 160/255 on the primary screen, or opaque `BG_TERMINAL` 255/255 when `TerminalSnapshot.alternate_screen` is true; 1px `BORDER`, radius 10/8, no card padding. The card fill is the sole primary-screen glass layer. Terminal-owned path/file-slot chrome and the body add no fill on the primary screen; in alternate-screen mode they paint opaque `BG_TERMINAL`. The optional session strip/header remains opaque `BG_HEADER`.
 - No default terminal header/path/status row or running pill. Essential folder context is in workspace tabs/explorer; optional session map appears only on request. Shell exit/error retains the contextual recovery surface.
-- Body: terminal padding 8; scrollbar 8. No scroll area, opacity, or input-handling change.
+- Body: terminal padding 8; scrollbar 8. The primary-screen body adds no fill so the card glass shows through; alternate-screen mode paints opaque `BG_TERMINAL` to keep TUI cells on an opaque surface. No scroll area or input-handling change.
 - Corner handling: terminal paints a square background; draw the card border after content with `rect_stroke`.
 - Shell overlay: bottom-left inset 10px, max width 520/340, `BG_ELEVATED`, 1px `WARNING`, radius 8, padding 10×8; message 11.5 warning; “Restart shell” 24px warning ghost.
 - Terminal unavailable: inset error card 24px margin, max 520, `ERROR_TINT`, 1px `ERROR`, radius 8, padding 12; title 13, message 11.5, hint 10.5 tertiary.
-- Palette: background `#0B0D10`, foreground `#D7DDE7`, cursor `#8BD5A7`, selection `#2E3A4E`/`#FFFFFF`; keep ANSI 1–7/9–15; raise ANSI 8 to `#707B8E` (4.55:1). The custom scrollback bar has no track or thumb at rest; when the pane is hovered it fades in over 0.14s as a thumb only, and when the bar itself is hovered or dragged the thumb widens to the 8px hit area and a faint track appears. It uses `SCROLL_THUMB`/`SCROLL_THUMB_HOVER` with opacity, fades out on leave, and never changes the grid width.
+- Palette: background `#0B0D10`, foreground `#D7DDE7`, cursor `#8BD5A7`, selection `#2E3A4E`/`#FFFFFF`; keep ANSI 1–7/9–15; raise ANSI 8 to `#707B8E` (4.55:1). Primary-screen terminal glass uses the same `#0B0D10` RGB; alternate-screen TUI cells always composite over opaque `BG_TERMINAL`. The custom scrollback bar has no track or thumb at rest; when the pane is hovered it fades in over 0.14s as a thumb only, and when the bar itself is hovered or dragged the thumb widens to the 8px hit area and a faint track appears. It uses `SCROLL_THUMB`/`SCROLL_THUMB_HOVER` with opacity, fades out on leave, and never changes the grid width.
 
 ### Explorer card
 
-- Fill `BG_CARD_GLASS` 202/255, 1px `BORDER`, radius 10/8, painted `GLASS_SHADOW`; optional native material behind the window.
-- Full right content height, no preview beneath. Header 34/30, `BG_HEADER_GLASS` 208/255 with 1px `GLASS_HIGHLIGHT`, padding 12/10, bottom divider: “EXPLORER” and root folder 11 mono tertiary with full-path tooltip. No Wider, Narrower, Reload, or Hide text actions. Watcher/live/starting state lives in Diagnostics.
+- Fill `BG_CARD_GLASS_NATIVE` 24/255 when a native backdrop was actually applied, otherwise `BG_CARD_GLASS` 188/255; 1px `BORDER`, radius 10/8, painted `GLASS_SHADOW`. The conditional fill follows the recorded applied status; Windows Mica uses the same selection. Border, shadow, and highlight are unchanged.
+- Full right content height, no preview beneath. Header 34/30, `BG_HEADER_GLASS_NATIVE` 32/255 when a native backdrop was actually applied, otherwise `BG_HEADER_GLASS` 194/255, with 1px `GLASS_HIGHLIGHT`, padding 12/10, bottom divider: “EXPLORER” and root folder 11 mono tertiary with full-path tooltip. No Wider, Narrower, Reload, or Hide text actions. Watcher/live/starting state lives in Diagnostics.
 - Hide/show animates panel width over about 150 ms quadratic ease-out. Lay out the tree at its stored width and clip to the sliding panel; reverse cleanly; settle at stored width; stop tree/splitter input once closed. The left surface receives reclaimed space without losing shell/root/selection/preview state.
 - Divider: pointer-drag only, clamped to usable left/tree widths. Transparent at rest: no permanent line/grip. Hover fades in over about 140 ms a discreet 1px line and 6×32 grip using `BORDER_CONTROL` at partial opacity; while dragging the same geometry uses the green `ACCENT` at a restrained opacity; leaving fades both out. Keep the 8px pointer hit area, resize cursor, and “Drag to resize explorer” tooltip. Hover alone does not change stored width. Not a keyboard stop; header Explorer toggle remains the keyboard path. Width/visibility/expansion/valid selection survive tab switching and hide/restore, not restart.
 - Body: 4px vertical / 8px horizontal padding; vertical floating scroll area (hidden at rest, fading overlay, zero allocated width).
@@ -399,13 +408,13 @@ Initially hidden, scoped to the selected workspace, visually separate from works
 
 ## Transparency and native backdrop policy
 
-- The window clear (`BG_CLEAR` 225/255 fallback, or `BG_CLEAR_NATIVE` 150/255 when native) carries alpha. The explorer card/header are the in-app glass surfaces; selected/hover workspace tabs are opaque fills (`BG_TAB_SELECTED`/`BG_TAB_HOVER`), while idle tabs use the translucent `BG_TAB_IDLE` black at 84/255.
-- The explorer surfaces are the in-app frosted-glass approximation: translucent tonal fill + painted `GLASS_SHADOW` + 1px `GLASS_HIGHLIGHT`. This is portable and readable when alpha is ignored. The floating header paints no fill, border, shadow, or highlight.
+- The window clear (`BG_CLEAR` 215/255 fallback, or `BG_CLEAR_NATIVE` 135/255 when native) carries alpha. The explorer card/header use `BG_CARD_GLASS_NATIVE` 24/255 and `BG_HEADER_GLASS_NATIVE` 32/255 only when the native backdrop is actually applied; otherwise they use `BG_CARD_GLASS` 188/255 and `BG_HEADER_GLASS` 194/255. Windows uses the same applied/fallback selection. Selected/hover workspace tabs are opaque fills (`BG_TAB_SELECTED`/`BG_TAB_HOVER`), while idle tabs use the translucent `BG_TAB_IDLE` black at 84/255.
+- The explorer surfaces are the in-app frosted-glass approximation: translucent tonal fill + painted `GLASS_SHADOW` + 1px `GLASS_HIGHLIGHT`. The native tint pair lets the OS material read through; the darker fallback pair keeps the Explorer legible without blur over a bright desktop. The floating header paints no fill, border, shadow, or highlight.
 - `made_platform::native_backdrop` optionally requests a native material once on the first UI frame: macOS `NSVisualEffectView` HudWindow (active), Windows 11 Mica only. Linux, unsupported compositors, `MADE_NATIVE_BACKDROP=off`, and failures keep `InAppGlass` with `applied=false` and an honest reason. Windows acrylic/blur are not used.
-- Native macOS/Windows rendering is compile-checked only; no runtime native-effect/blur claim is made. Linux Xvfb confirms the fallback.
-- Terminal, preview, picker, diagnostics, tooltips, and toast are opaque reading surfaces. Hover/selection/tints are opaque precomposited colors.
-- Do not use `ui.set_opacity` above the terminal or place alpha on terminal/preview/picker text.
-- Kill switch: `TRANSLUCENT_WINDOW: bool = true`; when false, no transparent request and alpha 1.0. The UI has no OS branches; platform-specific backdrop selection stays in `made-platform`.
+- macOS arm64 HudWindow vibrancy and UI rendering were manually verified natively on 2026-10-28 (windowed, resized, and fullscreen); Windows and macOS x64 are compile-checked only, and full native UX/native contrast certification remains pending. Linux Xvfb confirms the fallback.
+- Preview, picker, diagnostics, tooltips, and toast are opaque reading surfaces. The terminal card fill uses `BG_TERMINAL_GLASS` 160/255 only on the primary screen and is the sole terminal glass layer; the body and terminal-owned path/file-slot chrome add no translucent fill. When `TerminalCore::alternate_screen()`/`TerminalSnapshot.alternate_screen` reports the VT `ALT_SCREEN` mode used by OpenCode, vim, or less, the card, chrome, and body become fully opaque `BG_TERMINAL` 255/255 so TUI cells never composite over the backdrop. The optional session strip/header remains opaque `BG_HEADER`. Hover/selection/tints are opaque precomposited colors.
+- Do not use `ui.set_opacity` above the terminal or place alpha on terminal/preview/picker text; the only terminal alpha is the documented primary-screen surface fill.
+- Kill switch: `TRANSLUCENT_WINDOW: bool = true`; when false, no transparent window request and the clear uses alpha 1.0. The UI has no OS branches; platform-specific backdrop selection stays in `made-platform`.
 
 ## Motion
 
@@ -440,7 +449,7 @@ Contrast (opaque reading surfaces):
 | Control border / card | 3.14:1 |
 
 - `BORDER` card edges are decorative; never the sole control boundary.
-- Glass surfaces composite over the dark backdrop. The ratios cover opaque reading surfaces; native backdrop rendering, native blur, and glass text contrast are not separately certified.
+- Glass surfaces composite over the dark backdrop. The ratios cover opaque reading surfaces; native backdrop rendering, native blur, glass text contrast, the native Explorer tints (24/32), and the conditional primary-screen terminal glass are not separately certified. The fallback Explorer glass (188/194) is the legibility path without native blur and MUST be checked with primary/secondary text over a bright composited desktop. Alternate-screen TUI content uses the opaque `BG_TERMINAL` surface and the terminal ratios above.
 - ANSI 0 is a terminal background slot and cannot be made readable as foreground. Arbitrary ANSI/truecolor terminal content is outside app control; the default terminal pair meets AA.
 - Focus: every keyboard-reachable interactive control has a visible focus state; never rely on fill change alone. Custom tabs/ghost buttons use the double ring; picker card/buttons keep their focus rings. Deliberate exception: explorer tree rows/container and picker rows have no focus outline—their focus/selection is the inset `BG_SELECTED` fill plus `TEXT_PRIMARY` text. Focusing the tree before any selection selects the first visible row without opening a preview. The pointer-only divider is not focusable and uses hover/drag feedback.
 - Keyboard: labeled workspace open/switch/close, icon-only Explorer/Diagnostics (tooltip/accessibility names), optional Sessions; workspace/session tabs (Tab in, Left/Right, Enter/Space); terminal as one focus stop; explorer tree (arrows, Enter, Left/Right); preview actions/return; diagnostics normal egui focus. The resize divider is pointer-drag only and not a keyboard stop; the header Explorer toggle is the keyboard hide/restore path. Only the selected visible surface receives input, with visible focus after every transition.
@@ -458,16 +467,16 @@ Contrast (opaque reading surfaces):
 - Sustained output: near 60 fps without losing input; drop intermediate frames, never input.
 - The UI uses lazy tree loading, damage-driven terminal rendering, bounded channels/scrollback, cancellable tree/preview loads, and no hidden grid painting.
 - Visual acceptance includes both 1280×800 and 720×480, long titles/paths, 10k files, binary/large/missing preview, degraded/unsupported state, keyboard-only walkthrough, colorblind/status cues, glass fallback, and no terminal input/selection regression.
-- Evidence must distinguish Xvfb/headless software checks from native compositor, native pointer, native keyboard, hardware-GPU, and platform screen-reader evidence. Unverified platforms remain pending.
+- Evidence must distinguish Xvfb/headless software checks from native compositor, native pointer, native keyboard, hardware-GPU, and platform screen-reader evidence. Unverified platform/scenario combinations remain pending.
 
 ## Implementation notes
 
-- `crates/made-app/src/theme.rs`: tokens, typography, explorer glass painting, inactive-tab/icon opacity, unified action states, floating scroll style, focus rings, icon primitive (including the `+` glyph), wordmark galley and wordmark-breathing-gap token, close-visibility glyph and splitter-fade helpers, clear color/kill switch.
-- `crates/made-app/src/ui.rs`: floating workspace header, header actions, tabs/overflow, picker tree composition/rows/borderless secondary action, layout, explorer animation.
+- `crates/made-app/src/theme.rs`: tokens, typography, conditional Explorer glass painting, terminal card/overlay helpers, inactive-tab/icon opacity, unified action states, floating scroll style, focus rings, icon primitive (including the `+` glyph), wordmark galley and wordmark-breathing-gap token, close-visibility glyph and splitter-fade helpers, clear color/kill switch.
+- `crates/made-app/src/ui.rs`: floating workspace header, header actions, tabs/overflow, picker tree composition/rows/borderless secondary action, layout, explorer animation, terminal card fill and alternate-only chrome overlay.
 - `crates/made-app/src/workspace_picker.rs`: flattened picker tree model, per-directory child caches, expansion/selection/path target, refresh/Up state, per-directory cap and error handling.
 - `crates/made-app/src/workspace.rs`: picker tree delegation/toggle/expand/collapse and confirmation target semantics.
-- `crates/made-app/src/explorer_view.rs`: full-height glass tree, unified borderless rows, hover-only divider, full-left preview.
-- `crates/made-app/src/terminal_view.rs`: terminal grid and the custom hover-only scrollback bar.
+- `crates/made-app/src/explorer_view.rs`: full-height conditional glass tree, unified borderless rows, hover-only divider, full-left preview.
+- `crates/made-app/src/terminal_view.rs`: terminal grid, alternate-only opaque body overlay, and the custom hover-only scrollback bar.
 - `crates/made-app/src/session_map.rs`: optional map presentation and indicators.
 - `crates/made-app/src/diagnostics.rs`: opaque floating card, sections, copy actions.
 - `crates/made-platform/src/native_backdrop.rs`: one-shot native request and honest fallback status.
@@ -481,8 +490,9 @@ Do not rewrite terminal input/IME/selection code for visual reasons. Keep `nativ
 
 | Risk | Impact | Mitigation or evidence |
 |---|---|---|
-| Native compositor ignores alpha or renders glass differently | Visual quality or contrast differs by platform | In-app glass fallback, kill switch, native compositor validation remains pending |
-| Native macOS vibrancy / Windows Mica not runtime-validated | Native effect could fail or look wrong | Compile check only; honest `applied=false` fallback; native runtime task remains unchecked |
+| Native compositor ignores alpha or renders glass differently | Visual quality or contrast differs by platform | In-app glass fallback, kill switch; macOS arm64 windowed/resized/fullscreen check passed on 2026-10-28; Windows/macOS x64 compositor and native contrast certification remain pending |
+| Windows Mica / macOS x64 vibrancy not runtime-validated | Native effect could fail or look wrong | Compile checks for Windows/macOS x64; macOS arm64 manually verified on 2026-10-28; honest `applied=false` fallback; full native UX/native contrast certification remains unchecked |
+| Native Explorer tint is too transparent over a bright desktop | Explorer text may lose contrast | Native 24/32 tint only when the backdrop is actually applied; fallback 188/194 otherwise; fallback legibility check required; native tint contrast remains uncertified |
 | Xvfb has no window manager/compositor | Hover, focus, animation smoothness are not native evidence | Headless/Xvfb checks plus explicit pending native pointer/keyboard rows |
 | Accesskit absent | No platform screen-reader tree | Tooltip/accessibility-name metadata and keyboard/focus coverage; screen-reader claim withheld |
 | Compact layout clips controls or overflows | Essential actions become unreachable | 720×480 tests, labeled overflow, focus/target checks; native window-manager validation pending |

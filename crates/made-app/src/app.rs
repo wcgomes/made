@@ -682,13 +682,19 @@ impl AppModel {
             return;
         }
         let active = self.active;
+        let native_backdrop_applied = self.native_backdrop.is_applied();
         if let Some((id, workbench)) = self
             .workspaces
             .iter_mut()
             .find(|(id, _)| Some(*id) == active)
         {
             ui.push_id(*id, |ui| {
-                workbench.ui(ui, &mut self.show_sessions, &mut self.show_diagnostics)
+                workbench.ui(
+                    ui,
+                    &mut self.show_sessions,
+                    &mut self.show_diagnostics,
+                    native_backdrop_applied,
+                )
             });
         } else {
             ui::starting_ui(self, ui);

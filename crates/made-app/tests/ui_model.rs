@@ -22,6 +22,7 @@ use made_app::workspace::{
 };
 use made_app::workspace_picker::WorkspacePicker;
 use made_app::Workbench;
+use made_platform::native_backdrop::{NativeBackdropKind, NativeBackdropStatus};
 use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
 
@@ -2489,6 +2490,140 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
 }
 
 #[test]
+fn primary_screen_terminal_card_uses_glass_fill() {
+    if isolated("primary_screen_terminal_card_uses_glass_fill") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "terminal-glass", "notes.txt");
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let id = open_workspace(&mut model, &root);
+        let mut headless = Headless::new(model, width, height);
+        wait_explorer_ready(&mut headless, id);
+        let output = headless.render();
+        let glass = rects_with_fill(&output, made_app::theme::BG_TERMINAL_GLASS);
+        assert_eq!(
+            glass.len(),
+            1,
+            "{width}x{height} primary terminal must paint exactly one glass layer: {glass:?}"
+        );
+        let card = glass[0];
+        assert!(
+            card.width() > 300.0 && card.height() > 200.0,
+            "{width}x{height} terminal card must occupy the left surface: {card:?}"
+        );
+        assert!(
+            card.left() < 200.0,
+            "{width}x{height} terminal card must be on the left: {card:?}"
+        );
+        headless.model.shutdown();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn alternate_screen_terminal_surface_is_opaque_and_has_no_glass() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if isolated("alternate_screen_terminal_surface_is_opaque_and_has_no_glass") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "terminal-alt", "notes.txt");
+    let shell = temp.path().join("alternate-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nprintf '\\033[?1049h'\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var(made_platform::SHELL_ENV, &shell);
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.alternate_screen())
+    });
+    let output = headless.render();
+    let glass = rects_with_fill(&output, made_app::theme::BG_TERMINAL_GLASS);
+    assert!(
+        glass.is_empty(),
+        "alternate-screen terminal must not paint a glass layer: {glass:?}"
+    );
+    let opaque = rects_with_fill(&output, made_app::theme::BG_TERMINAL);
+    assert!(
+        opaque
+            .iter()
+            .any(|rect| rect.width() > 500.0 && rect.height() > 300.0),
+        "alternate-screen terminal card/body must be opaque BG_TERMINAL: {opaque:?}"
+    );
+    headless.model.shutdown();
+}
+
+#[test]
+fn explorer_glass_uses_native_tokens_only_when_backdrop_is_applied() {
+    if isolated("explorer_glass_uses_native_tokens_only_when_backdrop_is_applied") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "explorer-glass", "notes.txt");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+
+    let fallback = headless.render();
+    assert!(largest_rect(&fallback, made_app::theme::BG_CARD_GLASS).is_some());
+    assert!(largest_rect(&fallback, made_app::theme::BG_HEADER_GLASS).is_some());
+    assert!(largest_rect(&fallback, made_app::theme::BG_CARD_GLASS_NATIVE).is_none());
+    assert!(largest_rect(&fallback, made_app::theme::BG_HEADER_GLASS_NATIVE).is_none());
+
+    for (kind, reason) in [
+        (NativeBackdropKind::MacosVibrancy, "test macOS vibrancy"),
+        (NativeBackdropKind::WindowsMica, "test Windows Mica"),
+    ] {
+        headless.model.set_native_backdrop(NativeBackdropStatus {
+            kind,
+            applied: true,
+            reason: reason.to_owned(),
+        });
+        let output = headless.render();
+        assert!(
+            largest_rect(&output, made_app::theme::BG_CARD_GLASS_NATIVE).is_some(),
+            "{kind:?} applied must paint the native Explorer card tint"
+        );
+        assert!(
+            largest_rect(&output, made_app::theme::BG_HEADER_GLASS_NATIVE).is_some(),
+            "{kind:?} applied must paint the native Explorer header tint"
+        );
+        assert!(
+            largest_rect(&output, made_app::theme::BG_CARD_GLASS).is_none(),
+            "{kind:?} applied must not paint the fallback Explorer card"
+        );
+        assert!(
+            largest_rect(&output, made_app::theme::BG_HEADER_GLASS).is_none(),
+            "{kind:?} applied must not paint the fallback Explorer header"
+        );
+    }
+
+    headless
+        .model
+        .set_native_backdrop(NativeBackdropStatus::default());
+    let fallback = headless.render();
+    assert!(largest_rect(&fallback, made_app::theme::BG_CARD_GLASS).is_some());
+    assert!(largest_rect(&fallback, made_app::theme::BG_HEADER_GLASS).is_some());
+    assert!(largest_rect(&fallback, made_app::theme::BG_CARD_GLASS_NATIVE).is_none());
+    assert!(largest_rect(&fallback, made_app::theme::BG_HEADER_GLASS_NATIVE).is_none());
+    headless.model.shutdown();
+}
+
+#[test]
 fn explorer_hide_restore_and_resize_keep_state_and_reclaim_width() {
     if isolated("explorer_hide_restore_and_resize_keep_state_and_reclaim_width") {
         return;
@@ -2503,7 +2638,7 @@ fn explorer_hide_restore_and_resize_keep_state_and_reclaim_width() {
     wait_explorer_ready(&mut headless, id);
     let output = headless.render();
     let visible_terminal =
-        largest_rect(&output, made_app::theme::BG_TERMINAL).expect("terminal card painted");
+        largest_rect(&output, made_app::theme::BG_TERMINAL_GLASS).expect("terminal card painted");
     let explorer_width = headless.model.workspace(id).unwrap().explorer_width();
     assert!(explorer_width >= made_app::theme::EXPLORER_MIN_WIDTH);
 
@@ -2556,7 +2691,7 @@ fn explorer_hide_restore_and_resize_keep_state_and_reclaim_width() {
     let hidden = headless.render();
     let hidden_text = output_text(&hidden);
     assert!(!hidden_text.contains("EXPLORER"));
-    let hidden_terminal = largest_rect(&hidden, made_app::theme::BG_TERMINAL)
+    let hidden_terminal = largest_rect(&hidden, made_app::theme::BG_TERMINAL_GLASS)
         .expect("terminal card painted while hidden");
     assert!(
         hidden_terminal.width() > visible_terminal.width() + 300.0,
@@ -3837,6 +3972,24 @@ fn file_control_sits_below_session_strip_and_path() {
     let output = headless.render();
     let text = output_text(&output);
     assert!(text.contains("Owned session"));
+    let glass = rects_with_fill(&output, made_app::theme::BG_TERMINAL_GLASS);
+    assert_eq!(
+        glass.len(),
+        1,
+        "session/path/file-slot primary state must keep exactly one terminal glass layer: {glass:?}"
+    );
+    assert!(
+        glass[0].width() > 500.0 && glass[0].height() > 300.0,
+        "the sole glass rect must be the terminal card: {glass:?}"
+    );
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_TERMINAL).is_empty(),
+        "primary terminal body/path/file-slot chrome must not paint opaque BG_TERMINAL"
+    );
+    assert!(
+        !rects_with_fill(&output, made_app::theme::BG_HEADER).is_empty(),
+        "the optional session strip/header must remain opaque BG_HEADER"
+    );
     let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
     let file_rect = headless
         .response(left_surface_action_id(&pane_id, "file"))

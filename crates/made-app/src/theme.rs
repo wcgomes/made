@@ -1,12 +1,13 @@
 //! “Calm Editor” design tokens and egui theme installation.
 //!
-//! The contract is `specs/changes/made-ui-ux-v1/design.md`. Terminal, preview, and picker surfaces
-//! stay opaque; the Explorer card uses semi-transparent dark fills as an in-app frosted-glass
-//! approximation. A native backdrop (macOS vibrancy or Windows Mica) can be layered behind the
-//! window when the platform supports it; the in-app explorer glass remains legible on its own and
-//! stays the default on every platform without that effect. The workspace header floats directly
-//! over the clear/native backdrop with no band fill, border, shadow, or highlight. Keep the palette
-//! and geometry here rather than scattering literals through the views.
+//! The contract is `specs/changes/made-ui-ux-v1/design.md`. The terminal card is glass on its
+//! primary screen and opaque for alternate-screen TUIs; preview and picker surfaces stay opaque.
+//! The Explorer card uses semi-transparent dark fills as an in-app frosted-glass approximation.
+//! A native backdrop (macOS vibrancy or Windows Mica) can be layered behind the window when the
+//! platform supports it; the in-app explorer glass remains legible on its own and stays the
+//! default on every platform without that effect. The workspace header floats directly over the
+//! clear/native backdrop with no band fill, border, shadow, or highlight. Keep the palette and
+//! geometry here rather than scattering literals through the views.
 
 use eframe::egui::style::{WidgetVisuals, Widgets};
 use eframe::egui::text::LayoutJob;
@@ -25,19 +26,22 @@ pub const TRANSLUCENT_WINDOW: bool = true;
 
 // ── Colors ──────────────────────────────────────────────────────────────────
 
-// The fallback clear color is deliberately dark: alpha 225 keeps the window
+// The fallback clear color is deliberately dark: alpha 215 keeps the window
 // slightly translucent without making text chase a bright desktop when no
 // native material is applied. When a native compositor backdrop is active,
-// alpha 150 lets the OS material read through; the glass fills below carry the
+// alpha 135 lets the OS material read through; the glass fills below carry the
 // text contrast.
-pub const BG_CLEAR: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 225);
-pub const BG_CLEAR_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 150);
+pub const BG_CLEAR: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 215);
+pub const BG_CLEAR_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(10, 11, 14, 135);
 pub const BG_CLEAR_SOLID: Color32 = Color32::from_rgb(10, 11, 14);
 pub const BG_CHROME: Color32 = Color32::from_rgb(20, 22, 27);
 pub const BG_CARD: Color32 = Color32::from_rgb(23, 26, 32);
 pub const BG_HEADER: Color32 = Color32::from_rgb(20, 23, 28);
 pub const BG_DEEP: Color32 = Color32::from_rgb(18, 21, 26);
 pub const BG_TERMINAL: Color32 = Color32::from_rgb(11, 13, 16);
+/// Primary-screen terminal card fill: the `BG_TERMINAL` RGB at glass alpha.
+/// This is the sole glass layer; body/chrome overlays are transparent.
+pub const BG_TERMINAL_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(11, 13, 16, 160);
 pub const BG_ELEVATED: Color32 = Color32::from_rgb(27, 31, 38);
 pub const BG_HOVER: Color32 = Color32::from_rgb(29, 33, 41);
 pub const BG_SELECTED: Color32 = Color32::from_rgb(34, 42, 53);
@@ -49,11 +53,16 @@ pub const BG_TAB_HOVER: Color32 = Color32::from_rgb(0x15, 0x1C, 0x18);
 pub const BG_TAB_SELECTED: Color32 = Color32::from_rgb(0x1B, 0x23, 0x1F);
 
 // Frosted-glass approximation for the Explorer card. The RGB values preserve
-// the opaque tonal colors. Alpha 202–208 leaves the dark backdrop visible while
+// the opaque tonal colors. Alpha 188–194 leaves the dark backdrop visible while
 // keeping primary/secondary text contrast intact; these fills are used with or
 // without a native backdrop. The header has no persistent band fill.
-pub const BG_CARD_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 202);
-pub const BG_HEADER_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 208);
+pub const BG_CARD_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 188);
+pub const BG_HEADER_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 194);
+// Native-backdrop Explorer tints: very discreet so the macOS HudWindow or
+// Windows Mica material reads through. The fallback glass above remains
+// unchanged and is used whenever the native effect is not actually applied.
+pub const BG_CARD_GLASS_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 24);
+pub const BG_HEADER_GLASS_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 32);
 pub const GLASS_HIGHLIGHT: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 12);
 pub const GLASS_SHADOW: Color32 = Color32::from_rgba_unmultiplied_const(0, 0, 0, 58);
 
@@ -540,11 +549,28 @@ pub fn card_frame(layout: &Layout) -> Frame {
         .corner_radius(CornerRadius::same(layout.card_radius))
 }
 
+/// Terminal card fill: glass on the primary screen, opaque for TUIs that use
+/// the VT alternate screen. This is the sole primary-screen glass layer.
+pub fn terminal_surface(alternate_screen: bool) -> Color32 {
+    if alternate_screen {
+        BG_TERMINAL
+    } else {
+        BG_TERMINAL_GLASS
+    }
+}
+
+/// Overlay fill for terminal-owned body/chrome that sits on the terminal card.
+/// Primary screen: no fill, so the card's single glass layer shows through.
+/// Alternate screen: opaque `BG_TERMINAL` so TUI cells stay on an opaque surface.
+pub fn terminal_overlay_surface(alternate_screen: bool) -> Option<Color32> {
+    alternate_screen.then_some(BG_TERMINAL)
+}
+
 /// Terminal card frame. The terminal body is inset so its square grid fill
 /// never reaches the rounded outer corners.
-pub fn terminal_frame(layout: &Layout) -> Frame {
+pub fn terminal_frame(layout: &Layout, alternate_screen: bool) -> Frame {
     Frame::new()
-        .fill(BG_TERMINAL)
+        .fill(terminal_surface(alternate_screen))
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(layout.card_radius))
 }
@@ -626,10 +652,37 @@ fn paint_glass_highlight(painter: &egui::Painter, rect: egui::Rect, radius: u8) 
     );
 }
 
+/// Explorer card fill: native tint when the backdrop is actually applied,
+/// otherwise the darker fallback glass.
+pub fn explorer_card_glass(native_backdrop_applied: bool) -> Color32 {
+    if native_backdrop_applied {
+        BG_CARD_GLASS_NATIVE
+    } else {
+        BG_CARD_GLASS
+    }
+}
+
+/// Explorer header fill: native tint when the backdrop is actually applied,
+/// otherwise the darker fallback glass.
+pub fn explorer_header_glass(native_backdrop_applied: bool) -> Color32 {
+    if native_backdrop_applied {
+        BG_HEADER_GLASS_NATIVE
+    } else {
+        BG_HEADER_GLASS
+    }
+}
+
 /// In-app frosted fill for the full-height Explorer card.
 ///
-/// Terminal and preview cards stay opaque; only the Explorer surface uses this.
-pub fn paint_glass_card(painter: &egui::Painter, rect: egui::Rect, layout: &Layout) {
+/// Preview and picker cards stay opaque; the terminal card has its own conditional fill. Only the
+/// Explorer surface uses this glass fill.
+pub fn paint_glass_card(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    layout: &Layout,
+    native_backdrop_applied: bool,
+) {
+    let fill = explorer_card_glass(native_backdrop_applied);
     painter.rect_filled(
         rect.translate(egui::vec2(0.0, 2.0)).expand(1.0),
         CornerRadius::same(layout.card_radius.saturating_add(1)),
@@ -638,21 +691,27 @@ pub fn paint_glass_card(painter: &egui::Painter, rect: egui::Rect, layout: &Layo
     painter.rect(
         rect,
         CornerRadius::same(layout.card_radius),
-        BG_CARD_GLASS,
+        fill,
         Stroke::new(1.0, BORDER),
         StrokeKind::Inside,
     );
 }
 
 /// Paint the Explorer header with the glass tone and top highlight.
-pub fn paint_glass_card_header(ui: &Ui, rect: egui::Rect, layout: &Layout) {
+pub fn paint_glass_card_header(
+    ui: &Ui,
+    rect: egui::Rect,
+    layout: &Layout,
+    native_backdrop_applied: bool,
+) {
     let radius = CornerRadius {
         nw: layout.card_radius,
         ne: layout.card_radius,
         sw: 0,
         se: 0,
     };
-    ui.painter().rect_filled(rect, radius, BG_HEADER_GLASS);
+    let fill = explorer_header_glass(native_backdrop_applied);
+    ui.painter().rect_filled(rect, radius, fill);
     paint_glass_highlight(ui.painter(), rect, layout.card_radius);
     ui.painter().line_segment(
         [
@@ -1353,7 +1412,7 @@ pub fn clear_color() -> [f32; 4] {
 
 /// Clear color for a window, accounting for a running native backdrop.
 ///
-/// With native vibrancy/Mica active the lower alpha (150 instead of 225) lets
+/// With native vibrancy/Mica active the lower alpha (135 instead of 215) lets
 /// the OS material show through. Without it, the darker fallback alpha keeps
 /// the in-app glass readable even when the compositor ignores transparency.
 pub fn clear_color_with_native(native_backdrop: bool) -> [f32; 4] {
@@ -1434,6 +1493,10 @@ mod tests {
         assert_eq!(ACCENT_TINT, Color32::from_rgb(0x26, 0x35, 0x2C));
         assert_eq!(FOCUS, Color32::from_rgb(0xB8, 0xF0, 0xC9));
         assert_eq!(SUCCESS, Color32::from_rgb(0x4F, 0xCF, 0xA8));
+        assert_eq!(
+            BG_TERMINAL_GLASS,
+            Color32::from_rgba_unmultiplied_const(11, 13, 16, 160)
+        );
         assert_eq!(TERMINAL_BACKGROUND, [0x0B, 0x0D, 0x10]);
         assert_eq!(TERMINAL_BRIGHT_BLACK, [0x70, 0x7B, 0x8E]);
     }
@@ -1490,20 +1553,131 @@ mod tests {
 
     #[test]
     fn glass_tokens_are_translucent_and_tonal() {
-        for (glass, opaque) in [(BG_CARD_GLASS, BG_CARD), (BG_HEADER_GLASS, BG_HEADER)] {
+        for (glass, opaque, alpha) in [
+            (BG_CARD_GLASS, BG_CARD, 188),
+            (BG_HEADER_GLASS, BG_HEADER, 194),
+        ] {
             let [r, g, b, a] = glass.to_srgba_unmultiplied();
             let [opaque_r, opaque_g, opaque_b, _] = opaque.to_srgba_unmultiplied();
             assert!(
                 r.abs_diff(opaque_r) <= 1 && g.abs_diff(opaque_g) <= 1 && b.abs_diff(opaque_b) <= 1,
                 "glass tint must match the opaque tone within premultiplied rounding: {glass:?}"
             );
-            assert!(
-                (195..=215).contains(&a),
-                "glass alpha must stay in the frosted range: {glass:?}"
+            assert_eq!(
+                a, alpha,
+                "glass alpha must match the contract value: {glass:?}"
             );
         }
+
+        let terminal_glass = BG_TERMINAL_GLASS.to_srgba_unmultiplied();
+        let terminal = BG_TERMINAL.to_srgba_unmultiplied();
+        assert!(
+            terminal_glass[..3]
+                .iter()
+                .zip(&terminal[..3])
+                .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+            "terminal glass must preserve the BG_TERMINAL RGB: {terminal_glass:?} vs {terminal:?}"
+        );
+        assert_eq!(terminal_glass[3], 160);
+        assert_eq!(terminal_surface(false), BG_TERMINAL_GLASS);
+        assert_eq!(terminal_surface(true), BG_TERMINAL);
+        assert_eq!(terminal_overlay_surface(false), None);
+        assert_eq!(terminal_overlay_surface(true), Some(BG_TERMINAL));
+        let layout = Layout::for_window(1280.0, 800.0);
+        assert_eq!(terminal_frame(&layout, false).fill, BG_TERMINAL_GLASS);
+        assert_eq!(terminal_frame(&layout, true).fill, BG_TERMINAL);
+        assert!(
+            BG_CLEAR_NATIVE.a() < BG_TERMINAL_GLASS.a()
+                && BG_TERMINAL_GLASS.a() < BG_CARD_GLASS.a()
+                && BG_CARD_GLASS.a() < BG_HEADER_GLASS.a()
+                && BG_HEADER_GLASS.a() < BG_CLEAR.a(),
+            "the documented alpha order must hold"
+        );
         assert!(GLASS_HIGHLIGHT.a() < 20);
         assert!(GLASS_SHADOW.a() < 80);
+    }
+
+    #[test]
+    fn explorer_glass_selects_native_or_fallback_tokens() {
+        assert_eq!(explorer_card_glass(true), BG_CARD_GLASS_NATIVE);
+        assert_eq!(explorer_card_glass(false), BG_CARD_GLASS);
+        assert_eq!(explorer_header_glass(true), BG_HEADER_GLASS_NATIVE);
+        assert_eq!(explorer_header_glass(false), BG_HEADER_GLASS);
+
+        assert_eq!(
+            BG_CARD_GLASS_NATIVE,
+            Color32::from_rgba_unmultiplied_const(23, 26, 32, 24)
+        );
+        assert_eq!(
+            BG_CARD_GLASS,
+            Color32::from_rgba_unmultiplied_const(23, 26, 32, 188)
+        );
+        assert_eq!(
+            BG_HEADER_GLASS_NATIVE,
+            Color32::from_rgba_unmultiplied_const(20, 23, 28, 32)
+        );
+        assert_eq!(
+            BG_HEADER_GLASS,
+            Color32::from_rgba_unmultiplied_const(20, 23, 28, 194)
+        );
+        assert!(BG_CARD_GLASS_NATIVE.a() < BG_HEADER_GLASS_NATIVE.a());
+        assert!(BG_CARD_GLASS.a() < BG_HEADER_GLASS.a());
+    }
+
+    #[test]
+    fn fallback_explorer_glass_text_meets_aa_over_bright_desktop() {
+        fn composite(over: Color32, under: [f32; 3]) -> [f32; 3] {
+            let [r, g, b, a] = over.to_srgba_unmultiplied();
+            let alpha = f32::from(a) / 255.0;
+            [
+                f32::from(r) / 255.0 * alpha + under[0] * (1.0 - alpha),
+                f32::from(g) / 255.0 * alpha + under[1] * (1.0 - alpha),
+                f32::from(b) / 255.0 * alpha + under[2] * (1.0 - alpha),
+            ]
+        }
+        fn linear(channel: f32) -> f32 {
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(rgb: [f32; 3]) -> f32 {
+            0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+        }
+        fn contrast(a: [f32; 3], b: [f32; 3]) -> f32 {
+            let (a, b) = (luminance(a), luminance(b));
+            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        fn text_color(color: Color32) -> [f32; 3] {
+            let [r, g, b, _] = color.to_srgba_unmultiplied();
+            [
+                f32::from(r) / 255.0,
+                f32::from(g) / 255.0,
+                f32::from(b) / 255.0,
+            ]
+        }
+
+        let clear = composite(BG_CLEAR, [1.0, 1.0, 1.0]);
+        let card = composite(BG_CARD_GLASS, clear);
+        let header = composite(BG_HEADER_GLASS, clear);
+        for (name, color) in [
+            ("primary", TEXT_PRIMARY),
+            ("secondary", TEXT_SECONDARY),
+            ("tertiary", TEXT_TERTIARY),
+        ] {
+            let ratio = contrast(text_color(color), card);
+            assert!(
+                ratio >= 4.5,
+                "{name} text on fallback Explorer card must meet 4.5:1, got {ratio:.2}"
+            );
+            let ratio = contrast(text_color(color), header);
+            assert!(
+                ratio >= 4.5,
+                "{name} text on fallback Explorer header must meet 4.5:1, got {ratio:.2}"
+            );
+        }
     }
 
     #[test]
@@ -1728,13 +1902,13 @@ mod tests {
                 && fallback[1].abs_diff(11) <= 1
                 && fallback[2].abs_diff(14) <= 1
         );
-        assert_eq!(fallback[3], 225);
+        assert_eq!(fallback[3], 215);
         assert!(
             native_token[0].abs_diff(10) <= 1
                 && native_token[1].abs_diff(11) <= 1
                 && native_token[2].abs_diff(14) <= 1
         );
-        assert_eq!(native_token[3], 150);
+        assert_eq!(native_token[3], 135);
         assert!(
             fallback[3] > native_token[3],
             "the no-native fallback must be darker than the native clear"
@@ -1745,7 +1919,7 @@ mod tests {
         assert_eq!(in_app, clear_color_with_native(false));
 
         let expected_in_app_alpha = if TRANSLUCENT_WINDOW {
-            225.0 / 255.0
+            215.0 / 255.0
         } else {
             1.0
         };
@@ -1753,7 +1927,7 @@ mod tests {
 
         let native = clear_color_with_native(true);
         let expected_native_alpha = if TRANSLUCENT_WINDOW {
-            150.0 / 255.0
+            135.0 / 255.0
         } else {
             1.0
         };

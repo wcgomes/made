@@ -1,6 +1,6 @@
 # Platform Matrix
 
-Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windows x64** at the 2026-10-28 snapshot. Native runtime evidence is still limited to **Linux x64 WSL2 under Xvfb/llvmpipe software rendering**; this is not a native Linux desktop, macOS, or Windows UX pass. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in the [core spec](../../specs/changes/opencode-session-follow-v1/spec.md) and [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); current gaps are summarized below and in the [2026-10-26 v1 evidence snapshot](../records/20261026-v1-evidence.md).
+Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windows x64** at the 2026-10-28 snapshot. Native runtime evidence now includes a **macOS arm64 manual rendering check** on 2026-10-28; Linux x64 WSL2 under Xvfb/llvmpipe remains software rendering. Neither is a full native UX pass, and Windows has no native UX evidence. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in the [core spec](../../specs/changes/opencode-session-follow-v1/spec.md) and [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); current gaps are summarized below and in the [2026-10-26 v1 evidence snapshot](../records/20261026-v1-evidence.md).
 
 ## Runtime status
 
@@ -9,8 +9,8 @@ Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windo
 | Linux x64 WSL2 / Xvfb X11 | 658/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, bounded diagnostics log rotation/retention, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
 | Linux x64 native X11 | CI green 2026-10-28 (build/test); Xvfb smoke | None | **PENDING native UX** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass; CI Xvfb is not native X11. |
 | Linux x64 native Wayland | CI green 2026-10-28 (build/test); headless Weston smoke | Weston smoke only | **PENDING native UX** | Native compositor input/IME/clipboard and real OpenCode TUI. |
-| macOS arm64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |
-| macOS x64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | Same as arm64; native backdrop is compile-checked only. |
+| macOS arm64 | CI green 2026-10-28 (build/contract/app smoke) | Manual native check 2026-10-28: window/UI rendered, HudWindow vibrancy applied and visible; windowed/resized/fullscreen | **PENDING native UX** | Rendering/vibrancy checked; native home, terminal, tabs, cwd, preview, input/IME/clipboard, full UX pass pending. |
+| macOS x64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | No native run; native backdrop and UI remain compile-checked only. |
 | Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Mica, IME/clipboard. WSL is not a substitute. |
 
 ## Shell support
@@ -30,9 +30,9 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 
 | Capability | Linux Xvfb | Native Linux | macOS | Windows |
 |---|---|---|---|---|
-| In-app glass fallback (Explorer) | Verified | Pending compositor | Compile-only | Compile-only |
-| Native backdrop | N/A (honest fallback log) | N/A | **Compile-only** | **Compile-only** (Mica only; no acrylic) |
-| Mint header, 26/24 card-edge header, 225 fallback alpha, fill-only tab/close scale, splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
+| In-app glass fallback (Explorer) | Verified | Pending compositor | **Rendered on arm64**; x64 compile-only | Compile-only |
+| Native backdrop | N/A (honest fallback log) | N/A | **Verified on arm64**; x64 compile-only | **Compile-only** (Mica only; no acrylic) |
+| Mint header, 26/24 card-edge header, 215 fallback alpha, fill-only tab/close scale, splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
 | Preview roundtrip | Native Xvfb | Pending | Pending | Pending |
 | Diagnostics log rotation, `.1` retention, 0600/0700, bounded lock/refusal, final-exit stderr visibility gap | Verified Linux automated | Pending native lock/reparse check | Pending native lock/reparse check | Pending native lock/reparse check |
 | Native IME/clipboard/mouse/paste | Not native | Pending | Pending | Pending |
@@ -49,7 +49,7 @@ At the 2026-10-28 snapshot, all five workflows were observed green for the CI-st
 ## Release-blocking gaps
 
 - Native Linux X11/Wayland with real desktop input.
-- macOS arm64/x64 native run, including HudWindow vibrancy.
+- macOS arm64 full native UX pass; macOS x64 native run, including HudWindow vibrancy.
 - Windows x64 native/ConPTY, including Mica, Job Object cleanup, and native OpenCode.
 - Real zsh/fish/PowerShell cwd runs.
 - Live real-OpenCode switching, worktree removal/indicator, and native session-map focus.
