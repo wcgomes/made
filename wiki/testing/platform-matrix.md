@@ -1,17 +1,17 @@
 # Platform Matrix
 
-The current implementation is verified on **Linux x64 WSL2 under Xvfb/llvmpipe software rendering**. This is not a native Linux desktop, macOS, or Windows pass. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in the [core spec](../../specs/changes/opencode-session-follow-v1/spec.md) and [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); current gaps are summarized below and in the [v1 evidence record](../records/20261026-v1-evidence.md).
+Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windows x64** at the 2026-10-28 snapshot. Native runtime evidence is still limited to **Linux x64 WSL2 under Xvfb/llvmpipe software rendering**; this is not a native Linux desktop, macOS, or Windows UX pass. The matrix below separates build/automated coverage from native runtime evidence. Requirements are in the [core spec](../../specs/changes/opencode-session-follow-v1/spec.md) and [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); current gaps are summarized below and in the [2026-10-26 v1 evidence snapshot](../records/20261026-v1-evidence.md).
 
 ## Runtime status
 
 | Platform / display | Build and automated | Runtime evidence | Status | Notes |
 |---|---|---|---|---|
-| Linux x64 WSL2 / Xvfb X11 | 654/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, bounded diagnostics log rotation/retention, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
-| Linux x64 native X11 | CI build defined | None | **PENDING** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass. |
-| Linux x64 native Wayland | CI build defined; headless Weston smoke | WSLg/Weston smoke only | **PENDING** | Native compositor input/IME/clipboard and real OpenCode TUI. |
-| macOS arm64 | CI build/test/smoke defined | None | **PENDING** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |
-| macOS x64 | CI build/test/smoke defined | None | **PENDING** | Same as arm64; native backdrop is compile-checked only. |
-| Windows x64 native/ConPTY | CI build/test/PTY contract/smoke defined | None | **PENDING** | Native OpenCode, ConPTY resize, Job Object cleanup, Mica, IME/clipboard. WSL is not a substitute. |
+| Linux x64 WSL2 / Xvfb X11 | 658/0/2; fmt/clippy; plugin 29/29; Phase 0 19/19+5/5 | Terminal-first GUI, home/picker, glass fallback, tabs, preview, bash cwd, deleted-cwd, 10k startup, final software perf, bounded diagnostics log rotation/retention, 2026-10-26/27 mint/header/picker-tree and fill-only-tab Xvfb checks | **PASS in scope** | Software rendering, no WM; WSL2 is not a native desktop; Xvfb cannot show alpha blending over a light root. |
+| Linux x64 native X11 | CI green 2026-10-28 (build/test); Xvfb smoke | None | **PENDING native UX** | Real WM, pointer/keyboard, IME, clipboard, resize, native home, compositor glass; CI Xvfb is not native X11. |
+| Linux x64 native Wayland | CI green 2026-10-28 (build/test); headless Weston smoke | Weston smoke only | **PENDING native UX** | Native compositor input/IME/clipboard and real OpenCode TUI. |
+| macOS arm64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | Native home resolution, terminal, tabs, cwd, preview, input, HudWindow vibrancy. |
+| macOS x64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | Same as arm64; native backdrop is compile-checked only. |
+| Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Mica, IME/clipboard. WSL is not a substitute. |
 
 ## Shell support
 
@@ -42,9 +42,9 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 
 ## CI coverage and observed status
 
-Workflows exist for Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
+Workflows cover Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
 
-At the 2026-10-26 snapshot, CI runs/artifacts had **not been observed** from this workspace, and the staged packaged layout had not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
+At the 2026-10-28 snapshot, all five workflows were observed green for the CI-stabilization commit: CI (all six jobs), macOS smoke x64/arm64, Windows native smoke, Linux display smoke, and Development artifacts. Green CI proves compilation, contract/PTY tests, window/PTY smoke markers, and artifact assembly; it does not prove the native UX list above, and the packaged layout has not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
 
 ## Release-blocking gaps
 
@@ -55,9 +55,9 @@ At the 2026-10-26 snapshot, CI runs/artifacts had **not been observed** from thi
 - Live real-OpenCode switching, worktree removal/indicator, and native session-map focus.
 - Native IME/clipboard/mouse/paste/title/focus.
 - Hardware-GPU pacing/reference input latency.
-- Packaged layout launch and observed CI artifacts.
+- Packaged artifact launch (CI assembles artifacts but does not launch the staged layout).
 - Cross-user bridge DoS acceptance or reserved slot.
 
 Accepted residuals such as read-only preview, optional OpenCode only, no worktree lifecycle management, no installers/signing/auto-update, and same-user token exposure are documented in the [v1 evidence record](../records/20261026-v1-evidence.md) and [Security](../security.md).
 
-Related: [Test strategy](strategy.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).
+Related: [Test strategy](strategy.md), [CI platform quirks](ci-platform-quirks.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).

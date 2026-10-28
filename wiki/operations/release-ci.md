@@ -1,6 +1,6 @@
 # Release and CI
 
-Made v1 produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI is configured to prove compilation, contract tests, smoke markers, and artifact assembly; it does not certify native UX. See [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made v1 produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -23,14 +23,14 @@ CI jobs deliberately record “manual validation required” instead of claiming
 | `made-linux-x11-smoke-logs`, `made-linux-wayland-smoke-logs` | Xvfb/Weston smoke logs. |
 | `made-macos-arm64-smoke-logs`, `made-macos-x64-smoke-logs`, `made-windows-smoke-logs` | Platform smoke/OpenCode-install logs. |
 
-The development artifact stages the plugin at `<artifact_root>/plugins/opencode-made`, matching release `AppPaths` resolution. It removes `node_modules` and includes no `/plugin` directory.
+The development artifact stages the plugin at `<artifact_root>/plugins/opencode-made`, matching release `AppPaths` resolution. It removes `node_modules` and includes no `/plugin` directory. CI assembled these artifacts at the 2026-10-28 snapshot, but the staged layout has not been launched end-to-end.
 
 ## Release limits
 
 - Artifacts are unsigned; a local macOS build may be quarantined by Gatekeeper.
 - No notarization, installer, package repository, or auto-update payload.
 - The packaged/staged layout has **not been launched end-to-end**.
-- CI runs/artifacts had **not been observed** from this workspace at the 2026-10-26 snapshot.
+- CI is observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; artifacts are assembled but remain unlaunched, and green CI is not native UX evidence.
 - CI does not validate native window managers/compositors, native input/IME/clipboard, native shell hooks, Windows Job Object cleanup, native OpenCode TUI interaction, native macOS/Windows backdrop rendering, or hardware-GPU pacing.
 - WSL-hosted OpenCode is out of scope; Windows support means native OpenCode/ConPTY.
 
@@ -46,6 +46,6 @@ DISPLAY=127.0.0.1:99 LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
 
 ## Release-blocking boundary
 
-Do not treat a green CI build as v1 UX validation. The exit test is every spec scenario with passing evidence summarized in the [v1 evidence record](../records/20261026-v1-evidence.md); native Linux, macOS, Windows, real shells, live OpenCode switching, native input, packaged launch, and observed artifacts remain open. See [Platform matrix](../testing/platform-matrix.md) and [v1 evidence](../records/20261026-v1-evidence.md).
+Do not treat a green CI build as v1 UX validation. The exit test is every spec scenario with passing evidence summarized in the [v1 evidence record](../records/20261026-v1-evidence.md); native Linux, macOS, Windows, real shells, live OpenCode switching, native input, and packaged launch remain open. See [Platform matrix](../testing/platform-matrix.md) and [CI platform quirks](../testing/ci-platform-quirks.md).
 
-Related: [Build and test](build-and-test.md), [Testing strategy](../testing/strategy.md), [v1 evidence](../records/20261026-v1-evidence.md).
+Related: [Build and test](build-and-test.md), [Testing strategy](../testing/strategy.md), [CI platform quirks](../testing/ci-platform-quirks.md), [v1 evidence](../records/20261026-v1-evidence.md).

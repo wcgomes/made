@@ -1,12 +1,12 @@
 # Test Strategy
 
-Made's tests are layered: fast domain/model tests, real PTY/bridge integration tests, an OpenCode TUI smoke, the historical Phase 0 plugin gate, and a Linux/Xvfb UX validation pass. The **normative scenario list** is the 97-row core/UI checklist plus supplemental `UP-*` visual-polish rows in [`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md); results are summarized in the [v1 evidence record](../records/20261026-v1-evidence.md). Requirements remain in [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md); do not treat this page as a substitute for the checklist or those specs.
+Made's tests are layered: fast domain/model tests, real PTY/bridge integration tests, an OpenCode TUI smoke, the historical Phase 0 plugin gate, and a Linux/Xvfb UX validation pass. The **normative scenario list** is the 97-row core/UI checklist plus supplemental `UP-*` visual-polish rows in [`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md); the 2026-10-26 results are summarized in the [v1 evidence record](../records/20261026-v1-evidence.md). Requirements remain in [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`specs/changes/made-ui-ux-v1/spec.md`](../../specs/changes/made-ui-ux-v1/spec.md); do not treat this page as a substitute for the checklist or those specs.
 
 ## Layers and commands
 
 | Layer | Command | What it covers |
 |---|---|---|
-| Rust workspace | `cargo test --workspace` | Unit, model, PTY, bridge, explorer, platform and app tests across all crates. Current Linux baseline: 654 passed, 0 failed, 2 ignored. |
+| Rust workspace | `cargo test --workspace` | Unit, model, PTY, bridge, explorer, platform and app tests across all crates. Current Linux baseline: 658 passed, 0 failed, 2 ignored across 49 binaries. |
 | Format/lint | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | House style and warnings-as-errors. |
 | App UI model | `cargo test -p made-app --test ui_model` | Mint header accent, fallback clear alpha 225, 26/24 card-edge header geometry and wordmark gaps, `+` placement, right icon order, fill-only idle/hover/selected tabs and scaled red close, faded splitter, no-outline Explorer/picker rows, picker tree expansion/keyboard/path chip/minimal scroll, Explorer animation, preview roundtrip, scrollbars, quiet chrome, Diagnostics previous-log absent/present/copy/tooltip, 720 warning containment, and startup `.1` permission states. |
 | Workspace tabs | `cargo test -p made-app --test workspace_tabs` | Independent PTYs/roots/bridges, close-owner, hidden output, deleted-cwd recovery. |
@@ -22,11 +22,13 @@ Made's tests are layered: fast domain/model tests, real PTY/bridge integration t
 | App smoke | `cargo run -p made-app -- --smoke-test` | Creates the window, pumps frames, prints `made smoke: OK`, exits. |
 | Session-follow E2E | `tests/e2e/run-session-follow-e2e.sh` | Real window plus synthetic plugin: bridge -> root follow -> explorer. Not real OpenCode evidence. |
 
+CI invokes `cargo test --workspace --locked --no-fail-fast`, so one run reports every failing test binary instead of stopping at the first failure.
+
 ## Scenario validation
 
 [`tests/e2e/ux_validation.md`](../../tests/e2e/ux_validation.md) maps every core-spec scenario to a method (automated, Xvfb, real shell/spike, manual pending) and evidence. It has 97 pre-split scenario rows plus thirteen supplemental `UP-*` rows covering workspace launch, integration loading, shell follow, tabs, layout, session follow, worktrees, session map, preview, explorer updates, degraded state, terminal fidelity, cross-platform delivery, security, responsiveness, diagnostics, scope boundary, and the 2026-10-26/27 visual refinements.
 
-Results and current status are in the [v1 evidence record](../records/20261026-v1-evidence.md). A row is not “passed” merely because a model test exists; native/manual rows require native evidence.
+The 2026-10-26 snapshot is in the [v1 evidence record](../records/20261026-v1-evidence.md); the current status below supersedes its baseline. A row is not “passed” merely because a model test exists; native/manual rows require native evidence.
 
 ## Evidence layout
 
@@ -36,6 +38,7 @@ Results and current status are in the [v1 evidence record](../records/20261026-v
 | [v1 evidence record](../records/20261026-v1-evidence.md) | Baseline, verified behavior, open gaps, and performance summary. |
 | [Performance](../performance.md) | Final release software measurements and method. |
 | [Platform matrix](platform-matrix.md) | Build/automated coverage versus native runtime evidence. |
+| [CI platform quirks](ci-platform-quirks.md) | Non-obvious ConPTY, macOS, path, close-drain, and timing behavior. |
 
 The wiki carries distilled outcomes only. Screenshots are ad hoc validation artifacts and are intentionally not committed or maintained here; raw logs, JSON, and historical runs are also excluded.
 
@@ -77,10 +80,11 @@ XDG_RUNTIME_DIR="$root/runtime" \
 
 ## Current status
 
-- Rust: 654 passed, 0 failed, 2 ignored on Linux x64 WSL2; fmt/clippy clean.
+- Rust: 658 passed, 0 failed, 2 ignored across 49 binaries on Linux x64 WSL2; fmt/clippy clean.
+- CI: all workflows observed green on Linux, macOS x64/arm64, and Windows x64 at the 2026-10-28 snapshot, including workspace tests, display/native smoke, and development artifacts. This is automated/smoke evidence, not native UX validation.
 - Plugin: 29/29 and typecheck pass.
 - Phase 0: 19/19 gate plus 5/5 supporting against OpenCode v2.1.4.
 - UI/behavior: Linux automated/headless evidence for launch, tabs, preview, Explorer, glass fallback, picker, bash cwd, deleted-cwd recovery, 10k startup, final software performance, bounded diagnostics-log rotation/retention and previous-log presentation, and the 2026-10-26/27 refinements (mint accent, darker 225 fallback clear, card-edge 26/24 header with 42/36 content top, right-side wordmark with 24/18 gaps, `+` after tabs, Sessions/Diagnostics/Explorer order, fill-only idle/hover/selected tabs, scaled red close, faded splitter, no-outline rows, inline picker tree expansion/keyboard/path chip/minimal scroll, fading scrollbars).
-- Not validated: native Linux desktop, macOS, Windows/ConPTY, native log-lock/reparse behavior, final-exit log failure visibility (stderr only), real zsh/fish/PowerShell, live real-OpenCode switching, native IME/clipboard/mouse, hardware-GPU pacing, native backdrop rendering, packaged artifact launch, observed CI artifacts.
+- Not validated: native Linux desktop, macOS, and Windows/ConPTY runtime UX (green CI smoke is not native evidence), native log-lock/reparse behavior, final-exit log failure visibility (stderr only), real zsh/fish/PowerShell, live real-OpenCode switching, native IME/clipboard/mouse, hardware-GPU pacing, native backdrop rendering, packaged artifact launch.
 
-Related: [Platform matrix](platform-matrix.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).
+Related: [Platform matrix](platform-matrix.md), [CI platform quirks](ci-platform-quirks.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).
