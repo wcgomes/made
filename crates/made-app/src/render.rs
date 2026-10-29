@@ -21,6 +21,8 @@
 //! correct and the TUI is not corrupted. The emulator's per-code-point width
 //! behavior and this replacement-glyph fallback are the documented v1 limits.
 
+use std::time::Duration;
+
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
 use made_terminal::{
     CellAttributes, CellSnapshot, CursorShape, CursorSnapshot, TerminalColor, TerminalDamage,
@@ -728,6 +730,31 @@ pub fn build_row_runs(
     runs
 }
 
+/// Cursor blink phase length (on or off).
+pub const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Whether a blinking cursor is in its visible phase at `elapsed` since the
+/// pane's blink epoch. Steady cursors and unfocused panes stay visible.
+pub fn cursor_blink_on(blinking: bool, focused: bool, elapsed: Duration) -> bool {
+    if !blinking || !focused {
+        return true;
+    }
+    (elapsed.as_millis() / CURSOR_BLINK_INTERVAL.as_millis()).is_multiple_of(2)
+}
+
+/// Time until a focused, visible blinking cursor changes phase.
+pub fn cursor_blink_repaint_after(
+    cursor: CursorSnapshot,
+    focused: bool,
+    elapsed: Duration,
+) -> Option<Duration> {
+    if !focused || !cursor.visible || !cursor.blinking {
+        return None;
+    }
+    let remainder = elapsed.as_millis() % CURSOR_BLINK_INTERVAL.as_millis();
+    Some(CURSOR_BLINK_INTERVAL - Duration::from_millis(remainder as u64))
+}
+
 /// Paint options for one terminal frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaintOptions {
@@ -737,6 +764,8 @@ pub struct PaintOptions {
     pub metrics: CellMetrics,
     /// Whether the terminal pane has keyboard focus.
     pub focused: bool,
+    /// Whether the cursor blink phase is visible this frame.
+    pub cursor_blink_on: bool,
 }
 
 impl Default for PaintOptions {
@@ -745,8 +774,14 @@ impl Default for PaintOptions {
             font_size: DEFAULT_FONT_SIZE,
             metrics: CellMetrics::default(),
             focused: true,
+            cursor_blink_on: true,
         }
     }
+}
+
+/// Whether the cursor should be painted for these options.
+pub fn cursor_painted(cursor: CursorSnapshot, options: PaintOptions) -> bool {
+    cursor.visible && (!cursor.blinking || options.cursor_blink_on)
 }
 
 /// Draw cached runs and the cursor.
@@ -814,7 +849,7 @@ pub fn paint_grid(
         }
     }
 
-    if cursor.visible {
+    if cursor_painted(cursor, options) {
         let cursor_pos = Pos2::new(
             origin.x + cursor.col as f32 * metrics.width,
             origin.y + cursor.row as f32 * metrics.height,
@@ -884,6 +919,106 @@ mod tests {
 
     fn attributes() -> CellAttributes {
         CellAttributes::default()
+    }
+
+    #[test]
+    fn cursor_blink_uses_530_ms_on_off_boundaries() {
+        let on = |elapsed_ms| cursor_blink_on(true, true, Duration::from_millis(elapsed_ms));
+
+        assert_eq!(CURSOR_BLINK_INTERVAL, Duration::from_millis(530));
+        assert!(on(0));
+        assert!(on(529));
+        assert!(!on(530));
+        assert!(!on(1059));
+        assert!(on(1060));
+    }
+
+    #[test]
+    fn cursor_blink_stays_on_for_steady_and_unfocused_cursors() {
+        assert!(cursor_blink_on(false, true, Duration::from_millis(530)));
+        assert!(cursor_blink_on(true, false, Duration::from_millis(530)));
+        assert!(cursor_blink_on(true, true, Duration::ZERO));
+        assert!(!cursor_blink_on(true, true, Duration::from_millis(530)));
+    }
+
+    #[test]
+    fn cursor_paint_gate_keeps_steady_and_hides_off_phase_blinks() {
+        let steady = CursorSnapshot {
+            blinking: false,
+            visible: true,
+            ..CursorSnapshot::default()
+        };
+        let blinking = CursorSnapshot {
+            blinking: true,
+            ..steady
+        };
+        let hidden = CursorSnapshot {
+            visible: false,
+            ..blinking
+        };
+        let off_phase = PaintOptions {
+            cursor_blink_on: false,
+            ..PaintOptions::default()
+        };
+        let on_phase = PaintOptions {
+            cursor_blink_on: true,
+            ..PaintOptions::default()
+        };
+
+        assert!(cursor_painted(steady, off_phase));
+        assert!(!cursor_painted(blinking, off_phase));
+        assert!(cursor_painted(blinking, on_phase));
+        assert!(!cursor_painted(hidden, on_phase));
+    }
+
+    #[test]
+    fn cursor_blink_repaint_delay_targets_the_next_boundary() {
+        let cursor = CursorSnapshot {
+            blinking: true,
+            visible: true,
+            ..CursorSnapshot::default()
+        };
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, true, Duration::ZERO),
+            Some(Duration::from_millis(530))
+        );
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, true, Duration::from_millis(529)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, true, Duration::from_millis(530)),
+            Some(Duration::from_millis(530))
+        );
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, true, Duration::from_millis(1059)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, true, Duration::from_millis(1060)),
+            Some(Duration::from_millis(530))
+        );
+
+        let steady = CursorSnapshot {
+            blinking: false,
+            ..cursor
+        };
+        assert_eq!(
+            cursor_blink_repaint_after(steady, true, Duration::from_millis(530)),
+            None
+        );
+        assert_eq!(
+            cursor_blink_repaint_after(cursor, false, Duration::from_millis(530)),
+            None
+        );
+        let hidden = CursorSnapshot {
+            visible: false,
+            ..cursor
+        };
+        assert_eq!(
+            cursor_blink_repaint_after(hidden, true, Duration::from_millis(530)),
+            None
+        );
     }
 
     #[test]

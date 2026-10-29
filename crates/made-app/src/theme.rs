@@ -114,7 +114,7 @@ pub const SCROLL_THUMB_HOVER: Color32 = Color32::from_rgb(122, 132, 148);
 // Terminal palette (also exported to the grid renderer).
 pub const TERMINAL_BACKGROUND: [u8; 3] = [11, 13, 16];
 pub const TERMINAL_FOREGROUND: [u8; 3] = [215, 221, 231];
-pub const TERMINAL_CURSOR: [u8; 3] = [139, 213, 167];
+pub const TERMINAL_CURSOR: [u8; 3] = TERMINAL_FOREGROUND;
 pub const TERMINAL_SELECTION_BACKGROUND: [u8; 3] = [46, 58, 78];
 pub const TERMINAL_SELECTION_FOREGROUND: [u8; 3] = [255, 255, 255];
 pub const TERMINAL_BRIGHT_BLACK: [u8; 3] = [112, 123, 142];
@@ -2057,7 +2057,7 @@ mod tests {
         let palette = terminal_palette();
         assert_eq!(palette.background, [11, 13, 16]);
         assert_eq!(palette.foreground, [215, 221, 231]);
-        assert_eq!(palette.cursor, [139, 213, 167]);
+        assert_eq!(palette.cursor, [215, 221, 231]);
         assert_eq!(palette.ansi[8], [112, 123, 142]);
         assert_eq!(palette.selection_background, [46, 58, 78]);
     }

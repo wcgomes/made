@@ -21,8 +21,9 @@ use made_terminal::{
 use crate::diagnostics::{DiagnosticLog, LogLevel};
 use crate::metrics::Metrics;
 use crate::render::{
-    paint_grid, terminal_content_layout, CellMetrics, CellPoint, GridPalette, GridRenderer,
-    PaintOptions, SelectionRange, SCROLLBAR_WIDTH, TERMINAL_PADDING,
+    cursor_blink_on, cursor_blink_repaint_after, paint_grid, terminal_content_layout, CellMetrics,
+    CellPoint, GridPalette, GridRenderer, PaintOptions, SelectionRange, SCROLLBAR_WIDTH,
+    TERMINAL_PADDING,
 };
 
 /// Maximum PTY events drained per frame.
@@ -145,6 +146,7 @@ pub struct TerminalPane {
     read_error: Option<String>,
     eof: bool,
     focused: bool,
+    blink_epoch: Instant,
     selecting: bool,
     selection: Option<SelectionRange>,
     /// Cell where the current local-selection press began, before it is committed.
@@ -205,6 +207,7 @@ impl TerminalPane {
             read_error: None,
             eof: false,
             focused: false,
+            blink_epoch: Instant::now(),
             selecting: false,
             selection: None,
             selection_anchor: None,
@@ -568,6 +571,7 @@ impl TerminalPane {
                 Some("Input buffer full; some input was not sent to the shell.".to_owned());
             return false;
         }
+        self.blink_epoch = Instant::now();
         self.flush_pending_input(log);
         true
     }
@@ -828,6 +832,9 @@ impl TerminalPane {
         let focused = response.has_focus() && window_focused;
         if focused != self.focused {
             self.focused = focused;
+            if focused {
+                self.blink_epoch = Instant::now();
+            }
             let bytes = self.encoder.encode_focus(focused);
             self.write(&bytes, log);
             // The terminal is not an egui text widget, so it must opt in to
@@ -873,6 +880,8 @@ impl TerminalPane {
         let painter = ui.painter_at(pane_rect);
         self.grid_paint_count = self.grid_paint_count.saturating_add(1);
         self.last_grid_paint_visible = self.visible;
+        let blink_elapsed = self.blink_epoch.elapsed();
+        let cursor_blink_on = cursor_blink_on(snapshot.cursor.blinking, focused, blink_elapsed);
         paint_grid(
             &painter,
             content.origin,
@@ -883,9 +892,13 @@ impl TerminalPane {
                 font_size: self.font_size,
                 metrics: cell_metrics,
                 focused,
+                cursor_blink_on,
             },
             &self.palette,
         );
+        if let Some(delay) = cursor_blink_repaint_after(snapshot.cursor, focused, blink_elapsed) {
+            ctx.request_repaint_after(delay);
+        }
         self.process_scrollbar(ui, pane_rect, grid_size, pane_hovered);
         if let Some(elapsed) = self.take_painted_input_latency(&snapshot, &damage) {
             metrics.record_input_latency(elapsed);
@@ -1676,6 +1689,83 @@ mod tests {
             command: true,
             ..egui::Modifiers::NONE
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_resets_the_cursor_blink_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path()).with_shell("/bin/sh"),
+        )
+        .expect("spawn shell");
+        pane.blink_epoch = Instant::now() - Duration::from_secs(2);
+        let stale = pane.blink_epoch;
+        let before_input = Instant::now();
+        let mut log = DiagnosticLog::new();
+
+        assert!(pane.write(b"x", &mut log));
+        assert!(pane.blink_epoch > stale);
+        assert!(
+            pane.blink_epoch >= before_input,
+            "input must reset the blink epoch to the on phase"
+        );
+    }
+
+    #[test]
+    fn focus_gain_resets_the_cursor_blink_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(&platform, PtyOptions::new(temp.path())).unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = run_terminal_frame(
+                &ctx,
+                &mut pane,
+                &platform,
+                &mut metrics,
+                &mut log,
+                Vec::new(),
+            );
+        }
+        let terminal_focus = pane.focus_id().expect("terminal focus id");
+        assert!(pane.is_focused());
+
+        let other_focus = egui::Id::unique("blink-focus-other");
+        ctx.memory_mut(|memory| memory.request_focus(other_focus));
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        assert!(!pane.is_focused());
+
+        pane.blink_epoch = Instant::now() - Duration::from_secs(2);
+        let before_focus_gain = Instant::now();
+        ctx.memory_mut(|memory| memory.request_focus(terminal_focus));
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+
+        assert!(pane.is_focused());
+        assert!(
+            pane.blink_epoch >= before_focus_gain,
+            "focus gain must reset the blink epoch to the on phase"
+        );
+        assert!(cursor_blink_on(true, true, pane.blink_epoch.elapsed()));
+        pane.terminate(&mut log);
     }
 
     #[test]

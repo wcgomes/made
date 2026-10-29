@@ -5,7 +5,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 ## Intent
 
 - Depth comes from layered tonal surfaces, 1px borders, 8–10px gutters, and one soft painted shadow on the Explorer glass — not gradients or glows.
-- One accent (mint green) marks the wordmark initial, primary action, focus, spinner, terminal cursor, and splitter drag. Semantic teal/amber/red/blue are reserved for status; success is a cooler teal than the accent.
+- One accent (mint green) marks the wordmark initial, primary action, focus, spinner, and splitter drag. Semantic teal/amber/red/blue are reserved for status; success is a cooler teal than the accent.
 - Terminal and preview are high-contrast reading surfaces. The terminal card is glass on the primary screen and opaque in alternate-screen TUI mode; preview stays fully opaque. The header paints no band. Workspace-tab fills follow the [UI spec](../../specs/changes/made-ui-ux-v1/spec.md). Selected-tab stroke follows the same spec. Explorer and the primary terminal card are the in-app glass surfaces.
 - Hover and selection share one borderless fill language across header icons, session tabs, Explorer rows, and picker rows. Selected-tab stroke follows the [UI spec](../../specs/changes/made-ui-ux-v1/spec.md); selection still changes fill and text opacity.
 - Workspace tabs look editor-like, with a 28px wide / 20px compact wordmark-to-first-tab gap and no divider. OpenCode sessions are an optional, visually distinct map, not workspace tabs.
@@ -41,7 +41,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 | `TEXT_SECONDARY` | `#BCC2CC` | Body and default labels. |
 | `TEXT_TERTIARY` | `#9AA2B0` | Section labels, paths, metadata. |
 | `TEXT_DISABLED` | `#7A8494` | Disabled only. |
-| `ACCENT` | `#8BD5A7` | Wordmark initial, primary action, focus accent, spinner, terminal cursor, splitter drag. |
+| `ACCENT` | `#8BD5A7` | Wordmark initial, primary action, focus accent, spinner, splitter drag. |
 | `ACCENT_HOVER` | `#A3E3BA` | Accent hover. |
 | `ACCENT_PRESSED` | `#72BF8E` | Accent pressed. |
 | `ACCENT_TEXT` | `#08140D` | Text on accent. |
@@ -51,7 +51,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 | `ERROR` | `#E58A8A` | Error, workspace-tab close hover, unsupported, failed. |
 | `INFO` | `#8FB8E8` | Unread, informational. |
 | `FOCUS` | `#B8F0C9` | Focus ring. |
-| `TERMINAL_CURSOR` | `#8BD5A7` | Terminal cursor. |
+| `TERMINAL_CURSOR` | `#D7DDE7` | Terminal cursor; neutral terminal foreground, not the accent. |
 | `SCROLL_TRACK` | `#14171D` | Terminal track only while the bar is hovered or dragged. |
 | `SCROLL_THUMB` | `#626C7D` | Floating scrollbar thumb. |
 | `SCROLL_THUMB_HOVER` | `#7A8494` | Thumb on bar hover or drag. |
@@ -125,7 +125,8 @@ No text below 10px. `Style.text_styles`: Small 10.0, Body 12.5, Button 12.0, Hea
 - Header geometry: the row spans gutter..width-gutter with no extra horizontal padding; tabs start at the card/window content left edge; the wordmark sits before the right icon group with a reserved 24/18 strip-side gap and an exact 24/18 icon-side gap; the last icon’s 26/24 target, selected/hover fill, and focus ring all end exactly at the card right (`content.right`) with no gutter overhang; the 14px glyph stays centered in its target with normal optical padding. Session-map strip/tabs remain 36/34 and 28/26.
 - Floating scrollbars are overlay-only: 8px expanded bar, 3px thin thumb, 24px minimum handle, and zero allocated width. They are hidden at rest, fade in on scroll-area hover, and expand with a faint track only on bar hover or drag.
 - Shadows: `SHADOW_FLOAT` for floating overlays, `SHADOW_POPUP`, `SHADOW_TOAST`, and `GLASS_SHADOW` for the Explorer card/header. The floating header/selected tab and terminal/preview cards have no shadow.
-- Motion is limited to spinners, hover-triggered scrollbar fades (~120–160 ms), the Explorer splitter fade (~0.14 s), the Explorer hide/show width transition (~150 ms, quadratic ease-out), and standard control animation. Tabs never animate width; the close X is hidden at rest, appears on hover/focus at a fixed size, and never changes its 24×24 hit rect. No essential information exists only in motion.
+- Motion is limited to spinners, the terminal cursor blink (~530 ms on/off only while focused and when the terminal reports a blinking style), hover-triggered scrollbar fades (~120–160 ms), the Explorer splitter fade (~0.14 s), the Explorer hide/show width transition (~150 ms, quadratic ease-out), and standard control animation. Tabs never animate width; the close X is hidden at rest, appears on hover/focus at a fixed size, and never changes its 24×24 hit rect. No essential information exists only in motion.
+- The terminal cursor uses `TERMINAL_FOREGROUND` `#D7DDE7`, not the mint accent, so mint stays interaction chrome. A steady reported style or an unfocused pane keeps the cursor steady and visible; input resets the pane's stable blink epoch to the on phase, and the view schedules a repaint only at the next phase boundary instead of adding an idle 16 ms loop.
 
 ## Contrast and interaction
 
