@@ -23,6 +23,13 @@ eframe = { version = "0.37", default-features = false, features = [
     "clipboard",
 ] }
 
+# Explorer icons are embedded SVGs decoded through egui's image pipeline. Only
+# the SVG loader is enabled; no file, HTTP, or raster loader is ever installed.
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+
+[build-dependencies]
+serde_json = "1"
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"

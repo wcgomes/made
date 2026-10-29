@@ -94,7 +94,7 @@ Made MUST present a terminal-first workspace in one native window: workspace tab
 
 - Given expanded and collapsed folders, files, hover, selection, and keyboard focus in the explorer tree
 - When the tree renders
-- Then expanded folders are marked only by a small app-drawn disclosure triangle and a brighter label, rows use 24px height, a 4px horizontal inset, 6px radius, a 16px icon slot and text 24px from the row's left edge with 14px per depth, files keep a quiet app-drawn bullet, disclosure/bullet markers and labels share one vertical optical center, selection/focus uses only the inset `BG_SELECTED` fill plus `TEXT_PRIMARY` text, keyboard focus with no selection selects the first visible row without opening a preview, and no border, focus outline, accent side bar or extra expansion fill is painted
+- Then expanded folders use a brighter label, rows use 24px height, a 4px horizontal inset, 6px radius, a 16px icon slot and text 24px from the row's left edge with 14px per depth, explorer entry icons are owned by the realized `specs/explorer-file-icons.md` specification, which is authoritative for their resolution and rendering, and replace the former app-drawn file bullet and folder disclosure triangle in that 16px slot, entry icons and labels share one vertical optical center, selection/focus uses only the inset `BG_SELECTED` fill plus `TEXT_PRIMARY` text, keyboard focus with no selection selects the first visible row without opening a preview, and no border, focus outline, accent side bar or extra expansion fill is painted
 
 #### Scenario: Hover-only fading scrollbars
 

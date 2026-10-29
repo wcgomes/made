@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use made_app::app::{AppModel, AppOptions, WorkspaceId};
 use made_app::cli::LaunchArgs;
+use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
 use made_app::ui::{
     diagnostics_copy_id, diagnostics_previous_log_copy_id, diagnostics_previous_log_path_id,
@@ -790,6 +791,152 @@ fn path_center(path: &egui::epaint::PathShape) -> egui::Pos2 {
     egui::Rect::from_points(&path.points).center()
 }
 
+/// The 16px icon slot of a 24px explorer row: the 4px inset plus 14px per
+/// depth, centered vertically on the row.
+fn icon_slot(row: egui::Rect, depth: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(row.left() + 4.0 + 14.0 * depth as f32, row.center().y - 8.0),
+        egui::vec2(16.0, 16.0),
+    )
+}
+
+/// A texture drawn by `egui::Image`, with the geometry and paint it carries.
+#[derive(Debug, Clone, Copy)]
+struct PaintedImage {
+    rect: egui::Rect,
+    texture: egui::TextureId,
+    tint: egui::Color32,
+    stroke: egui::Stroke,
+    corner_radius: egui::CornerRadius,
+}
+
+fn painted_images(output: &egui::FullOutput) -> Vec<PaintedImage> {
+    fn visit(shape: &egui::Shape, images: &mut Vec<PaintedImage>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill_texture_id() != egui::TextureId::default() => {
+                images.push(PaintedImage {
+                    rect: rect.rect,
+                    texture: rect.fill_texture_id(),
+                    tint: rect.fill,
+                    stroke: rect.stroke,
+                    corner_radius: rect.corner_radius,
+                });
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, images);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut images = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, &mut images);
+    }
+    images
+}
+
+/// The painted 16px icon whose slot is centered in `row` at `depth`.
+fn icon_in_slot(output: &egui::FullOutput, row: egui::Rect, depth: usize) -> Option<PaintedImage> {
+    let slot = icon_slot(row, depth);
+    painted_images(output).into_iter().find(|image| {
+        (image.rect.center() - slot.center()).length() < 0.75
+            && (image.rect.width() - 16.0).abs() < 0.75
+            && (image.rect.height() - 16.0).abs() < 0.75
+    })
+}
+
+/// The texture egui uses for one icon at explorer size. It loads through the
+/// same URI, texture options, and size hint that `egui::Image` paints with.
+fn icon_texture(ctx: &egui::Context, icon: explorer_icons::IconId) -> egui::TextureId {
+    ctx.include_bytes(icon.uri(), icon.bytes());
+    let hint = egui::load::SizeHint::Size {
+        width: 16,
+        height: 16,
+        maintain_aspect_ratio: false,
+    };
+    match ctx.try_load_texture(icon.uri(), egui::TextureOptions::default(), hint) {
+        Ok(egui::load::TexturePoll::Ready { texture }) => texture.id,
+        Ok(egui::load::TexturePoll::Pending { .. }) => {
+            panic!("{} is still loading", icon.name())
+        }
+        Err(error) => panic!("{} failed to load: {error:?}", icon.name()),
+    }
+}
+
+/// The vendored icon whose SVG file is `name`. Expectations name the file the
+/// theme maps, so they do not simply echo whatever the resolver returns.
+fn icon_named(name: &str) -> explorer_icons::IconId {
+    explorer_icons::icon_ids()
+        .find(|id| id.name() == name)
+        .unwrap_or_else(|| panic!("{name} is not a vendored icon"))
+}
+
+/// Single-glyph text marks: the glyph's rect and its resolved color.
+fn glyph_marks(output: &egui::FullOutput, glyph: &str) -> Vec<(egui::Rect, egui::Color32)> {
+    fn visit(shape: &egui::Shape, glyph: &str, marks: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == glyph => {
+                let color =
+                    text.galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(text.fallback_color, |section| {
+                            if section.format.color == egui::Color32::PLACEHOLDER {
+                                text.fallback_color
+                            } else {
+                                section.format.color
+                            }
+                        });
+                marks.push((
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    color,
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, glyph, marks);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut marks = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, glyph, &mut marks);
+    }
+    marks
+}
+
+/// Stable widget id of the tree row at `index`.
+fn explorer_row_id(headless: &Headless, id: WorkspaceId, index: usize) -> egui::Id {
+    headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::explorer)
+        .expect("explorer")
+        .row_widget_id(index)
+}
+
+/// Rect of the tree row at `index`, as laid out in the last frame.
+fn explorer_row_rect(headless: &Headless, id: WorkspaceId, index: usize) -> egui::Rect {
+    headless.response(explorer_row_id(headless, id, index)).rect
+}
+
+/// Restores a directory's mode when dropped so the temporary tree can be removed.
+#[cfg(unix)]
+struct RestoreMode(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
 fn focus_ring_rects(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<egui::Rect> {
     rect_shapes(output)
         .into_iter()
@@ -1506,37 +1653,37 @@ fn explorer_rows_use_unified_metrics_and_open_folder_treatment() {
     );
     assert!(
         !output_text(&output).contains('▾') && !output_text(&output).contains('▸'),
-        "folder disclosure must be an app-drawn shape, not a font glyph"
+        "the folder disclosure triangle must not paint as a font glyph"
     );
     assert!(
         !output_text(&output).contains('·'),
-        "file bullet must be an app-drawn shape, not a font glyph"
+        "the file bullet must not paint as a font glyph"
     );
-    let folder_marker = path_shapes(&output)
-        .into_iter()
-        .filter(|path| path.points.len() == 3 && path.fill == made_app::theme::TEXT_PRIMARY)
-        .find(|path| {
-            let center = path_center(path);
-            folder_rect.contains(center) && (center.x - (folder_rect.left() + 12.0)).abs() < 1.5
-        })
-        .expect("expanded folder app-drawn disclosure triangle");
-    let folder_marker_rect = egui::Rect::from_points(&folder_marker.points);
-    assert!(
-        (folder_marker_rect.center().y - folder_text.center().y).abs() < 0.75,
-        "disclosure must share the label's optical center: {folder_marker_rect:?} vs {folder_text:?}"
-    );
-    let file_marker = circle_shapes(&output)
-        .into_iter()
-        .filter(|circle| circle.radius <= 3.0 && file_rect.contains(circle.center))
-        .find(|circle| (circle.center.x - (folder_marker_rect.center().x + 14.0)).abs() < 1.5)
-        .expect("file app-drawn bullet");
-    assert!(
-        (file_marker.center.y - file_text.center().y).abs() < 0.75,
-        "file bullet must share the label's optical center: {file_marker:?} vs {file_text:?}"
+    let folder_icon =
+        icon_in_slot(&output, folder_rect, 0).expect("expanded folder Material icon in its slot");
+    assert_eq!(
+        folder_icon.texture,
+        icon_texture(&headless.ctx, icon_named("folder-src-open.svg"),),
+        "an expanded folder must show its open icon"
     );
     assert!(
-        (file_marker.center.x - (folder_marker_rect.center().x + 14.0)).abs() < 1.5,
-        "depth must shift the icon slot by 14px: {file_marker:?} vs {folder_marker_rect:?}"
+        (folder_icon.rect.center().y - folder_text.center().y).abs() < 0.75,
+        "folder icon must share the label's optical center: {folder_icon:?} vs {folder_text:?}"
+    );
+    let file_icon =
+        icon_in_slot(&output, file_rect, 1).expect("file Material icon in its depth-1 slot");
+    assert_eq!(
+        file_icon.texture,
+        icon_texture(&headless.ctx, icon_named("rust.svg"),),
+        "main.rs must show its Rust icon"
+    );
+    assert!(
+        (file_icon.rect.center().y - file_text.center().y).abs() < 0.75,
+        "file icon must share the label's optical center: {file_icon:?} vs {file_text:?}"
+    );
+    assert!(
+        (file_icon.rect.center().x - (folder_icon.rect.center().x + 14.0)).abs() < 1.5,
+        "depth must shift the icon slot by 14px: {file_icon:?} vs {folder_icon:?}"
     );
 
     let hovered = headless.hover(folder_row);
@@ -1552,6 +1699,439 @@ fn explorer_rows_use_unified_metrics_and_open_folder_treatment() {
             .expect("hovered explorer row shape")
             .corner_radius,
         egui::CornerRadius::same(6)
+    );
+}
+
+#[test]
+fn explorer_rows_render_material_icons_in_the_icon_slot() {
+    if isolated("explorer_rows_render_material_icons_in_the_icon_slot") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("icons");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.pump_until_rows(id, 2);
+    let output = headless.render();
+
+    // Directories sort first: the collapsed `src` folder, then `main.rs`.
+    let folder = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("folder icon in its 16px slot");
+    let file = icon_in_slot(&output, explorer_row_rect(&headless, id, 1), 0)
+        .expect("file icon in its 16px slot");
+    assert_eq!(
+        folder.texture,
+        icon_texture(&headless.ctx, icon_named("folder-src.svg"),),
+        "a collapsed src folder must show its closed icon"
+    );
+    assert_eq!(
+        file.texture,
+        icon_texture(&headless.ctx, icon_named("rust.svg"),),
+        "main.rs must show its Rust icon"
+    );
+    assert_ne!(folder.texture, file.texture, "folder and file icons differ");
+    for image in [folder, file] {
+        assert_eq!(
+            image.tint,
+            egui::Color32::WHITE,
+            "icons keep the neutral tint"
+        );
+        assert_eq!(image.stroke, egui::Stroke::NONE, "icons paint no border");
+        assert_eq!(
+            image.corner_radius,
+            egui::CornerRadius::ZERO,
+            "icons paint no rounding"
+        );
+    }
+}
+
+#[test]
+fn explorer_folder_icon_changes_between_closed_and_open() {
+    if isolated("explorer_folder_icon_changes_between_closed_and_open") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("named-folder");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let output = headless.render();
+    let closed = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("collapsed folder icon");
+    assert_eq!(
+        closed.texture,
+        icon_texture(&headless.ctx, icon_named("folder-src.svg"),),
+        "a collapsed folder must show its closed icon"
+    );
+
+    headless.click(explorer_row_id(&headless, id, 0));
+    headless.pump_until_rows(id, 2);
+    let output = headless.render();
+    let open = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("expanded folder icon");
+    assert_eq!(
+        open.texture,
+        icon_texture(&headless.ctx, icon_named("folder-src-open.svg"),),
+        "an expanded folder must show its open icon"
+    );
+    assert_ne!(
+        closed.texture, open.texture,
+        "closed and open folder icons must differ"
+    );
+}
+
+#[test]
+fn explorer_default_folder_icon_changes_between_closed_and_open() {
+    if isolated("explorer_default_folder_icon_changes_between_closed_and_open") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("default-folder");
+    fs::create_dir_all(root.join("zz-plain")).unwrap();
+    fs::write(root.join("zz-plain/inner.txt"), "inner\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let output = headless.render();
+    let closed = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("collapsed default folder icon");
+    assert_eq!(
+        closed.texture,
+        icon_texture(&headless.ctx, icon_named("folder.svg"),),
+        "an unmapped collapsed folder must show the theme's default closed icon"
+    );
+
+    headless.click(explorer_row_id(&headless, id, 0));
+    headless.pump_until_rows(id, 2);
+    let output = headless.render();
+    let open = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("expanded default folder icon");
+    assert_eq!(
+        open.texture,
+        icon_texture(&headless.ctx, icon_named("folder-open.svg"),),
+        "an unmapped expanded folder must show the theme's default open icon"
+    );
+    assert_ne!(
+        closed.texture, open.texture,
+        "default closed and open folder icons must differ"
+    );
+}
+
+#[test]
+fn explorer_unknown_file_uses_default_icon() {
+    if isolated("explorer_unknown_file_uses_default_icon") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("unknown-file");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("notes.zzunknown"), "notes\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let output = headless.render();
+    let icon = icon_in_slot(&output, explorer_row_rect(&headless, id, 0), 0)
+        .expect("unknown file icon in its 16px slot");
+    assert_eq!(
+        icon.texture,
+        icon_texture(&headless.ctx, icon_named("file.svg")),
+        "an unmapped file must show the theme's default file icon"
+    );
+}
+
+#[test]
+fn explorer_rows_keep_text_offsets_and_vertical_centering() {
+    if isolated("explorer_rows_keep_text_offsets_and_vertical_centering") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("layout");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let id = open_workspace(&mut model, &root);
+        let mut headless = Headless::new(model, width, height);
+        wait_explorer_ready(&mut headless, id);
+        headless.render();
+        headless.click(explorer_row_id(&headless, id, 0));
+        headless.pump_until_rows(id, 2);
+        let output = headless.render();
+
+        let layout = made_app::theme::Layout::for_window(width, height);
+        let explorer_left = width - layout.gutter - layout.right_card_width;
+        let body_top = layout.gap + layout.top_height + layout.gap + layout.card_header_height;
+        let folder_row = explorer_row_rect(&headless, id, 0);
+        let file_row = explorer_row_rect(&headless, id, 1);
+        assert!(
+            (folder_row.height() - 24.0).abs() < 0.5 && (file_row.height() - 24.0).abs() < 0.5,
+            "{width}x{height}: rows keep 24px height: {folder_row:?} {file_row:?}"
+        );
+        assert!(
+            (folder_row.left() - (explorer_left + 8.0)).abs() < 1.0,
+            "{width}x{height}: rows keep the 4px inset inside the body padding: {folder_row:?}"
+        );
+
+        // Text starts 24px from the row edge at depth 0, plus 14px per depth.
+        let folder_text = text_rects(&output, "src", body_top + 24.0)
+            .into_iter()
+            .find(|rect| rect.top() > body_top)
+            .expect("folder label");
+        let file_text = text_rects(&output, "main.rs", body_top + 48.0)
+            .into_iter()
+            .find(|rect| rect.top() > body_top)
+            .expect("file label");
+        assert!(
+            (folder_text.left() - (folder_row.left() + 24.0)).abs() < 1.0,
+            "{width}x{height}: depth-0 text must start 24px from the row edge: {folder_text:?}"
+        );
+        assert!(
+            (file_text.left() - (folder_row.left() + 38.0)).abs() < 1.0,
+            "{width}x{height}: depth 1 must add exactly 14px: {file_text:?}"
+        );
+
+        // Each 16px icon sits in the inset slot, 4px before its label, and
+        // shares the label's vertical optical center.
+        for (row, depth, text) in [(folder_row, 0, folder_text), (file_row, 1, file_text)] {
+            let icon = icon_in_slot(&output, row, depth).expect("icon in its slot");
+            assert!(
+                (icon.rect.left() - (row.left() + 4.0 + 14.0 * depth as f32)).abs() < 1.0,
+                "{width}x{height}: icon must start in the inset slot: {icon:?} vs {row:?}"
+            );
+            assert!(
+                (text.left() - icon.rect.right() - 4.0).abs() < 1.0,
+                "{width}x{height}: label keeps its 4px gap after the icon: {icon:?} vs {text:?}"
+            );
+            assert!(
+                (icon.rect.center().y - text.center().y).abs() < 0.75
+                    && (icon.rect.center().y - row.center().y).abs() < 0.75,
+                "{width}x{height}: icon and label share the row's optical center: {icon:?} vs {text:?}"
+            );
+        }
+
+        // The former disclosure triangle and bullet are not painted in the tree.
+        let tree_body = egui::Rect::from_min_max(
+            egui::pos2(explorer_left, body_top),
+            egui::pos2(width, height),
+        );
+        assert!(
+            path_shapes(&output)
+                .iter()
+                .all(|path| !tree_body.contains(path_center(path))),
+            "{width}x{height}: the app-drawn disclosure triangle must not paint"
+        );
+        assert!(
+            circle_shapes(&output)
+                .iter()
+                .all(|circle| !tree_body.contains(circle.center)),
+            "{width}x{height}: the app-drawn file bullet must not paint"
+        );
+
+        // The unselected file row gains no fill, border, outline, or accent.
+        let slot = icon_slot(file_row, 1);
+        let extra: Vec<egui::Rect> = rect_shapes(&output)
+            .into_iter()
+            .filter(|shape| {
+                shape.fill_texture_id() == egui::TextureId::default()
+                    && shape.rect.height() <= 24.5
+                    && shape.rect.intersects(slot)
+            })
+            .map(|shape| shape.rect)
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "{width}x{height}: the icon must not add a fill, border, or accent: {extra:?}"
+        );
+    }
+}
+
+#[test]
+fn explorer_icons_keep_full_color_on_hover_and_selection() {
+    if isolated("explorer_icons_keep_full_color_on_hover_and_selection") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("states");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.pump_until_rows(id, 2);
+    let tree_id = headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::explorer)
+        .expect("explorer")
+        .tree_focus_id();
+
+    // At rest, the file row has no state fill.
+    let output = headless.render();
+    let row = explorer_row_rect(&headless, id, 1);
+    let rest = icon_in_slot(&output, row, 0).expect("file icon at rest");
+    assert_eq!(
+        rest.texture,
+        icon_texture(&headless.ctx, icon_named("rust.svg"),)
+    );
+    assert!(
+        rects_with_fill(&output, made_app::theme::BG_HOVER)
+            .iter()
+            .chain(rects_with_fill(&output, made_app::theme::BG_SELECTED).iter())
+            .all(|rect| !rect.intersects(row)),
+        "the file row must start without a state fill"
+    );
+
+    // Hover changes the row fill, never the icon.
+    let hovered_output = headless.hover(explorer_row_id(&headless, id, 1));
+    let hovered = icon_in_slot(&hovered_output, row, 0).expect("file icon while hovered");
+    assert!(
+        rects_with_fill(&hovered_output, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(row)),
+        "hover must keep the row fill"
+    );
+    assert_eq!(
+        (hovered.texture, hovered.tint),
+        (rest.texture, rest.tint),
+        "hover must not recolor the icon"
+    );
+
+    // Keyboard focus selects the file row: the fill changes, the icon does not.
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(4.0, 796.0))]);
+    headless.focus(tree_id);
+    headless.press_key(egui::Key::ArrowDown);
+    let selected_output = headless.render();
+    assert_eq!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::explorer)
+            .and_then(ExplorerPane::selected_path),
+        Some(fs::canonicalize(root.join("main.rs")).unwrap().as_path()),
+        "arrow navigation must select the file row"
+    );
+    let selected = icon_in_slot(&selected_output, row, 0).expect("file icon while selected");
+    assert!(
+        rects_with_fill(&selected_output, made_app::theme::BG_SELECTED)
+            .iter()
+            .any(|rect| rect.intersects(row)),
+        "selection must keep the row fill"
+    );
+    for image in [rest, hovered, selected] {
+        assert_eq!(
+            (image.texture, image.tint),
+            (rest.texture, egui::Color32::WHITE),
+            "rest, hover, and selection must all render the same full-color icon"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn explorer_special_rows_keep_explicit_markers() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    if isolated("explorer_special_rows_keep_explicit_markers") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("markers");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("target.txt"), "target\n").unwrap();
+    symlink(root.join("target.txt"), root.join("link.txt")).unwrap();
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(root.join("pipe"))
+        .status()
+        .expect("mkfifo");
+    assert!(mkfifo.success(), "mkfifo must create the special entry");
+    // An unreadable folder shows an error row once expanded.
+    let locked = root.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode(locked);
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    headless.click(explorer_row_id(&headless, id, 0));
+    headless.pump_until_rows(id, 5);
+    let output = headless.render();
+
+    // Rows: the expanded folder, its error row, then symlink, special, and file.
+    let locked_row = explorer_row_rect(&headless, id, 0);
+    let error_row = explorer_row_rect(&headless, id, 1);
+    let link_row = explorer_row_rect(&headless, id, 2);
+    let pipe_row = explorer_row_rect(&headless, id, 3);
+    let target_row = explorer_row_rect(&headless, id, 4);
+    for (label, row) in [
+        ("link.txt", link_row),
+        ("pipe", pipe_row),
+        ("target.txt", target_row),
+    ] {
+        assert!(
+            text_rects(&output, label, 1000.0)
+                .iter()
+                .any(|rect| (rect.center().y - row.center().y).abs() < 0.75),
+            "{label} must occupy row {row:?}"
+        );
+    }
+
+    let marker = |glyph: &str, row: egui::Rect, depth: usize| {
+        glyph_marks(&output, glyph)
+            .into_iter()
+            .find(|(rect, _)| {
+                (rect.center().y - row.center().y).abs() < 0.75
+                    && (rect.center().x - (row.left() + 12.0 + 14.0 * depth as f32)).abs() < 1.5
+            })
+            .unwrap_or_else(|| panic!("{glyph} marker must sit in its icon slot of {row:?}"))
+            .1
+    };
+    assert_eq!(
+        marker("@", link_row, 0),
+        made_app::theme::TEXT_TERTIARY,
+        "symlink rows keep the @ marker in the tertiary tone"
+    );
+    assert_eq!(
+        marker("?", pipe_row, 0),
+        made_app::theme::TEXT_TERTIARY,
+        "special rows keep the ? marker in the tertiary tone"
+    );
+    assert_eq!(
+        marker("!", error_row, 1),
+        made_app::theme::ERROR,
+        "error rows keep the ! marker in the error tone"
+    );
+    for (row, depth) in [(link_row, 0), (pipe_row, 0), (error_row, 1)] {
+        assert!(
+            icon_in_slot(&output, row, depth).is_none(),
+            "special rows must not show a theme icon: {row:?}"
+        );
+    }
+
+    // Folders and regular files keep their theme icons.
+    assert_eq!(
+        icon_in_slot(&output, locked_row, 0)
+            .expect("expanded folder icon")
+            .texture,
+        icon_texture(&headless.ctx, icon_named("folder-open.svg"),)
+    );
+    assert_eq!(
+        icon_in_slot(&output, target_row, 0)
+            .expect("file icon")
+            .texture,
+        icon_texture(&headless.ctx, icon_named("document.svg"),)
     );
 }
 

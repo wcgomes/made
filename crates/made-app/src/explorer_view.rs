@@ -31,8 +31,12 @@ use made_explorer::tree::{DirListing, DirRequest, EntryKind, TreeModel, TreeRow}
 use made_explorer::watch::FsWatcher;
 
 use crate::diagnostics::{DiagnosticLog, LogLevel};
+use crate::explorer_icons;
 use crate::sanitize::sanitize_display;
 use crate::theme;
+
+/// Edge of the square icon slot that file and folder rows reserve, in points.
+const ENTRY_ICON_SIZE: f32 = 16.0;
 
 const MAX_TREE_RESULTS_PER_FRAME: usize = 64;
 const MAX_WATCH_EVENTS_PER_FRAME: usize = 512;
@@ -556,6 +560,8 @@ pub struct ExplorerPane {
     preview_worker: PreviewWorker,
     pending_tree_loads: PendingTreeLoads,
     rows: Vec<TreeRow>,
+    /// Icon for each row in `rows`, resolved once when the rows are rebuilt.
+    row_icons: Vec<Option<explorer_icons::IconId>>,
     rows_dirty: bool,
     row_rebuilds: u64,
     pending_expand: Vec<PathBuf>,
@@ -601,6 +607,7 @@ impl ExplorerPane {
             preview_worker: PreviewWorker::start(),
             pending_tree_loads: PendingTreeLoads::default(),
             rows: Vec::new(),
+            row_icons: Vec::new(),
             rows_dirty: true,
             row_rebuilds: 0,
             pending_expand: Vec::new(),
@@ -780,6 +787,7 @@ impl ExplorerPane {
         self.root_unavailable = None;
         self.pending_tree_loads = PendingTreeLoads::default();
         self.rows.clear();
+        self.row_icons.clear();
         self.rows_dirty = true;
         self.pending_expand.clear();
         self.preview = PreviewState::default();
@@ -1239,6 +1247,11 @@ impl ExplorerPane {
             return;
         }
         self.rows = self.tree.as_ref().map(TreeModel::rows).unwrap_or_default();
+        self.row_icons = self
+            .rows
+            .iter()
+            .map(|row| explorer_icons::resolve(&row.name, row.kind, row.expanded))
+            .collect();
         self.rows_dirty = false;
         self.row_rebuilds = self.row_rebuilds.saturating_add(1);
     }
@@ -1499,6 +1512,7 @@ impl ExplorerPane {
             self.apply_selection_path(&first);
         }
         let rows = &self.rows;
+        let row_icons = &self.row_icons;
 
         ui.spacing_mut().item_spacing.y = 0.0;
         ScrollArea::vertical()
@@ -1509,6 +1523,7 @@ impl ExplorerPane {
                     let Some(row) = rows.get(index) else {
                         continue;
                     };
+                    let icon = row_icons.get(index).copied().flatten();
                     let (rect, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 24.0),
                         Sense::hover(),
@@ -1560,14 +1575,10 @@ impl ExplorerPane {
                     // the markers use that same optical center.
                     let marker_center = egui::pos2(rect.left() + indent + 8.0, rect.center().y);
                     match row.kind {
-                        EntryKind::Directory => theme::paint_disclosure(
-                            ui.painter(),
-                            marker_center,
-                            row.expanded,
-                            icon_color,
-                        ),
-                        EntryKind::File => {
-                            theme::paint_bullet(ui.painter(), marker_center, icon_color)
+                        EntryKind::Directory | EntryKind::File => {
+                            if let Some(icon) = icon {
+                                paint_entry_icon(ui, marker_center, icon);
+                            }
                         }
                         EntryKind::Symlink => {
                             ui.painter().text(
@@ -1948,6 +1959,15 @@ fn paint_card_header(ui: &Ui, rect: egui::Rect, layout: &theme::Layout, fill: Co
         ],
         Stroke::new(1.0, theme::BORDER_HEADER),
     );
+}
+
+/// Paint a file or folder theme icon in the 16px slot centered on `center`.
+///
+/// The image keeps the default white tint, so the upstream artwork is drawn
+/// exactly as shipped in every row state.
+fn paint_entry_icon(ui: &Ui, center: egui::Pos2, icon: explorer_icons::IconId) {
+    let rect = egui::Rect::from_center_size(center, egui::Vec2::splat(ENTRY_ICON_SIZE));
+    egui::Image::from_bytes(icon.uri(), icon.bytes()).paint_at(ui, rect);
 }
 
 fn tone_strip(
