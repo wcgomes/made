@@ -1543,7 +1543,7 @@ impl ExplorerPane {
                             .rect_filled(row_rect, CornerRadius::same(6), fill);
                     }
 
-                    let indent = 4.0 + row.depth as f32 * 14.0;
+                    let icon_slot_left = 8.0 + row.depth as f32 * 14.0;
                     let expanded = row.kind == EntryKind::Directory && row.expanded;
                     let color = if row.kind == EntryKind::Error {
                         theme::ERROR
@@ -1560,7 +1560,7 @@ impl ExplorerPane {
                         theme::TEXT_TERTIARY
                     };
                     let name = sanitize_display(&row.name, 200);
-                    let text_left = rect.left() + 24.0 + row.depth as f32 * 14.0;
+                    let text_left = rect.left() + 28.0 + row.depth as f32 * 14.0;
                     let width = (rect.right() - text_left - 6.0).max(1.0);
                     theme::paint_ellipsized_centered(
                         ui.painter(),
@@ -1573,7 +1573,8 @@ impl ExplorerPane {
                     );
                     // The label helper centers its galley on the row center, so
                     // the markers use that same optical center.
-                    let marker_center = egui::pos2(rect.left() + indent + 8.0, rect.center().y);
+                    let marker_center =
+                        egui::pos2(rect.left() + icon_slot_left + 8.0, rect.center().y);
                     match row.kind {
                         EntryKind::Directory | EntryKind::File => {
                             if let Some(icon) = icon {

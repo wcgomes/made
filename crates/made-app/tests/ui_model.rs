@@ -791,11 +791,11 @@ fn path_center(path: &egui::epaint::PathShape) -> egui::Pos2 {
     egui::Rect::from_points(&path.points).center()
 }
 
-/// The 16px icon slot of a 24px explorer row: the 4px inset plus 14px per
-/// depth, centered vertically on the row.
+/// The 16px icon slot of a 24px explorer row: the 8px slot start plus 14px
+/// per depth, centered vertically on the row.
 fn icon_slot(row: egui::Rect, depth: usize) -> egui::Rect {
     egui::Rect::from_min_size(
-        egui::pos2(row.left() + 4.0 + 14.0 * depth as f32, row.center().y - 8.0),
+        egui::pos2(row.left() + 8.0 + 14.0 * depth as f32, row.center().y - 8.0),
         egui::vec2(16.0, 16.0),
     )
 }
@@ -1632,8 +1632,8 @@ fn explorer_rows_use_unified_metrics_and_open_folder_treatment() {
         .find(|rect| rect.top() > body_top)
         .expect("expanded folder label");
     assert!(
-        (folder_text.left() - (explorer_left + 32.0)).abs() < 1.0,
-        "depth-0 text must start 24px from the row edge: {folder_text:?}"
+        (folder_text.left() - (explorer_left + 36.0)).abs() < 1.0,
+        "depth-0 text must start 28px from the row edge: {folder_text:?}"
     );
     assert!(
         (folder_text.center().y - folder_rect.center().y).abs() < 0.75,
@@ -1882,7 +1882,7 @@ fn explorer_rows_keep_text_offsets_and_vertical_centering() {
             "{width}x{height}: rows keep the 4px inset inside the body padding: {folder_row:?}"
         );
 
-        // Text starts 24px from the row edge at depth 0, plus 14px per depth.
+        // Text starts 28px from the row edge at depth 0, plus 14px per depth.
         let folder_text = text_rects(&output, "src", body_top + 24.0)
             .into_iter()
             .find(|rect| rect.top() > body_top)
@@ -1892,11 +1892,11 @@ fn explorer_rows_keep_text_offsets_and_vertical_centering() {
             .find(|rect| rect.top() > body_top)
             .expect("file label");
         assert!(
-            (folder_text.left() - (folder_row.left() + 24.0)).abs() < 1.0,
-            "{width}x{height}: depth-0 text must start 24px from the row edge: {folder_text:?}"
+            (folder_text.left() - (folder_row.left() + 28.0)).abs() < 1.0,
+            "{width}x{height}: depth-0 text must start 28px from the row edge: {folder_text:?}"
         );
         assert!(
-            (file_text.left() - (folder_row.left() + 38.0)).abs() < 1.0,
+            (file_text.left() - (folder_row.left() + 42.0)).abs() < 1.0,
             "{width}x{height}: depth 1 must add exactly 14px: {file_text:?}"
         );
 
@@ -1905,7 +1905,7 @@ fn explorer_rows_keep_text_offsets_and_vertical_centering() {
         for (row, depth, text) in [(folder_row, 0, folder_text), (file_row, 1, file_text)] {
             let icon = icon_in_slot(&output, row, depth).expect("icon in its slot");
             assert!(
-                (icon.rect.left() - (row.left() + 4.0 + 14.0 * depth as f32)).abs() < 1.0,
+                (icon.rect.left() - (row.left() + 8.0 + 14.0 * depth as f32)).abs() < 1.0,
                 "{width}x{height}: icon must start in the inset slot: {icon:?} vs {row:?}"
             );
             assert!(
@@ -1953,6 +1953,42 @@ fn explorer_rows_keep_text_offsets_and_vertical_centering() {
             "{width}x{height}: the icon must not add a fill, border, or accent: {extra:?}"
         );
     }
+}
+
+#[test]
+fn explorer_selected_row_fill_keeps_icon_inset() {
+    if isolated("explorer_selected_row_fill_keeps_icon_inset") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "icon-inset", "entry.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    let row_id = explorer_row_id(&headless, id, 0);
+    headless.click(row_id);
+    let output = headless.render();
+
+    let row = headless.response(row_id).rect;
+    let fill = rects_with_fill(&output, made_app::theme::BG_SELECTED)
+        .into_iter()
+        .find(|rect| rect.intersects(row) && (rect.height() - 24.0).abs() < 0.5)
+        .expect("selected row fill");
+    let icon = icon_in_slot(&output, row, 0).expect("selected row icon");
+    assert!(
+        (fill.left() - (row.left() + 4.0)).abs() < 0.5,
+        "the fill must keep its 4px horizontal inset: {fill:?} vs {row:?}"
+    );
+    assert!(
+        icon.rect.left() >= fill.left() + 3.5,
+        "the icon must sit at least 3.5px inside the fill's left edge: {icon:?} vs {fill:?}"
+    );
+    assert!(
+        icon.rect.left() >= fill.left() && icon.rect.right() <= fill.right(),
+        "the icon must stay fully inside the fill horizontally: {icon:?} vs {fill:?}"
+    );
 }
 
 #[test]
@@ -2093,7 +2129,7 @@ fn explorer_special_rows_keep_explicit_markers() {
             .into_iter()
             .find(|(rect, _)| {
                 (rect.center().y - row.center().y).abs() < 0.75
-                    && (rect.center().x - (row.left() + 12.0 + 14.0 * depth as f32)).abs() < 1.5
+                    && (rect.center().x - (row.left() + 16.0 + 14.0 * depth as f32)).abs() < 1.5
             })
             .unwrap_or_else(|| panic!("{glyph} marker must sit in its icon slot of {row:?}"))
             .1

@@ -60,13 +60,13 @@ Made MUST show a full-color Material Icon Theme icon for every regular file and 
 
 ### Requirement: Explorer Entry Icon Presentation
 
-Explorer entry icons MUST render full-color exactly as shipped by the vendored theme, without tinting, desaturation, monochrome conversion, or alpha recoloring. Their artwork colors MUST NOT change at rest, hover, selection, or keyboard focus; hover and selection MUST be conveyed only by the existing row fill and label treatment. Icons MUST occupy the existing 16px icon slot and share the row label's vertical optical center. File and folder rows in the Explorer MUST NOT paint the former app-drawn file bullet or folder disclosure triangle. Row height (24px), the 4px horizontal inset, 6px radius, the text start at 24px from the row's left edge plus 14px per depth, hover/selection fills, label colors, hit areas, and focus treatment MUST remain unchanged. An icon MUST NOT add a fill, border, focus outline, accent bar, or extra indent.
+Explorer entry icons MUST render full-color exactly as shipped by the vendored theme, without tinting, desaturation, monochrome conversion, or alpha recoloring. Their artwork colors MUST NOT change at rest, hover, selection, or keyboard focus; hover and selection MUST be conveyed only by the existing row fill and label treatment. Icons MUST occupy the existing 16px icon slot and share the row label's vertical optical center. File and folder rows in the Explorer MUST NOT paint the former app-drawn file bullet or folder disclosure triangle. Row height (24px), the 4px horizontal inset, 6px radius, the 16px icon slot inset 4px within the painted row fill (slot start at 8px from the row's left edge), the text start at 28px from the row's left edge plus 14px per depth, hover/selection fills, label colors, hit areas, and focus treatment MUST remain unchanged. An icon MUST NOT add a fill, border, focus outline, accent bar, or extra indent.
 
 #### Scenario: Explorer row layout is unchanged
 
 - Given Explorer rows with file and folder icons at multiple depths
 - When the tree renders at 1280×800 or 720×480
-- Then rows keep 24px height, a 4px horizontal inset, 6px radius, a 16px icon slot, text 24px from the row's left edge plus 14px per depth, and unchanged hit areas; each icon and its label share one vertical optical center; the former app-drawn file bullet and folder disclosure triangle are not painted; and no icon adds a fill, border, focus outline, accent bar, or extra indent
+- Then rows keep 24px height, a 4px horizontal inset, 6px radius, a 16px icon slot inset 4px within the painted row fill (slot start at 8px from the row's left edge), text 28px from the row's left edge plus 14px per depth, and unchanged hit areas; each icon and its label share one vertical optical center; the former app-drawn file bullet and folder disclosure triangle are not painted; and no icon adds a fill, border, focus outline, accent bar, or extra indent
 
 #### Scenario: Hover and selection do not tint icons
 
