@@ -42,6 +42,7 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
     let options = AppOptions {
         smoke_test: smoke,
         started_at,
+        ..AppOptions::new().with_compatible_tui_detection()
     };
     let model = AppModel::new(args, options);
 

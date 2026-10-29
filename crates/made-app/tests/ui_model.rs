@@ -13,16 +13,16 @@ use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
 use made_app::ui::{
     diagnostics_copy_id, diagnostics_previous_log_copy_id, diagnostics_previous_log_path_id,
-    explorer_splitter_id, left_surface_action_id, picker_control_id, picker_current_target,
-    picker_list_id, picker_path_id, top_action_id, top_workspace_action_id, workspace_tab_close_id,
-    workspace_tab_id,
+    explorer_splitter_id, left_surface_action_id, new_tab_menu_item_id, picker_control_id,
+    picker_current_target, picker_list_id, picker_path_id, top_action_id, top_workspace_action_id,
+    workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
     LaunchPlan, Surfaces, WorkspaceLaunch, WorkspaceSelection, WorkspaceSource,
 };
 use made_app::workspace_picker::WorkspacePicker;
-use made_app::Workbench;
+use made_app::{CompatibleTui, TerminalTarget, Workbench};
 use made_platform::native_backdrop::{NativeBackdropKind, NativeBackdropStatus};
 use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
@@ -1034,9 +1034,13 @@ fn isolated(name: &str) -> bool {
     let runtime = home.path().join("runtime");
     let roaming = home.path().join("AppData").join("Roaming");
     let local = home.path().join("AppData").join("Local");
+    #[cfg(unix)]
+    let bin = home.path().join("bin");
     for directory in [&tmp, &runtime, &roaming, &local] {
         std::fs::create_dir_all(directory).unwrap();
     }
+    #[cfg(unix)]
+    std::fs::create_dir(&bin).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1057,6 +1061,17 @@ fn isolated(name: &str) -> bool {
         .env("APPDATA", &roaming)
         .env("LOCALAPPDATA", &local);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = bin.join("opencode");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    }
     if std::path::Path::new("/bin/bash").exists() {
         command.env("SHELL", "/bin/bash");
     }
@@ -2810,6 +2825,205 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
     assert!(headless.model.workbench().is_none());
     let final_text = output_text(&headless.render());
     assert!(final_text.contains("Open a workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn background_tui_detection_adopts_the_isolated_opencode() {
+    if isolated("background_tui_detection_adopts_the_isolated_opencode") {
+        return;
+    }
+    let model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    assert!(
+        model.compatible_tuis().is_empty(),
+        "detection must not block construction"
+    );
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    headless.pump_until(|model| model.compatible_tuis() == [CompatibleTui::OpenCode].as_slice());
+    assert_eq!(
+        headless.model.compatible_tuis(),
+        &[CompatibleTui::OpenCode],
+        "the background worker must adopt the isolated PATH result"
+    );
+}
+
+#[test]
+fn header_plus_without_a_detected_tui_opens_the_folder_picker() {
+    if isolated("header_plus_without_a_detected_tui_opens_the_folder_picker") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "fallback", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(top_action_id("open-folder"));
+    assert!(headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(headless.model.workspace(id).is_some());
+}
+
+#[test]
+fn header_plus_menu_lists_terminal_before_detected_tuis() {
+    if isolated("header_plus_menu_lists_terminal_before_detected_tuis") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "menu", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    let hovered =
+        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
+    assert!(
+        hovered.contains("Open folder"),
+        "Open folder tooltip missing while a TUI is detected: {hovered}"
+    );
+
+    headless.click(top_action_id("open-folder"));
+    let output = headless.render();
+    let terminal = headless.response(new_tab_menu_item_id("terminal"));
+    let opencode = headless.response(new_tab_menu_item_id("opencode"));
+    assert!(
+        terminal.rect.top() < opencode.rect.top(),
+        "Terminal must be the first menu item"
+    );
+    assert!(
+        terminal.rect.width() >= 24.0 && terminal.rect.height() >= 24.0,
+        "menu targets must stay at least 24x24: {:?}",
+        terminal.rect
+    );
+    let text = output_text(&output);
+    assert!(text.contains("Terminal"), "missing Terminal item: {text}");
+    assert!(text.contains("OpenCode"), "missing OpenCode item: {text}");
+    assert!(!headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+}
+
+#[test]
+fn new_tab_menu_terminal_item_runs_the_add_workspace_flow() {
+    if isolated("new_tab_menu_terminal_item_runs_the_add_workspace_flow") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "terminal-menu", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("terminal"));
+    assert!(headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(headless.model.workspace(id).is_some());
+}
+
+#[test]
+fn new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one() {
+    if isolated("new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one") {
+        return;
+    }
+    use made_platform::Platform;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "current", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+    let home = made_platform::host_platform()
+        .home_dir()
+        .expect("test home")
+        .canonicalize()
+        .expect("canonical test home");
+
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("opencode"));
+
+    assert_eq!(headless.model.active_workspace_id(), Some(id));
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(
+        headless.model.start_pending(),
+        "the new TUI tab must be scheduled for background preparation"
+    );
+    assert_eq!(
+        headless.model.terminal_target(),
+        TerminalTarget::Tui(CompatibleTui::OpenCode)
+    );
+    assert_eq!(
+        headless.model.launch().source(),
+        WorkspaceSource::DefaultHome
+    );
+    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
+    assert!(headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .is_some());
+}
+
+#[test]
+fn new_tab_menu_items_are_keyboard_reachable_with_visible_focus() {
+    if isolated("new_tab_menu_items_are_keyboard_reachable_with_visible_focus") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "keyboard-menu", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.render();
+    headless.focus(top_action_id("open-folder"));
+    headless.press_key(egui::Key::Enter);
+    headless.render();
+    headless.press_key(egui::Key::ArrowDown);
+    headless.render();
+    // The popup fades in over `animation_time`; let the open animation settle so
+    // the focus ring is painted at full opacity rather than mid-fade.
+    headless.settle_animation();
+    let terminal_id = new_tab_menu_item_id("terminal");
+    let terminal = headless.response(terminal_id);
+    assert!(
+        terminal.has_focus(),
+        "ArrowDown must focus the first menu item"
+    );
+    let focused = headless.render();
+    let terminal = headless.response(terminal_id);
+    assert!(
+        !focus_ring_rects(&focused, terminal.rect).is_empty(),
+        "the focused menu item must paint a visible focus ring"
+    );
+
+    headless.press_key(egui::Key::Enter);
+    assert!(headless.model.is_picker());
 }
 
 #[test]

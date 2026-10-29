@@ -23,7 +23,6 @@ use made_explorer::root_switch::RootGeneration;
 use made_platform::{
     host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
 };
-use made_terminal::PtyOptions;
 
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
@@ -38,6 +37,7 @@ use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
 use crate::session_map::SessionMap;
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
+use crate::tui::TerminalTarget;
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
 use crate::worktree::{GitRunner, MetadataStatus, WorktreeMetadata};
 use crate::{APP_NAME, APP_VERSION};
@@ -192,6 +192,7 @@ pub struct Workbench {
     pub(crate) plan: Option<LaunchPlan>,
     pub(crate) workspace_error: Option<WorkspaceError>,
     pub(crate) terminal_cwd: PathBuf,
+    pub(crate) terminal_target: TerminalTarget,
     pub(crate) paths: Option<AppPaths>,
     pub(crate) token: Option<Token>,
     pub(crate) bridge: Option<BridgeHandle>,
@@ -270,6 +271,7 @@ impl Workbench {
         plan: Option<LaunchPlan>,
         mut workspace_error: Option<WorkspaceError>,
         terminal_cwd: PathBuf,
+        terminal_target: TerminalTarget,
         started_at: Instant,
     ) -> Self {
         let platform = host_platform();
@@ -322,6 +324,7 @@ impl Workbench {
             plan,
             workspace_error,
             terminal_cwd,
+            terminal_target,
             paths: app_paths,
             token: None,
             bridge: None,
@@ -609,7 +612,20 @@ impl Workbench {
     }
 
     fn start_terminal(&mut self, composed_content: Option<String>) {
-        let mut options = PtyOptions::new(self.terminal_cwd.clone())
+        // One PATH snapshot serves the primary spawn and the fallback retry, so
+        // a TUI resolves to the same executable for both.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let cwd = self.terminal_cwd.clone();
+        let Some(options) = self.terminal_target.pty_options(cwd, &path) else {
+            let detail = format!(
+                "{} is not available on PATH",
+                self.terminal_target.program_label()
+            );
+            self.diag.log_mut().record(LogLevel::Error, detail.clone());
+            self.terminal_error = Some(detail);
+            return;
+        };
+        let mut options = options
             .with_size(PtySize {
                 rows: DEFAULT_ROWS as u16,
                 cols: DEFAULT_COLS as u16,
@@ -622,10 +638,14 @@ impl Workbench {
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
             Ok(pane) => {
+                let pane = pane.with_target(self.terminal_target);
                 if let Some(pid) = pane.pid() {
                     self.diag.log_mut().record(
                         LogLevel::Info,
-                        format!("terminal shell started (pid {pid})"),
+                        format!(
+                            "terminal {} started (pid {pid})",
+                            self.terminal_target.log_label()
+                        ),
                     );
                 }
                 self.terminal = Some(pane);
@@ -633,7 +653,10 @@ impl Workbench {
                 if composed_content.is_none() {
                     self.diag.log_mut().record(
                         LogLevel::Warn,
-                        "terminal shell started with the original environment (no Made configuration)",
+                        format!(
+                            "terminal {} started with the original environment (no Made configuration)",
+                            self.terminal_target.log_label()
+                        ),
                     );
                 }
             }
@@ -642,28 +665,35 @@ impl Workbench {
                 // spawn. Retry once in the documented safe fallback directory.
                 let fallback = fallback_terminal_cwd();
                 if fallback != self.terminal_cwd {
-                    let mut retry = PtyOptions::new(fallback.clone())
-                        .with_size(options.size)
-                        .with_channel_capacity(256);
-                    if let Some(content) = &composed_content {
-                        retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
-                    }
-                    if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
-                        self.diag.log_mut().record(
-                            LogLevel::Warn,
-                            "workspace shell failed; terminal started in the fallback directory",
-                        );
-                        self.terminal_cwd = fallback;
-                        self.integration.set_terminal_cwd(&self.terminal_cwd);
-                        if let Some(follow) = self.follow.as_mut() {
-                            follow.set_terminal_cwd(&self.terminal_cwd);
+                    if let Some(retry) = self.terminal_target.pty_options(fallback.clone(), &path) {
+                        let mut retry = retry.with_size(options.size).with_channel_capacity(256);
+                        if let Some(content) = &composed_content {
+                            retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }
-                        self.terminal = Some(pane);
-                        self.terminal_error = None;
-                        return;
+                        if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
+                            let pane = pane.with_target(self.terminal_target);
+                            self.diag.log_mut().record(
+                                LogLevel::Warn,
+                                format!(
+                                    "workspace {} failed; terminal started in the fallback directory",
+                                    self.terminal_target.log_label()
+                                ),
+                            );
+                            self.terminal_cwd = fallback;
+                            self.integration.set_terminal_cwd(&self.terminal_cwd);
+                            if let Some(follow) = self.follow.as_mut() {
+                                follow.set_terminal_cwd(&self.terminal_cwd);
+                            }
+                            self.terminal = Some(pane);
+                            self.terminal_error = None;
+                            return;
+                        }
                     }
                 }
-                let detail = format!("terminal shell could not start: {first_error}");
+                let detail = format!(
+                    "terminal {} could not start: {first_error}",
+                    self.terminal_target.log_label()
+                );
                 self.diag.log_mut().record(LogLevel::Error, detail.clone());
                 self.terminal_error = Some(detail);
             }
@@ -743,6 +773,10 @@ impl Workbench {
     /// Mutable terminal for explicit input and lifecycle actions.
     pub fn terminal_mut(&mut self) -> Option<&mut TerminalPane> {
         self.terminal.as_mut()
+    }
+    /// Which child process this workspace's terminal starts.
+    pub fn terminal_target(&self) -> TerminalTarget {
+        self.terminal_target
     }
     /// Validated launch plan for picker cancellation and folder labels.
     pub fn launch_plan(&self) -> Option<&LaunchPlan> {

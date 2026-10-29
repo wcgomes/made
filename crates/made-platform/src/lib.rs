@@ -92,6 +92,14 @@
 //! glass. The module never uses Windows acrylic/blur, whose resize lag is a
 //! documented regression risk.
 //!
+//! # Compatible TUIs
+//!
+//! [`detect_compatible_tuis`] performs a metadata-only `PATH` lookup for
+//! optional terminal UIs the app can launch directly. It never spawns the
+//! candidate, probes a version, or waits for a service. Empty and relative
+//! `PATH` segments are ignored so detection never resolves an executable from
+//! the current directory.
+//!
 //! # Backends
 //!
 //! Only the host backend is compiled. Each backend implements the same
@@ -1982,6 +1990,119 @@ pub use windows::WindowsPlatform as HostPlatform;
 /// Construct the host backend.
 pub fn host_platform() -> HostPlatform {
     HostPlatform::new()
+}
+
+/// A compatible TUI that Made can launch directly in a new tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CompatibleTui {
+    /// OpenCode v2. Detection checks the executable name only; the version is
+    /// not verified.
+    OpenCode,
+}
+
+impl CompatibleTui {
+    /// Every TUI Made knows how to launch, in new-tab menu order.
+    pub const ALL: &'static [Self] = &[Self::OpenCode];
+
+    /// Executable name resolved through `PATH`.
+    pub const fn program(self) -> &'static str {
+        match self {
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    /// Display label for the new-tab menu.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpenCode => "OpenCode",
+        }
+    }
+}
+
+/// Detect compatible TUIs on the current process `PATH`.
+///
+/// This is a metadata-only executable lookup intended to run once on a
+/// background thread. It never spawns the program, probes a version, or waits
+/// for a service. Callers must not make shell or explorer startup depend on the
+/// result.
+pub fn detect_compatible_tuis() -> Vec<CompatibleTui> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    detect_compatible_tuis_in_path(&path)
+}
+
+/// Detect compatible TUIs in an explicit `PATH` value.
+///
+/// Empty and relative path segments are ignored rather than resolved against
+/// the current directory, so detection cannot pick up an untrusted relative
+/// executable.
+pub fn detect_compatible_tuis_in_path(path: impl AsRef<OsStr>) -> Vec<CompatibleTui> {
+    CompatibleTui::ALL
+        .iter()
+        .copied()
+        .filter(|tui| find_executable_on_path(OsStr::new(tui.program()), path.as_ref()).is_some())
+        .collect()
+}
+
+/// Find an executable named `program` in an explicit `PATH` value.
+///
+/// Only bare names are searched. A `program` with more than one path component
+/// (for example `./opencode` or `/usr/bin/opencode`) returns `None`, so the
+/// lookup never resolves from the current directory. The lookup uses filesystem
+/// metadata only and never executes the candidate. Empty and relative path
+/// segments are ignored. On Windows, a name that already has an extension is
+/// used as given. A name without one tries only `.exe` and `.com`: the
+/// extensionless `sh` shim that npm writes beside `opencode.cmd` and
+/// `opencode.ps1` is never matched, and neither is a batch file, because
+/// CreateProcess cannot run either.
+pub fn find_executable_on_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    let program = Path::new(program);
+    if program.components().count() > 1 {
+        return None;
+    }
+    let file_name = program.file_name()?;
+    for directory in env::split_paths(path) {
+        if directory.as_os_str().is_empty() || directory.is_relative() {
+            continue;
+        }
+        for candidate in executable_candidates(directory.join(file_name), file_name) {
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn executable_candidates(candidate: PathBuf, _file_name: &OsStr) -> Vec<PathBuf> {
+    vec![candidate]
+}
+
+#[cfg(windows)]
+fn executable_candidates(candidate: PathBuf, file_name: &OsStr) -> Vec<PathBuf> {
+    if Path::new(file_name).extension().is_some() {
+        return vec![candidate];
+    }
+    let mut candidates = Vec::with_capacity(2);
+    for extension in ["exe", "com"] {
+        let mut with_extension = candidate.clone();
+        with_extension.set_extension(extension);
+        candidates.push(with_extension);
+    }
+    candidates
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Shell resolution shared by the POSIX and Windows backends.

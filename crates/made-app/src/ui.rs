@@ -782,6 +782,11 @@ pub fn top_action_id(action: &str) -> egui::Id {
     egui::Id::unique(("made-top-action", action))
 }
 
+/// Stable id for one item in the `+` new-tab menu.
+pub fn new_tab_menu_item_id(action: &str) -> egui::Id {
+    egui::Id::unique(("made-new-tab-menu-item", action))
+}
+
 /// Stable id for a top-bar control whose state belongs to one workspace.
 pub fn top_workspace_action_id(id: WorkspaceId, action: &str) -> egui::Id {
     egui::Id::unique(("made-top-workspace-action", action, id.get()))
@@ -886,6 +891,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         })
         .collect();
     let has_workbench = model.workbench().is_some();
+    let compatible_tuis = model.compatible_tuis().to_vec();
     let explorer_visible = model.workbench().is_some_and(Workbench::explorer_visible);
     let sessions_visible = model.workbench().is_some_and(Workbench::sessions_visible);
     let sessions_available = model.workbench().is_some_and(|workbench| {
@@ -906,6 +912,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut activate = None;
     let mut close = None;
     let mut create = false;
+    let mut launch_tui = None;
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
     let mut diagnostics = false;
@@ -1077,8 +1084,39 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 layout.tab_height,
                 theme::BG_CLEAR,
             );
-            if open_folder.activated {
-                create = true;
+            if compatible_tuis.is_empty() {
+                if open_folder.activated {
+                    create = true;
+                }
+            } else {
+                egui::Popup::menu(&open_folder.response)
+                    .open_memory(
+                        open_folder
+                            .activated
+                            .then_some(egui::SetOpenCommand::Toggle),
+                    )
+                    .show(|ui| {
+                        if new_tab_menu_item(
+                            ui,
+                            new_tab_menu_item_id("terminal"),
+                            "Terminal",
+                            layout.button_height,
+                        ) {
+                            create = true;
+                            ui.close();
+                        }
+                        for tui in &compatible_tuis {
+                            if new_tab_menu_item(
+                                ui,
+                                new_tab_menu_item_id(tui.program()),
+                                tui.label(),
+                                layout.button_height,
+                            ) {
+                                launch_tui = Some(*tui);
+                                ui.close();
+                            }
+                        }
+                    });
             }
             if overflow {
                 let overflow_action = theme::ghost_action(
@@ -1121,6 +1159,9 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             }
         });
 
+    if let Some(tui) = launch_tui {
+        model.begin_tui_workspace(tui);
+    }
     if create {
         model.begin_new_workspace();
     }
@@ -1141,6 +1182,14 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         }
     }
     diagnostics
+}
+
+fn new_tab_menu_item(ui: &mut Ui, id: egui::Id, label: &str, height: f32) -> bool {
+    let action = theme::ghost_action(ui, id, label, false, height, theme::BG_CARD);
+    action
+        .response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    action.activated
 }
 
 fn workspace_tab_ui(
@@ -1808,14 +1857,18 @@ impl Workbench {
         }
         if output.restart_requested {
             if let Some(terminal) = self.terminal.as_mut() {
+                let label = self.terminal_target.program_label();
                 match terminal.relaunch(&self.platform, self.diag.log_mut()) {
-                    Ok(()) => self.set_notice("Shell restarted."),
+                    Ok(()) => self.set_notice(format!("{label} restarted.")),
                     Err(error) => {
                         self.diag.log_mut().record(
                             crate::diagnostics::LogLevel::Error,
-                            format!("shell relaunch failed: {error}"),
+                            format!(
+                                "{} relaunch failed: {error}",
+                                self.terminal_target.log_label()
+                            ),
                         );
-                        self.set_notice(format!("Shell relaunch failed: {error}"));
+                        self.set_notice(format!("{label} relaunch failed: {error}"));
                     }
                 }
             }

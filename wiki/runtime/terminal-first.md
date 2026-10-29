@@ -1,6 +1,6 @@
 # Terminal-First Runtime
 
-A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
+A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
 
 ## Launch and default workspace
 
@@ -13,6 +13,8 @@ A Made workspace starts as a real shell and explorer in a folder. OpenCode is op
 | `--smoke-test` without a folder | Test-only picker surface; never starts a real home shell. |
 
 An explicit workspace does not require OpenCode installation, detection, a version wait, plugin readiness, a probe, or automatic launch. The folder picker is also the add-workspace surface and the state after the final tab closes.
+
+When `opencode` is on `PATH`, the `+` new-tab control opens a menu with `Terminal` first and `OpenCode` second. `Terminal` runs the existing folder-picker flow. `OpenCode` starts `opencode` directly as the PTY child of a new home-directory tab: no shell first, no picker, and the current tab keeps running. The launched process is the absolute path that the same lookup finds, never the bare name. Detection is a metadata-only `PATH` lookup on a background thread started at launch; it never spawns the program, never verifies its version, and never delays shell or explorer startup. With no detected TUI, `+` keeps opening the folder picker directly.
 
 The home/`--picker`/explicit-path policy is an accepted product decision; see [ADR 0005](../decisions/0005-home-default-startup.md). Implementation lives in [`workspace.rs`](../../crates/made-app/src/workspace.rs) and [`cli.rs`](../../crates/made-app/src/cli.rs).
 
@@ -67,7 +69,7 @@ Each tab owns a separate loopback bridge and credential set. Events carry the ow
 
 ## Optional OpenCode behavior
 
-- Normal shell use is `inactive`, not degraded; there is no OpenCode detection wait or automatic launch.
+- Normal shell use is `inactive`, not degraded; detection is a background metadata lookup only, with no version wait, probe, or automatic launch.
 - A valid plugin hello and snapshot move the tab to `connected`.
 - A lost connection, heartbeat timeout, or plugin error moves it to `degraded` and resumes shell cwd.
 - A protocol or OpenCode major mismatch is `unsupported`; the terminal remains usable.
@@ -76,7 +78,7 @@ Each tab owns a separate loopback bridge and credential set. Events carry the ow
 
 ## Practical implications
 
-- Do not make shell startup depend on OpenCode readiness.
+- Do not make shell startup depend on OpenCode readiness or detection.
 - Keep shell cwd valid while OpenCode is authoritative.
 - Do not retain an agent root after disconnect.
 - Do not share bridge state, tokens, preview state, or focus across tabs.

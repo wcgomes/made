@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_platform::native_backdrop::NativeBackdropStatus;
-use made_platform::Platform;
+use made_platform::{CompatibleTui, Platform};
 
 use crate::cli::LaunchArgs;
 use crate::theme;
+use crate::tui::TerminalTarget;
 use crate::ui;
 use crate::workbench::{platform_family_label, Workbench};
 use crate::workspace::{
@@ -50,20 +51,52 @@ pub struct AppOptions {
     /// moment that workspace's preparation is scheduled, so a tab opened much
     /// later never inherits the application's launch age.
     pub started_at: Instant,
+    /// Compatible TUIs offered by the `+` new-tab menu.
+    ///
+    /// The default is deliberately empty so tests and direct callers cannot
+    /// launch a real TUI by accident. The binary enables a background `PATH`
+    /// lookup with [`AppOptions::with_compatible_tui_detection`]. Tests that
+    /// opt in must isolate `PATH`.
+    pub compatible_tuis: Vec<CompatibleTui>,
+    /// Whether to detect compatible TUIs on a background thread at startup.
+    ///
+    /// Detection reads executable metadata only. The window, shell, and
+    /// explorer never wait for it.
+    pub detect_compatible_tuis: bool,
 }
 
 impl AppOptions {
-    /// Default options with no smoke run.
+    /// Default options with no smoke run and no detected TUIs.
     pub fn new() -> Self {
         Self {
             smoke_test: None,
             started_at: Instant::now(),
+            compatible_tuis: Vec::new(),
+            detect_compatible_tuis: false,
         }
     }
 
     /// Enable the smoke run.
     pub fn with_smoke(mut self, duration: Duration) -> Self {
         self.smoke_test = Some(duration);
+        self
+    }
+
+    /// Set the compatible TUIs offered by the `+` menu.
+    ///
+    /// An explicit list disables background detection.
+    pub fn with_compatible_tuis(mut self, tuis: impl IntoIterator<Item = CompatibleTui>) -> Self {
+        self.compatible_tuis = tuis.into_iter().collect();
+        self.detect_compatible_tuis = false;
+        self
+    }
+
+    /// Detect compatible TUIs on a background thread started at launch.
+    ///
+    /// This clears any explicit list; the last builder call wins.
+    pub fn with_compatible_tui_detection(mut self) -> Self {
+        self.compatible_tuis.clear();
+        self.detect_compatible_tuis = true;
         self
     }
 }
@@ -100,6 +133,25 @@ struct PendingStart {
     source: WorkspaceSource,
 }
 
+/// Start the optional metadata-only TUI lookup off the UI thread.
+///
+/// The receiver is polled by [`AppModel::logic`]; a failure to spawn a thread
+/// leaves the menu in its no-TUI state rather than blocking startup.
+fn spawn_compatible_tui_detection() -> Option<Receiver<Vec<CompatibleTui>>> {
+    let (sender, receiver) = mpsc::channel();
+    match thread::Builder::new()
+        .name("made-tui-detection".to_owned())
+        .spawn(move || {
+            let _ = sender.send(made_platform::detect_compatible_tuis());
+        }) {
+        Ok(_) => Some(receiver),
+        Err(error) => {
+            eprintln!("made: compatible TUI detection thread could not start ({error})");
+            None
+        }
+    }
+}
+
 /// The app model for one process.
 pub struct AppModel {
     launch: WorkspaceLaunch,
@@ -118,6 +170,9 @@ pub struct AppModel {
     ui_frames: u64,
     theme_ready: bool,
     native_backdrop: NativeBackdropStatus,
+    compatible_tuis: Vec<CompatibleTui>,
+    compatible_tui_receiver: Option<Receiver<Vec<CompatibleTui>>>,
+    terminal_target: TerminalTarget,
     smoke: Option<SmokeState>,
 }
 
@@ -161,6 +216,11 @@ impl AppModel {
             reported: false,
         });
         let start_pending = launch.surfaces().has_terminal();
+        let compatible_tui_receiver = if options.detect_compatible_tuis {
+            spawn_compatible_tui_detection()
+        } else {
+            None
+        };
         Self {
             launch,
             workspaces: Vec::new(),
@@ -178,6 +238,9 @@ impl AppModel {
             ui_frames: 0,
             theme_ready: false,
             native_backdrop: NativeBackdropStatus::default(),
+            compatible_tuis: options.compatible_tuis,
+            compatible_tui_receiver,
+            terminal_target: TerminalTarget::Shell,
             smoke,
         }
     }
@@ -228,6 +291,16 @@ impl AppModel {
         self.active
     }
 
+    /// Compatible TUIs offered by the `+` new-tab menu.
+    pub fn compatible_tuis(&self) -> &[CompatibleTui] {
+        &self.compatible_tuis
+    }
+
+    /// PTY child selected for the next workspace preparation.
+    pub fn terminal_target(&self) -> TerminalTarget {
+        self.terminal_target
+    }
+
     /// Look up a live owner; closed identities never resolve again.
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workbench> {
         self.workspaces
@@ -263,8 +336,26 @@ impl AppModel {
         if let Some(workbench) = self.workbench_mut() {
             workbench.set_visible(false);
         }
+        self.terminal_target = TerminalTarget::Shell;
         self.launch = WorkspaceLaunch::waiting_for_picker();
         self.start_pending = false;
+    }
+
+    /// Start a new home-directory tab whose PTY child is `tui`.
+    ///
+    /// The current tab keeps running. Preparation uses the same background
+    /// path as any other workspace, and the new tab is selected only when its
+    /// runtime is ready.
+    pub fn begin_tui_workspace(&mut self, tui: CompatibleTui) {
+        self.cancel_pending_start();
+        self.reset_ui_focus = true;
+        self.terminal_target = TerminalTarget::Tui(tui);
+        self.launch = WorkspaceLaunch::from_selection_with_home(
+            WorkspaceSelection::None,
+            made_platform::host_platform().home_dir(),
+        );
+        self.start_pending = true;
+        self.show_sessions = false;
     }
 
     /// Return from the picker to the selected running workspace.
@@ -282,6 +373,7 @@ impl AppModel {
         }
         self.cancel_pending_start();
         self.reset_ui_focus = true;
+        self.terminal_target = TerminalTarget::Shell;
         self.launch = WorkspaceLaunch::from_selection_with_home(
             WorkspaceSelection::None,
             made_platform::host_platform().home_dir(),
@@ -395,6 +487,7 @@ impl AppModel {
     pub fn confirm_picker(&mut self) -> Result<(), WorkspaceError> {
         self.cancel_pending_start();
         self.launch.confirm_picker()?;
+        self.terminal_target = TerminalTarget::Shell;
         self.start_pending = true;
         self.show_sessions = false;
         if let Some(workbench) = self.workbench_mut() {
@@ -407,6 +500,7 @@ impl AppModel {
     pub fn open_plan(&mut self, plan: LaunchPlan) {
         self.cancel_pending_start();
         self.launch.open_plan(plan);
+        self.terminal_target = TerminalTarget::Shell;
         self.start_pending = true;
         self.show_sessions = false;
         if let Some(workbench) = self.workbench_mut() {
@@ -485,12 +579,23 @@ impl AppModel {
         match &self.launch {
             WorkspaceLaunch::Ready(plan) => {
                 let cwd = plan.terminal_cwd().to_path_buf();
-                let workbench = Workbench::start(Some(plan.clone()), None, cwd, prepared_at);
+                let workbench = Workbench::start(
+                    Some(plan.clone()),
+                    None,
+                    cwd,
+                    self.terminal_target,
+                    prepared_at,
+                );
                 self.insert_workbench(workbench, source);
             }
             WorkspaceLaunch::TerminalFallback { error, cwd, .. } => {
-                let workbench =
-                    Workbench::start(None, Some(error.clone()), cwd.clone(), prepared_at);
+                let workbench = Workbench::start(
+                    None,
+                    Some(error.clone()),
+                    cwd.clone(),
+                    self.terminal_target,
+                    prepared_at,
+                );
                 self.insert_workbench(workbench, source);
             }
             WorkspaceLaunch::Picker { .. } => {}
@@ -524,6 +629,7 @@ impl AppModel {
         let generation = self.start_generation;
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let terminal_target = self.terminal_target;
         let prepared_at = Instant::now();
         let (sender, receiver) = mpsc::sync_channel(1);
         let spawn = thread::Builder::new()
@@ -532,7 +638,8 @@ impl AppModel {
                 if worker_cancel.load(Ordering::Acquire) {
                     return;
                 }
-                let mut workbench = Workbench::start(plan, launch_error, cwd, prepared_at);
+                let mut workbench =
+                    Workbench::start(plan, launch_error, cwd, terminal_target, prepared_at);
                 if worker_cancel.load(Ordering::Acquire) {
                     workbench.shutdown();
                     return;
@@ -604,8 +711,32 @@ impl AppModel {
         retire_preparation(pending.receiver);
     }
 
+    /// Adopt the background TUI detection result once it is ready.
+    ///
+    /// While the worker is pending, schedule another frame so an otherwise idle
+    /// window still updates its `+` menu. A disconnected worker leaves the
+    /// current (empty) list in place.
+    fn poll_compatible_tui_detection(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.compatible_tui_receiver.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(tuis) => {
+                self.compatible_tuis = tuis;
+                self.compatible_tui_receiver = None;
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.compatible_tui_receiver = None;
+            }
+        }
+    }
+
     /// Poll runtime work and drive the smoke run.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        self.poll_compatible_tui_detection(ctx);
         self.apply_focus_reset(ctx);
         self.poll_pending_start();
         self.begin_pending_start();

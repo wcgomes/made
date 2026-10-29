@@ -5,17 +5,26 @@ use eframe::egui;
 use made_app::app::{AppModel, AppOptions};
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{LaunchPlan, WorkspaceLaunch, WorkspaceSource};
+use made_app::TerminalTarget;
 use serde_json::{json, Value};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use tungstenite::{Message, WebSocket};
 
 fn isolated(name: &str) -> bool {
+    isolated_with_opencode_launches(name, 0)
+}
+
+/// Run `name` in an isolated child process with a fake `opencode` first on
+/// `PATH`, then assert the fake ran exactly `expected_opencode_launches` times.
+fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize) -> bool {
     if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
         return false;
     }
     let home = tempfile::tempdir().unwrap();
-    let sentinel = home.path().join("unexpected-opencode-launch");
+    let sentinel = home.path().join("opencode-launch");
+    let config_capture = home.path().join("opencode-config");
+    let cwd_capture = home.path().join("opencode-cwd");
     let bin = home.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let tmp = home.path().join("tmp");
@@ -45,11 +54,12 @@ fn isolated(name: &str) -> bool {
         .env("APPDATA", &roaming)
         .env("LOCALAPPDATA", &local);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
     if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
         let executable = bin.join("opencode");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf invoked > \"$MADE_OPENCODE_SENTINEL\"\nprintf '1.9.0\\n'\n",
+            "#!/bin/sh\nprintf 'invoked\\n' >> \"$MADE_OPENCODE_SENTINEL\"\nprintf '%s' \"$OPENCODE_CLI_CONFIG_CONTENT\" > \"$MADE_OPENCODE_CONFIG_CAPTURE\"\npwd > \"$MADE_OPENCODE_CWD_CAPTURE\"\nprintf '1.9.0\\n'\n",
         )
         .unwrap();
         assert!(std::process::Command::new("chmod")
@@ -62,6 +72,8 @@ fn isolated(name: &str) -> bool {
         let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
         command.env("PATH", std::env::join_paths(paths).unwrap());
         command.env("MADE_OPENCODE_SENTINEL", &sentinel);
+        command.env("MADE_OPENCODE_CONFIG_CAPTURE", &config_capture);
+        command.env("MADE_OPENCODE_CWD_CAPTURE", &cwd_capture);
         command.env("SHELL", "/bin/bash");
     }
     let output = command.output().unwrap();
@@ -71,11 +83,35 @@ fn isolated(name: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !sentinel.exists(),
-        "normal workspace use must never invoke OpenCode, even for --version"
-    );
+    let launches = std::fs::read_to_string(&sentinel)
+        .map(|content| content.lines().filter(|line| *line == "invoked").count())
+        .unwrap_or(0);
+    if expected_opencode_launches == 0 {
+        assert_eq!(
+            launches, 0,
+            "normal workspace use must never invoke OpenCode, even for --version"
+        );
+    } else {
+        assert_eq!(
+            launches, expected_opencode_launches,
+            "expected exactly {expected_opencode_launches} OpenCode launch(es)"
+        );
+    }
     true
+}
+
+#[cfg(unix)]
+fn wait_for_capture(path: &std::path::Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(content) if !content.is_empty() => return content,
+            _ if Instant::now() >= deadline => {
+                return std::fs::read_to_string(path).unwrap_or_default();
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 fn type_command(workbench: &mut made_app::Workbench, command: &str) {
@@ -1295,7 +1331,8 @@ fn shutdown_diagnostics_preserve_workspace_capability_versions_and_metrics() {
     std::fs::create_dir(&workspace).unwrap();
     let plan = LaunchPlan::open(&workspace, WorkspaceSource::Picker).unwrap();
     let cwd = plan.terminal_cwd().to_path_buf();
-    let mut workbench = made_app::Workbench::start(Some(plan), None, cwd, Instant::now());
+    let mut workbench =
+        made_app::Workbench::start(Some(plan), None, cwd, TerminalTarget::Shell, Instant::now());
 
     let identity = workbench.pane_id().to_owned();
     let shell_cwd = workbench.shell_cwd().to_path_buf();
@@ -1919,6 +1956,7 @@ fn oversized_user_config_is_skipped_without_blocking_workspace_start() {
         Some(plan),
         None,
         workspace.path().to_path_buf(),
+        TerminalTarget::Shell,
         Instant::now(),
     );
     assert!(
@@ -1955,7 +1993,13 @@ fn special_user_config_is_rejected_without_blocking_workspace_start() {
     let cwd = workspace.path().to_path_buf();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let workbench = made_app::Workbench::start(Some(plan), None, cwd, Instant::now());
+        let workbench = made_app::Workbench::start(
+            Some(plan),
+            None,
+            cwd,
+            TerminalTarget::Shell,
+            Instant::now(),
+        );
         let _ = sender.send(workbench);
     });
     let mut workbench = receiver
@@ -1965,5 +2009,77 @@ fn special_user_config_is_rejected_without_blocking_workspace_start() {
     assert!(failure.contains("not a regular file"), "{failure}");
     assert!(failure.contains("skipped without reading"), "{failure}");
     assert!(workbench.terminal().is_some(), "the shell stays usable");
+    workbench.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_terminal_target_spawns_opencode_with_composed_config_in_the_isolated_home() {
+    if isolated_with_opencode_launches(
+        "tui_terminal_target_spawns_opencode_with_composed_config_in_the_isolated_home",
+        1,
+    ) {
+        return;
+    }
+    use made_platform::Platform;
+
+    let home = made_platform::host_platform()
+        .home_dir()
+        .expect("test home")
+        .canonicalize()
+        .expect("canonical test home");
+    let config_capture = PathBuf::from(
+        std::env::var_os("MADE_OPENCODE_CONFIG_CAPTURE").expect("config capture path"),
+    );
+    let cwd_capture =
+        PathBuf::from(std::env::var_os("MADE_OPENCODE_CWD_CAPTURE").expect("cwd capture path"));
+
+    let mut workbench = made_app::Workbench::start(
+        None,
+        None,
+        home.clone(),
+        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        Instant::now(),
+    );
+    assert_eq!(
+        workbench.terminal_target(),
+        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode)
+    );
+
+    let config = wait_for_capture(&config_capture);
+    let config: Value = serde_json::from_str(&config).expect("captured config must be JSON");
+    let options = config["plugins"]
+        .as_array()
+        .expect("composed config must contain a plugins array")
+        .iter()
+        .find_map(|entry| entry.get("options")?.get("made").cloned())
+        .expect("composed config must contain Made plugin options");
+    let options = options
+        .as_object()
+        .expect("Made plugin options must be an object");
+    assert!(
+        !options.is_empty(),
+        "Made plugin options must be a non-empty object"
+    );
+    assert!(
+        options.get("bridgeUrl").is_some_and(Value::is_string),
+        "missing bridgeUrl"
+    );
+    assert!(
+        options.get("token").is_some_and(Value::is_string),
+        "missing token"
+    );
+    assert!(
+        options.get("paneId").is_some_and(Value::is_string),
+        "missing paneId"
+    );
+
+    let cwd = wait_for_capture(&cwd_capture);
+    assert_eq!(
+        std::fs::canonicalize(cwd.trim()).expect("captured cwd must exist"),
+        home,
+        "the TUI child must start in the isolated home"
+    );
+
     workbench.shutdown();
 }

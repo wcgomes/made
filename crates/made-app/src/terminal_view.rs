@@ -25,6 +25,7 @@ use crate::render::{
     CellPoint, GridPalette, GridRenderer, PaintOptions, SelectionRange, SCROLLBAR_WIDTH,
     TERMINAL_PADDING,
 };
+use crate::tui::TerminalTarget;
 
 /// Maximum PTY events drained per frame.
 const MAX_PTY_EVENTS_PER_FRAME: usize = 128;
@@ -136,6 +137,8 @@ pub struct TerminalPane {
     core: TerminalCore,
     pty: Option<PtyProcess>,
     options: PtyOptions,
+    /// Program this pane runs; names the exit overlay and restart copy.
+    target: TerminalTarget,
     encoder: InputEncoder,
     renderer: GridRenderer,
     font_size: f32,
@@ -197,6 +200,7 @@ impl TerminalPane {
             core,
             pty: Some(pty),
             options,
+            target: TerminalTarget::Shell,
             encoder,
             renderer: GridRenderer::new(CellMetrics::default()),
             font_size: crate::render::DEFAULT_FONT_SIZE,
@@ -232,6 +236,12 @@ impl TerminalPane {
         pane.encoder.set_modes(pane.core.input_modes());
         pane.core.clear_selection();
         Ok(pane)
+    }
+
+    /// Name the program this pane runs in its exit overlay and restart copy.
+    pub fn with_target(mut self, target: TerminalTarget) -> Self {
+        self.target = target;
+        self
     }
 
     /// Current child process id.
@@ -750,7 +760,10 @@ impl TerminalPane {
         self.title = None;
         self.cwd = None;
         self.renderer.invalidate_all();
-        log.record(LogLevel::Info, "terminal shell relaunched");
+        log.record(
+            LogLevel::Info,
+            format!("terminal {} relaunched", self.target.log_label()),
+        );
         Ok(())
     }
 
@@ -1296,14 +1309,15 @@ impl TerminalPane {
     }
 
     fn paint_shell_state(&mut self, ui: &mut Ui, grid_rect: Rect, output: &mut TerminalUiOutput) {
+        let label = self.target.program_label();
         let message = if let Some(error) = &self.monitor_error {
-            Some(format!("Shell monitor failed: {error}"))
+            Some(format!("{label} monitor failed: {error}"))
         } else if let Some(error) = &self.read_error {
-            Some(format!("Shell output failed: {error}"))
+            Some(format!("{label} output failed: {error}"))
         } else if let Some(exit) = &self.exit {
-            Some(format!("Shell exited ({exit})."))
+            Some(format!("{label} exited ({exit})."))
         } else if self.eof {
-            Some("Shell output closed.".to_owned())
+            Some(format!("{label} output closed."))
         } else {
             None
         };
@@ -1354,7 +1368,7 @@ impl TerminalPane {
             .put(
                 button_rect,
                 egui::Button::new(
-                    egui::RichText::new("Restart shell")
+                    egui::RichText::new(self.target.restart_label())
                         .font(egui::FontId::proportional(11.5))
                         .color(crate::theme::WARNING),
                 )

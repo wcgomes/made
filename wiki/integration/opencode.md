@@ -1,13 +1,20 @@
 # OpenCode Bridge
 
-Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches or manages OpenCode: the user runs `opencode` in a Made terminal, and the plugin loads from configuration injected into that shell. The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
+Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches OpenCode automatically: the user runs `opencode` in a Made terminal, or explicitly chooses OpenCode from the `+` menu when it is detected on `PATH`, and the plugin loads from configuration injected into the terminal process (the user shell or a directly launched OpenCode TUI). The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
+
+## Launching from Made
+
+`made-platform::detect_compatible_tuis` performs a metadata-only `PATH` lookup on a background thread started at launch. It never spawns the program, verifies its version, or waits for a service, and empty or relative `PATH` segments are ignored rather than resolved against the current directory. Shell and explorer startup never depend on the result.
+
+When `opencode` is detected, the `+` control opens a menu with `Terminal` first and `OpenCode` second. `Terminal` runs the existing add-workspace picker flow. `OpenCode` starts `opencode` directly as the PTY child of a new home-directory tab — no shell first and no picker — while the current tab keeps running. The launched process is the absolute path that the same lookup finds, never the bare name `opencode`, so an empty or relative `PATH` segment cannot change which executable runs. With no detected TUI, `+` opens the folder picker directly.
+
 
 ## Topology
 
 ```text
 Made workspace tab
   terminal PTY
-    user runs `opencode`
+    user runs `opencode` (or the `+` menu starts it directly)
       OpenCode v2 TUI + app-owned plugin
         ws://127.0.0.1:<ephemeral>/made
           made-bridge (one listener per tab)
