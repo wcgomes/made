@@ -1921,39 +1921,6 @@ impl Workbench {
             });
     }
 
-    fn workspace_diagnostics(&self) -> crate::diagnostics::WorkspaceDiagnostics {
-        let label = self
-            .plan
-            .as_ref()
-            .map(|plan| plan.workspace.display_name().to_owned())
-            .unwrap_or_else(|| "Workspace unavailable".to_owned());
-        let path = self
-            .plan
-            .as_ref()
-            .map(|plan| plan.workspace.path().to_path_buf());
-        let capability = self.shell_cwd_capability();
-        crate::diagnostics::WorkspaceDiagnostics {
-            identity: self.pane_id().to_owned(),
-            label,
-            path,
-            shell_cwd: Some(self.shell_cwd().to_path_buf()),
-            cwd_supported: capability.map(made_platform::ShellCwdCapability::is_supported),
-            cwd_reason: capability.map(|capability| capability.reason.clone()),
-            root_source: Some(self.root_source().to_owned()),
-            watcher: self.explorer.as_ref().map(|explorer| {
-                if explorer.has_watcher() {
-                    "live".to_owned()
-                } else if let Some(error) = explorer.watcher_error() {
-                    format!("unavailable: {}", sanitize_display(error, 300))
-                } else if explorer.watcher_loading() {
-                    "starting".to_owned()
-                } else {
-                    "unavailable".to_owned()
-                }
-            }),
-        }
-    }
-
     fn diagnostics_signature(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.pane_id().hash(&mut hasher);
@@ -1970,6 +1937,15 @@ impl Workbench {
         self.integration.active_session_title().hash(&mut hasher);
         self.shell_cwd().hash(&mut hasher);
         self.root_source().hash(&mut hasher);
+        if let Some(view) = self
+            .follow
+            .as_ref()
+            .and_then(|follow| follow.view_directory())
+        {
+            view.directory().hash(&mut hasher);
+            view.available.hash(&mut hasher);
+            view.reason.hash(&mut hasher);
+        }
         self.explorer_root().hash(&mut hasher);
         if let Some(worktree) = self.worktree() {
             worktree.status.label().hash(&mut hasher);
@@ -2000,8 +1976,9 @@ impl Workbench {
                 return cache;
             }
         }
-        let mut snapshot = self.diagnostics_snapshot();
-        snapshot.attach_workspace(self.workspace_diagnostics());
+        // `diagnostics_snapshot` already attaches the selected workspace
+        // context through `workspace_diagnostics_context`.
+        let snapshot = self.diagnostics_snapshot();
         let bridge_stats = self
             .bridge
             .as_ref()
@@ -2218,6 +2195,25 @@ impl Workbench {
                                         .root_source
                                         .clone()
                                         .unwrap_or_else(|| "unknown".to_owned()),
+                                ),
+                                (
+                                    "View directory",
+                                    match (
+                                        &snapshot.view_directory,
+                                        snapshot.view_directory_available,
+                                    ) {
+                                        (Some(path), Some(false)) => format!(
+                                            "{} (unavailable{})",
+                                            path.display(),
+                                            snapshot
+                                                .view_directory_reason
+                                                .as_ref()
+                                                .map(|reason| format!(": {reason}"))
+                                                .unwrap_or_default()
+                                        ),
+                                        (Some(path), _) => path.display().to_string(),
+                                        (None, _) => "none".to_owned(),
+                                    },
                                 ),
                                 (
                                     "Watcher",

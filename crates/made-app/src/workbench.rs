@@ -767,13 +767,11 @@ impl Workbench {
     pub fn config_failure(&self) -> Option<&str> {
         self.config_failure.as_deref()
     }
-    /// Whether the effective tree is currently owned by an active session.
+    /// Whether the effective tree is currently owned by OpenCode.
     pub fn root_source(&self) -> &'static str {
-        if self.active_session().is_some() {
-            "opencode"
-        } else {
-            "shell"
-        }
+        self.follow
+            .as_ref()
+            .map_or("shell", |follow| follow.effective_root_source().as_str())
     }
     /// Reporting capability delegated from the owning live PTY.
     ///
@@ -1278,7 +1276,7 @@ impl Workbench {
                         let shell_owns_root = self
                             .follow
                             .as_ref()
-                            .is_none_or(|follow| follow.active_session().is_none());
+                            .is_none_or(|follow| !follow.is_agent_owned());
                         if shell_owns_root {
                             self.invalidate_preview_for_unavailable_root(detail);
                         }
@@ -1377,7 +1375,7 @@ impl Workbench {
         self.shell_root_check_in_flight = false;
 
         let shell_authoritative = self.follow.as_ref().is_some_and(|follow| {
-            follow.active_session().is_none() && follow.generation() == result.generation
+            !follow.is_agent_owned() && follow.generation() == result.generation
         });
         if !shell_authoritative || self.explorer_root() != Some(result.path.as_path()) {
             return;
@@ -1431,7 +1429,7 @@ impl Workbench {
         let Some(follow) = self.follow.as_ref() else {
             return;
         };
-        if follow.active_session().is_some() {
+        if follow.is_agent_owned() {
             return;
         }
         if now.saturating_duration_since(self.shell_root_checked_at)
@@ -1683,6 +1681,50 @@ impl Workbench {
                     // refresh the read-only header metadata.
                     self.request_worktree(outcome.root.clone(), outcome.generation);
                 }
+            }
+            SessionFollowUpdate::ViewDirectory => {
+                self.shell_root_unavailable = None;
+                if let Some(explorer) = self.explorer.as_mut() {
+                    explorer.clear_root_unavailable();
+                }
+                self.integration.note_root(&outcome.root);
+                if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+                    let view = self
+                        .follow
+                        .as_ref()
+                        .and_then(SessionFollowCoordinator::view_directory)
+                        .map(|view| view.directory().display().to_string());
+                    self.switch_root(
+                        outcome.root.clone(),
+                        outcome.generation,
+                        RootSwitchOrigin::Session,
+                    );
+                    if let Some(view) = view {
+                        self.diag.log_mut().push(LogEntry::new(
+                            LogLevel::Info,
+                            format!("view directory followed: {view}"),
+                        ));
+                    }
+                }
+            }
+            SessionFollowUpdate::ViewDirectoryUnavailable { directory, detail } => {
+                self.diag.log_mut().push(LogEntry::new(
+                    LogLevel::Warn,
+                    format!(
+                        "view directory unavailable at {}: {detail}",
+                        directory.display()
+                    ),
+                ));
+                if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+                    self.switch_root(
+                        outcome.root.clone(),
+                        outcome.generation,
+                        RootSwitchOrigin::Session,
+                    );
+                }
+                // A reported but unusable view directory falls back to the
+                // shell root without presenting an unavailable-root tree.
+                self.settle_no_active_root(&outcome.root);
             }
             SessionFollowUpdate::ActiveDirectoryUnavailable {
                 session_id, detail, ..
@@ -2048,6 +2090,18 @@ impl Workbench {
             .as_ref()
             .map(|plan| plan.workspace.path().to_path_buf());
         let capability = self.shell_cwd_capability();
+        let (view_directory, view_directory_available, view_directory_reason) = self
+            .follow
+            .as_ref()
+            .and_then(|follow| follow.view_directory())
+            .map(|view| {
+                (
+                    Some(view.directory().to_path_buf()),
+                    Some(view.available),
+                    view.reason.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
         WorkspaceDiagnostics {
             identity: self.pane_id.clone(),
             label,
@@ -2067,6 +2121,9 @@ impl Workbench {
                     "unavailable".to_owned()
                 }
             }),
+            view_directory,
+            view_directory_available,
+            view_directory_reason,
         }
     }
 

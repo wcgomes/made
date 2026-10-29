@@ -52,6 +52,7 @@ fn snapshot(active: Option<&str>, tabs_enabled: bool) -> SessionSnapshot {
         revision: 1,
         active_session_id: active.map(str::to_owned),
         tabs_enabled,
+        view_directory: None,
         sessions,
     }
 }

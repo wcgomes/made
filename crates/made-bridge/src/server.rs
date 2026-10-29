@@ -1940,16 +1940,15 @@ fn redact_snapshot(mut snapshot: SessionSnapshot, token: &Token) -> SessionSnaps
     if let Some(active_id) = &mut snapshot.active_session_id {
         redact_in_place(active_id, token);
     }
+    if let Some(view_directory) = &mut snapshot.view_directory {
+        redact_path(view_directory, token);
+    }
     for session in &mut snapshot.sessions {
         redact_in_place(&mut session.session_id, token);
         redact_in_place(&mut session.title, token);
 
-        if let Some(directory) = &session.directory {
-            let display = directory.to_string_lossy();
-            let secret = token.expose_secret();
-            if !secret.is_empty() && display.contains(secret) {
-                session.directory = Some(PathBuf::from(display.replace(secret, REDACTED)));
-            }
+        if let Some(directory) = &mut session.directory {
+            redact_path(directory, token);
         }
         if let Some(subpath) = &mut session.subpath {
             redact_in_place(subpath, token);
@@ -1959,6 +1958,14 @@ fn redact_snapshot(mut snapshot: SessionSnapshot, token: &Token) -> SessionSnaps
         }
     }
     snapshot
+}
+
+fn redact_path(path: &mut PathBuf, token: &Token) {
+    let display = path.to_string_lossy();
+    let secret = token.expose_secret();
+    if !secret.is_empty() && display.contains(secret) {
+        *path = PathBuf::from(display.replace(secret, REDACTED));
+    }
 }
 
 fn redact_in_place(value: &mut String, token: &Token) {

@@ -33,6 +33,10 @@ pub struct SessionSnapshot {
     pub active_session_id: Option<String>,
     /// Whether OpenCode reports that session tabs are available.
     pub tabs_enabled: bool,
+    /// Optional absolute view directory selected in OpenCode's Home/new-session
+    /// view. Additive within protocol major 1.
+    #[serde(default)]
+    pub view_directory: Option<PathBuf>,
     /// Open root-session tabs.
     pub sessions: Vec<SessionInfo>,
 }
@@ -169,6 +173,26 @@ pub enum SnapshotError {
         /// Index in the session array.
         index: usize,
     },
+    /// `viewDirectory` was present but empty.
+    #[error("viewDirectory is empty")]
+    EmptyViewDirectory,
+    /// `viewDirectory` was not absolute.
+    #[error("viewDirectory is not absolute")]
+    ViewDirectoryNotAbsolute,
+    /// `viewDirectory` contained a NUL character.
+    #[error("viewDirectory contains a NUL character")]
+    NulInViewDirectory,
+    /// `viewDirectory` contained a `.` or `..` segment.
+    #[error("viewDirectory contains a traversal segment")]
+    ViewDirectoryTraversal,
+    /// `viewDirectory` was longer than [`MAX_PATH_CHARS`].
+    #[error("viewDirectory is {length} characters; the maximum is {max}")]
+    ViewDirectoryTooLong {
+        /// Observed length in characters.
+        length: usize,
+        /// Maximum permitted length.
+        max: usize,
+    },
     /// A project identifier was longer than [`MAX_PROJECT_ID_CHARS`].
     #[error("session at index {index} projectID is {length} characters; the maximum is {max}")]
     ProjectIdTooLong {
@@ -223,7 +247,8 @@ impl SessionSnapshot {
     /// free of NUL characters. Directory and subpath are at most
     /// [`MAX_PATH_CHARS`] characters; `projectID` is at most
     /// [`MAX_PROJECT_ID_CHARS`]. Paths containing `.` or `..` segments are
-    /// rejected.
+    /// rejected. An optional `viewDirectory` is validated like a session
+    /// directory as defense-in-depth against malformed state.
     ///
     /// At most one session may be marked active. When `activeSessionID` is
     /// present it must name that session, and when a session is marked active
@@ -238,6 +263,9 @@ impl SessionSnapshot {
                 count: self.sessions.len(),
                 max: MAX_SESSIONS,
             });
+        }
+        if let Some(view_directory) = &self.view_directory {
+            validate_view_directory(view_directory)?;
         }
 
         let mut seen = HashSet::with_capacity(self.sessions.len());
@@ -358,6 +386,34 @@ fn validate_directory(index: usize, path: &Path) -> Result<(), SnapshotError> {
             index,
             field: "directory",
         });
+    }
+    Ok(())
+}
+
+fn validate_view_directory(path: &Path) -> Result<(), SnapshotError> {
+    let raw = path.to_string_lossy();
+    let length = raw.chars().count();
+    if length > MAX_PATH_CHARS {
+        return Err(SnapshotError::ViewDirectoryTooLong {
+            length,
+            max: MAX_PATH_CHARS,
+        });
+    }
+    if path.as_os_str().is_empty() {
+        return Err(SnapshotError::EmptyViewDirectory);
+    }
+    if raw.contains('\0') {
+        return Err(SnapshotError::NulInViewDirectory);
+    }
+    if !path.is_absolute() {
+        return Err(SnapshotError::ViewDirectoryNotAbsolute);
+    }
+    if has_dot_segment(&raw)
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(SnapshotError::ViewDirectoryTraversal);
     }
     Ok(())
 }

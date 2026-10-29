@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use made_bridge::{
     protocol::StateMessage,
-    security::MAX_PATH_CHARS,
+    security::{MAX_MESSAGE_BYTES, MAX_PATH_CHARS},
     state::{SessionInfo, SessionSnapshot, SnapshotError, SnapshotTracker, MAX_PROJECT_ID_CHARS},
 };
 use serde_json::json;
@@ -51,8 +51,23 @@ fn snapshot(revision: u64, sessions: Vec<SessionInfo>) -> SessionSnapshot {
         revision,
         active_session_id: None,
         tabs_enabled: true,
+        view_directory: None,
         sessions,
     }
+}
+
+fn state_with_view(view: serde_json::Value) -> SessionSnapshot {
+    let wire = json!({
+        "type": "state",
+        "revision": 1,
+        "activeSessionID": null,
+        "tabsEnabled": true,
+        "sessions": [],
+        "viewDirectory": view
+    });
+    serde_json::from_value::<StateMessage>(wire)
+        .expect("state parses")
+        .into_snapshot()
 }
 
 #[test]
@@ -308,6 +323,92 @@ fn wire_field_names_match_the_production_plugin() {
         Some("project-1")
     );
     assert!(snapshot.validate().is_ok());
+}
+
+#[test]
+fn view_directory_is_optional_nullable_and_wire_named() {
+    let directory = absolute_test_path("view-directory")
+        .to_string_lossy()
+        .into_owned();
+
+    let snapshot = state_with_view(json!(directory));
+    assert!(snapshot.validate().is_ok());
+    let wire = serde_json::to_value(StateMessage::new(snapshot)).expect("serializes");
+    assert_eq!(wire["viewDirectory"], directory);
+
+    let absent = serde_json::from_value::<StateMessage>(json!({
+        "type": "state",
+        "revision": 1,
+        "activeSessionID": null,
+        "tabsEnabled": true,
+        "sessions": []
+    }))
+    .expect("state without a view directory parses")
+    .into_snapshot();
+    assert!(absent.validate().is_ok());
+    let wire = serde_json::to_value(StateMessage::new(absent)).expect("serializes");
+    assert!(
+        wire.get("viewDirectory").is_some(),
+        "viewDirectory must stay additive and explicit on the wire"
+    );
+    assert_eq!(wire["viewDirectory"], serde_json::Value::Null);
+
+    let null = state_with_view(serde_json::Value::Null);
+    assert!(null.validate().is_ok());
+    let wire = serde_json::to_value(StateMessage::new(null)).expect("serializes");
+    assert_eq!(wire["viewDirectory"], serde_json::Value::Null);
+}
+
+#[test]
+fn view_directory_must_be_absolute_nonempty_nul_free_and_without_traversal() {
+    for (value, expected) in [
+        (json!(""), "empty"),
+        (json!("relative/view"), "absolute"),
+        (
+            json!(format!("{}\0view", std::env::temp_dir().display())),
+            "nul",
+        ),
+        (
+            json!(absolute_traversal_paths()[0].to_string_lossy()),
+            "traversal",
+        ),
+    ] {
+        let error = state_with_view(value)
+            .validate()
+            .expect_err("invalid view directory must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("viewDirectory"),
+            "view-directory-specific reason expected: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains(expected),
+            "missing {expected:?} in {message}"
+        );
+    }
+
+    let error = state_with_view(json!(
+        absolute_path_with_len(MAX_PATH_CHARS + 1).to_string_lossy()
+    ))
+    .validate()
+    .expect_err("oversized view directory must be rejected");
+    assert!(
+        error.to_string().contains("viewDirectory"),
+        "view-directory-specific reason expected: {error}"
+    );
+    assert!(error
+        .to_string()
+        .contains(&(MAX_PATH_CHARS + 1).to_string()));
+
+    let max = state_with_view(json!(
+        absolute_path_with_len(MAX_PATH_CHARS).to_string_lossy()
+    ));
+    assert!(max.validate().is_ok());
+    let wire = serde_json::to_vec(&StateMessage::new(max)).expect("serializes");
+    assert!(
+        wire.len() < MAX_MESSAGE_BYTES,
+        "a maximum-length view directory must fit the message limit"
+    );
 }
 
 #[test]

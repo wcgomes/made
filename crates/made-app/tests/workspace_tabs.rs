@@ -183,6 +183,19 @@ fn state(socket: &mut WebSocket<TcpStream>, revision: u64, directory: &std::path
     );
 }
 
+fn state_with_view(
+    socket: &mut WebSocket<TcpStream>,
+    revision: u64,
+    view: Option<&std::path::Path>,
+) {
+    send(
+        socket,
+        json!({"type":"state", "revision":revision, "activeSessionID":null, "tabsEnabled":true,
+        "sessions":[],
+        "viewDirectory": view.map(|path| path.to_string_lossy().into_owned())}),
+    );
+}
+
 fn pump_until(model: &mut AppModel, ctx: &egui::Context, predicate: impl Fn(&AppModel) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !predicate(model) && Instant::now() < deadline {
@@ -344,6 +357,220 @@ fn real_bridges_keep_state_focus_epochs_and_late_deliveries_tab_local() {
 fn open(model: &mut AppModel, path: &std::path::Path) {
     model.open_plan(LaunchPlan::open(path, WorkspaceSource::Picker).unwrap());
     model.ensure_workbench();
+}
+
+#[test]
+fn view_directory_follow_switches_root_invalidates_preview_and_reports_source() {
+    if isolated("view_directory_follow_switches_root_invalidates_preview_and_reports_source") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    let view = root.join("view");
+    let missing = root.join("missing-view");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(&view).unwrap();
+    let preview_file = workspace.join("preview.txt");
+    std::fs::write(&preview_file, "previewed content\n").unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let ctx = egui::Context::default();
+    open(&mut model, &workspace);
+
+    let config = credentials(model.workbench().unwrap());
+    let mut socket = connect(&config);
+    state(&mut socket, 1, &workspace);
+    pump_until(&mut model, &ctx, |model| {
+        model.workbench().unwrap().root_source() == "opencode"
+    });
+    assert_eq!(
+        model.workbench().unwrap().explorer_root(),
+        Some(workspace.as_path())
+    );
+
+    model
+        .workbench_mut()
+        .unwrap()
+        .explorer_mut()
+        .unwrap()
+        .open_preview(preview_file);
+    pump_until(&mut model, &ctx, |model| {
+        model
+            .workbench()
+            .unwrap()
+            .explorer()
+            .unwrap()
+            .preview_document()
+            .is_some()
+    });
+
+    // A connected view directory replaces the shell root once the session is
+    // gone and invalidates preview work for the previous root.
+    state_with_view(&mut socket, 2, Some(&view));
+    pump_until(&mut model, &ctx, |model| {
+        model.workbench().unwrap().explorer_root() == Some(view.as_path())
+    });
+    {
+        let workbench = model.workbench().unwrap();
+        assert_eq!(workbench.root_source(), "opencode");
+        assert!(
+            workbench.explorer().unwrap().preview_document().is_none(),
+            "the preview for the previous root is invalidated"
+        );
+        let diagnostics = workbench.diagnostics_snapshot();
+        assert_eq!(diagnostics.status, made_app::IntegrationStatus::Connected);
+        assert_eq!(diagnostics.status_label, "connected");
+        assert_eq!(diagnostics.active_session_id, None);
+        assert_eq!(diagnostics.active_session_title, None);
+        assert_eq!(diagnostics.active_root.as_deref(), Some(view.as_path()));
+        assert_eq!(diagnostics.root_source.as_deref(), Some("opencode"));
+        assert_eq!(diagnostics.view_directory.as_deref(), Some(view.as_path()));
+        assert_eq!(diagnostics.view_directory_available, Some(true));
+        assert_eq!(diagnostics.view_directory_reason, None);
+        assert!(diagnostics.tabs_enabled);
+        assert_eq!(diagnostics.plugin_version.as_deref(), Some("test"));
+        assert_eq!(diagnostics.opencode_version.as_deref(), Some("2.1.4"));
+        assert_eq!(diagnostics.protocol_version, Some(1));
+        let text = diagnostics.to_text();
+        for expected in [
+            "status: connected",
+            "active session: none",
+            "root source: opencode",
+            "view directory available: yes",
+            "plugin version: test",
+            "opencode version: 2.1.4",
+            "protocol version: 1",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+    }
+
+    // An unavailable view directory falls back to the shell root without
+    // presenting an unavailable-root tree, and keeps the reason.
+    let shell_fallback = model.workbench().unwrap().shell_cwd().to_path_buf();
+    state_with_view(&mut socket, 3, Some(&missing));
+    pump_until(&mut model, &ctx, |model| {
+        model.workbench().unwrap().explorer_root() == Some(shell_fallback.as_path())
+    });
+    {
+        let workbench = model.workbench().unwrap();
+        assert_eq!(workbench.root_source(), "shell");
+        assert_eq!(workbench.explorer().unwrap().root_unavailable(), None);
+        let diagnostics = workbench.workspace_diagnostics_context();
+        assert_eq!(
+            diagnostics.view_directory.as_deref(),
+            Some(missing.as_path())
+        );
+        assert_eq!(diagnostics.view_directory_available, Some(false));
+        assert!(diagnostics
+            .view_directory_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()));
+    }
+
+    // Recovery switches to the view root again.
+    state_with_view(&mut socket, 4, Some(&view));
+    pump_until(&mut model, &ctx, |model| {
+        model.workbench().unwrap().explorer_root() == Some(view.as_path())
+    });
+
+    send(
+        &mut socket,
+        json!({"type":"goodbye", "reason":"normal exit"}),
+    );
+    pump_until(&mut model, &ctx, |model| {
+        model.workbench().unwrap().explorer_root() == Some(shell_fallback.as_path())
+    });
+    let workbench = model.workbench().unwrap();
+    assert_eq!(workbench.root_source(), "shell");
+    assert_eq!(
+        workbench.workspace_diagnostics_context().view_directory,
+        None
+    );
+}
+
+#[test]
+fn view_directories_stay_isolated_across_live_workspaces() {
+    if isolated("view_directories_stay_isolated_across_live_workspaces") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    let first_view = root.join("first-view");
+    let second_view = root.join("second-view");
+    for path in [&first, &second, &first_view, &second_view] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let ctx = egui::Context::default();
+    open(&mut model, &first);
+    let first_id = model.active_workspace_id().unwrap();
+    open(&mut model, &second);
+    let second_id = model.active_workspace_id().unwrap();
+    assert_ne!(first_id, second_id);
+
+    let first_config = credentials(model.workspace(first_id).unwrap());
+    let second_config = credentials(model.workspace(second_id).unwrap());
+    let mut first_socket = connect(&first_config);
+    let mut second_socket = connect(&second_config);
+    state_with_view(&mut first_socket, 1, Some(&first_view));
+    state_with_view(&mut second_socket, 1, Some(&second_view));
+    pump_until(&mut model, &ctx, |model| {
+        model.workspace(first_id).unwrap().explorer_root() == Some(first_view.as_path())
+            && model.workspace(second_id).unwrap().explorer_root() == Some(second_view.as_path())
+    });
+
+    for (id, view) in [
+        (first_id, first_view.as_path()),
+        (second_id, second_view.as_path()),
+    ] {
+        let workbench = model.workspace(id).unwrap();
+        assert_eq!(workbench.root_source(), "opencode");
+        let diagnostics = workbench.diagnostics_snapshot();
+        assert_eq!(diagnostics.status_label, "connected");
+        assert_eq!(diagnostics.active_session_id, None);
+        assert_eq!(diagnostics.active_root.as_deref(), Some(view));
+        assert_eq!(diagnostics.root_source.as_deref(), Some("opencode"));
+        assert_eq!(diagnostics.view_directory.as_deref(), Some(view));
+        assert_eq!(diagnostics.view_directory_available, Some(true));
+    }
+
+    // Closing one workbench must not clear or change the other's view state.
+    assert!(model.close_workspace(first_id));
+    assert!(model.workspace(first_id).is_none());
+    {
+        let workbench = model.workspace(second_id).unwrap();
+        assert_eq!(
+            workbench.explorer_root(),
+            Some(second_view.as_path()),
+            "the surviving workspace keeps its own view root"
+        );
+        assert_eq!(workbench.root_source(), "opencode");
+        let diagnostics = workbench.diagnostics_snapshot();
+        assert_eq!(
+            diagnostics.view_directory.as_deref(),
+            Some(second_view.as_path())
+        );
+        assert_eq!(diagnostics.view_directory_available, Some(true));
+        assert_eq!(diagnostics.root_source.as_deref(), Some("opencode"));
+    }
+
+    // The surviving bridge connection still accepts its own view state.
+    state_with_view(&mut second_socket, 2, Some(&second_view));
+    pump_until(&mut model, &ctx, |model| {
+        model.workspace(second_id).unwrap().explorer_root() == Some(second_view.as_path())
+    });
+    assert_eq!(
+        model
+            .workspace(second_id)
+            .unwrap()
+            .diagnostics_snapshot()
+            .view_directory
+            .as_deref(),
+        Some(second_view.as_path())
+    );
 }
 
 #[test]

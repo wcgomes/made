@@ -30,6 +30,7 @@ fn snapshot(active: Option<&str>, sessions: Vec<SessionInfo>) -> SessionSnapshot
         revision: 1,
         active_session_id: active.map(str::to_owned),
         tabs_enabled: true,
+        view_directory: None,
         sessions,
     }
 }
@@ -198,6 +199,7 @@ fn duplicate_active_flags_never_produce_two_markers() {
         revision: 1,
         active_session_id: None,
         tabs_enabled: true,
+        view_directory: None,
         sessions: vec![first, second],
     });
 

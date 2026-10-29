@@ -487,6 +487,9 @@ impl Diagnostics {
             cwd_reason: None,
             root_source: None,
             watcher: None,
+            view_directory: None,
+            view_directory_available: None,
+            view_directory_reason: None,
             active_session_id,
             active_session_title,
             active_subpath,
@@ -568,6 +571,12 @@ pub struct WorkspaceDiagnostics {
     pub root_source: Option<String>,
     /// Explorer watcher state/reason.
     pub watcher: Option<String>,
+    /// Connected OpenCode view directory, when one is reported.
+    pub view_directory: Option<PathBuf>,
+    /// Whether the reported view directory exists and is readable.
+    pub view_directory_available: Option<bool>,
+    /// Why the reported view directory cannot be used.
+    pub view_directory_reason: Option<String>,
 }
 
 /// Immutable diagnostics data consumed by the panel.
@@ -597,6 +606,12 @@ pub struct DiagnosticsSnapshot {
     pub root_source: Option<String>,
     /// Explorer watcher state/reason.
     pub watcher: Option<String>,
+    /// Connected OpenCode view directory, when reported.
+    pub view_directory: Option<PathBuf>,
+    /// Whether the reported view directory is usable.
+    pub view_directory_available: Option<bool>,
+    /// Why the reported view directory cannot be used.
+    pub view_directory_reason: Option<String>,
     /// Active session identifier.
     pub active_session_id: Option<String>,
     /// Active session title.
@@ -669,6 +684,15 @@ impl DiagnosticsSnapshot {
         self.watcher = workspace
             .watcher
             .map(|watcher| sanitize_log_text(&redact_hex_secrets(&watcher)));
+        self.view_directory = workspace.view_directory.map(|path| {
+            PathBuf::from(sanitize_log_text(&redact_hex_secrets(
+                &path.to_string_lossy(),
+            )))
+        });
+        self.view_directory_available = workspace.view_directory_available;
+        self.view_directory_reason = workspace
+            .view_directory_reason
+            .map(|reason| sanitize_log_text(&redact_hex_secrets(&reason)));
     }
 
     /// Human-readable report suitable for copying into a bug report.
@@ -709,6 +733,25 @@ impl DiagnosticsSnapshot {
         }
         if let Some(watcher) = &self.watcher {
             push_line(&mut text, "watcher", watcher);
+        }
+        push_line(
+            &mut text,
+            "view directory",
+            &self
+                .view_directory
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+        );
+        if let Some(available) = self.view_directory_available {
+            push_line(
+                &mut text,
+                "view directory available",
+                if available { "yes" } else { "no" },
+            );
+        }
+        if let Some(reason) = &self.view_directory_reason {
+            push_line(&mut text, "view directory reason", reason);
         }
         push_line(
             &mut text,

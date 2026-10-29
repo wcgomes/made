@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use made_app::session_follow::{FollowedSession, SessionFollowCoordinator, SessionFollowUpdate};
+use made_app::session_follow::{
+    FollowedSession, RootSource, SessionFollowCoordinator, SessionFollowUpdate,
+};
 use made_bridge::server::{BridgeEvent, ConnectionInfo, DisconnectedInfo, ProtocolError};
 use made_bridge::state::{SessionInfo, SessionSnapshot};
 
@@ -41,8 +43,20 @@ fn snapshot(active: Option<&str>, sessions: Vec<SessionInfo>, revision: u64) -> 
         revision,
         active_session_id: active.map(str::to_owned),
         tabs_enabled: true,
+        view_directory: None,
         sessions,
     }
+}
+
+fn snapshot_with_view(
+    active: Option<&str>,
+    sessions: Vec<SessionInfo>,
+    view: Option<&Path>,
+    revision: u64,
+) -> SessionSnapshot {
+    let mut value = snapshot(active, sessions, revision);
+    value.view_directory = view.map(Path::to_path_buf);
+    value
 }
 
 fn coordinator(temp: &tempfile::TempDir) -> (SessionFollowCoordinator, PathBuf, PathBuf) {
@@ -586,6 +600,7 @@ fn no_active_session_returns_to_latest_shell_root() {
         revision: 2,
         active_session_id: None,
         tabs_enabled: true,
+        view_directory: None,
         sessions: vec![session("a", "A", &worktree, None)],
     });
 
@@ -594,6 +609,342 @@ fn no_active_session_returns_to_latest_shell_root() {
     assert!(none.generation > generation);
     assert!(none.active_session.is_none());
     assert!(none.root_switched);
+}
+
+#[test]
+fn usable_view_directory_is_followed_without_an_active_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let view = fixture_dir(&temp, "view");
+    let shell = fixture_dir(&temp, "shell");
+    let other = fixture_dir(&temp, "other-session");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    assert_eq!(follow.follow_shell_cwd(&shell).unwrap().root, shell);
+    let outcome = follow.apply_snapshot(snapshot_with_view(
+        None,
+        vec![session("inactive", "Inactive", &other, None)],
+        Some(&view),
+        1,
+    ));
+
+    assert!(
+        matches!(outcome.update, SessionFollowUpdate::ViewDirectory),
+        "unexpected update: {:?}",
+        outcome.update
+    );
+    assert_eq!(outcome.root, fs::canonicalize(&view).unwrap());
+    assert!(outcome.root_switched);
+    assert!(outcome.active_session.is_none());
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert!(follow.is_agent_owned());
+    let recorded = follow.view_directory().expect("view directory retained");
+    assert_eq!(recorded.requested, view);
+    assert!(recorded.available);
+    assert_eq!(recorded.reason, None);
+
+    // Shell reports are recorded but cannot switch the root while the view wins.
+    let hidden_shell = follow.follow_shell_cwd(&terminal).unwrap();
+    assert_eq!(hidden_shell.root, fs::canonicalize(&view).unwrap());
+    assert!(!hidden_shell.root_switched);
+    assert!(matches!(
+        hidden_shell.update,
+        SessionFollowUpdate::ViewDirectory
+    ));
+    assert_eq!(follow.terminal_cwd(), Some(terminal.as_path()));
+}
+
+#[test]
+fn view_directory_change_switches_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = fixture_dir(&temp, "view-a");
+    let second = fixture_dir(&temp, "view-b");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    let initial = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&first), 1));
+    let generation = initial.generation;
+    let changed = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&second), 2));
+
+    assert!(matches!(changed.update, SessionFollowUpdate::ViewDirectory));
+    assert!(changed.root_switched);
+    assert_eq!(changed.root, fs::canonicalize(&second).unwrap());
+    assert_eq!(changed.generation, generation.next());
+}
+
+#[test]
+fn active_session_directory_wins_over_a_view_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let active_dir = fixture_dir(&temp, "active");
+    let missing_active = temp.path().join("missing-active");
+    let view = fixture_dir(&temp, "view");
+    let other_view = fixture_dir(&temp, "view-2");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    let active = follow.apply_snapshot(snapshot_with_view(
+        Some("a"),
+        vec![session("a", "A", &active_dir, None)],
+        Some(&view),
+        1,
+    ));
+    assert!(matches!(active.update, SessionFollowUpdate::ActiveSession));
+    assert_eq!(active.root, fs::canonicalize(&active_dir).unwrap());
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+
+    // A view-directory change never replaces an active session root.
+    let changed = follow.apply_snapshot(snapshot_with_view(
+        Some("a"),
+        vec![session("a", "A", &active_dir, None)],
+        Some(&other_view),
+        2,
+    ));
+    assert!(matches!(changed.update, SessionFollowUpdate::ActiveSession));
+    assert!(!changed.root_switched);
+    assert_eq!(changed.root, fs::canonicalize(&active_dir).unwrap());
+
+    // An unavailable active directory is not silently replaced by the view.
+    let unavailable = follow.apply_snapshot(snapshot_with_view(
+        Some("b"),
+        vec![session("b", "B", &missing_active, None)],
+        Some(&view),
+        3,
+    ));
+    assert!(unavailable.update.is_unavailable());
+    assert_eq!(unavailable.root, active.root);
+    assert!(!unavailable.root_switched);
+    assert_eq!(
+        follow.unavailable_root(),
+        Some(missing_active.as_path()),
+        "the unavailable active identity is retained"
+    );
+}
+
+#[test]
+fn missing_view_directory_falls_back_to_shell_with_a_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-view");
+    let shell = fixture_dir(&temp, "shell");
+    let (mut follow, _, _) = coordinator(&temp);
+    follow.follow_shell_cwd(&shell).unwrap();
+
+    let outcome = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&missing), 1));
+    match &outcome.update {
+        SessionFollowUpdate::ViewDirectoryUnavailable { directory, detail } => {
+            assert_eq!(directory, &missing);
+            assert!(!detail.is_empty());
+        }
+        other => panic!("unexpected update: {other:?}"),
+    }
+    assert_eq!(outcome.root, shell);
+    assert!(!outcome.root_switched);
+    assert!(!follow.is_root_unavailable());
+    assert_eq!(follow.unavailable_root(), None);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+    let recorded = follow.view_directory().expect("view directory retained");
+    assert!(!recorded.available);
+    assert!(recorded
+        .reason
+        .as_deref()
+        .is_some_and(|reason| !reason.is_empty()));
+
+    fixture_dir(&temp, "missing-view");
+    let recovered = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&missing), 2));
+    assert!(matches!(
+        recovered.update,
+        SessionFollowUpdate::ViewDirectory
+    ));
+    assert_eq!(recovered.root, fs::canonicalize(&missing).unwrap());
+    assert!(recovered.root_switched);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+}
+
+#[test]
+fn unreadable_view_directory_falls_back_to_shell_without_unavailable_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = fixture_dir(&temp, "shell");
+    let unreadable = temp.path().join("unreadable-view");
+    fs::create_dir(&unreadable).unwrap();
+    if !chmod(&unreadable, "000") {
+        eprintln!("skipping unreadable-view assertion: chmod is unavailable");
+        return;
+    }
+    let still_readable = fs::read_dir(&unreadable).is_ok();
+    let (mut follow, _, _) = coordinator(&temp);
+    follow.follow_shell_cwd(&shell).unwrap();
+
+    let outcome = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&unreadable), 1));
+    let restored = chmod(&unreadable, "755");
+    assert!(restored, "could not restore permissions");
+
+    if still_readable {
+        eprintln!(
+            "skipping unreadable-view assertion: the current user can read a mode-000 directory"
+        );
+        return;
+    }
+    match &outcome.update {
+        SessionFollowUpdate::ViewDirectoryUnavailable { directory, detail } => {
+            assert_eq!(directory, &unreadable);
+            assert!(!detail.is_empty());
+        }
+        other => panic!("unexpected update: {other:?}"),
+    }
+    assert_eq!(outcome.root, shell);
+    assert!(!outcome.root_switched);
+    assert!(!follow.is_root_unavailable());
+    assert_eq!(follow.unavailable_root(), None);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+    let recorded = follow.view_directory().expect("view directory retained");
+    assert!(!recorded.available);
+    assert_eq!(recorded.canonical, None);
+    assert!(recorded
+        .reason
+        .as_deref()
+        .is_some_and(|reason| !reason.is_empty()));
+}
+
+#[test]
+fn tabs_disabled_clears_the_view_directory_and_keeps_the_shell_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let view = fixture_dir(&temp, "view");
+    let shell = fixture_dir(&temp, "shell");
+    let (mut follow, _, _) = coordinator(&temp);
+    follow.follow_shell_cwd(&shell).unwrap();
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
+    assert_eq!(follow.current_root(), fs::canonicalize(&view).unwrap());
+
+    let mut disabled = snapshot_with_view(None, Vec::new(), Some(&view), 2);
+    disabled.tabs_enabled = false;
+    let outcome = follow.apply_snapshot(disabled);
+
+    assert!(matches!(
+        outcome.update,
+        SessionFollowUpdate::NoActiveSession
+    ));
+    assert_eq!(outcome.root, shell);
+    assert!(outcome.root_switched);
+    assert!(follow.view_directory().is_none());
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+
+    // An active session and a view directory are both ignored when tabs are off.
+    let mut disabled_active = snapshot_with_view(
+        Some("a"),
+        vec![session("a", "A", &view, None)],
+        Some(&view),
+        3,
+    );
+    disabled_active.tabs_enabled = false;
+    let outcome = follow.apply_snapshot(disabled_active);
+    assert_eq!(outcome.root, shell);
+    assert!(outcome.active_session.is_none());
+    assert!(follow.view_directory().is_none());
+}
+
+#[test]
+fn clearing_the_view_directory_resumes_shell_follow() {
+    let temp = tempfile::tempdir().unwrap();
+    let view = fixture_dir(&temp, "view");
+    let shell = fixture_dir(&temp, "shell");
+    let (mut follow, _, _) = coordinator(&temp);
+    follow.follow_shell_cwd(&shell).unwrap();
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
+
+    let cleared = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), None, 2));
+    assert!(matches!(
+        cleared.update,
+        SessionFollowUpdate::NoActiveSession
+    ));
+    assert_eq!(cleared.root, shell);
+    assert!(cleared.root_switched);
+    assert!(follow.view_directory().is_none());
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+}
+
+#[test]
+fn lifecycle_events_and_a_new_epoch_clear_the_view_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_view = fixture_dir(&temp, "view-a");
+    let second_view = fixture_dir(&temp, "view-b");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    let connected = |connection_id| {
+        BridgeEvent::Connected(ConnectionInfo {
+            connection_id,
+            pane_id: "pane".to_owned(),
+            plugin_version: "0.1.0".to_owned(),
+            opencode_version: "2.1.4".to_owned(),
+            pid: 1,
+            cwd: temp.path().to_path_buf(),
+            protocol_version: 1,
+        })
+    };
+
+    follow.apply_bridge_event(&connected(7));
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&first_view), 1));
+    assert!(follow.view_directory().is_some());
+
+    let goodbye = follow
+        .apply_bridge_event(&BridgeEvent::Goodbye(made_bridge::server::Goodbye {
+            connection_id: 7,
+            reason: "normal exit".to_owned(),
+        }))
+        .expect("current goodbye");
+    assert!(matches!(
+        goodbye.update,
+        SessionFollowUpdate::NoActiveSession
+    ));
+    assert_eq!(goodbye.root, terminal);
+    assert!(follow.view_directory().is_none());
+
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&first_view), 2));
+    assert!(follow.view_directory().is_some());
+    let disconnected = follow
+        .apply_bridge_event(&BridgeEvent::Disconnected(DisconnectedInfo {
+            connection_id: 7,
+            authenticated: true,
+            code: Some(1000),
+            reason: "normal exit".to_owned(),
+            replaced: false,
+        }))
+        .expect("current disconnect");
+    assert_eq!(disconnected.root, terminal);
+    assert!(follow.view_directory().is_none());
+
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&first_view), 3));
+    let reconnected = follow
+        .apply_bridge_event(&connected(8))
+        .expect("new connection");
+    assert!(follow.view_directory().is_none());
+    assert_eq!(reconnected.root, terminal);
+    assert_eq!(follow.epoch(), 2);
+
+    let outcome =
+        follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&second_view), 1));
+    assert!(matches!(outcome.update, SessionFollowUpdate::ViewDirectory));
+    assert_eq!(outcome.root, fs::canonicalize(&second_view).unwrap());
+}
+
+#[test]
+fn relative_view_directory_is_rejected_at_the_snapshot_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut follow, _, _) = coordinator(&temp);
+
+    let outcome = follow.apply_snapshot(snapshot_with_view(
+        None,
+        Vec::new(),
+        Some(Path::new("relative/view")),
+        1,
+    ));
+
+    match &outcome.update {
+        SessionFollowUpdate::RejectedSnapshot { detail } => {
+            assert!(
+                detail.contains("viewDirectory"),
+                "unexpected rejection detail: {detail}"
+            );
+        }
+        other => panic!("expected RejectedSnapshot, got {other:?}"),
+    }
+    assert!(!outcome.root_switched);
+    assert!(follow.view_directory().is_none());
 }
 
 #[test]

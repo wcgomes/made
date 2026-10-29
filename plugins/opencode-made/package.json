@@ -9,7 +9,7 @@
     "./tui": "./tui.ts"
   },
   "scripts": {
-    "test": "node --test tests/lifecycle.test.ts",
+    "test": "node --test tests/lifecycle.test.ts tests/view-directory.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

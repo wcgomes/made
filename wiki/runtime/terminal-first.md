@@ -1,6 +1,6 @@
 # Terminal-First Runtime
 
-A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md).
+A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
 
 ## Launch and default workspace
 
@@ -32,12 +32,13 @@ The home/`--picker`/explicit-path policy is an accepted product decision; see [A
 
 ## Root precedence
 
-1. A connected OpenCode active session directory wins while it is present and usable.
-2. Otherwise, the latest validated shell cwd wins.
-3. Otherwise, the launch/picker folder or platform-resolved home.
-4. A stale OpenCode root is never retained ahead of a newer shell cwd.
+1. A connected OpenCode active session directory wins while an active session exists; an unavailable active directory is shown as unavailable, not replaced by the view directory or shell cwd.
+2. Otherwise, a connected OpenCode view directory selected in the Home/new-session view wins while tabs are enabled, no session is active, and the directory is usable.
+3. Otherwise, the latest validated shell cwd wins.
+4. Otherwise, the launch/picker folder or platform-resolved home.
+5. A stale OpenCode root is never retained ahead of a newer shell cwd.
 
-While OpenCode is authoritative, shell cwd reports continue to be recorded. On OpenCode disconnect or normal exit, the root returns to the latest shell cwd; if no shell cwd exists, it returns to the launch folder. Shell-owned roots that are deleted or become unreadable are revalidated by a low-frequency background worker, marked unavailable once, and recover when the path returns. Agent-owned roots are unaffected by bad shell reports.
+While OpenCode is authoritative, shell cwd reports continue to be recorded. A connected view directory applies only while tabs are enabled and no session is active; an absent view directory leaves the latest shell cwd or launch folder in effect, while an invalid, missing, or unreadable one falls back to the latest shell cwd, then the launch folder, and is reported in Diagnostics. The view directory is cleared when OpenCode disconnects or exits, when integration is unsupported, when session tabs become unavailable, or on a new connection epoch. On OpenCode disconnect or normal exit, the root returns to the latest shell cwd; if no shell cwd exists, it returns to the launch folder. Shell-owned roots that are deleted or become unreadable are revalidated by a low-frequency background worker, marked unavailable once, and recover when the path returns. Agent-owned roots are unaffected by bad shell reports.
 
 The root model distinguishes effective path, display name, source, git/worktree metadata, and availability. Root changes increment a generation, clear open preview, and invalidate stale tree/preview results. See [`session_follow.rs`](../../crates/made-app/src/session_follow.rs) and [`root_switch.rs`](../../crates/made-explorer/src/root_switch.rs).
 

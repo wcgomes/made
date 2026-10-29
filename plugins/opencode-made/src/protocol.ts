@@ -101,6 +101,13 @@ export interface StateMessage {
   revision: number;
   activeSessionID: string | null;
   tabsEnabled: boolean;
+  /**
+   * Absolute directory selected in OpenCode's Home/new-session view.
+   *
+   * Additive within protocol major 1: absent or `null` means no connected view
+   * directory. The plugin omits unusable values rather than truncating them.
+   */
+  viewDirectory?: string | null;
   sessions: SessionSnapshot[];
 }
 

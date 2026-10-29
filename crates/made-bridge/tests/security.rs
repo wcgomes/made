@@ -514,6 +514,32 @@ fn bridge_debug_output_and_events_never_contain_the_token() {
 }
 
 #[test]
+fn view_directory_is_redacted_before_state_events() {
+    let (token, handle) = start_bridge();
+    let secret = token.expose_secret().to_owned();
+    let mut socket = connect(&handle);
+    authenticate(&handle, &mut socket, &token);
+
+    let view = test_path(&format!("view-{secret}"));
+    let mut message = state(1, None, Vec::new());
+    message["viewDirectory"] = json!(view);
+    send(&mut socket, &message);
+
+    let event = wait_for(&handle, |event| matches!(event, BridgeEvent::State(_)));
+    let rendered = format!("{event:?}");
+    assert!(
+        rendered.contains("view-"),
+        "the view directory was dropped instead of redacted: {rendered}"
+    );
+    assert!(!rendered.contains(&secret), "leaked token in {rendered}");
+    assert!(
+        rendered.contains(REDACTED),
+        "the view directory path was not redacted: {rendered}"
+    );
+    handle.shutdown().unwrap();
+}
+
+#[test]
 fn unauthorized_connection_gets_no_state() {
     let (_token, handle) = start_bridge();
     let mut socket = connect(&handle);

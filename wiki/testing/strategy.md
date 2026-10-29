@@ -16,7 +16,7 @@ Made's tests are layered: fast domain/model tests, real PTY/bridge integration t
 | Explorer | `cargo test -p made-explorer` | Tree, watcher, root generation, preview guards, path guard. |
 | Terminal | `cargo test -p made-terminal` | VT emulation, input encoding, PTY/ConPTY behavior. |
 | Platform | `cargo test -p made-platform` | Paths, shell integration, contract tests, native backdrop, exact-threshold log rotation, lock symlink/directory/permission/timeout refusal, public rename-failure refusal, mode preservation, and barrier-synchronized append/rotation. |
-| Plugin | `cd plugins/opencode-made && npm test && npm run typecheck` | Lifecycle, handshake, state bounds, focus, reconnect, redaction. Current: 29/29 plus typecheck. |
+| Plugin | `cd plugins/opencode-made && npm test && npm run typecheck` | Lifecycle, handshake, state bounds, focus, reconnect, redaction. Current: 39/39 plus typecheck. |
 | Phase 0 gate (historical) | Harness removed after the gate | Real OpenCode v2.1.4 TUI: load, auth, tabs, worktree location, focus, reconnection, config immutability. 19/19 + 5/5; outcomes in the [Phase 0 record](../records/20261025-phase-0-gate.md). |
 | Real TUI smoke | `cargo test -p made-app --test opencode_tui -- --nocapture` | PTY/TerminalCore runs a real OpenCode TUI when installed; skips otherwise. |
 | App smoke | `cargo run -p made-app -- --smoke-test` | Creates the window, pumps frames, prints `made smoke: OK`, exits. |
@@ -82,7 +82,7 @@ XDG_RUNTIME_DIR="$root/runtime" \
 
 - Rust: 658 passed, 0 failed, 2 ignored across 49 binaries on Linux x64 WSL2; fmt/clippy clean.
 - CI: all workflows observed green on Linux, macOS x64/arm64, and Windows x64 at the 2026-10-28 snapshot, including workspace tests, display/native smoke, and development artifacts. This is automated/smoke evidence, not native UX validation.
-- Plugin: 29/29 and typecheck pass.
+- Plugin: 39/39 and typecheck pass.
 - Phase 0: 19/19 gate plus 5/5 supporting against OpenCode v2.1.4.
 - UI/behavior: Linux automated/headless evidence for launch, tabs, preview, Explorer, glass fallback, conditional Explorer glass, and primary/alternate terminal surfaces, picker, bash cwd, deleted-cwd recovery, 10k startup, final software performance, bounded diagnostics-log rotation/retention and previous-log presentation, and the current visual refinements (mint accent, darker 215 fallback clear, card-edge 26/24 header with 42/36 content top, right-side wordmark with 24/18 gaps, `+` after tabs, Sessions/Diagnostics/Explorer order, workspace-tab states per the [UI spec](../../specs/changes/made-ui-ux-v1/spec.md), scaled red close, faded splitter, no-outline rows, inline picker tree expansion/keyboard/path chip/minimal scroll, fading scrollbars).
 - Not validated: native Linux desktop, full native macOS UX, and Windows/ConPTY runtime UX (green CI smoke is not native evidence), native log-lock/reparse behavior, final-exit log failure visibility (stderr only), real zsh/fish/PowerShell, live real-OpenCode switching, native IME/clipboard/mouse, hardware-GPU pacing, Windows/macOS x64 native backdrop rendering, Phase 15 post-fix terminal pixel parity, native Explorer tint contrast, packaged artifact launch.

@@ -1,6 +1,6 @@
 # OpenCode Bridge
 
-Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches or manages OpenCode: the user runs `opencode` in a Made terminal, and the plugin loads from configuration injected into that shell. The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md).
+Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches or manages OpenCode: the user runs `opencode` in a Made terminal, and the plugin loads from configuration injected into that shell. The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
 
 ## Topology
 
@@ -75,22 +75,24 @@ Handshake and limits implemented in [`server.rs`](../../crates/made-bridge/src/s
 - Close codes: `4401` invalid token/pane/malformed hello, `4402` protocol or OpenCode version mismatch, `4403` handshake deadline, `4409` replaced by a newer authenticated connection, `1009` oversized message.
 - Messages are capped at 256 KiB; snapshots at 64 sessions, 512-character titles, 4096-character paths, and 128-character IDs. A malformed frame closes with a protocol error; unknown fields are ignored.
 - `revision` increases per sent snapshot and resets to `1` on a new authenticated epoch. The app discards stale revisions and coalesces one pending snapshot per epoch.
+- `state` carries an optional nullable `viewDirectory` for the folder selected in OpenCode's Home/new-session view. It is additive within protocol major 1; older plugins omit it and older apps ignore it. The bridge validates it like a session directory.
 - Heartbeat is every 5 seconds with a 3-missed-pong limit. Focus requests time out after 5 seconds and fail non-blockingly.
 - The bridge never sends `goodbye`; the plugin tolerates one for forward compatibility.
 
 ## Plugin behavior
 
-The React/Solid integration observes `context.ui.tabs.enabled()` and `context.ui.tabs.list()` inside an injected reactive effect. Each tab's directory comes synchronously from `context.data.session.get(sessionID)`. Rapid changes are coalesced with a 60 ms debounce; full snapshots are sent on accepted change, `request_state`, and reconnect.
+The React/Solid integration in [`src/integration.ts`](../../plugins/opencode-made/src/integration.ts) observes `context.ui.tabs.enabled()`, `context.ui.tabs.list()`, and `context.location` inside an injected reactive effect. Each tab's directory comes synchronously from `context.data.session.get(sessionID)`. Rapid changes are coalesced with a 60 ms debounce; full snapshots are sent on accepted change, `request_state`, and reconnect.
 
+- `context.location` tracks the folder selected in OpenCode's Home/new-session view (also `/cd` and `/worktrees`), including before any session exists, and may briefly be `undefined` during synchronization. While tabs are enabled and no session is active, the plugin retains the last known value across that transient, validates it as an absolute local path within the protocol path limit, and sends it as optional `viewDirectory`; otherwise it sends `null`. An invalid path is treated as absent and reported as a non-fatal `error`; the plugin stays connected.
 - `unread` is derived as `promptPulse > 0` because OpenCode v2.1.4 exposes no unread field; `attention` is the real attention signal.
 - Before focusing, the plugin checks the current tab list. A closed or missing session returns `focus_result {ok:false, error:"session not open"}` and is not reopened.
 - Unexpected closes reconnect with bounded exponential backoff (100 ms base, 5 s cap, jitter). Auth/protocol rejection, replacement, and fatal plugin-error closes are terminal for that instance; `1008`/`1009` retries are limited to three consecutive attempts.
 - Backoff and fatal-rejection budgets reset only after a connection has held both `welcome` and a sent state for five seconds.
 - The plugin never logs the token; error text is truncated and token-redacted. It does not run shell commands or read arbitrary files.
 
-## Phase 0 observed API divergences
+## Observed OpenCode API divergences
 
-The Phase 0 gate ran against OpenCode v2.1.4. These are the durable differences from the original design:
+The Phase 0 gate ran against OpenCode v2.1.4; sessionless `context.location` behavior was verified on OpenCode v2.2.0. These are the durable differences from the original design:
 
 | Assumption | Observed |
 |---|---|
@@ -98,7 +100,7 @@ The Phase 0 gate ran against OpenCode v2.1.4. These are the durable differences 
 | `tabs.list()` includes `unread` | No `unread` field; returns `sessionID`, `title`, `active`, `promptPulse`, `attention`, `busy`, `renaming`. |
 | `session.get()` is async | Synchronous and reactive in 2.1.4. |
 | `tabs.focus()` focuses only open tabs | It can open a closed tab; the plugin now checks the list and refuses closed sessions. |
-| `context.location` is the launch cwd | Reactive to the active session location. Use `process.cwd()` for `hello.cwd` and `session.get().location.directory` per tab. |
+| `context.location` is only the launch cwd | Reactive to the folder selected in OpenCode's Home/new-session view (also `/cd` and `/worktrees`), not the launch directory. `process.cwd()` is the launch directory; per-tab directories come from `session.get().location.directory`. |
 | A `.ts` file can be injected | A directory package with `tui.ts` loads; a bare `.ts` entry did not. |
 | `tabs.enabled` is enough | Current settings are `tabs.mode` (`on`/`auto`/`off`) and `tabs.scope` (`cwd`/`global`); legacy `tabs.enabled` is still accepted. |
 | Focus changes state atomically | A transient `activeSessionID: null` (~20 ms observed) can occur during transitions; the app must tolerate it. |
@@ -113,9 +115,10 @@ The plugin is pinned to this observed surface. Bridge protocol version gates maj
 
 ## Evidence and limits
 
-- Plugin tests: 29/29 plus typecheck (`plugins/opencode-made`).
+- Plugin tests: 39/39 plus typecheck (`plugins/opencode-made`).
 - Phase 0 gate: 19/19 gate plus 5/5 supporting checks against OpenCode v2.1.4; see the [Phase 0 gate record](../records/20261025-phase-0-gate.md). The harness was removed after the gate.
 - App-level live session switching on the revised terminal-first build is still pending; the current evidence for bridge/config/root precedence is test-level plus historical real-OpenCode runs.
+- Connected view-directory follow is TUI-only; a folder selected in the OpenCode desktop app's own picker is not observable.
 - WSL-hosted OpenCode, remote/SSH OpenCode, ACP, and other agents are out of scope.
 
 Related: [Security](../security.md), [Runtime terminal-first](../runtime/terminal-first.md), [Phase 0 record](../records/20261025-phase-0-gate.md).

@@ -40,6 +40,8 @@ Why this is the right boundary:
 - `context.ui.tabs.list()` is reactive in a Solid computation and returns the open root-session tabs with `sessionID`, `title`, `active`, `busy`, `attention`, and `unread`. This is exactly the session-map data.
 - `context.ui.tabs.focus(sessionID)` is the supported way to make a session active. This enables the session-map focus behavior without synthesizing keystrokes.
 - `context.data.session.get(sessionID)` returns session info including `location.directory` (the session's working directory, which may be an OpenCode-managed worktree), `subpath`, `projectID`, and `title`. This is exactly the explorer-follow data.
+- `context.location.directory` is reactive in the plugin's `createEffect` and exposes the folder selected in OpenCode's Home/new-session view (`/cd`, `/worktrees`, Home), including before any session exists while session tabs are enabled. It can be transiently `undefined` while OpenCode synchronizes. `process.cwd()` remains the launch directory and is not a substitute.
+- A TUI plugin can observe only the OpenCode TUI view location. A folder selected in the OpenCode desktop app's own picker is not exposed to the plugin and is outside v1.
 - The plugin runs in the TUI process, can use WebSocket/fetch, can read environment and plugin options, and can observe tab changes reactively. No polling of the TUI screen is needed.
 - The plugin is small and app-owned. It translates OpenCode state into a normalized protocol; the app does not depend on OpenCode internals.
 
@@ -87,7 +89,7 @@ Transport:
 Protocol versioning:
 
 - `protocolVersion` is an integer major version. V1 uses `1`.
-- Additive fields are allowed within a major version; consumers ignore unknown fields.
+- Additive fields are allowed within a major version; consumers ignore unknown fields. `viewDirectory` is an optional, nullable additive field in major version 1 and does not require a protocol major bump.
 - A major mismatch produces an unsupported status in Made and a close from the bridge.
 - `revision` is a monotonically increasing integer per plugin connection. Made ignores state with a revision at or below the last accepted revision. A new `hello` starts a new epoch and resets revision tracking.
 
@@ -97,7 +99,7 @@ Messages:
 |---|---|---|---|
 | `hello` | plugin → app | Authenticate and identify the connection | `protocolVersion`, `token`, `paneId`, `pluginVersion`, `opencodeVersion`, `pid`, `cwd` |
 | `welcome` | app → plugin | Confirm authentication and version | `protocolVersion`, `appVersion`, `heartbeatIntervalMs` |
-| `state` | plugin → app | Full normalized snapshot | `revision`, `activeSessionID`, `tabsEnabled`, `sessions` |
+| `state` | plugin → app | Full normalized snapshot | `revision`, `activeSessionID`, `tabsEnabled`, `sessions`; optional `viewDirectory` |
 | `focus` | app → plugin | Focus a session in OpenCode | `requestID`, `sessionID` |
 | `focus_result` | plugin → app | Report focus outcome | `requestID`, `ok`, `error` (when not ok) |
 | `request_state` | app → plugin | Ask for a fresh snapshot | `requestID` |
@@ -120,12 +122,28 @@ Session snapshot fields:
 | `subpath` | Optional subpath within the project or worktree |
 | `projectID` | OpenCode project identifier |
 
+Top-level state field:
+
+| Field | Meaning |
+|---|---|
+| `viewDirectory` | Optional nullable absolute path selected in OpenCode's Home/new-session view; absent or `null` means no connected view directory. |
+
+- `viewDirectory` is the TUI's selected view folder, not a session directory and not `process.cwd()`.
+- The plugin accepts only a non-empty absolute local path without NUL or dot/parent traversal, at most `MAX_PATH_LENGTH` (4096 Unicode code points). Invalid or over-limit values are treated as absent and reported through the existing non-fatal `error` message; the plugin stays connected and never sends an invalid view path. No new protocol event or bridge error channel is introduced.
+- The validated value is included in snapshot size fitting and the change-detection key; because an invalid or over-limit value is omitted first, it cannot cause avoidable session loss. The plugin emits `null` while an active session exists or session tabs are unavailable.
+- The plugin keeps the last known value across transient `undefined` within a connection epoch; disconnect, unload, a new epoch, or an invalid value clears it.
+- The bridge maps the wire field to `SessionSnapshot.view_directory: Option<PathBuf>` with `#[serde(default)]` and validates it like a session `directory` (non-empty absolute local path, no NUL, no dot/parent traversal, at most `MAX_PATH_CHARS`) as defense-in-depth, rejecting malformed state from a buggy or malicious client through the existing invalid-state path. The normal plugin already omits invalid values.
+- The app treats an absolute path that passes validation but is missing or unreadable during root resolution as unusable and falls back to shell cwd with a Diagnostics reason instead of producing an unavailable-root state.
+- `view_directory` is redacted with the bridge token like session directories before state leaves the bridge; paths may appear in local logs only.
+- A missing field or `null` means no view directory; the app falls back to shell cwd.
+
 Plugin behavior:
 
 - Read `context.options` on load: `bridgeUrl`, `token`, `paneId`, `protocolVersion`, `appVersion`.
 - Validate that `bridgeUrl` is a loopback WebSocket URL before connecting. Refuse to connect to a non-loopback host.
 - Connect, send `hello`, and wait for `welcome` before sending state.
 - Observe `context.ui.tabs.list()` in a reactive computation. When the tab set or active tab changes, resolve the active session with `context.data.session.get(sessionID)`.
+- Observe `context.location.directory` in the same reactive computation. Validate it as described above; treat invalid values as absent and report a non-fatal `error`. Retain the last known value across transient `undefined`; emit `null` while an active session exists or session tabs are unavailable. Include the validated value in every snapshot and in change detection.
 - Guard asynchronous session lookups with a generation counter so a slow response for an old active tab cannot overwrite a newer selection.
 - Coalesce rapid tab changes into a bounded number of snapshots. The goal is to keep the TUI responsive while still delivering the final state quickly.
 - Send a full snapshot on every accepted change, on `request_state`, and on reconnect. Full snapshots keep the app simple and make dropped messages recoverable.
@@ -138,11 +156,11 @@ Plugin behavior:
 App behavior:
 
 - On `hello`, validate token, pane id, protocol version, and OpenCode version. If the OpenCode major version is below 2, mark the integration unsupported and close the connection; otherwise send `welcome`.
-- On `state`, validate the snapshot, discard stale revisions, update the session map, and drive the session-follow coordinator.
+- On `state`, validate the snapshot, discard stale revisions, update the session map, and drive the session-follow coordinator. Apply `viewDirectory` only when `tabsEnabled` is true; when tabs are unavailable, clear view state and keep the degraded shell-cwd fallback.
 - On `focus_result`, correlate the request id. A timeout or failure produces a non-blocking error in the session map and a `request_state` refresh.
 - Send `ping` on the heartbeat interval and mark the connection degraded after a bounded number of missed pongs.
-- On `goodbye` or socket close, resume latest known shell cwd (then launch folder), record integration state in Diagnostics, and keep the terminal usable.
-- On a new authenticated `hello` for the same pane, replace the old connection and treat the new snapshot as a new epoch.
+- On `goodbye` or socket close, clear the connected view directory, resume latest known shell cwd (then launch folder), record integration state in Diagnostics, and keep the terminal usable.
+- On a new authenticated `hello` for the same pane, replace the old connection, clear the previous epoch's view directory, and treat the new snapshot as a new epoch.
 
 ### D5: Session and workspace model
 
@@ -157,13 +175,14 @@ The app keeps a normalized `SessionSnapshot` and a `WorkspaceRoot`.
 - worktree name or path when available;
 - metadata status (`known`, `unknown`, `unavailable`).
 
-Active-session resolution:
+Root resolution:
 
-1. Resolve independently per workbench. If no connected active session directory exists, use latest known shell cwd, then the launch folder. Record root source for Diagnostics; an empty optional session map reports no active session. Initial visibility/presentation is owned by `made-ui-ux-v1`.
-2. If the active session has a `directory`, canonicalize it.
-3. If the canonical directory differs from the current root, switch the explorer root to that directory.
-4. If `subpath` is present, show it as context and optionally reveal it in the tree. The root remains `location.directory`, because the product requirement is to show the session's worktree root, not the main checkout.
-5. If the authoritative directory is missing or unreadable, show an unavailable-root message instead of presenting the previous tree as that directory. Keep the terminal usable and reject stale tree/preview results.
+1. Resolve independently per workbench. While connected with session tabs enabled, use the active session directory when one exists; otherwise use a usable connected view directory; otherwise use the latest known shell cwd, then the launch folder. When session tabs are unavailable, skip active-session and view-directory arbitration and use the latest known shell cwd, then the launch folder. Record root source for Diagnostics; an empty optional session map reports no active session. Initial visibility/presentation is owned by `made-ui-ux-v1`.
+2. While session tabs are enabled, if the active session has a `directory`, canonicalize it. An active session directory takes precedence over the view directory and shell cwd.
+3. If session tabs are enabled, there is no active session, and a view directory is reported, canonicalize it. A usable view directory takes precedence over shell cwd. An absent or null view directory is ignored; a path that passes validation but is missing or unreadable is treated as unusable and falls back to shell cwd without an unavailable-root state. The plugin omits empty, non-absolute, NUL-bearing, traversal-bearing, or oversized values and reports a non-fatal error; the bridge rejects such malformed state only as defense-in-depth. When session tabs are unavailable, the view directory is not used.
+4. If the canonical directory differs from the current root, switch the explorer root to that directory.
+5. If `subpath` is present, show it as context and optionally reveal it in the tree. The root remains `location.directory`, because the product requirement is to show the session's worktree root, not the main checkout.
+6. If the authoritative active-session directory is missing or unreadable, show an unavailable-root message instead of presenting the previous tree as that directory. Keep the terminal usable and reject stale tree/preview results.
 
 Worktree detection is read-only:
 
@@ -181,11 +200,12 @@ The app never runs `git worktree add`, `remove`, `prune`, `merge`, or any comman
 
 Root precedence for every transition:
 
-1. Connected OpenCode active session directory, even if unavailable (show unavailable, not unrelated content).
-2. Latest validated shell cwd; keep updating this independently while OpenCode wins.
-3. Workspace folder supplied by launch argument, chosen in the in-app picker, or opened from the default home workspace.
+1. Connected OpenCode active session directory, even if unavailable (show unavailable, not unrelated content), while session tabs are enabled.
+2. Connected OpenCode sessionless view directory when usable and session tabs are enabled; when tabs are unavailable or the view directory is unusable, treat it as absent and record in Diagnostics.
+3. Latest validated shell cwd; keep updating this independently while OpenCode wins.
+4. Workspace folder supplied by launch argument, chosen in the in-app picker, or opened from the default home workspace.
 
-Disconnect, normal exit, invalid/unsupported integration, or a snapshot with no active directory recomputes this precedence rather than retaining an old OpenCode root. Root-generation changes also clear the previous preview and select the terminal visual mode. Shell reports use the same root validation and generation pipeline, not a second tree mutation path.
+Disconnect, normal exit, invalid/unsupported integration, a new connection epoch, session tabs becoming unavailable, or a snapshot with no active session and no usable view directory recomputes this precedence rather than retaining an old OpenCode root. Root-generation changes also clear the previous preview and select the terminal visual mode. Shell reports use the same root validation and generation pipeline, not a second tree mutation path.
 
 ### D6: Terminal stack
 
@@ -296,15 +316,18 @@ Transitions:
 | From | Event | To | Behavior |
 |---|---|---|---|
 | any | workspace start | `inactive` | Shell and explorer usable without waiting for OpenCode |
-| `inactive` | valid `hello` and snapshot | `connected` | Apply snapshot; follow active session if present |
-| `connected` | socket close, heartbeat timeout, or plugin error | `degraded` | Resume shell cwd; diagnostic reason; terminal usable |
+| `inactive` | valid `hello` and snapshot, `tabsEnabled: true` | `connected` | Apply snapshot; follow active session or usable view directory if present |
+| `inactive` | valid `hello` and snapshot, `tabsEnabled: false` | `degraded` | Diagnostic v1 tabs constraint; clear view directory; resume shell cwd; do not follow view directory |
+| `connected` | socket close, heartbeat timeout, or fatal plugin error | `degraded` | Resume shell cwd; diagnostic reason; terminal usable |
 | any | protocol major mismatch | `unsupported` | Reject state; resume shell cwd; terminal usable |
 | `connected` | OpenCode exits normally | `inactive` | Resume shell cwd; shell remains usable |
-| `degraded` | valid `hello` | `connected` | Restore state and follow active session |
-| `unsupported` | valid compatible `hello` | `connected` | Restore state and follow active session |
-| `connected` | `tabsEnabled: false` | `degraded` | Diagnostic v1 tabs constraint; resume shell cwd |
+| `degraded` | valid `hello` | `connected` | Restore state and follow active session or usable view directory when tabs are enabled; `tabsEnabled: false` stays degraded |
+| `unsupported` | valid compatible `hello` | `connected` | Restore state and follow active session or usable view directory when tabs are enabled; `tabsEnabled: false` stays degraded |
+| `connected` | `tabsEnabled: false` | `degraded` | Diagnostic v1 tabs constraint; clear view directory; resume shell cwd; do not follow view directory |
+| `degraded` | same connection reports `tabsEnabled: true` | `connected` | Clear the tabs constraint; re-evaluate active session or usable view directory |
 | `connected` | active directory unavailable | `connected` with unavailable root | Contextual root error; no unrelated content; terminal usable |
-| `connected` | no active session directory | `connected` | Follow shell cwd; no-active-session detail in optional map/Diagnostics |
+| `connected` | no active session directory, usable view directory, `tabsEnabled: true` | `connected` | Follow connected view directory; keep recording shell cwd |
+| `connected` | no active session directory, no usable view directory, `tabsEnabled: true` | `connected` | Follow shell cwd; no-active-session detail in optional map/Diagnostics |
 
 Rules:
 
@@ -312,6 +335,7 @@ Rules:
 - No integration failure blocks terminal input or the explorer.
 - Degraded and unsupported details appear in Diagnostics. Routine chrome suppression and contextual feedback presentation are owned by `specs/changes/made-ui-ux-v1/design.md`.
 - Latest shell cwd is retained independently across integration epochs and used across disconnects and exits.
+- Connected view directory is retained across transient `undefined` within an epoch and cleared on disconnect, goodbye, normal exit, unsupported integration, a new hello epoch, or `tabsEnabled: false`. It never outranks an active session directory. View-directory follow is scoped to `tabsEnabled: true`; when tabs are unavailable, view state is cleared and shell cwd fallback applies, and the view directory never establishes session activity. A new authenticated connection whose first snapshot has `tabsEnabled: false` is degraded even from `inactive`, `degraded`, or `unsupported` and never restores view-directory follow until a later snapshot on that connection reports tabs enabled.
 - Reconnect is automatic from the plugin side; the app accepts a new authenticated connection and replaces the old one.
 - A stale snapshot from a previous connection cannot overwrite a newer epoch.
 
@@ -394,6 +418,7 @@ Exposed state:
 
 - integration status (`inactive`, `connected`, unavailable/`degraded`, `unsupported`) for the selected workspace, not app health;
 - workspace identity, shell reporting capability/reason, latest known shell cwd, effective root and source;
+- connected view directory and its usability when no session is active and session tabs are enabled;
 - reason code and human-readable reason;
 - active session id and title;
 - active workspace or worktree path;
@@ -415,6 +440,7 @@ Failure reasons include:
 - heartbeat timeout;
 - session tabs unavailable;
 - active directory unavailable;
+- connected view directory unavailable or invalid, or an invalid plugin-side view report (non-fatal);
 - worktree metadata unavailable;
 - focus request failed or timed out.
 
@@ -449,6 +475,9 @@ Final-exit write and rotation failures are reported only on stderr; the Diagnost
 | OpenCode v2 plugin/CLI config API changes | Integration fails on a new OpenCode release | Phase 0 gate records the observed API; protocol version gate; adapter layer; unsupported status instead of crash |
 | Plugin cannot be loaded from a local path in some distributions | No session follow | Phase 0 validates loading from a normal terminal and from an injected inline config; degraded fallback |
 | `location.directory` semantics differ for worktrees or subpaths | Explorer shows the wrong root | Phase 0 validates tab and worktree location changes with real OpenCode sessions |
+| `context.location` is transiently `undefined` during synchronization | Explorer flaps to shell cwd or loses the selected folder | Retain the last known view directory within the epoch; clear on disconnect, goodbye, a new epoch, `tabsEnabled: false`, or an invalid value |
+| OpenCode desktop app picker is not observable by a TUI plugin | A folder selected outside the TUI does not update Made | Documented TUI-only limitation; follow the TUI Home/new-session location; no screen scraping or `process.cwd()` substitute |
+| A malformed optional view path disconnects the plugin | Integration drops for a bad optional field | Plugin validates and treats invalid values as absent with a non-fatal `error`; bridge validation remains defense-in-depth for buggy or malicious state; no new event or error channel |
 | Config merge loses a user plugin or writes a file | User trust and security failure | Merge tests with existing plugins and inline config; hash check; no-write design |
 | `libghostty-vt` Windows support is incomplete | Windows target blocked | Phase 1 platform spike; `TerminalCore` boundary permits a fallback VT implementation |
 | ConPTY resize, mouse, or child cleanup issues | Windows terminal usability | Windows smoke tests in Phase 4; platform contract tests |
@@ -471,6 +500,8 @@ Final-exit write and rotation failures are reported only on stderr; the Diagnost
 - Preview is read-only; there is no edit, save, dirty state, LSP, or diff path.
 - One window with independent workspace tabs and one terminal per workspace. No-arg startup opens the platform-resolved user home; the picker is explicit through the Open folder action or `--picker`, and an explicit path overrides it. Multi-window, splits, a second terminal-tab hierarchy and restart persistence are out of scope.
 - The plugin is app-owned and versioned. The bridge protocol is versioned.
+- `viewDirectory` is additive within protocol major 1; older plugins omit it and older apps ignore it.
+- Connected sessionless view-directory follow is TUI-only; the OpenCode desktop app's own folder picker is not observable and is outside v1.
 - Git metadata is best-effort; a non-git folder or missing git CLI yields a plain folder with unknown metadata, not an error.
 - Terminal cwd reporting uses D17 capability-gated launch-local hooks; cmd/unsupported/restricted modes explicitly fall back to latest known cwd or initial folder without claiming guaranteed follow.
 - Development builds and CI artifacts are sufficient; signing, notarization, installers, and auto-update are not v1 requirements.
@@ -541,8 +572,16 @@ OpenCode flow:
 2. OpenCode loads the Made plugin from the injected configuration.
 3. The plugin connects to the bridge and authenticates with `hello`.
 4. The app sends `welcome`.
-5. The plugin observes tabs, resolves the active session, and sends a `state` snapshot.
-6. The owning workbench records connected integration, updates its optional session map, and follows the active session directory if present; otherwise shell cwd still wins.
+5. The plugin observes tabs and `context.location`, validates the view path, resolves the active session or the sessionless view directory, and sends a `state` snapshot.
+6. The owning workbench records connected integration, updates its optional session map, and follows the active session directory if present; otherwise a usable view directory while session tabs are enabled; otherwise shell cwd. When session tabs are unavailable, it keeps the degraded shell-cwd fallback and does not use the view directory.
+
+View directory flow:
+
+1. The user changes the folder in OpenCode's Home/new-session view.
+2. The plugin's reactive effect reads `context.location.directory`; invalid values are treated as absent with a non-fatal `error`, a transient `undefined` retains the last known value, and an active session or unavailable session tabs emit `null`.
+3. The plugin sends a coalesced `state` snapshot with `viewDirectory` and a new revision.
+4. The app validates and redacts the field. With session tabs enabled and no active session, the owning workbench follows the usable view directory; with an active session, it keeps the active session directory; with session tabs unavailable, it keeps the degraded shell-cwd fallback.
+5. Disconnect, goodbye, normal exit, a new epoch, or `tabsEnabled: false` clears the view state and recomputes shell-cwd fallback.
 
 Session switch flow:
 
@@ -566,7 +605,7 @@ Disconnect flow:
 
 1. The plugin unloads, OpenCode exits, or the socket closes.
 2. The owning workbench records disconnected integration (inactive on known normal exit) in Diagnostics; routine chrome presentation is owned by `made-ui-ux-v1`.
-3. Root arbitration resumes latest shell cwd, then launch folder; prior-root preview is cleared.
+3. Root arbitration clears the connected view directory, resumes latest shell cwd, then launch folder; prior-root preview is cleared.
 4. The terminal remains usable.
 5. The plugin reconnects when OpenCode is available again; the app replaces the old connection and resumes following.
 
@@ -603,9 +642,9 @@ Dependency direction:
 
 Data flow:
 
-- OpenCode state → plugin → bridge → session snapshot → session-follow coordinator → explorer root and session map.
+- OpenCode state → plugin (tabs and view location) → bridge → session snapshot → session-follow coordinator → explorer root and session map.
 - User session selection → session map → bridge → plugin → OpenCode focus.
-- Shell cwd report → validation → owning root coordinator → explorer (unless connected active OpenCode directory wins).
+- Shell cwd report → validation → owning root coordinator → explorer (unless a connected active OpenCode directory or usable view directory wins).
 - Explorer file open → path guard → preview loader → owning read-only preview state (presentation owned by the UI design).
 - Filesystem watcher → tree/preview refresh.
 - Git CLI → worktree metadata → explorer root context (presentation owned by the UI design).
@@ -617,6 +656,8 @@ No component outside the plugin calls OpenCode APIs. No component outside the pl
 There is no data migration: Made is a new product and v1 has no persisted workspace database. The startup default changes from picker-first to home-first without persisted state; `--picker` and the Open folder action preserve the picker path, and an explicit path remains available as the rollback/compatibility path. Invalid home falls back to the existing terminal-only state rather than creating a new picker flow.
 
 The integration is additive. If the injected configuration is removed, OpenCode runs as the user configured it and Made remains a normal shell-following workspace with diagnostic integration detail. Because Made never writes user shell/OpenCode configuration, disabling integration requires no user-file rollback. Preserve historical checked tasks; new revision work and regression checkpoints remain unchecked until verified. Existing readiness records are historical, not proof that revised behavior is delivered.
+
+The view-directory protocol field is additive within major version 1. An older plugin that omits it yields `None` and the existing shell-cwd fallback; an older app ignores it. No data migration, major bump, or user-config change is required. Rollback removes the observation and field and restores the prior shell-only fallback without affecting active-session follow.
 
 If a platform's terminal core cannot meet the requirement, the `TerminalCore` boundary allows a fallback implementation without changing bridge, explorer or root policy. A plugin failure cannot block the terminal-first workflow, but it does not waive the optional OpenCode integration acceptance scenarios required to complete v1. Similarly, unverified shell hooks/platforms remain pending rather than being certified through fallback.
 

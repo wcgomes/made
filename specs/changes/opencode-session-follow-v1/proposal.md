@@ -2,7 +2,7 @@
 
 ## Intent
 
-Made is a native, terminal-first workspace: open a folder and immediately use a shell and following explorer, without needing OpenCode. Independent workspace tabs retain their live terminals; opening a file selects a read-only preview state, never stopping its process. OpenCode v2 is an optional enhancement that follows the active session and worktree when connected. V1 is still an undelivered UX validation slice, not a production release. The UI/UX/visual contract has been split into the active `made-ui-ux-v1` change so this change can stay focused on product, runtime, integration, security, and performance behavior.
+Made is a native, terminal-first workspace: open a folder and immediately use a shell and following explorer, without needing OpenCode. Independent workspace tabs retain their live terminals; opening a file selects a read-only preview state, never stopping its process. OpenCode v2 is an optional enhancement that follows the active session, worktree, or connected sessionless view folder when session tabs are enabled. V1 is still an undelivered UX validation slice, not a production release. The UI/UX/visual contract has been split into the active `made-ui-ux-v1` change so this change can stay focused on product, runtime, integration, security, and performance behavior.
 
 ## Scope
 
@@ -13,7 +13,7 @@ In scope:
 - Independent workspace tabs, each owning a real shell, explorer, directory-follow state, optional integration, preview state, and focus state; switching retains live processes.
 - A terminal that works independently and also runs the real OpenCode v2 TUI with its required terminal features.
 - OpenCode v2 integration through an officially supported extension mechanism and a local-only bridge.
-- Shell-directory follow through safe per-launch integration; a connected active OpenCode session directory takes precedence, including OpenCode-managed worktrees, and disconnect resumes the latest shell cwd.
+- Shell-directory follow through safe per-launch integration; a connected active OpenCode session directory takes precedence, including OpenCode-managed worktrees, and a usable connected sessionless OpenCode view directory is followed when session tabs are enabled and no session is active; session tabs unavailable keeps the degraded shell-cwd fallback, and disconnect clears view state.
 - Session-map data for open root-session tabs, with focus-from-Made as a SHOULD.
 - A per-workspace explorer and read-only preview state, with layout/presentation delegated to `made-ui-ux-v1`.
 - Read-only preview guards, diagnostics data and bounded active-plus-previous log retention, security boundaries, and measured performance/fluidity targets for the complete workflow.
@@ -27,13 +27,14 @@ In scope:
 - Remote, SSH, or WSL-hosted OpenCode.
 - Multi-window, terminal splits, plugin marketplace, auto-update, production installers, signing, or notarization. Workspace tabs are in scope; a second terminal-tab hierarchy is not.
 - Workspace/tab restoration across app restart, automatic OpenCode launch, persistent shell or OpenCode configuration writes, prompt/title scraping, or injecting commands into a running shell to discover cwd.
+- Following a folder selected in the OpenCode desktop app's own picker; only the OpenCode TUI Home/new-session view location is observable to the plugin.
 - Any AI or chat UI that replaces the OpenCode TUI.
 - Production release readiness.
 - UI/UX/visual ownership: Calm Editor layout, chrome, wordmark, glass/native backdrop, tabs/session-map presentation, picker UX, preview/diagnostics presentation, motion, responsive layout, keyboard focus, and accessibility presentation are in `made-ui-ux-v1`.
 
 ## Approach
 
-Made opens a shell and explorer per workspace tab in one native window. With no launch path it opens the current user's home directory; the picker is an explicit action or `--picker`, and an explicit path takes precedence. Safe launch-local shell hooks report cwd without rewriting user configuration; shell capability and fallback are explicit. The user may run OpenCode normally; the app-owned plugin and authenticated tab-local loopback bridge then supply active-session state. Directory arbitration, tab isolation, root generations, read-only preview safety, integration state, diagnostics data with bounded active-plus-previous log retention, and bounded hidden-workspace processing preserve the terminal-first runtime. Normal shell use is not a degraded state; technical integration detail lives in Diagnostics. UI presentation is owned by `made-ui-ux-v1` and its design. Expanded core decisions are in `design.md`.
+Made opens a shell and explorer per workspace tab in one native window. With no launch path it opens the current user's home directory; the picker is an explicit action or `--picker`, and an explicit path takes precedence. Safe launch-local shell hooks report cwd without rewriting user configuration; shell capability and fallback are explicit. The user may run OpenCode normally; the app-owned plugin and authenticated tab-local loopback bridge then supply active-session and, when session tabs are enabled, connected sessionless view-directory state. Directory arbitration, tab isolation, root generations, read-only preview safety, integration state, diagnostics data with bounded active-plus-previous log retention, and bounded hidden-workspace processing preserve the terminal-first runtime. Normal shell use is not a degraded state; technical integration detail lives in Diagnostics. UI presentation is owned by `made-ui-ux-v1` and its design. Expanded core decisions are in `design.md`.
 
 ## Decision index
 
@@ -41,7 +42,9 @@ Made opens a shell and explorer per workspace tab in one native window. With no 
 - **Official OpenCode extension plus loopback bridge:** observes tabs and session directories reliably, supports focus commands, and avoids screen scraping (design: [D2](design.md#d2-plugin-and-loopback-bridge)).
 - **No persistent user-config changes:** integration configuration is composed per launch and injected into the child process; user files stay untouched (design: [D3](design.md#d3-plugin-loading-and-config-merge)).
 - **Home-default startup with explicit override and picker:** no-arg startup opens the current user's home directory instead of blocking on a picker; `--workspace`/positional wins, while `--picker` and the Open folder action make the picker explicit (design: [D5](design.md#d5-session-and-workspace-model), [D19](design.md#d19-home-default-launch-and-picker-boundary)).
-- **Directory precedence:** connected integration with an active session directory wins; otherwise latest known shell cwd, then launch folder. Disconnect never pins the old agent root (design: [D5](design.md#d5-session-and-workspace-model)).
+- **Directory precedence:** connected integration with session tabs enabled and an active session directory wins; otherwise a usable connected sessionless view directory when tabs are enabled, then latest known shell cwd, then launch folder. When session tabs are unavailable, the degraded shell-cwd fallback applies and the view directory is not followed. Disconnect clears view state and never pins the old agent root (design: [D5](design.md#d5-session-and-workspace-model)).
+- **Connected sessionless view directory:** follow OpenCode's TUI `context.location.directory` before any session exists while session tabs are enabled, so changing the folder in the Home/new-session view updates the explorer; retain the last known value across transient `undefined`, emit null while a session is active or tabs are unavailable, and treat invalid plugin-side paths as absent with a non-fatal error (design: [D2](design.md#d2-plugin-and-loopback-bridge), [D4](design.md#d4-bridge-protocol-and-plugin-contract), [D5](design.md#d5-session-and-workspace-model)).
+- **TUI-only view-directory limitation:** the OpenCode desktop app's own folder picker is not observable by a TUI plugin; only the TUI Home/new-session view location is supported in v1 (design: [D2](design.md#d2-plugin-and-loopback-bridge), [D16](design.md#d16-v1-constraints-and-assumptions)).
 - **Safe shell capabilities:** provide launch-local cwd reporting for bash, zsh, fish, and PowerShell; cmd and unsafe/unsupported launches explicitly fall back without claiming automatic follow (design: [D17](design.md#d17-shell-directory-reporting)).
 - **Independent workspace tabs:** reuse one workbench per tab with isolated credentials, process, root generation, preview state, and focus; hidden tabs keep processing bounded output/state without painting grids (design: [D18](design.md#d18-workspace-ownership-and-visibility)).
 - **Read-only preview safety:** preview state is read-only, keeps the terminal process alive, isolates input, and rejects stale roots; presentation is owned by `made-ui-ux-v1` (design: [D8](design.md#d8-explorer-and-preview)).
@@ -83,7 +86,9 @@ Made opens a shell and explorer per workspace tab in one native window. With no 
 - **Q:** Is this a separate version or change?
   **A:** No. The UI contract was split into the active `made-ui-ux-v1` change; this remains the active, undelivered v1 core. Nothing is archived and no version is created.
 - **Q:** Which directory wins while OpenCode is active, and after disconnect?
-  **A:** The live active OpenCode session directory wins while integration is connected; otherwise use the latest known shell cwd, then the launch folder. Continue recording shell cwd while OpenCode wins.
+  **A:** The live active OpenCode session directory wins while integration is connected with session tabs enabled; with no active session, a usable connected TUI view directory wins when tabs are enabled; otherwise use the latest known shell cwd, then the launch folder. When session tabs are unavailable, the degraded shell-cwd fallback applies and the view directory is not followed. Disconnect, normal exit, unsupported integration, session tabs becoming unavailable, or a new epoch clears the view state. Continue recording shell cwd while OpenCode wins. Invalid plugin-side view paths are treated as absent with a non-fatal error; bridge validation remains defense-in-depth and does not add a new event or error channel.
+- **Q:** Does a folder selected in the OpenCode desktop app update Made?
+  **A:** No. Only the OpenCode TUI's Home/new-session view location is observable to a TUI plugin; the desktop app's own picker is outside v1.
 - **Q:** What happens when Made starts with no workspace folder?
   **A:** Made opens the current user's home directory directly with a terminal and explorer. The picker is not a blocking startup step; it remains available from the Open folder action and `--picker`. An explicit `--workspace`/positional path takes precedence over `--picker`.
 - **Q:** What happens when the default home directory is missing or unreadable?

@@ -52,13 +52,13 @@ Made MUST accept an explicit workspace folder at launch through a launch argumen
 
 ### Requirement: OpenCode Integration Loading
 
-Made MUST observe the active OpenCode v2 session identity and working directory as the user switches sessions. Made MUST load its integration without persistently modifying the user's OpenCode configuration. Routine integration chrome is owned by the UI spec; this requirement owns integration state and Diagnostics content.
+Made MUST observe the active OpenCode v2 session identity and working directory as the user switches sessions, and, while OpenCode reports session tabs enabled, MUST observe the connected sessionless view directory exposed by the OpenCode TUI when no session is active. Made MUST load its integration without persistently modifying the user's OpenCode configuration. Routine integration chrome is owned by the UI spec; this requirement owns integration state and Diagnostics content.
 
 #### Scenario: Plugin loads on first OpenCode launch
 
-- Given OpenCode v2 is installed and the user starts it in the Made terminal
+- Given OpenCode v2 is installed with session tabs enabled and the user starts it in the Made terminal
 - When the OpenCode TUI becomes ready
-- Then Made receives the active session identity and working directory and reports connected state in Diagnostics
+- Then Made receives the active session identity and working directory, or, when session tabs are enabled and no session is active, the connected view directory, and reports connected state in Diagnostics
 
 #### Scenario: Existing user plugins are preserved
 
@@ -68,7 +68,13 @@ Made MUST observe the active OpenCode v2 session identity and working directory 
 
 #### Scenario: No OpenCode session yet
 
-- Given OpenCode is running but no session tab is open
+- Given OpenCode is running with session tabs enabled but no session tab is open and OpenCode reports a usable view directory
+- When Made receives integration state
+- Then Diagnostics reports connected with no active session and the explorer follows that view directory, not the latest known shell cwd
+
+#### Scenario: No OpenCode session and no usable view directory
+
+- Given OpenCode is running with session tabs enabled but no session tab is open and no usable view directory is reported
 - When Made receives integration state
 - Then Diagnostics reports connected with no active session and the explorer follows the latest known shell cwd, falling back to the launch folder only until cwd is known
 
@@ -108,7 +114,7 @@ For supported launch-local shell integration, Made MUST follow real directory ch
 
 ### Requirement: Independent Workspace Tabs
 
-Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. No tab persistence across app restart is required.
+Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state including the connected view directory, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. No tab persistence across app restart is required.
 
 #### Scenario: Open and switch independent workspaces
 
@@ -142,7 +148,7 @@ Made MUST let users open an additional workspace folder in a new tab, switch wor
 
 ### Requirement: Active Session Follow
 
-While integration is connected with an active OpenCode session directory, the explorer MUST follow that directory in its owning workspace tab, taking precedence over shell cwd. Without such an active directory, including disconnect and normal OpenCode exit, Made MUST resume the latest known shell cwd, then the launch folder if none is known; an old agent root MUST NOT override that fallback. Shell cwd updates MUST continue to be recorded while OpenCode takes precedence. When the active session changes, Made MUST update the explorer root as soon as the change is received and SHOULD complete it within 500 ms for a local workspace. Made MUST NOT redirect to a repository's main checkout by default. An unavailable active directory MUST be represented as unavailable, not silently replaced with unrelated root content.
+While integration is connected with session tabs enabled and an active OpenCode session directory, the explorer MUST follow that directory in its owning workspace tab, taking precedence over the connected view directory and shell cwd. While session tabs are enabled and no active session directory is present, Made MUST follow a usable connected view directory when one is reported, and otherwise resume the latest known shell cwd, then the launch folder if none is known. When session tabs are unavailable, Made MUST keep the degraded shell-cwd fallback and MUST NOT use the connected view directory. Disconnect, normal OpenCode exit, unsupported integration, session tabs becoming unavailable, or a new connection epoch MUST clear the view directory before applying that fallback; an old agent or view root MUST NOT override it. Shell cwd updates MUST continue to be recorded while OpenCode takes precedence. When the active session changes, Made MUST update the explorer root as soon as the change is received and SHOULD complete it within 500 ms for a local workspace. Made MUST NOT redirect to a repository's main checkout by default. An unavailable active directory MUST be represented as unavailable, not silently replaced with unrelated root content.
 
 #### Scenario: Switch between sessions in the same worktree
 
@@ -173,6 +179,52 @@ While integration is connected with an active OpenCode session directory, the ex
 - Given the active session's working directory has been removed or is unreadable
 - When Made attempts to follow it
 - Then Made shows an unavailable-root message, keeps the terminal usable, and does not crash
+
+### Requirement: Connected View Directory Follow
+
+While integration is connected with session tabs enabled and no active OpenCode session, the explorer MUST follow the OpenCode TUI's connected view directory when OpenCode reports a usable local absolute directory for the folder selected in its Home/new-session view, taking precedence over shell cwd. When OpenCode reports session tabs unavailable, Made MUST keep the degraded shell-cwd fallback, MUST NOT follow the view directory, and MUST clear any retained view-directory state. The view directory MUST be treated as untrusted data and validated like a session directory; an absent, null, relative, malformed, oversized, or unavailable view directory MUST NOT itself become the root. A reported but unusable view directory MUST fall back to the latest known shell cwd, then the launch folder, and MUST be recorded in Diagnostics without crashing or presenting unrelated content as the view directory. When the view directory changes, Made MUST update the owning explorer root as soon as the change is received and SHOULD complete it within 500 ms for a local workspace. While an active session exists, the active session directory MUST take precedence and view-directory changes MUST NOT change the root. On disconnect, normal OpenCode exit, unsupported integration, session tabs becoming unavailable, or a new connection epoch, Made MUST clear the view directory and resume the latest known shell cwd, then the launch folder if none is known. The view directory is observed only through the OpenCode TUI plugin; a folder selected in the OpenCode desktop app's own picker is not observable by this integration and is outside this requirement.
+
+#### Scenario: Connected view directory before any session
+
+- Given OpenCode is connected with session tabs enabled, no session tab is active, and OpenCode reports a usable view directory for the folder selected in its Home/new-session view
+- When Made receives integration state
+- Then the owning explorer follows that view directory and the latest known shell cwd does not override it
+
+#### Scenario: View directory changes in the new-session view
+
+- Given OpenCode is connected with session tabs enabled and no active session and the explorer follows view directory V1
+- When the user changes the workspace or folder in OpenCode's Home/new-session view to V2
+- Then Made updates the owning explorer root to V2 as soon as the change is received and SHOULD complete it within 500 ms for a local workspace
+
+#### Scenario: Active session directory wins over view directory
+
+- Given OpenCode is connected with session tabs enabled, an active session directory B, and a usable connected view directory V
+- When Made receives integration state or V changes
+- Then the explorer follows B, not V, and V does not replace B while the session remains active
+
+#### Scenario: View directory ignored when session tabs are unavailable
+
+- Given OpenCode is connected but reports session tabs unavailable and a usable-looking view directory
+- When Made receives integration state
+- Then Made keeps the degraded shell-cwd fallback, does not follow the view directory, and Diagnostics identifies the v1 tabs constraint
+
+#### Scenario: Disconnected or no usable view directory
+
+- Given integration is disconnected, or OpenCode reports no usable view directory
+- When Made computes the workspace root
+- Then the explorer resumes the latest known shell cwd, falling back to the launch folder only until cwd is known, and an old view or agent root does not override that fallback
+
+#### Scenario: Unusable view directory
+
+- Given OpenCode is connected with session tabs enabled and reports an absolute view directory that is missing or unreadable
+- When Made receives integration state
+- Then the unusable directory cannot become the root, the latest known shell cwd or launch folder remains usable, Diagnostics records the unusable view directory, and Made does not crash
+
+#### Scenario: Invalid view path stays non-fatal
+
+- Given OpenCode's Home/new-session view reports an empty, relative, NUL-bearing, traversal-bearing, or oversized path
+- When the plugin builds integration state
+- Then the invalid value is treated as absent, the plugin reports a non-fatal error without disconnecting, and Made follows the latest known shell cwd rather than an invalid view root
 
 ### Requirement: Worktree Awareness
 
@@ -347,14 +399,14 @@ OpenCode integration is optional. If it is unavailable, disabled, incompatible, 
 #### Scenario: Reconnect
 
 - Given integration returns after a disconnect
-- When a valid connection is established
-- Then Diagnostics reports connected and Made resumes following the active session in that workspace without applying stale connection state
+- When a valid connection with session tabs enabled is established
+- Then Diagnostics reports connected and Made resumes following the active session or, when no session is active and session tabs are enabled, the connected view directory in that workspace without applying stale connection state
 
 #### Scenario: Session tabs unavailable
 
 - Given OpenCode reports that session tabs are disabled
 - When Made receives the state
-- Then Diagnostics identifies the v1 tabs requirement and Made keeps the terminal and shell-following explorer usable
+- Then Diagnostics identifies the v1 tabs requirement, Made keeps the terminal and shell-following explorer usable, and Made does not follow the connected view directory
 
 #### Scenario: Configuration composition fails
 
@@ -450,7 +502,7 @@ Made MUST build from one source tree for macOS arm64, macOS x64, Linux x64 on X1
 
 ### Requirement: Security and Local-Only Integration
 
-Made MUST accept integration connections only over the loopback interface, on a randomly assigned port, authenticated by a per-workspace-instance secret. Credentials and routing MUST isolate workspace tabs: a valid client for one tab MUST NOT mutate, focus, replace the connection of, or disclose state from another tab. Made MUST reject unauthenticated or unauthorized clients before disclosing state. Made MUST NOT persistently modify user shell or OpenCode configuration files. Made MUST load integration code from an app-owned location. Made MUST restrict workspace-content reads to the owning tab's current root and paths the user explicitly selects, and MUST reject path traversal outside those roots. Explicit folder selection, the default home workspace, and validated local cwd/session reports authorize root changes only for their owning tab; they MUST NOT authorize arbitrary file reads in other tabs. Read-only user configuration composition and app-owned resources remain separate from workspace-content reads. The integration bridge MUST NOT be reachable from non-loopback interfaces.
+Made MUST accept integration connections only over the loopback interface, on a randomly assigned port, authenticated by a per-workspace-instance secret. Credentials and routing MUST isolate workspace tabs: a valid client for one tab MUST NOT mutate, focus, replace the connection of, or disclose state from another tab. Made MUST reject unauthenticated or unauthorized clients before disclosing state. Made MUST NOT persistently modify user shell or OpenCode configuration files. Made MUST load integration code from an app-owned location. Made MUST restrict workspace-content reads to the owning tab's current root and paths the user explicitly selects, and MUST reject path traversal outside those roots. Explicit folder selection, the default home workspace, and validated local cwd, session, or view-directory reports authorize root changes only for their owning tab; they MUST NOT authorize arbitrary file reads in other tabs. Read-only user configuration composition and app-owned resources remain separate from workspace-content reads. The integration bridge MUST NOT be reachable from non-loopback interfaces.
 
 #### Scenario: Unauthorized bridge client rejected
 
@@ -490,7 +542,7 @@ Made MUST accept integration connections only over the loopback interface, on a 
 
 ### Requirement: Responsiveness and Lightness
 
-Made MUST NOT use a webview runtime. Extreme responsiveness and fluid interaction are base v1 acceptance criteria; Calm Editor visual quality is owned by the UI spec. Shell use, optional OpenCode, tab switching, preview roundtrip, and explorer hide/resize MUST NOT block input or perform synchronous tree/preview scans on the UI thread. On a supported reference machine, Made SHOULD meet these targets: startup to an interactive terminal and browsable explorer within 2 seconds for a 10,000-file workspace, reported cwd/active-session change to explorer update within 500 ms, terminal input-to-render within 50 ms, and sustained output at 60 frames per second without losing input. Hidden tabs and preview-covered terminals MUST consume bounded output and connection state without rendering hidden grids; activation MUST show current state without replaying an unbounded UI backlog. Evidence MUST distinguish automated/model and software-rendered checks from real hardware-accelerated GUI measurements, with machine, backend, workload, tab count and unverified platforms recorded; software evidence alone MUST NOT claim hardware smoothness.
+Made MUST NOT use a webview runtime. Extreme responsiveness and fluid interaction are base v1 acceptance criteria; Calm Editor visual quality is owned by the UI spec. Shell use, optional OpenCode, tab switching, preview roundtrip, and explorer hide/resize MUST NOT block input or perform synchronous tree/preview scans on the UI thread. On a supported reference machine, Made SHOULD meet these targets: startup to an interactive terminal and browsable explorer within 2 seconds for a 10,000-file workspace, reported cwd, active-session, or view-directory change to explorer update within 500 ms, terminal input-to-render within 50 ms, and sustained output at 60 frames per second without losing input. Hidden tabs and preview-covered terminals MUST consume bounded output and connection state without rendering hidden grids; activation MUST show current state without replaying an unbounded UI backlog. Evidence MUST distinguish automated/model and software-rendered checks from real hardware-accelerated GUI measurements, with machine, backend, workload, tab count and unverified platforms recorded; software evidence alone MUST NOT claim hardware smoothness.
 
 #### Scenario: Startup budget
 
@@ -530,7 +582,7 @@ Made MUST NOT use a webview runtime. Extreme responsiveness and fluid interactio
 
 ### Requirement: Diagnostics
 
-Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session and workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible without a debugger. User-action failures MUST remain discoverable. Logs and copied diagnostics MUST NOT contain workspace-instance secrets. Diagnostics panel layout, technical-detail placement, and routine chrome are owned by the UI spec.
+Made MUST expose optional integration status (inactive, connected, unavailable/degraded, or unsupported), the selected workspace identity, latest known shell cwd and cwd-reporting capability/reason, effective root and its source, active session or, when session tabs are enabled, connected view directory, workspace/worktree, integration version when connected, and access to integration logs in Diagnostics. Normal shell use MUST be inactive, not an app-level degraded state. Technical statuses, versions, branch/worktree metadata, watcher state, metrics and connection details MUST remain accessible without a debugger. User-action failures MUST remain discoverable. Logs and copied diagnostics MUST NOT contain workspace-instance secrets. Diagnostics panel layout, technical-detail placement, and routine chrome are owned by the UI spec.
 
 Diagnostics logs MUST be bounded and retained as one active log plus one previous log. For current-version appends that take the app-owned lock, the active log MUST stay at most 1 MiB; Made MUST rotate before a write would exceed it. A mixed-version or non-cooperating writer can exceed this bound and is a documented residual. The previous log may exceed 1 MiB only when it preserves a legacy active file that was already oversized; its bytes MUST NOT be truncated, rewritten, or deleted. A single entry message MUST be capped at 4 KiB on a UTF-8 boundary with a visible truncation marker, retained log text MUST be capped at 512 KiB with oldest entries evicted before newer ones, at most 500 entries MUST be retained, and every record written to the active log MUST be smaller than 1 MiB. Every append MUST be serialized by an app-owned lock with a bounded wait. If the lock is unavailable or times out, or a required rotation cannot be performed safely, the append MUST be refused and the active and previous logs left untouched. Startup MUST keep a non-blocking warning for a legacy active log already above 1 MiB and for an unsafe previous-log or lock path. Write and rotation failures MUST be reported on stderr; Diagnostics shows a warning or error only while the app is still rendering (the startup warnings and any issue present before the window closes). Final-exit write failures are not visible in-app and remain a documented evidence gap.
 
@@ -538,7 +590,13 @@ Diagnostics logs MUST be bounded and retained as one active log plus one previou
 
 - Given integration is connected
 - When the user opens diagnostics
-- Then Made shows connected status, the active session, the workspace or worktree path, and the integration version
+- Then Made shows connected status, the active session or connected view directory, the workspace or worktree path, and the integration version
+
+#### Scenario: Connected diagnostics without a session
+
+- Given integration is connected with session tabs enabled, no active session, and a usable connected view directory
+- When the user opens diagnostics
+- Then Made shows connected status, the connected view directory, the effective root and its source, and the integration version
 
 #### Scenario: Degraded diagnostics
 

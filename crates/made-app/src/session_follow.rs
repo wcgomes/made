@@ -48,6 +48,45 @@ impl FollowedSession {
     }
 }
 
+/// The connected OpenCode view directory after a snapshot is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowedViewDirectory {
+    /// Directory exactly as reported by OpenCode, before canonicalization.
+    pub requested: PathBuf,
+    /// Canonical directory when it exists and is readable.
+    pub canonical: Option<PathBuf>,
+    /// Whether the directory exists and is readable.
+    pub available: bool,
+    /// Why the directory cannot be used, when unavailable.
+    pub reason: Option<String>,
+}
+
+impl FollowedViewDirectory {
+    /// Best available directory for display.
+    pub fn directory(&self) -> &Path {
+        self.canonical.as_deref().unwrap_or(&self.requested)
+    }
+}
+
+/// Which owner selected the effective explorer root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSource {
+    /// The latest validated shell cwd or launch folder.
+    Shell,
+    /// A connected OpenCode active session or view directory.
+    OpenCode,
+}
+
+impl RootSource {
+    /// Stable identifier used by diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
 /// What one accepted or rejected snapshot changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionFollowUpdate {
@@ -68,6 +107,16 @@ pub enum SessionFollowUpdate {
     /// The active session was applied. Check `root_switched` to know whether
     /// the explorer root changed.
     ActiveSession,
+    /// No active session; the usable connected view directory was applied.
+    ViewDirectory,
+    /// The connected view directory is reported but cannot be used. The shell
+    /// fallback is current and no unavailable-root state is presented.
+    ViewDirectoryUnavailable {
+        /// Requested view directory.
+        directory: PathBuf,
+        /// Why the directory cannot be used.
+        detail: String,
+    },
     /// The active session directory is missing, unreadable, relative, or was
     /// not reported. The previous root is retained.
     ActiveDirectoryUnavailable {
@@ -172,10 +221,12 @@ pub struct SessionFollowCoordinator {
     generation: GenerationGate,
     last_known_active_root: Option<PathBuf>,
     active_session: Option<FollowedSession>,
+    view_directory: Option<FollowedViewDirectory>,
     unavailable: Option<UnavailableRoot>,
     connection_id: Option<u64>,
     tracker: SnapshotTracker,
     directory_check: Option<CachedDirectoryCheck>,
+    view_check: Option<CachedDirectoryCheck>,
     directory_cache_ttl: Duration,
     directory_validation_count: u64,
     fallback_cache: Option<(PathBuf, Instant)>,
@@ -234,10 +285,12 @@ impl SessionFollowCoordinator {
             generation: GenerationGate::new(RootGeneration::INITIAL),
             last_known_active_root: None,
             active_session: None,
+            view_directory: None,
             unavailable: None,
             connection_id: None,
             tracker: SnapshotTracker::new(),
             directory_check: None,
+            view_check: None,
             directory_cache_ttl: DEFAULT_DIRECTORY_CACHE_TTL,
             directory_validation_count: 0,
             fallback_cache: None,
@@ -263,6 +316,33 @@ impl SessionFollowCoordinator {
     /// Active session identity.
     pub fn active_session(&self) -> Option<&FollowedSession> {
         self.active_session.as_ref()
+    }
+
+    /// Connected OpenCode view directory, when one is reported.
+    pub fn view_directory(&self) -> Option<&FollowedViewDirectory> {
+        self.view_directory.as_ref()
+    }
+
+    /// Which owner selected the effective explorer root.
+    pub fn effective_root_source(&self) -> RootSource {
+        if self.active_session.is_some() || self.view_is_effective() {
+            RootSource::OpenCode
+        } else {
+            RootSource::Shell
+        }
+    }
+
+    fn view_is_effective(&self) -> bool {
+        self.active_session.is_none()
+            && self
+                .view_directory
+                .as_ref()
+                .is_some_and(|view| view.available)
+    }
+
+    /// Whether OpenCode currently owns the effective root.
+    pub fn is_agent_owned(&self) -> bool {
+        self.effective_root_source() == RootSource::OpenCode
     }
 
     /// Last root established by an active session.
@@ -296,7 +376,11 @@ impl SessionFollowCoordinator {
     }
 
     /// Reset revision tracking for a new plugin connection epoch.
+    ///
+    /// The previous epoch's connected view directory is cleared before the new
+    /// epoch can accept snapshots.
     pub fn begin_epoch(&mut self) -> u64 {
+        self.clear_view_directory();
         self.tracker.begin_epoch()
     }
 
@@ -408,7 +492,8 @@ impl SessionFollowCoordinator {
     }
 
     /// Validate a changed shell report once, retaining the usable tree on error.
-    /// A connected active session keeps precedence until explicitly released.
+    /// A connected active session or usable view directory keeps precedence
+    /// until explicitly released.
     pub fn follow_shell_cwd(&mut self, cwd: &Path) -> Result<SessionFollowOutcome, WorkspaceError> {
         let canonical = usable_directory(cwd)?;
         self.fallback_cache = None;
@@ -416,11 +501,22 @@ impl SessionFollowCoordinator {
         if self.active_session.is_some() {
             return Ok(self.outcome(SessionFollowUpdate::ActiveSession, false));
         }
-        Ok(self.release_active_session())
+        if self.view_is_effective() {
+            return Ok(self.outcome(SessionFollowUpdate::ViewDirectory, false));
+        }
+        Ok(self.release_to_fallback(SessionFollowUpdate::NoActiveSession))
     }
 
     /// Release agent precedence on no-active, tabs-disabled or disconnection.
+    ///
+    /// The connected view directory belongs to the connection epoch, so it is
+    /// cleared here before the shell fallback is applied.
     pub fn release_active_session(&mut self) -> SessionFollowOutcome {
+        self.clear_view_directory();
+        self.release_to_fallback(SessionFollowUpdate::NoActiveSession)
+    }
+
+    fn release_to_fallback(&mut self, update: SessionFollowUpdate) -> SessionFollowOutcome {
         self.active_session = None;
         self.unavailable = None;
         self.directory_check = None;
@@ -442,7 +538,7 @@ impl SessionFollowCoordinator {
             self.generation.advance();
             self.current_root = root;
         }
-        self.outcome(SessionFollowUpdate::NoActiveSession, switched)
+        self.outcome(update, switched)
     }
 
     /// Terminal working directory known to the coordinator.
@@ -473,10 +569,19 @@ impl SessionFollowCoordinator {
 
     fn apply_accepted(&mut self, snapshot: SessionSnapshot) -> SessionFollowOutcome {
         if !snapshot.tabs_enabled {
+            // The view directory is scoped to tabs-enabled sessions. Clear it
+            // before the degraded shell-cwd fallback can be observed.
             return self.release_active_session();
         }
+
+        if let Some(view) = snapshot.view_directory.clone() {
+            self.record_view_directory(&view);
+        } else {
+            self.clear_view_directory();
+        }
+
         let Some(active_id) = snapshot.active_session_id.clone() else {
-            return self.release_active_session();
+            return self.apply_view_or_fallback();
         };
 
         let Some(session) = snapshot
@@ -551,6 +656,62 @@ impl SessionFollowCoordinator {
         }
     }
 
+    fn apply_view_or_fallback(&mut self) -> SessionFollowOutcome {
+        let Some(view) = self.view_directory.as_ref() else {
+            return self.release_active_session();
+        };
+        let available = view.available;
+        let requested = view.requested.clone();
+        let canonical = view.canonical.clone();
+        let reason = view.reason.clone();
+
+        if !available {
+            return self.release_to_fallback(SessionFollowUpdate::ViewDirectoryUnavailable {
+                directory: requested,
+                detail: reason.unwrap_or_else(|| "the view directory is unavailable".to_owned()),
+            });
+        }
+        let Some(canonical) = canonical else {
+            return self.release_active_session();
+        };
+
+        self.active_session = None;
+        self.unavailable = None;
+        self.directory_check = None;
+        let switched = canonical != self.current_root;
+        if switched {
+            self.generation.advance();
+            self.current_root = canonical;
+        }
+        self.outcome(SessionFollowUpdate::ViewDirectory, switched)
+    }
+
+    fn record_view_directory(&mut self, requested: &Path) {
+        match self.validate_view_directory(requested) {
+            Ok(canonical) => {
+                self.view_directory = Some(FollowedViewDirectory {
+                    requested: requested.to_path_buf(),
+                    canonical: Some(canonical),
+                    available: true,
+                    reason: None,
+                });
+            }
+            Err(error) => {
+                self.view_directory = Some(FollowedViewDirectory {
+                    requested: requested.to_path_buf(),
+                    canonical: None,
+                    available: false,
+                    reason: Some(error.message()),
+                });
+            }
+        }
+    }
+
+    fn clear_view_directory(&mut self) {
+        self.view_directory = None;
+        self.view_check = None;
+    }
+
     fn mark_unavailable(&mut self, session_id: &str, requested: &Path) {
         let unchanged = self.unavailable.as_ref().is_some_and(|unavailable| {
             unavailable.session_id == session_id && unavailable.requested == requested
@@ -569,10 +730,35 @@ impl SessionFollowCoordinator {
     }
 
     fn validate_directory(&mut self, requested: &Path) -> Result<PathBuf, WorkspaceError> {
+        let ttl = self.directory_cache_ttl;
+        Self::validate_cached_directory(
+            &mut self.directory_check,
+            &mut self.directory_validation_count,
+            ttl,
+            requested,
+        )
+    }
+
+    fn validate_view_directory(&mut self, requested: &Path) -> Result<PathBuf, WorkspaceError> {
+        let ttl = self.directory_cache_ttl;
+        Self::validate_cached_directory(
+            &mut self.view_check,
+            &mut self.directory_validation_count,
+            ttl,
+            requested,
+        )
+    }
+
+    fn validate_cached_directory(
+        cache: &mut Option<CachedDirectoryCheck>,
+        validation_count: &mut u64,
+        ttl: Duration,
+        requested: &Path,
+    ) -> Result<PathBuf, WorkspaceError> {
         let now = Instant::now();
-        if let Some(cached) = &self.directory_check {
+        if let Some(cached) = cache {
             if cached.requested == requested
-                && now.saturating_duration_since(cached.checked_at) < self.directory_cache_ttl
+                && now.saturating_duration_since(cached.checked_at) < ttl
             {
                 // A cached failure is only reused while the path still looks
                 // absent. A directory that reappears is revalidated at the next
@@ -586,8 +772,8 @@ impl SessionFollowCoordinator {
         }
 
         let result = usable_directory(requested);
-        self.directory_validation_count = self.directory_validation_count.saturating_add(1);
-        self.directory_check = Some(CachedDirectoryCheck {
+        *validation_count = (*validation_count).saturating_add(1);
+        *cache = Some(CachedDirectoryCheck {
             requested: requested.to_path_buf(),
             result: result.clone(),
             checked_at: now,

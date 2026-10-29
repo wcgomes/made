@@ -206,6 +206,13 @@ function normalizePromptPulse(value: unknown): number {
   return value > UINT32_MAX ? UINT32_MAX : value;
 }
 
+function hasActiveTab(tabs: TuiTab[]): boolean {
+  for (const tab of tabs) {
+    if (tab.active === true) return true;
+  }
+  return false;
+}
+
 function normalizeTab(value: unknown): TuiTab | undefined {
   if (!isRecord(value)) return undefined;
   try {
@@ -247,6 +254,54 @@ function normalizeSessionInfo(value: unknown): SessionInfoView {
   }
 }
 
+type ViewDirectoryObservation =
+  | { kind: "usable"; directory: string }
+  | { kind: "absent"; retain: boolean }
+  | { kind: "invalid"; reason: string; value: string };
+
+function isAbsoluteLocalPath(value: string): boolean {
+  if (value.startsWith("/")) return true;
+  // Windows drive and UNC paths, for OpenCode running on Windows.
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;
+  return value.startsWith("\\\\");
+}
+
+/**
+ * Validate the Home/new-session view directory before it reaches the wire.
+ *
+ * `undefined` is transient during OpenCode synchronization and retains the
+ * last known value. Every other unusable value is absent: an invalid value
+ * clears the retained directory and is reported non-fatally. Oversized values
+ * are omitted rather than truncated so a path prefix is never presented as the
+ * selected folder.
+ */
+function validateViewDirectory(value: unknown): ViewDirectoryObservation {
+  if (value === undefined) return { kind: "absent", retain: true };
+  if (value === null) return { kind: "absent", retain: false };
+  if (typeof value !== "string") {
+    return { kind: "invalid", reason: "is not a string", value: "" };
+  }
+  if (value.length === 0) return { kind: "invalid", reason: "is empty", value };
+  if (value.includes("\0")) {
+    return { kind: "invalid", reason: "contains a NUL character", value };
+  }
+  if (exceedsCodePoints(value, MAX_PATH_LENGTH)) {
+    return {
+      kind: "invalid",
+      reason: `exceeds ${MAX_PATH_LENGTH} code points`,
+      value,
+    };
+  }
+  if (!isAbsoluteLocalPath(value)) {
+    return { kind: "invalid", reason: "is not absolute", value };
+  }
+  const segments = value.split(/[\\/]+/);
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    return { kind: "invalid", reason: "contains a dot segment", value };
+  }
+  return { kind: "usable", directory: value };
+}
+
 function trimSession(
   session: SessionSnapshot,
   titleLength: number,
@@ -264,6 +319,7 @@ function stateForSize(
   sessions: SessionSnapshot[],
   activeSessionID: string | null,
   tabsEnabled: boolean,
+  viewDirectory: string | null,
 ): StateMessage {
   return {
     type: "state",
@@ -272,6 +328,7 @@ function stateForSize(
     revision: Number.MAX_SAFE_INTEGER,
     activeSessionID,
     tabsEnabled,
+    viewDirectory,
     sessions,
   };
 }
@@ -348,6 +405,8 @@ export function createIntegration(
   let generation = 0;
   let tabsEnabled = false;
   let tabList: TuiTab[] = [];
+  let viewDirectory: string | null = null;
+  let lastViewErrorKey = "";
   let stateSentThisEpoch = false;
   let deferredError: { code: string; message: string } | undefined;
 
@@ -378,6 +437,39 @@ export function createIntegration(
       fatal,
     };
     send(payload);
+  };
+
+  const observeViewDirectory = (): void => {
+    let raw: unknown;
+    try {
+      raw = context.location?.directory;
+    } catch (error) {
+      viewDirectory = null;
+      lastViewErrorKey = "";
+      sendError("view_directory_unavailable", errorText(error));
+      return;
+    }
+
+    const observation = validateViewDirectory(raw);
+    if (observation.kind === "usable") {
+      viewDirectory = observation.directory;
+      lastViewErrorKey = "";
+      return;
+    }
+    if (observation.kind === "absent") {
+      if (!observation.retain) viewDirectory = null;
+      lastViewErrorKey = "";
+      return;
+    }
+
+    // An invalid value is absent and clears the retained directory. Report it
+    // once per distinct bad value so a reactive effect cannot spam the bridge.
+    viewDirectory = null;
+    const key = `${observation.reason}\u0000${observation.value}`;
+    if (key === lastViewErrorKey) return;
+    lastViewErrorKey = key;
+    const detail = observation.value.length > 0 ? `: ${observation.value}` : "";
+    sendError("view_directory_invalid", `view directory ${observation.reason}${detail}`);
   };
 
   const clearStableTimer = (): void => {
@@ -462,11 +554,13 @@ export function createIntegration(
   const fitSnapshot = (
     sessions: SessionSnapshot[],
     activeSessionID: string | null,
+    viewDirectory: string | null,
   ): StateMessage => {
     let titleLength = MAX_TITLE_LENGTH;
     let pathLength = MAX_PATH_LENGTH;
+    let currentView = viewDirectory;
     let current = sessions.map((session) => trimSession(session, titleLength, pathLength));
-    let message = stateForSize(current, activeSessionID, tabsEnabled);
+    let message = stateForSize(current, activeSessionID, tabsEnabled, currentView);
 
     while (
       snapshotByteLength(message) + SNAPSHOT_SIZE_HEADROOM >
@@ -480,7 +574,15 @@ export function createIntegration(
         current = sessions.map((session) =>
           trimSession(session, titleLength, pathLength),
         );
-        message = stateForSize(current, activeSessionID, tabsEnabled);
+        message = stateForSize(current, activeSessionID, tabsEnabled, currentView);
+        continue;
+      }
+
+      // Drop the view directory before any session. It is optional, while the
+      // session map is the primary payload.
+      if (currentView !== null) {
+        currentView = null;
+        message = stateForSize(current, activeSessionID, tabsEnabled, currentView);
         continue;
       }
 
@@ -494,7 +596,7 @@ export function createIntegration(
         }
         if (dropIndex >= 0) {
           current.splice(dropIndex, 1);
-          message = stateForSize(current, activeSessionID, tabsEnabled);
+          message = stateForSize(current, activeSessionID, tabsEnabled, currentView);
           continue;
         }
       }
@@ -504,7 +606,7 @@ export function createIntegration(
       current = current.map((session) =>
         trimSession(session, MIN_FINAL_TITLE_LENGTH, MIN_FINAL_PATH_LENGTH),
       );
-      message = stateForSize(current, activeSessionID, tabsEnabled);
+      message = stateForSize(current, activeSessionID, tabsEnabled, currentView);
       break;
     }
 
@@ -514,7 +616,8 @@ export function createIntegration(
   const sendState = (force: boolean): void => {
     if (!welcomed || unloaded || stopped) return;
     const built = buildSnapshot();
-    const snapshot = fitSnapshot(built.sessions, built.activeSessionID);
+    const view = tabsEnabled && !hasActiveTab(tabList) ? viewDirectory : null;
+    const snapshot = fitSnapshot(built.sessions, built.activeSessionID, view);
     let key: string;
     try {
       key = JSON.stringify({ ...snapshot, revision: 0 });
@@ -654,6 +757,11 @@ export function createIntegration(
         revision = 0;
         lastSnapshotKey = "";
         stateSentThisEpoch = false;
+        // A new authenticated epoch never reuses the previous epoch's view
+        // directory. Re-read it so the first snapshot reflects the current
+        // Home/new-session selection without waiting for another effect run.
+        viewDirectory = null;
+        lastViewErrorKey = "";
         clearStableTimer();
         if (deferredError) {
           sendError(deferredError.code, deferredError.message, true);
@@ -662,6 +770,9 @@ export function createIntegration(
           stopped = true;
           clearStableTimer();
           return;
+        }
+        if (tabsEnabled && !hasActiveTab(tabList)) {
+          observeViewDirectory();
         }
         sendState(true);
         return;
@@ -866,6 +977,17 @@ export function createIntegration(
     const runGeneration = ++generation;
     const { enabled, tabs } = readTabs();
 
+    // Read the selected Home/new-session folder in the same reactive pass as
+    // the tab list. Only the sessionless tab-enabled state may retain a value
+    // across a transient undefined; an active session or unavailable tabs
+    // clear the cache so a later undefined cannot resurrect it.
+    if (enabled && !hasActiveTab(tabs)) {
+      observeViewDirectory();
+    } else {
+      viewDirectory = null;
+      lastViewErrorKey = "";
+    }
+
     const seen = new Set<string>();
     for (const tab of tabs) {
       seen.add(tab.sessionID);
@@ -899,6 +1021,8 @@ export function createIntegration(
     if (unloaded) return;
     unloaded = true;
     generation += 1;
+    viewDirectory = null;
+    lastViewErrorKey = "";
     if (debounceTimer !== undefined) {
       clearTimeout(debounceTimer);
       debounceTimer = undefined;

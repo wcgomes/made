@@ -36,6 +36,7 @@ fn snapshot() -> SessionSnapshot {
         revision: 7,
         active_session_id: Some("ses_active".to_owned()),
         tabs_enabled: true,
+        view_directory: None,
         sessions: vec![SessionInfo {
             session_id: "ses_active".to_owned(),
             title: "Investigate the parser".to_owned(),
@@ -151,6 +152,84 @@ fn connected_diagnostics_expose_every_required_field() {
 }
 
 #[test]
+fn workspace_view_directory_is_sanitized_redacted_and_reported() {
+    let token = token();
+    let integration = IntegrationState::new(
+        Some(PathBuf::from("/workspace")),
+        PathBuf::from("/workspace"),
+    );
+    let diagnostics = Diagnostics::new("/tmp/made-integration.log");
+    let mut view = diagnostics.snapshot(
+        &integration,
+        None,
+        Some(&PathBuf::from("/workspace/view")),
+        None,
+    );
+    view.attach_workspace(WorkspaceDiagnostics {
+        identity: "made-123-7".to_owned(),
+        label: "made".to_owned(),
+        path: Some(PathBuf::from("/workspace")),
+        shell_cwd: Some(PathBuf::from("/workspace/sub")),
+        cwd_supported: Some(true),
+        cwd_reason: None,
+        root_source: Some("opencode".to_owned()),
+        watcher: Some("live".to_owned()),
+        view_directory: Some(PathBuf::from(format!(
+            "/workspace/view\n\u{202e}hidden-{}",
+            token.expose_secret()
+        ))),
+        view_directory_available: Some(false),
+        view_directory_reason: Some(format!("directory unavailable: {}", token.expose_secret())),
+    });
+
+    let directory = view.view_directory.as_ref().expect("view directory kept");
+    assert!(!directory.to_string_lossy().contains('\n'));
+    assert!(!directory.to_string_lossy().contains('\u{202e}'));
+    assert_eq!(view.view_directory_available, Some(false));
+    let reason = view.view_directory_reason.as_deref().expect("reason kept");
+    assert!(!reason.contains(token.expose_secret()));
+    assert!(reason.contains("[redacted]"));
+
+    let text = view.to_text();
+    assert!(text.contains("root source: opencode"));
+    assert!(text.contains("view directory: /workspace/view"));
+    assert!(text.contains("view directory available: no"));
+    assert!(text.contains("view directory reason: directory unavailable: [redacted]"));
+    assert!(!text.contains(token.expose_secret()));
+    assert!(!view.contains_secret(&token));
+}
+
+#[test]
+fn tabs_unavailable_diagnostics_report_no_view_directory() {
+    let integration = IntegrationState::new(
+        Some(PathBuf::from("/workspace")),
+        PathBuf::from("/workspace"),
+    );
+    let diagnostics = Diagnostics::new("/tmp/made-integration.log");
+    let mut view =
+        diagnostics.snapshot(&integration, None, Some(&PathBuf::from("/workspace")), None);
+    view.attach_workspace(WorkspaceDiagnostics {
+        identity: "made-123-7".to_owned(),
+        label: "made".to_owned(),
+        path: Some(PathBuf::from("/workspace")),
+        shell_cwd: Some(PathBuf::from("/workspace/sub")),
+        cwd_supported: Some(true),
+        cwd_reason: None,
+        root_source: Some("shell".to_owned()),
+        watcher: Some("live".to_owned()),
+        view_directory: None,
+        view_directory_available: None,
+        view_directory_reason: None,
+    });
+
+    assert_eq!(view.view_directory, None);
+    let text = view.to_text();
+    assert!(text.contains("tabs enabled: no"));
+    assert!(text.contains("view directory: none"));
+    assert!(!text.contains("view directory available:"));
+}
+
+#[test]
 fn workspace_shell_context_is_inspectable_and_redacted() {
     let token = token();
     let integration = IntegrationState::new(
@@ -173,6 +252,9 @@ fn workspace_shell_context_is_inspectable_and_redacted() {
         )),
         root_source: Some("shell".to_owned()),
         watcher: Some("live".to_owned()),
+        view_directory: None,
+        view_directory_available: None,
+        view_directory_reason: None,
     });
 
     assert_eq!(view.workspace_identity.as_deref(), Some("made-123-7"));
