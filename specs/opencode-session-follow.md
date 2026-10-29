@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This active, undelivered v1 change owns product, runtime, integration, security, and performance behavior. UI/UX/visual behavior — Calm Editor layout and chrome, home/picker presentation and selection, workspace-tab and session-map presentation, full-left preview presentation, explorer layout, diagnostics presentation, wordmark, glass/native backdrop, motion, responsive layout, keyboard focus, and accessibility presentation — is owned by `specs/changes/archive/20261029-made-ui-ux-v1/spec.md`. Requirements below cross-reference that contract instead of duplicating it. This change is not archived and no new version is created.
+This specification owns product, runtime, integration, security, and performance behavior. UI/UX/visual behavior — Calm Editor layout and chrome, home/picker presentation and selection, workspace-tab and session-map presentation, full-left preview presentation, explorer layout, diagnostics presentation, wordmark, glass/native backdrop, motion, responsive layout, keyboard focus, and accessibility presentation — is owned by the UI specification (`specs/made-ui-ux.md`). Requirements below cross-reference that contract instead of duplicating it.
 
 ## Requirements
 

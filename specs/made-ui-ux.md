@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This active change owns the UI/UX/visual/presentation contract for the undelivered v1, split from `opencode-session-follow-v1`. Product/runtime/integration/security/performance behavior remains in the core change (`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`). This is not a new version, release, or archive. The UI is implemented on Linux with 654 passing tests and Xvfb/headless evidence; macOS arm64 HudWindow vibrancy and UI rendering were manually verified natively on 2026-10-28 (windowed, resized, and fullscreen), while full native UX and native contrast certification remain pending, as do Windows, macOS x64, native Linux desktop, native pointer/keyboard, and hardware-GPU evidence.
+This specification owns the UI/UX/visual/presentation contract for v1. Product/runtime/integration/security/performance behavior is owned by the core specification (`specs/opencode-session-follow.md`). The UI is implemented on Linux with 654 passing tests and Xvfb/headless evidence; macOS arm64 HudWindow vibrancy and UI rendering were manually verified natively on 2026-10-28 (windowed, resized, and fullscreen). Native UX and native contrast certification are not current requirements; Windows, macOS x64, native Linux desktop, native pointer/keyboard, and hardware-GPU evidence remain unverified.
 
 ## Requirements
 
