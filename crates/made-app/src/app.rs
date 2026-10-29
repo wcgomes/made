@@ -665,6 +665,13 @@ impl AppModel {
 
     /// Render the current surface.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        // eframe calls `ui` in the same frame that `logic` handles the window
+        // close request. Shutdown has already dropped the terminal, so
+        // rendering now would paint the terminal-unavailable card into the
+        // closing frame.
+        if self.shutdown_done {
+            return;
+        }
         self.apply_focus_reset(ui.ctx());
         self.ui_frames = self.ui_frames.saturating_add(1);
         if !self.theme_ready {

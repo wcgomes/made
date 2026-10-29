@@ -3544,6 +3544,70 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_window_close_frame_does_not_paint_the_workspace() {
+        let _app_paths = IsolatedAppPaths::new();
+        let temp = tempfile::tempdir().unwrap();
+        let mut model = AppModel::from_launch(
+            crate::workspace::WorkspaceLaunch::waiting_for_picker(),
+            crate::app::AppOptions::new(),
+        );
+        model.open_plan(
+            crate::workspace::LaunchPlan::open(
+                temp.path(),
+                crate::workspace::WorkspaceSource::Picker,
+            )
+            .unwrap(),
+        );
+        model.ensure_workbench();
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw(), |ui| model.ui(ui));
+        output.textures_delta.clear();
+        assert!(
+            !output.shapes.is_empty(),
+            "the live workspace must render before shutdown"
+        );
+        assert!(
+            text_rect(&output, "Terminal unavailable").is_none(),
+            "the live terminal must not show the unavailable card"
+        );
+
+        // eframe runs `logic` (which observes the close request and shuts the
+        // app down) and then `ui` in the same frame. The shutdown frame must
+        // not paint the now-removed terminal's error card.
+        model.shutdown();
+        let frames = model.ui_frame_count();
+        let mut output = ctx.run_ui(raw(), |ui| model.ui(ui));
+        output.textures_delta.clear();
+        assert!(
+            text_rect(&output, "Terminal unavailable").is_none(),
+            "shutdown must not paint the terminal-unavailable card"
+        );
+        assert!(
+            !fill_rects(&output)
+                .iter()
+                .any(|(_, fill)| *fill == theme::ERROR_TINT),
+            "shutdown must not paint an error-tinted card"
+        );
+        assert!(
+            output.shapes.is_empty(),
+            "shutdown must not render the workspace"
+        );
+        assert_eq!(
+            model.ui_frame_count(),
+            frames,
+            "a shutdown UI pass must not count as a rendered frame"
+        );
+    }
+
+    #[test]
     fn diagnostics_status_pill_renders_shapes() {
         let ctx = egui::Context::default();
         theme::install(&ctx);
