@@ -23,6 +23,7 @@ pub mod session_follow;
 pub mod session_map;
 pub mod terminal_view;
 pub mod theme;
+pub mod tui;
 pub mod ui;
 pub mod workbench;
 pub mod workspace;
@@ -42,6 +43,7 @@ pub use integration_status::{
     AgentIntegration, IntegrationReport, IntegrationState, IntegrationStatus, ReasonCode,
     ScopeBoundary, StatusChange, StatusReason, V1_SCOPE,
 };
+pub use made_platform::CompatibleTui;
 pub use metrics::{BudgetStatus, Metrics, PerformanceReport};
 pub use render::{
     paint_grid, CellMetrics, CellPoint, GridPalette, GridRenderer, PaintOptions, SelectionRange,
@@ -58,6 +60,7 @@ pub use session_follow::{
 pub use session_map::{SessionMap, SessionMapUpdate, SessionRow};
 pub use terminal_view::{TerminalPane, TerminalUiOutput};
 pub use theme::TRANSLUCENT_WINDOW;
+pub use tui::TerminalTarget;
 pub use workbench::{
     platform_family_label, worktree_indicator, LeftSurface, Workbench, WorktreeState,
 };

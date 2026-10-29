@@ -7,16 +7,17 @@
 //! mutating process-wide environment variables.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
-    append_private_log_rotated_with_timeout, host_platform, install_root_for_executable,
-    is_sensitive_env_key, open_private_log, previous_private_log_path, private_log_lock_path,
-    repository_plugin_dir, repository_root, resolve_user_home, validate_user_home, AppPaths,
-    Clipboard, Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard,
+    append_private_log_rotated_with_timeout, detect_compatible_tuis_in_path,
+    find_executable_on_path, host_platform, install_root_for_executable, is_sensitive_env_key,
+    open_private_log, previous_private_log_path, private_log_lock_path, repository_plugin_dir,
+    repository_root, resolve_user_home, validate_user_home, AppPaths, Clipboard, CompatibleTui,
+    Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard,
     LogAppendOutcome, LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily,
     PluginDirSource, PtyRequest, PtySize, REDACTED_VALUE,
 };
@@ -69,6 +70,111 @@ fn home_resolution_prefers_home_on_linux_and_macos() {
         .expect("home resolves");
         assert_eq!(home, PathBuf::from("/home/primary"), "{family}");
     }
+}
+
+#[test]
+fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
+    let root = unique_temp("tui-path");
+    let empty = root.join("empty");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir(empty.join("opencode")).unwrap();
+
+    assert!(detect_compatible_tuis_in_path(OsStr::new("")).is_empty());
+    let empty_path = std::env::join_paths([&empty]).unwrap();
+    assert!(detect_compatible_tuis_in_path(&empty_path).is_empty());
+    assert_eq!(
+        find_executable_on_path(OsStr::new("opencode"), &empty_path),
+        None
+    );
+
+    let relative_name = format!("{}-relative", root.file_name().unwrap().to_string_lossy());
+    let relative_dir = std::env::current_dir().unwrap().join(&relative_name);
+    std::fs::create_dir_all(&relative_dir).unwrap();
+    #[cfg(windows)]
+    let relative_executable = relative_dir.join("opencode.exe");
+    #[cfg(not(windows))]
+    let relative_executable = relative_dir.join("opencode");
+    std::fs::write(&relative_executable, b"not a real program").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&relative_executable, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let relative_path = std::env::join_paths([Path::new(&relative_name)]).unwrap();
+    let relative_detected = find_executable_on_path(OsStr::new("opencode"), &relative_path);
+    let _ = std::fs::remove_dir_all(&relative_dir);
+    assert_eq!(
+        relative_detected, None,
+        "relative PATH entries must be ignored"
+    );
+
+    #[cfg(windows)]
+    let executable = bin.join("opencode.exe");
+    #[cfg(not(windows))]
+    let executable = bin.join("opencode");
+    // On Unix the candidate is a script that records any launch. Detection only
+    // reads metadata, so the sentinel must still be absent afterwards.
+    #[cfg(unix)]
+    let sentinel = root.join("launched");
+    #[cfg(unix)]
+    let body = format!("#!/bin/sh\nprintf launched > '{}'\n", sentinel.display());
+    #[cfg(not(unix))]
+    let body = "not a real program".to_owned();
+    std::fs::write(&executable, body).unwrap();
+
+    #[cfg(windows)]
+    {
+        // A bare file must not shadow the preferred .exe candidate.
+        std::fs::write(bin.join("opencode"), b"not a real program").unwrap();
+    }
+
+    let path = std::env::join_paths([&empty, &bin]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            find_executable_on_path(OsStr::new("opencode"), &path),
+            None,
+            "a non-executable file must not be detected"
+        );
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    assert_eq!(
+        detect_compatible_tuis_in_path(&path),
+        vec![CompatibleTui::OpenCode]
+    );
+    assert_eq!(
+        find_executable_on_path(executable.as_os_str(), &path),
+        None,
+        "path-shaped programs must never be searched"
+    );
+    assert_eq!(
+        find_executable_on_path(OsStr::new("opencode"), &path),
+        Some(executable)
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            !sentinel.exists(),
+            "detection must not execute the candidate"
+        );
+        // Positive control: running the same script must create the sentinel,
+        // which proves the absence check above can observe an execution.
+        let status = std::process::Command::new(bin.join("opencode"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fake candidate must run");
+        assert!(
+            sentinel.exists(),
+            "running the fake candidate must create the sentinel"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
