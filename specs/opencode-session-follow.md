@@ -1,8 +1,10 @@
-# Change Spec: opencode-session-follow-v1
+# OpenCode Session Follow Specification
 
-> **Scope:** This active, undelivered v1 change owns product, runtime, integration, security, and performance behavior. UI/UX/visual behavior — Calm Editor layout and chrome, home/picker presentation and selection, workspace-tab and session-map presentation, full-left preview presentation, explorer layout, diagnostics presentation, wordmark, glass/native backdrop, motion, responsive layout, keyboard focus, and accessibility presentation — is owned by `specs/changes/made-ui-ux-v1/spec.md`. Requirements below cross-reference that contract instead of duplicating it. This change is not archived and no new version is created.
+## Purpose
 
-## ADDED Requirements
+This active, undelivered v1 change owns product, runtime, integration, security, and performance behavior. UI/UX/visual behavior — Calm Editor layout and chrome, home/picker presentation and selection, workspace-tab and session-map presentation, full-left preview presentation, explorer layout, diagnostics presentation, wordmark, glass/native backdrop, motion, responsive layout, keyboard focus, and accessibility presentation — is owned by `specs/changes/archive/20261029-made-ui-ux-v1/spec.md`. Requirements below cross-reference that contract instead of duplicating it. This change is not archived and no new version is created.
+
+## Requirements
 
 ### Requirement: Workspace Launch
 

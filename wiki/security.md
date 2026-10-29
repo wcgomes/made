@@ -1,6 +1,6 @@
 # Security
 
-Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, and untrusted text arriving from OpenCode or the terminal. This page records the implemented model and accepted v1 residuals. Normative requirements are in [`specs/changes/opencode-session-follow-v1/spec.md`](../specs/changes/opencode-session-follow-v1/spec.md).
+Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, and untrusted text arriving from OpenCode or the terminal. This page records the implemented model and accepted v1 residuals. Normative requirements are in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md).
 
 ## Local bridge
 

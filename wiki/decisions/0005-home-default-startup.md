@@ -27,4 +27,4 @@ With no workspace argument, open the current user's **platform-resolved home dir
 
 ## Evidence
 
-[`specs/changes/opencode-session-follow-v1/spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) Workspace Launch, [core design](../../specs/changes/opencode-session-follow-v1/design.md) D19, [`crates/made-app/tests/launch_workspace.rs`](../../crates/made-app/tests/launch_workspace.rs), [`crates/made-app/src/workspace.rs`](../../crates/made-app/src/workspace.rs). Linux Xvfb evidence: `RF-1`/`RF-8` in [v1 evidence](../records/20261026-v1-evidence.md).
+[`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md) Workspace Launch, [core design](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) D19, [`crates/made-app/tests/launch_workspace.rs`](../../crates/made-app/tests/launch_workspace.rs), [`crates/made-app/src/workspace.rs`](../../crates/made-app/src/workspace.rs). Linux Xvfb evidence: `RF-1`/`RF-8` in [v1 evidence](../records/20261026-v1-evidence.md).

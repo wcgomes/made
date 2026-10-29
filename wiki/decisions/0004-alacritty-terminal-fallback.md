@@ -20,4 +20,4 @@ Use **`alacritty_terminal` 0.26** as the VT implementation behind Made's `Termin
 
 ## Evidence
 
-[Platform matrix](../testing/platform-matrix.md), [v1 evidence](../records/20261026-v1-evidence.md), [`specs/changes/opencode-session-follow-v1/design.md`](../../specs/changes/opencode-session-follow-v1/design.md) D6, [`crates/made-terminal/tests/emulation.rs`](../../crates/made-terminal/tests/emulation.rs), [`crates/made-app/tests/opencode_tui.rs`](../../crates/made-app/tests/opencode_tui.rs). Architecture: [Architecture](../architecture.md).
+[Platform matrix](../testing/platform-matrix.md), [v1 evidence](../records/20261026-v1-evidence.md), [`specs/changes/archive/20261029-opencode-session-follow-v1/design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) D6, [`crates/made-terminal/tests/emulation.rs`](../../crates/made-terminal/tests/emulation.rs), [`crates/made-app/tests/opencode_tui.rs`](../../crates/made-app/tests/opencode_tui.rs). Architecture: [Architecture](../architecture.md).

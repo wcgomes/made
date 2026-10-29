@@ -1,6 +1,6 @@
 //! “Calm Editor” design tokens and egui theme installation.
 //!
-//! The contract is `specs/changes/made-ui-ux-v1/design.md`. The terminal card is glass on its
+//! The contract is `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. The terminal card is glass on its
 //! primary screen and opaque for alternate-screen TUIs; preview and picker surfaces stay opaque.
 //! The Explorer card uses semi-transparent dark fills as an in-app frosted-glass approximation.
 //! A native backdrop (macOS vibrancy or Windows Mica) can be layered behind the window when the

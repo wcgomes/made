@@ -1,6 +1,6 @@
 # Terminal-First Runtime
 
-A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
+A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md).
 
 ## Launch and default workspace
 

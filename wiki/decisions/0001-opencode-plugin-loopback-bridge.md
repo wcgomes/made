@@ -27,7 +27,7 @@ Use the official OpenCode v2 CLI/TUI plugin API as the observation boundary, and
 
 ## Evidence
 
-[`specs/changes/opencode-session-follow-v1/design.md`](../../specs/changes/opencode-session-follow-v1/design.md) D2/D4, the [Phase 0 gate record](../records/20261025-phase-0-gate.md), [OpenCode bridge](../integration/opencode.md), [`plugins/opencode-made/README.md`](../../plugins/opencode-made/README.md). Implementation: [`made-bridge`](../../crates/made-bridge/src/server.rs), [`plugins/opencode-made`](../../plugins/opencode-made/tui.ts). The Phase 0 harness was removed after the gate.
+[`specs/changes/archive/20261029-opencode-session-follow-v1/design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) D2/D4, the [Phase 0 gate record](../records/20261025-phase-0-gate.md), [OpenCode bridge](../integration/opencode.md), [`plugins/opencode-made/README.md`](../../plugins/opencode-made/README.md). Implementation: [`made-bridge`](../../crates/made-bridge/src/server.rs), [`plugins/opencode-made`](../../plugins/opencode-made/tui.ts). The Phase 0 harness was removed after the gate.
 
 ## Amendment (2026-10-29)
 

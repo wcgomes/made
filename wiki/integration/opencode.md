@@ -1,6 +1,6 @@
 # OpenCode Bridge
 
-Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches OpenCode automatically: the user runs `opencode` in a Made terminal, or explicitly chooses OpenCode from the `+` menu when it is detected on `PATH`, and the plugin loads from configuration injected into the terminal process (the user shell or a directly launched OpenCode TUI). The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/opencode-session-follow-v1/design.md).
+Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches OpenCode automatically: the user runs `opencode` in a Made terminal, or explicitly chooses OpenCode from the `+` menu when it is detected on `PATH`, and the plugin loads from configuration injected into the terminal process (the user shell or a directly launched OpenCode TUI). The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md).
 
 ## Launching from Made
 

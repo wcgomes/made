@@ -2,17 +2,17 @@
 
 > **Checkbox scope:** checked implementation/test items reflect implementation and automated Linux evidence in this
 > tree, not cross-platform manual validation; documentation/spec tasks are checked when their artifact update is complete. Tasks with broader feature descriptions may still
-> have manual-only sub-items recorded in the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md). Tasks 4.8 (manual platform results) and 5.11 (all-OS end-to-end) remain open, and checkpoint boxes remain unchecked until every scenario has evidence. See the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md).
+> have manual-only sub-items recorded in the [v1 evidence record](../../../../wiki/records/20261026-v1-evidence.md). Tasks 4.8 (manual platform results) and 5.11 (all-OS end-to-end) remain open, and checkpoint boxes remain unchecked until every scenario has evidence. See the [v1 evidence record](../../../../wiki/records/20261026-v1-evidence.md).
 
-> **Approved in-place terminal-first revision:** Phases 0–5 are historical work/checkpoints and retain their 84 historical checks honestly; their old implementation descriptions are superseded by `spec.md`. Phases 6–10 checkboxes reflect Linux code/automated evidence only, not cross-platform delivery: real zsh/fish/PowerShell, native Linux/macOS/Windows, native pointer/keyboard, native home resolution and hardware-GPU evidence remain pending. Phase 10 implementation/test items are checked; its manual checkpoints stay unchecked, as do 4.8, 5.11, 9.6 and 9.8, until every native/platform scenario has evidence. See the [v1 evidence record](../../../wiki/records/20261026-v1-evidence.md).
+> **Approved in-place terminal-first revision:** Phases 0–5 are historical work/checkpoints and retain their 84 historical checks honestly; their old implementation descriptions are superseded by `spec.md`. Phases 6–10 checkboxes reflect Linux code/automated evidence only, not cross-platform delivery: real zsh/fish/PowerShell, native Linux/macOS/Windows, native pointer/keyboard, native home resolution and hardware-GPU evidence remain pending. Phase 10 implementation/test items are checked; its manual checkpoints stay unchecked, as do 4.8, 5.11, 9.6 and 9.8, until every native/platform scenario has evidence. See the [v1 evidence record](../../../../wiki/records/20261026-v1-evidence.md).
 >
-> **UI/UX split:** UI-owned tasks and evidence moved to `specs/changes/made-ui-ux-v1/tasks.md` (former core 1.20–1.21, 2.12–2.14, 3.12, 8.1–8.2, 8.5–8.9, and Phase 11). Core retains 8.3–8.4 diagnostics data and every runtime/integration/security/preview-safety task. Core checkpoints for moved UI scenarios rely on the UI change; no UI scenario is silently dropped.
+> **UI/UX split:** UI-owned tasks and evidence moved to `specs/changes/archive/20261029-made-ui-ux-v1/tasks.md` (former core 1.20–1.21, 2.12–2.14, 3.12, 8.1–8.2, 8.5–8.9, and Phase 11). Core retains 8.3–8.4 diagnostics data and every runtime/integration/security/preview-safety task. Core checkpoints for moved UI scenarios rely on the UI change; no UI scenario is silently dropped.
 >
 > **Phase 13 status (2026-10-28):** Implementation/test tasks 13.3–13.14 are complete with automated evidence recorded in [Verification — Phase 13](#verification--phase-13); spec/analyze tasks 13.1–13.2a are checked. Manual/native scenario checkpoints remain open. The historical Phase 13 analyze gate's `NOT DELIVERED` row records the pre-implementation state, not current status.
 
 ## 0. Phase 0 — Bridge spike gate (blocking)
 
-> The Phase 0 spike harness was removed after the gate passed. Historical task paths below point to the preserved gate record; outcomes, acceptance evidence, and residual risks are in [`wiki/records/20261025-phase-0-gate.md`](../../../wiki/records/20261025-phase-0-gate.md).
+> The Phase 0 spike harness was removed after the gate passed. Historical task paths below point to the preserved gate record; outcomes, acceptance evidence, and residual risks are in [`wiki/records/20261025-phase-0-gate.md`](../../../../wiki/records/20261025-phase-0-gate.md).
 
 - [x] 0.1 Record the spike acceptance matrix and the fixture workspace for plugin loading, active-tab tracking, worktree location changes, focus, and config immutability (path: `wiki/records/20261025-phase-0-gate.md`)
 - [x] 0.2 Create a fixture OpenCode config with a pre-existing user plugin entry and a baseline content hash (path: `wiki/records/20261025-phase-0-gate.md`)
@@ -235,7 +235,7 @@
 | Diagnostics | 5.1–5.4, 8.3–8.4, 12.1–12.7, 13.13–13.14 | Phase 5, Phase 8, Phase 12, Phase 13 (presentation in `made-ui-ux-v1`) |
 | V1 Scope Boundary | 0.7–0.8, 3.15–3.16, 5.9–5.11 | Phase 0, Phase 3, Phase 5 |
 
-UI requirements and their task coverage live in `specs/changes/made-ui-ux-v1/tasks.md`; this table covers core scenarios only.
+UI requirements and their task coverage live in `specs/changes/archive/20261029-made-ui-ux-v1/tasks.md`; this table covers core scenarios only.
 
 ## 6. Revision — Terminal-first startup and safe cwd follow
 
@@ -309,7 +309,7 @@ Depends on Phases 6–8. Readiness analysis is not delivery verification; keep t
 ## Checkpoint — Phase 9
 
 - [ ] Run `cargo fmt --all --check`, workspace tests, `cargo clippy --workspace --all-targets -- -D warnings`, plugin tests and applicable native GUI/process checks; retain manual-only gaps explicitly (path: `wiki/records/20261026-v1-evidence.md`)
-- [ ] Every core scenario in `spec.md` maps to passing evidence, including modified Diagnostics, integration, security and responsiveness requirements; UI scenarios are tracked in `specs/changes/made-ui-ux-v1/tasks.md`. Resolve missed budgets/visual regressions or record them as blocking readiness, not silently waived success (path: `wiki/records/20261026-v1-evidence.md`)
+- [ ] Every core scenario in `spec.md` maps to passing evidence, including modified Diagnostics, integration, security and responsiveness requirements; UI scenarios are tracked in `specs/changes/archive/20261029-made-ui-ux-v1/tasks.md`. Resolve missed budgets/visual regressions or record them as blocking readiness, not silently waived success (path: `wiki/records/20261026-v1-evidence.md`)
 
 ## 10. Revision — Home-default startup and explicit picker
 
@@ -355,9 +355,9 @@ Spec-first retention of the active log plus one previous log, with record-atomic
 
 Depends on Phases 6–10 and the retained plugin/bridge/session-follow tests. The field is additive within protocol major 1; no new change, archive, version, module, process, or persistence surface is introduced. View-directory follow is scoped to `tabsEnabled: true`; when OpenCode reports session tabs unavailable, the existing degraded shell-cwd fallback applies and the view directory is not followed. Invalid plugin-side view paths are treated as absent with a non-fatal plugin error; bridge validation remains defense-in-depth. Execute each test task first and record a meaningful failing assertion against current behavior before its implementation tasks. Historical checked tasks are unchanged.
 
-- [x] 13.1 Refine the active spec/design/proposal for connected sessionless view-directory follow; record the additive protocol field, validation/sizing/redaction, precedence, and TUI-only limitation; confirm no clarification markers remain (path: `specs/changes/opencode-session-follow-v1/spec.md`, `specs/changes/opencode-session-follow-v1/design.md`, `specs/changes/opencode-session-follow-v1/proposal.md`)
-- [x] 13.2 Record the Phase 13 analyze gate and scenario traceability before implementation dispatch (path: `specs/changes/opencode-session-follow-v1/tasks.md`)
-- [x] 13.2a Resolve the tabs-disabled and invalid-view-path consistency pass: scope view-directory follow to `tabsEnabled: true`, keep the degraded shell-cwd fallback, and record plugin-side invalid-path handling with bridge defense-in-depth (path: `specs/changes/opencode-session-follow-v1/spec.md`, `specs/changes/opencode-session-follow-v1/design.md`, `specs/changes/opencode-session-follow-v1/tasks.md`)
+- [x] 13.1 Refine the active spec/design/proposal for connected sessionless view-directory follow; record the additive protocol field, validation/sizing/redaction, precedence, and TUI-only limitation; confirm no clarification markers remain (path: `specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`, `specs/changes/archive/20261029-opencode-session-follow-v1/design.md`, `specs/changes/archive/20261029-opencode-session-follow-v1/proposal.md`)
+- [x] 13.2 Record the Phase 13 analyze gate and scenario traceability before implementation dispatch (path: `specs/changes/archive/20261029-opencode-session-follow-v1/tasks.md`)
+- [x] 13.2a Resolve the tabs-disabled and invalid-view-path consistency pass: scope view-directory follow to `tabsEnabled: true`, keep the degraded shell-cwd fallback, and record plugin-side invalid-path handling with bridge defense-in-depth (path: `specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`, `specs/changes/archive/20261029-opencode-session-follow-v1/design.md`, `specs/changes/archive/20261029-opencode-session-follow-v1/tasks.md`)
 - [x] 13.3 Write failing plugin tests for a usable view directory with no active session, `null` while a session is active or session tabs are unavailable, transient `undefined` retaining the last known value, snapshot sizing/change detection, unload clearing, and invalid empty/non-absolute/NUL/traversal/oversized values treated as absent with a non-fatal plugin error; confirm failures (path: `plugins/opencode-made/tests/view-directory.test.ts`)
 - [x] 13.4 Add the optional nullable `viewDirectory` field and bounded path handling to the plugin protocol types (path: `plugins/opencode-made/src/protocol.ts`)
 - [x] 13.5 Observe `context.location.directory` reactively, validate it, treat invalid values as absent and report a non-fatal plugin error, retain the last known value across transient `undefined`, emit `null` while an active session exists or session tabs are unavailable, include the validated value in snapshots, sizing, and change detection, and clear it on unload (path: `plugins/opencode-made/src/integration.ts`)
@@ -384,7 +384,7 @@ Depends on Phases 6–10 and the retained plugin/bridge/session-follow tests. Th
 - [ ] Verify "Session tabs unavailable" keeps the degraded shell-cwd fallback and does not follow the view directory
 - [ ] Verify "Connected diagnostics without a session"
 - [ ] Verify additive protocol compatibility: an older plugin omitting `viewDirectory` falls back to shell cwd, an older app ignores the field, and no protocol major bump is required
-- [ ] Run `cargo fmt --all --check`, workspace tests, `cargo clippy --workspace --all-targets -- -D warnings`, plugin tests, and diff review; record unverified native/manual gaps honestly (path: `specs/changes/opencode-session-follow-v1/tasks.md`)
+- [ ] Run `cargo fmt --all --check`, workspace tests, `cargo clippy --workspace --all-targets -- -D warnings`, plugin tests, and diff review; record unverified native/manual gaps honestly (path: `specs/changes/archive/20261029-opencode-session-follow-v1/tasks.md`)
 
 ## Analyze — Connected sessionless view directory (2026-10-28)
 
@@ -540,7 +540,7 @@ Readiness analysis found and corrected missing requirement-summary coverage for 
 | Analyze gate | Result | Basis |
 |---|---|---|
 | In-place scope and live-contract consistency | PASS | Both changes remain active; no version, archive, or new product scope. Core retains product/runtime/integration/security/performance; UI owns visual/presentation |
-| Outcome versus implementation separation | PASS | Core spec keeps observable behavior/data/security outcomes; UI spec keeps observable presentation/interaction outcomes; expanded visual rationale is non-normative in `specs/changes/made-ui-ux-v1/design.md` |
+| Outcome versus implementation separation | PASS | Core spec keeps observable behavior/data/security outcomes; UI spec keeps observable presentation/interaction outcomes; expanded visual rationale is non-normative in `specs/changes/archive/20261029-made-ui-ux-v1/design.md` |
 | Scenario traceability and no loss | PASS | 97 original scenarios accounted for: 85 retained in core, 12 moved to `made-ui-ux-v1`; 2 derived core scenarios and 21 derived UI scenarios cover split-out behavior/presentation without dropping a title |
 | Unresolved clarification markers | PASS | No unresolved clarification markers, TODO, or unresolved placeholder in either active change |
 | Duplicated normative contract | PASS | Minimal Workspace Layout and UI-only scenarios removed from core; core requirements cross-reference the UI spec; core safety/read-only/security guarantees remain only in core |
@@ -580,9 +580,9 @@ Additional diagnostics-wide coverage: "Logs redact token" and "Shell-only diagno
 
 
 
-Spec ref: `specs/changes/opencode-session-follow-v1/`
+Spec ref: `specs/changes/archive/20261029-opencode-session-follow-v1/`
 
-UI/UX presentation ownership: `specs/changes/made-ui-ux-v1/`. UI files, tasks and native UI evidence are owned there; this table covers the core runtime/integration/safety scope only.
+UI/UX presentation ownership: `specs/changes/archive/20261029-made-ui-ux-v1/`. UI files, tasks and native UI evidence are owned there; this table covers the core runtime/integration/safety scope only.
 
 | Bounded implementation scope | Owned files | Dependencies |
 |---|---|---|
@@ -593,6 +593,6 @@ UI/UX presentation ownership: `specs/changes/made-ui-ux-v1/`. UI files, tasks an
 | Connected sessionless view-directory follow | `plugins/opencode-made/src/protocol.ts`, `plugins/opencode-made/src/integration.ts`, `plugins/opencode-made/tests/view-directory.test.ts` (new), `crates/made-bridge/src/state.rs`, `crates/made-bridge/src/server.rs`, `crates/made-bridge/tests/state.rs`, `crates/made-bridge/tests/security.rs`, `crates/made-app/src/session_follow.rs`, `crates/made-app/src/workbench.rs`, `crates/made-app/src/diagnostics.rs`, `crates/made-app/tests/session_follow.rs`, `crates/made-app/tests/diagnostics.rs` | Phase 13; additive protocol field; coordinate `workbench.rs`/`session_follow.rs` writes with the root-arbitration owner and `diagnostics.rs` with the diagnostics-data owner; no new module, process, or persistence surface |
 | Workspace runtime/lifecycle | `crates/made-app/src/app.rs`, `crates/made-app/src/workbench.rs`, `crates/made-app/src/terminal_view.rs`, `crates/made-app/tests/workspace_tabs.rs` (new), `crates/made-platform/tests/contract.rs`, `crates/made-platform/src/windows.rs` | Root/launch and bridge contracts; coordinate writes to platform lib with bootstrap owner; own all workbench writes (6.11, 7.5, 9.2a). Native Windows descendant cleanup is a delivery gate, not an inherited guarantee |
 | Preview safety, session focus and diagnostics data | `crates/made-explorer/src/paths.rs`, `preview.rs`, `preview_refresh.rs`, `root_switch.rs`, `crates/made-app/src/session_focus.rs`, `crates/made-app/src/diagnostics.rs`, `crates/made-app/tests/session_map.rs`, `crates/made-app/tests/read_only_ui.rs`, `crates/made-app/tests/diagnostics.rs` | Runtime exposes stable active workspace/left-surface/focus state; UI layout/presentation is owned by `made-ui-ux-v1`; `session_map.rs` implementation and `read_only_ui.rs` presentation are shared with UI tasks, so writes are serialized |
-| Evidence/performance/readiness | `crates/made-app/src/metrics.rs`, `crates/made-app/tests/performance.rs`, `tests/e2e/ux_validation.md`, `wiki/records/20261026-v1-evidence.md`, `wiki/testing/platform-matrix.md` | Phases 6–10, core scenarios and available native shells/displays/hardware; UI evidence is tracked in `specs/changes/made-ui-ux-v1/tasks.md`; report unavailable evidence as pending |
+| Evidence/performance/readiness | `crates/made-app/src/metrics.rs`, `crates/made-app/tests/performance.rs`, `tests/e2e/ux_validation.md`, `wiki/records/20261026-v1-evidence.md`, `wiki/testing/platform-matrix.md` | Phases 6–10, core scenarios and available native shells/displays/hardware; UI evidence is tracked in `specs/changes/archive/20261029-made-ui-ux-v1/tasks.md`; report unavailable evidence as pending |
 
 Before any new module is introduced, update its crate export in that crate's `src/lib.rs` only as needed; include this mechanical integration in the owning implementation scope. Existing terminal input, preview loaders/path guards, plugin APIs, runtime ownership and platform behavior are regression boundaries, not permission for refactoring. UI-owned `ui.rs`, `theme.rs`, `explorer_view.rs`, `session_map.rs` and picker presentation must be changed under `made-ui-ux-v1` ownership; coordinate shared-file writes serially. If implementation requires another source-file touch, justify it to the coordinator before expanding ownership. Do not mark revision work complete based on the preserved historical checkboxes.

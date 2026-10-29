@@ -1,6 +1,6 @@
 # Design: opencode-session-follow-v1
 
-> **Scope:** This design covers product/runtime/integration/security/performance architecture. UI/UX/visual design — Calm Editor tokens, layout, chrome, wordmark, glass/native backdrop, tabs/session-map presentation, picker UX, preview/diagnostics presentation, motion, responsive behavior, and keyboard/accessibility presentation — is owned by `specs/changes/made-ui-ux-v1/design.md`. This design links there instead of duplicating that contract.
+> **Scope:** This design covers product/runtime/integration/security/performance architecture. UI/UX/visual design — Calm Editor tokens, layout, chrome, wordmark, glass/native backdrop, tabs/session-map presentation, picker UX, preview/diagnostics presentation, motion, responsive behavior, and keyboard/accessibility presentation — is owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. This design links there instead of duplicating that contract.
 
 ## Approach
 
@@ -242,7 +242,7 @@ Input and terminal features:
 Rendering:
 
 - The terminal grid is rendered with a dedicated glyph atlas and damage-driven draw calls on the GPU surface.
-- UI composition, layout, chrome and presentation are owned by `specs/changes/made-ui-ux-v1/design.md`. This design requires that only the selected left surface is painted — terminal grid or preview, never both — and that hidden terminals continue parsing output.
+- UI composition, layout, chrome and presentation are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. This design requires that only the selected left surface is painted — terminal grid or preview, never both — and that hidden terminals continue parsing output.
 - Frame pacing targets 60 fps. When output is heavy, the renderer may drop intermediate frames but must not drop input or block the event loop.
 - The terminal has priority over background tree loading and metadata refreshes.
 
@@ -273,7 +273,7 @@ The platform layer does not own product behavior. It exposes capabilities; the a
 
 Explorer:
 
-- Explorer layout, header, hide/restore animation, divider painting and context menu chrome are owned by `specs/changes/made-ui-ux-v1/design.md`. This design owns the tree model, root generation, watcher, path guard and per-workbench visibility/width state used by the UI.
+- Explorer layout, header, hide/restore animation, divider painting and context menu chrome are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. This design owns the tree model, root generation, watcher, path guard and per-workbench visibility/width state used by the UI.
 - Per-workbench visibility and width survive tab switching; restoring reconciles filesystem changes, using a bounded dirty/rescan signal if updates were coalesced while hidden.
 - The tree is rooted at the active `WorkspaceRoot`.
 - Directories are loaded lazily; the app does not scan a 10,000-file workspace at startup.
@@ -286,7 +286,7 @@ Explorer:
 
 Preview:
 
-- Opening a file selects a read-only preview state. Full-left presentation, header/actions, meta, gutter, syntax-highlighting presentation and safe-state styling are owned by `specs/changes/made-ui-ux-v1/design.md`. The terminal remains alive and receives no user input while hidden. Close/return selects the same terminal and restores its focus; no relaunch or output replay is needed. There is no editor widget or save command.
+- Opening a file selects a read-only preview state. Full-left presentation, header/actions, meta, gutter, syntax-highlighting presentation and safe-state styling are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. The terminal remains alive and receives no user input while hidden. Close/return selects the same terminal and restores its focus; no relaunch or output replay is needed. There is no editor widget or save command.
 - The preview size limit is 2 MiB. Files above the limit show a clear size-limit message with the file size; they are not rendered.
 - Binary detection checks for a NUL byte in the first 8 KiB. A binary file shows a binary-file message; raw bytes are not rendered.
 - Invalid UTF-8 text is treated as unsupported text and shows a safe message rather than replacement-character noise.
@@ -333,7 +333,7 @@ Rules:
 
 - The app does not infer OpenCode launch/failure from prompt text or a missing connection. In the absence of evidence it reports inactive/not connected in Diagnostics, not a startup failure. Specific known failures keep their reason there; normal exit can retain disconnect history.
 - No integration failure blocks terminal input or the explorer.
-- Degraded and unsupported details appear in Diagnostics. Routine chrome suppression and contextual feedback presentation are owned by `specs/changes/made-ui-ux-v1/design.md`.
+- Degraded and unsupported details appear in Diagnostics. Routine chrome suppression and contextual feedback presentation are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`.
 - Latest shell cwd is retained independently across integration epochs and used across disconnects and exits.
 - Connected view directory is retained across transient `undefined` within an epoch and cleared on disconnect, goodbye, normal exit, unsupported integration, a new hello epoch, or `tabsEnabled: false`. It never outranks an active session directory. View-directory follow is scoped to `tabsEnabled: true`; when tabs are unavailable, view state is cleared and shell cwd fallback applies, and the view directory never establishes session activity. A new authenticated connection whose first snapshot has `tabsEnabled: false` is degraded even from `inactive`, `degraded`, or `unsupported` and never restores view-directory follow until a later snapshot on that connection reports tabs enabled.
 - Reconnect is automatic from the plugin side; the app accepts a new authenticated connection and replaces the old one.
@@ -408,7 +408,7 @@ Techniques:
 - Cancellable tree and preview loads when the root or selection changes.
 - Bounded scrollback and bounded bridge queues.
 - Session-follow updates are applied immediately; tree population can show a loading state without blocking the root switch.
-- Metrics instrument startup, cwd/session follow, tab activation, preview roundtrip, explorer hide/resize, input latency and frame time. Measure a 10k tree and at least three tabs including hidden sustained output; record queue/scrollback bounds and zero hidden-grid paint counts. Real hardware GUI measurements are distinct from software-rendered/model evidence; neither untested shells nor platforms inherit a pass. Visual review evidence and its native/software distinction are owned by `specs/changes/made-ui-ux-v1/design.md`.
+- Metrics instrument startup, cwd/session follow, tab activation, preview roundtrip, explorer hide/resize, input latency and frame time. Measure a 10k tree and at least three tabs including hidden sustained output; record queue/scrollback bounds and zero hidden-grid paint counts. Real hardware GUI measurements are distinct from software-rendered/model evidence; neither untested shells nor platforms inherit a pass. Visual review evidence and its native/software distinction are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`.
 
 ### D13: Diagnostics and observability
 
@@ -444,7 +444,7 @@ Failure reasons include:
 - worktree metadata unavailable;
 - focus request failed or timed out.
 
-Logs are local, structured, and bounded. The token is redacted. Logs identify the pane and connection, not the secret. The diagnostics data is available without a debugger and without reading raw terminal output; panel presentation is owned by `specs/changes/made-ui-ux-v1/design.md`.
+Logs are local, structured, and bounded. The token is redacted. Logs identify the pane and connection, not the secret. The diagnostics data is available without a debugger and without reading raw terminal output; panel presentation is owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`.
 
 Retention uses one active file (`integration.log`) and one previous file (`integration.log.1`) plus a persistent `integration.log.lock`. Entries stay in memory during the session; a clean shutdown builds one record from the header and snapshot text, scans that exact string for the bridge secret, and appends it with one write while holding an exclusive read+write lock. The lock handle is read+write because Windows whole-file locks cannot use an append-only handle; the Windows handle/lock path is cross-compiled, not runtime-verified. Lock acquisition uses `try_lock` with a bounded wait of at most one second per workspace, so a stuck peer cannot hang one tab's shutdown indefinitely; closing N tabs can wait up to roughly N seconds. Rotation stats the active file under the lock and, when `current + record > 1 MiB`, renames it directly over the previous file. On POSIX the rename replacement is atomic; Windows uses the platform replacement rename but that behavior is unverified. The old backup is not removed first, and no existing bytes are truncated, rewritten, or copied. `write_all` is a single call, but it is not failure-atomic on a partial I/O error; a partial active record can remain, while the previous log is preserved when rotation already occurred.
 
@@ -531,7 +531,7 @@ Evolve `AppModel` from one optional `Workbench` into an ordered collection with 
 
 Tree/preview callbacks carry workspace id plus root/request generation; bridge events carry the owning endpoint and connection epoch. Closing a tab invalidates delivery before releasing its workbench, terminates/reaps only its process tree, stops its listener/watchers, cancels loads and releases credentials/bootstrap files. Audit today's `Workbench::shutdown` call to platform-wide `cleanup`: shared platform state must not make one tab kill another tab's children. The current Windows PTY contract documents immediate-child-only termination; descendant cleanup therefore requires new scoped native implementation/evidence, not an inherited pass. Final close returns to the picker; that explicit lifecycle surface is unchanged by home-default startup. Window close shuts down all workbenches. No persisted tab schema or restart migration is added.
 
-UI presentation — Calm Editor tokens, layout, chrome, wordmark, tabs/session-map, full-left preview, diagnostics card, picker, glass/native backdrop, motion, responsive behavior, widget ids and accessibility presentation — is owned by `specs/changes/made-ui-ux-v1/design.md`. This design requires that the runtime expose stable workspace-scoped preview mode/selection, explorer visibility/width, left-surface state and focus so the UI never shares global state across tabs. Keyboard/IME input routing remains a runtime invariant.
+UI presentation — Calm Editor tokens, layout, chrome, wordmark, tabs/session-map, full-left preview, diagnostics card, picker, glass/native backdrop, motion, responsive behavior, widget ids and accessibility presentation — is owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. This design requires that the runtime expose stable workspace-scoped preview mode/selection, explorer visibility/width, left-surface state and focus so the UI never shares global state across tabs. Keyboard/IME input routing remains a runtime invariant.
 
 ### D19: Home-default launch and picker boundary
 
@@ -543,7 +543,7 @@ Launch behavior:
 - Home resolution belongs to `made-platform` so macOS/Linux/Windows semantics stay out of UI/workspace policy. The app maps the resolved path to the existing launch/open path; no new workspace model is introduced.
 - The test-only `--smoke-test` harness without a folder keeps its no-workbench behavior; it is not a product startup path and must not start a real shell in the user's home during automated checks.
 
-Picker selection/close UX, icon-only header actions, wordmark, explorer divider, motion and accessibility presentation are owned by `specs/changes/made-ui-ux-v1/design.md`. The core design retains only launch precedence, process boundaries, home resolution, fallback behavior, and the requirement that no process starts before an explicit picker confirmation.
+Picker selection/close UX, icon-only header actions, wordmark, explorer divider, motion and accessibility presentation are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. The core design retains only launch precedence, process boundaries, home resolution, fallback behavior, and the requirement that no process starts before an explicit picker confirmation.
 
 ## Flow
 
@@ -564,7 +564,7 @@ Launch flow:
 2. The app allocates a workspace id/workbench and initializes its shell/explorer in the folder; optional local config/bridge preparation cannot depend on OpenCode probes or readiness and fails open to the original shell environment.
 3. The workbench owns its loopback endpoint, unique token and expected pane id and its safe shell launch plan.
 4. The shell starts with launch-local hooks and any safely composed OpenCode configuration; no OpenCode is auto-launched.
-5. The explorer shows the workspace root, then validated shell cwd. Initial session-map visibility and routine chrome are owned by `specs/changes/made-ui-ux-v1/design.md`.
+5. The explorer shows the workspace root, then validated shell cwd. Initial session-map visibility and routine chrome are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`.
 
 OpenCode flow:
 
@@ -615,7 +615,7 @@ Preview flow:
 2. The path guard canonicalizes the root and target and rejects escapes.
 3. The preview loader reads metadata and a small prefix.
 4. Binary and oversized files produce safe messages.
-5. Preview state is selected; text is read-only with optional highlighting. Full-left placement and presentation are owned by `specs/changes/made-ui-ux-v1/design.md`. The hidden terminal continues processing output, not input or painting.
+5. Preview state is selected; text is read-only with optional highlighting. Full-left placement and presentation are owned by `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. The hidden terminal continues processing output, not input or painting.
 6. The file watcher refreshes the preview on external changes or reports staleness.
 7. Close/return selects and focuses the same live terminal; a root change clears preview and invalidates stale loads.
 
@@ -629,7 +629,7 @@ Crates and modules:
 - `crates/made-explorer`: tree model, watcher, preview loader, path guard.
 - `crates/made-bridge`: protocol, bridge server, config composition, security, state validation.
 - `plugins/opencode-made`: app-owned OpenCode plugin.
-- Phase 0 gate: outcomes are preserved in [`wiki/records/20261025-phase-0-gate.md`](../../../wiki/records/20261025-phase-0-gate.md); the spike harness was removed after the gate.
+- Phase 0 gate: outcomes are preserved in [`wiki/records/20261025-phase-0-gate.md`](../../../../wiki/records/20261025-phase-0-gate.md); the spike harness was removed after the gate.
 
 Dependency direction:
 

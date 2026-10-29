@@ -1,6 +1,6 @@
 # Performance
 
-Made's v1 performance evidence is a final release-build pass on Linux x64 under **Xvfb/llvmpipe software rendering**. It is explicitly not a hardware-GPU, native-desktop, macOS, or Windows result. The measurements and method are recorded below and summarized in the [v1 evidence record](records/20261026-v1-evidence.md). Product targets are SHOULD-level in [`specs/changes/opencode-session-follow-v1/spec.md`](../specs/changes/opencode-session-follow-v1/spec.md).
+Made's v1 performance evidence is a final release-build pass on Linux x64 under **Xvfb/llvmpipe software rendering**. It is explicitly not a hardware-GPU, native-desktop, macOS, or Windows result. The measurements and method are recorded below and summarized in the [v1 evidence record](records/20261026-v1-evidence.md). Product targets are SHOULD-level in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md).
 
 ## Final measured results
 

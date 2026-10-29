@@ -137,6 +137,6 @@ The file preview is read-only: no editing, saving, LSP, or diff view. Builds are
 ## Documentation
 
 - [Made wiki](wiki/index.md)
-- [Core product spec](specs/changes/opencode-session-follow-v1/)
-- [UI/UX spec](specs/changes/made-ui-ux-v1/)
+- [Core product spec](specs/changes/archive/20261029-opencode-session-follow-v1/)
+- [UI/UX spec](specs/changes/archive/20261029-made-ui-ux-v1/)
 - [End-to-end test checklist](tests/e2e/ux_validation.md)

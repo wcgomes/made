@@ -16,7 +16,7 @@ Alternatives considered:
 | Introduce a component library or design system package | The implemented UI is a small native surface; a new abstraction would add ceremony without solving a current coupling problem |
 | Add animation everywhere to signal quality | Motion is limited to spinners, hover-triggered scrollbar fades, and the explorer transition; animation must not carry essential information or animate tab widths |
 
-This document is the durable visual reference. It is non-normative; the observable guarantees are in [`spec.md`](spec.md). The core implementation design is [`../opencode-session-follow-v1/design.md`](../opencode-session-follow-v1/design.md).
+This document is the durable visual reference. It is non-normative; the observable guarantees are in [`spec.md`](spec.md). The core implementation design is [`../opencode-session-follow-v1/design.md`](../20261029-opencode-session-follow-v1/design.md).
 
 ## Significant decisions
 
@@ -482,7 +482,7 @@ Contrast (opaque reading surfaces):
 - `crates/made-app/src/diagnostics.rs`: opaque floating card, sections, copy actions.
 - `crates/made-platform/src/native_backdrop.rs`: one-shot native request and honest fallback status.
 - `crates/made-app/tests/ui_model.rs` and `tests/read_only_ui.rs`: headless visual/interaction evidence.
-- [`wiki/records/20261026-v1-evidence.md`](../../../wiki/records/20261026-v1-evidence.md): Linux/Xvfb/headless evidence, pending native rows.
+- [`wiki/records/20261026-v1-evidence.md`](../../../../wiki/records/20261026-v1-evidence.md): Linux/Xvfb/headless evidence, pending native rows.
 - This design plus [`spec.md`](spec.md): the durable non-normative contract and implementation reference; the legacy UI document was removed after migration.
 
 Do not rewrite terminal IME or the mouse-report encoder for visual reasons. Local selection is committed only after the pointer reaches another cell: a click does not highlight or copy and clears any existing local selection; a drag that reaches another cell still copies on release; typing, a writing key, an IME commit, and a paste clear that mark, while Cmd/Ctrl+C copy keeps it; Shift+drag inside a mouse-reporting TUI still selects locally. Keep `native_options.clipboard_shortcuts = false`. No `#[cfg(target_os)]` outside `made-platform`. Do not introduce a webview, per-OS UI branch, terminal splits, restart persistence, or editing.
