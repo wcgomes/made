@@ -12,6 +12,7 @@
 pub mod app;
 pub mod cli;
 pub mod diagnostics;
+pub mod explorer_icons;
 pub mod explorer_view;
 pub mod integration_status;
 pub mod metrics;

@@ -15,6 +15,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontId, Frame, Margin, RichText, Shadow, Stroke, StrokeKind,
     TextFormat, TextStyle, Ui, UiBuilder, Visuals,
 };
+use egui_extras::loaders::svg_loader::SvgLoader;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -404,11 +405,6 @@ pub fn paint_disclosure(
         ]
     };
     painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
-}
-
-/// Paint the quiet app-drawn file bullet.
-pub fn paint_bullet(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
-    painter.circle_filled(center, 2.0, color);
 }
 
 // ── Geometry ────────────────────────────────────────────────────────────────
@@ -1323,6 +1319,18 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.scroll = scroll_style();
         style.animation_time = 0.12;
     });
+    install_icon_loader(ctx);
+}
+
+/// Install the SVG loader that decodes the embedded Explorer icons, once per
+/// context.
+///
+/// Only [`SvgLoader`] is added. No file, HTTP, or raster loader is installed,
+/// so icon bytes come only from the embedded vendored assets.
+fn install_icon_loader(ctx: &egui::Context) {
+    if !ctx.is_loader_installed(SvgLoader::ID) {
+        ctx.add_image_loader(Arc::new(SvgLoader::default()));
+    }
 }
 
 /// Dark visuals for the contract.
