@@ -850,10 +850,21 @@ fn icon_in_slot(output: &egui::FullOutput, row: egui::Rect, depth: usize) -> Opt
 /// The texture egui uses for one icon at explorer size. It loads through the
 /// same URI, texture options, and size hint that `egui::Image` paints with.
 fn icon_texture(ctx: &egui::Context, icon: explorer_icons::IconId) -> egui::TextureId {
+    icon_texture_px(ctx, icon, 16, 16)
+}
+
+/// Same as [`icon_texture`] at an explicit pixel size. `Image::paint_at` asks
+/// for `pixels_per_point * rect`, so a 16px icon is not always a 16px texture.
+fn icon_texture_px(
+    ctx: &egui::Context,
+    icon: explorer_icons::IconId,
+    width: u32,
+    height: u32,
+) -> egui::TextureId {
     ctx.include_bytes(icon.uri(), icon.bytes());
     let hint = egui::load::SizeHint::Size {
-        width: 16,
-        height: 16,
+        width,
+        height,
         maintain_aspect_ratio: false,
     };
     match ctx.try_load_texture(icon.uri(), egui::TextureOptions::default(), hint) {
@@ -1023,6 +1034,57 @@ fn text_rects(output: &egui::FullOutput, needle: &str, max_y: f32) -> Vec<egui::
         visit(&clipped.shape, needle, max_y, &mut rects);
     }
     rects
+}
+
+/// One painted menu label: the galley line box, the shared baseline, and the
+/// tight ink. The ink bottom includes descenders; the letterform body does not.
+struct PaintedMenuLabel {
+    line: egui::Rect,
+    baseline_y: f32,
+    ink: egui::Rect,
+}
+
+fn painted_menu_label(
+    output: &egui::FullOutput,
+    needle: &str,
+    row: egui::Rect,
+) -> PaintedMenuLabel {
+    fn find(shape: &egui::Shape, needle: &str, row: egui::Rect) -> Option<PaintedMenuLabel> {
+        match shape {
+            egui::Shape::Text(text) => {
+                let line = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if !text.galley.job.text.contains(needle) || !row.intersects(line) {
+                    return None;
+                }
+                let placed = text
+                    .galley
+                    .rows
+                    .first()
+                    .unwrap_or_else(|| panic!("{needle} label has no text row"));
+                let glyph = placed
+                    .glyphs
+                    .first()
+                    .unwrap_or_else(|| panic!("{needle} label has no glyphs"));
+                Some(PaintedMenuLabel {
+                    line,
+                    baseline_y: text.pos.y + placed.pos.y + glyph.pos.y,
+                    ink: text.galley.mesh_bounds.translate(text.pos.to_vec2()),
+                })
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, needle, row)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, needle, row))
+        .unwrap_or_else(|| panic!("{needle} label was not painted in {row:?}"))
+}
+
+/// Midpoint of the ink top and the baseline. Ignores descenders below the baseline.
+fn letterform_center_y(label: &PaintedMenuLabel) -> f32 {
+    (label.ink.top() + label.baseline_y) * 0.5
 }
 
 fn isolated(name: &str) -> bool {
@@ -3060,6 +3122,240 @@ fn new_tab_menu_items_are_keyboard_reachable_with_visible_focus() {
 
     headless.press_key(egui::Key::Enter);
     assert!(headless.model.is_picker());
+}
+
+#[test]
+fn new_tab_menu_items_paint_leading_icons() {
+    if isolated("new_tab_menu_items_paint_leading_icons") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "menu-icons", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    // At 1× this font's ink center lands on the galley line box, so centering
+    // that box looks correct. 2× keeps the ink in the upper part of the box.
+    headless.ctx.set_pixels_per_point(2.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(top_action_id("open-folder"));
+    // The menu fades in; settle so glyph colors are the label tone, not a fade multiply.
+    headless.advance(0.3);
+    let output = headless.render();
+    let text = output_text(&output);
+    assert!(text.contains("Terminal"), "missing Terminal item: {text}");
+    assert!(text.contains("OpenCode"), "missing OpenCode item: {text}");
+
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    assert!(
+        terminal.top() < opencode.top(),
+        "Terminal must stay the first menu item"
+    );
+    assert!(
+        terminal.width() >= 24.0
+            && terminal.height() >= 24.0
+            && opencode.width() >= 24.0
+            && opencode.height() >= 24.0,
+        "menu targets must stay at least 24x24: {terminal:?} {opencode:?}"
+    );
+    assert!(
+        (terminal.left() - opencode.left()).abs() < 0.75
+            && (terminal.width() - opencode.width()).abs() < 0.75,
+        "both rows must fill the same menu width: {terminal:?} {opencode:?}"
+    );
+
+    let terminal_label = painted_menu_label(&output, "Terminal", terminal);
+    let opencode_label = painted_menu_label(&output, "OpenCode", opencode);
+    assert!(
+        (terminal_label.line.left() - opencode_label.line.left()).abs() < 1.0,
+        "labels must share the same left inset: {:?} {:?}",
+        terminal_label.line,
+        opencode_label.line
+    );
+    // 8px row inset + 14px slot + 8px gap.
+    assert!(
+        (terminal_label.line.left() - (terminal.left() + 30.0)).abs() < 1.0,
+        "the 14px slot keeps an 8px gap before the label: {:?} in {terminal:?}",
+        terminal_label.line
+    );
+    let terminal_baseline = terminal_label.baseline_y - terminal.center().y;
+    let opencode_baseline = opencode_label.baseline_y - opencode.center().y;
+    assert!(
+        (terminal_baseline - opencode_baseline).abs() < 0.2,
+        "Terminal and OpenCode must share one baseline: {terminal_baseline} vs {opencode_baseline}"
+    );
+    assert!(
+        opencode_label.ink.bottom() > terminal_label.ink.bottom() + 0.5,
+        "OpenCode keeps the p descender below Terminal's ink"
+    );
+    for (row, label) in [(terminal, &terminal_label), (opencode, &opencode_label)] {
+        assert!(
+            label.line.left() > row.left() + 16.0 && label.line.right() < row.right() - 4.0,
+            "label must be left-aligned inside the row with right padding: {:?} {row:?}",
+            label.line
+        );
+        let body_y = letterform_center_y(label);
+        assert!(
+            (body_y - row.center().y).abs() < 0.2,
+            "letterforms must sit on the icon, not in the upper part of the galley box: body {body_y} ink {:?} baseline {} row {row:?}",
+            label.ink,
+            label.baseline_y
+        );
+        assert!(
+            label.line.center().y > row.center().y + 0.15,
+            "centering the galley line box leaves the ink above the icon: line {:?} row {row:?}",
+            label.line
+        );
+    }
+
+    let window = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && (shape.stroke.width - 1.5).abs() < 0.05
+                && shape.stroke.color == made_app::theme::TEXT_TERTIARY
+                && shape.corner_radius == egui::CornerRadius::same(2)
+                && terminal.contains_rect(shape.rect)
+                && shape.rect.right() <= terminal_label.line.left() - 2.0
+        })
+        .map(|shape| shape.rect)
+        .expect("terminal window glyph");
+    assert!(
+        (window.center().y - terminal.center().y).abs() < 1.0
+            && (window.left() - (terminal.left() + 8.0)).abs() < 1.0,
+        "terminal glyph must sit in the left slot: {window:?} {terminal:?}"
+    );
+    let terminal_paths: Vec<_> = path_shapes(&output)
+        .into_iter()
+        .filter(|path| {
+            let bounds = egui::Rect::from_points(&path.points);
+            terminal.contains_rect(bounds) && bounds.right() <= terminal_label.line.left() - 1.0
+        })
+        .collect();
+    assert_eq!(
+        terminal_paths.len(),
+        2,
+        "terminal glyph is a chevron plus cursor, not a sparkle: {terminal_paths:?}"
+    );
+    let chevron = terminal_paths
+        .iter()
+        .find(|path| path.points.len() == 3)
+        .expect("prompt chevron");
+    assert!(
+        chevron.points[1].x > chevron.points[0].x + 1.0
+            && chevron.points[1].x > chevron.points[2].x + 1.0
+            && (chevron.points[0].x - chevron.points[2].x).abs() < 0.5,
+        "chevron must point right: {:?}",
+        chevron.points
+    );
+    let cursor = terminal_paths
+        .iter()
+        .find(|path| path.points.len() == 2)
+        .expect("prompt cursor");
+    assert!(
+        (cursor.points[0].y - cursor.points[1].y).abs() < 0.5
+            && cursor.points[1].x > cursor.points[0].x + 1.0,
+        "cursor must be a short underscore: {:?}",
+        cursor.points
+    );
+    for path in [&chevron, &cursor] {
+        assert!(
+            window.contains_rect(egui::Rect::from_points(&path.points)),
+            "prompt strokes must sit inside the terminal window"
+        );
+        assert!(
+            (path.stroke.width - 1.5).abs() < 0.05
+                && matches!(
+                    path.stroke.color,
+                    egui::epaint::ColorMode::Solid(color)
+                        if color == made_app::theme::TEXT_TERTIARY
+                ),
+            "prompt strokes must use the 1.5px tertiary stroke"
+        );
+    }
+
+    let opencode_icon = explorer_icons::icon_by_file_name("opencode.svg")
+        .expect("opencode.svg is vendored with the explorer icons");
+    let opencode_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && opencode.contains_rect(image.rect)
+                && image.rect.right() <= opencode_label.line.left() - 1.0
+        })
+        .expect("OpenCode row must paint opencode.svg left of the label");
+    let image_px = (output.pixels_per_point * opencode_image.rect.size()).round();
+    assert!(
+        opencode_label.line.left() - opencode_image.rect.right() >= 6.0 - 0.75,
+        "the 16px image keeps at least 6px before the label: {:?} vs {:?}",
+        opencode_image.rect,
+        opencode_label.line
+    );
+    assert_eq!(
+        opencode_image.texture,
+        icon_texture_px(
+            &headless.ctx,
+            opencode_icon,
+            image_px.x as u32,
+            image_px.y as u32,
+        ),
+        "the menu must use the embedded opencode.svg bytes"
+    );
+    assert_eq!(
+        opencode_image.tint,
+        egui::Color32::WHITE,
+        "the SVG keeps its shipped colors"
+    );
+    assert!(
+        (opencode_image.rect.center().y - opencode.center().y).abs() < 1.0,
+        "the SVG must be vertically centered in the row: {:?}",
+        opencode_image.rect
+    );
+    for other in [
+        "opencode_light.svg",
+        "folder-opencode.svg",
+        "folder-opencode-open.svg",
+    ] {
+        assert_ne!(
+            opencode_image.texture,
+            icon_texture_px(
+                &headless.ctx,
+                icon_named(other),
+                image_px.x as u32,
+                image_px.y as u32,
+            ),
+            "the menu must not use {other}"
+        );
+    }
+
+    let hovered = headless.hover(new_tab_menu_item_id("terminal"));
+    let hovered_row = headless.response(new_tab_menu_item_id("terminal")).rect;
+    assert!(
+        rect_shapes(&hovered).iter().any(|shape| {
+            shape.fill == made_app::theme::BG_HOVER
+                && (shape.rect.left() - hovered_row.left()).abs() < 1.0
+                && (shape.rect.right() - hovered_row.right()).abs() < 1.0
+                && (shape.rect.top() - hovered_row.top()).abs() < 1.0
+                && (shape.rect.bottom() - hovered_row.bottom()).abs() < 1.0
+        }),
+        "hover fill must cover the full Terminal row: {hovered_row:?}"
+    );
+    assert!(
+        rect_shapes(&hovered).iter().any(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && shape.stroke.color == made_app::theme::TEXT_PRIMARY
+                && hovered_row.contains_rect(shape.rect)
+        }),
+        "hovered terminal glyph must use the primary label color"
+    );
 }
 
 #[test]

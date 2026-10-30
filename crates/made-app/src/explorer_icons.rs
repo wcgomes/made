@@ -101,6 +101,11 @@ pub fn icon_ids() -> impl Iterator<Item = IconId> {
     (0..ICONS.len()).map(|index| IconId(u16::try_from(index).expect("index fits in u16")))
 }
 
+/// Embedded icon whose SVG file name is `name`, for example `opencode.svg`.
+pub fn icon_by_file_name(name: &str) -> Option<IconId> {
+    icon_ids().find(|id| id.name() == name)
+}
+
 /// Size and invariants of the generated index, for audits and tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {

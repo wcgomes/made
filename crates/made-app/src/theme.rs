@@ -814,7 +814,7 @@ pub struct ActionResponse {
 
 // ── Icon-only actions ───────────────────────────────────────────────────────
 
-/// Monochrome app-drawn glyphs used by icon-only header actions.
+/// Monochrome app-drawn glyphs for header actions and new-tab menu rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconGlyph {
     /// Simple app-drawn plus: open another workspace.
@@ -827,6 +827,8 @@ pub enum IconGlyph {
     SessionList,
     /// Small X: dismiss the picker or a chrome surface.
     Close,
+    /// Small terminal window with a prompt chevron.
+    Terminal,
 }
 
 /// Widest app-drawn header glyph (Explorer panel/Diagnostics).
@@ -928,6 +930,12 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, glyph: IconGlyph, color
             line(vec![point(-3.5, -3.5), point(3.5, 3.5)]);
             line(vec![point(3.5, -3.5), point(-3.5, 3.5)]);
         }
+        IconGlyph::Terminal => {
+            let panel = egui::Rect::from_center_size(center, egui::vec2(ICON_GLYPH_WIDTH, 11.0));
+            painter.rect_stroke(panel, CornerRadius::same(2), stroke, StrokeKind::Middle);
+            line(vec![point(-3.5, -2.5), point(-1.0, 0.0), point(-3.5, 2.5)]);
+            line(vec![point(-0.25, 2.5), point(2.75, 2.5)]);
+        }
     }
 }
 
@@ -1003,6 +1011,119 @@ pub fn ghost_action_with(
             input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
         });
     let activated = enabled && (response.clicked() || keyboard);
+    ActionResponse {
+        response,
+        activated,
+    }
+}
+
+/// Leading mark on a new-tab menu row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuLeading {
+    /// App-drawn chrome glyph, colored with the label.
+    Glyph(IconGlyph),
+    /// Vendored SVG. Painted at 16px with the default white tint, so hover does not recolor it.
+    Image {
+        /// `bytes://` URI that keys the texture cache.
+        uri: &'static str,
+        /// Embedded SVG document.
+        bytes: &'static [u8],
+    },
+}
+
+/// Galley origin that puts the letterform body on `center_y`.
+///
+/// The body runs from the tight ink top to the baseline. `mesh_bounds` also
+/// extends through descenders, so centering that box would lift "OpenCode"
+/// above "Terminal".
+fn menu_label_origin_y(galley: &egui::Galley, center_y: f32) -> f32 {
+    let Some(row) = galley.rows.first() else {
+        return center_y - galley.size().y * 0.5;
+    };
+    let Some(glyph) = row.glyphs.first() else {
+        return center_y - galley.size().y * 0.5;
+    };
+    let baseline = row.pos.y + glyph.pos.y;
+    let ink_top = galley.mesh_bounds.min.y;
+    let body_center = if ink_top.is_finite() {
+        (ink_top + baseline) * 0.5
+    } else {
+        baseline - glyph.font_face_ascent * 0.5
+    };
+    center_y - body_center
+}
+
+/// Full-width menu row: leading mark and left-aligned label in one click target.
+///
+/// [`ghost_action`] stays centered and icon-free. This row fills a justified
+/// menu with an 8px inset and an 8px gap after the 14px icon slot. Both labels
+/// share one baseline, and the letterform body — not the galley line box — is
+/// centered on the icon.
+pub(crate) fn menu_labeled_action(
+    ui: &mut Ui,
+    id: egui::Id,
+    leading: MenuLeading,
+    label: &str,
+    height: f32,
+    gap: Color32,
+) -> ActionResponse {
+    const PAD_X: f32 = 8.0;
+    const ICON_GAP: f32 = 8.0;
+    let font = FontId::proportional(11.5);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), TEXT_TERTIARY)
+        .size()
+        .x;
+    let height = height.max(24.0);
+    let width = (PAD_X + ICON_GLYPH_WIDTH + ICON_GAP + text_width + PAD_X).max(24.0);
+    // `allocate_at_least` keeps the justified menu width. During the popup's
+    // sizing pass, cross-justify is off, so the menu measures the widest row.
+    let (rect, _) = ui.allocate_at_least(egui::vec2(width, height), egui::Sense::hover());
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let hovered = response.hovered();
+    let fill = if hovered {
+        BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let color = if hovered { TEXT_PRIMARY } else { TEXT_TERTIARY };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + PAD_X + ICON_GLYPH_WIDTH * 0.5,
+            rect.center().y,
+        ),
+        egui::vec2(ICON_GLYPH_WIDTH, ICON_GLYPH_WIDTH),
+    );
+    match leading {
+        MenuLeading::Glyph(glyph) => paint_icon(ui.painter(), icon_rect, glyph, color),
+        MenuLeading::Image { uri, bytes } => {
+            let image_rect =
+                egui::Rect::from_center_size(icon_rect.center(), egui::Vec2::splat(16.0));
+            egui::Image::from_bytes(uri, bytes).paint_at(ui, image_rect);
+        }
+    }
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    ui.painter().galley(
+        egui::pos2(
+            icon_rect.right() + ICON_GAP,
+            menu_label_origin_y(&galley, rect.center().y),
+        ),
+        galley,
+        color,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.has_focus() {
+        paint_focus_ring(ui, rect, CornerRadius::same(6), gap);
+    }
+    let keyboard = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let activated = response.clicked() || keyboard;
     ActionResponse {
         response,
         activated,

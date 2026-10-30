@@ -29,7 +29,7 @@ use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
 use crate::workbench::{LeftSurface, Workbench};
 use crate::APP_VERSION;
-use made_platform::{Clipboard, LogIssueSeverity, PlatformError};
+use made_platform::{Clipboard, CompatibleTui, LogIssueSeverity, PlatformError};
 
 // ── Status tone mapping ─────────────────────────────────────────────────────
 
@@ -1099,6 +1099,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                         if new_tab_menu_item(
                             ui,
                             new_tab_menu_item_id("terminal"),
+                            theme::MenuLeading::Glyph(theme::IconGlyph::Terminal),
                             "Terminal",
                             layout.button_height,
                         ) {
@@ -1106,9 +1107,23 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                             ui.close();
                         }
                         for tui in &compatible_tuis {
+                            let leading = match tui {
+                                CompatibleTui::OpenCode => {
+                                    let icon =
+                                        crate::explorer_icons::icon_by_file_name("opencode.svg")
+                                            .expect(
+                                                "opencode.svg is vendored with the explorer icons",
+                                            );
+                                    theme::MenuLeading::Image {
+                                        uri: icon.uri(),
+                                        bytes: icon.bytes(),
+                                    }
+                                }
+                            };
                             if new_tab_menu_item(
                                 ui,
                                 new_tab_menu_item_id(tui.program()),
+                                leading,
                                 tui.label(),
                                 layout.button_height,
                             ) {
@@ -1184,8 +1199,14 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     diagnostics
 }
 
-fn new_tab_menu_item(ui: &mut Ui, id: egui::Id, label: &str, height: f32) -> bool {
-    let action = theme::ghost_action(ui, id, label, false, height, theme::BG_CARD);
+fn new_tab_menu_item(
+    ui: &mut Ui,
+    id: egui::Id,
+    leading: theme::MenuLeading,
+    label: &str,
+    height: f32,
+) -> bool {
+    let action = theme::menu_labeled_action(ui, id, leading, label, height, theme::BG_CARD);
     action
         .response
         .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
