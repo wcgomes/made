@@ -20,10 +20,16 @@
 //! glyph inside the cell width reported by the emulator, so grid geometry stays
 //! correct and the TUI is not corrupted. The emulator's per-code-point width
 //! behavior and this replacement-glyph fallback are the documented v1 limits.
+//!
+//! Box drawing, block elements, and braille are not taken from that font.
+//! The cell-glyph painter draws them as geometry fitted to the cell, then clips
+//! the ink, so a mark cannot cover the next column or merge into a solid rectangle.
 
 use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
+
+use crate::cell_glyphs::{self, Span};
 use made_terminal::{
     CellAttributes, CellSnapshot, CursorShape, CursorSnapshot, TerminalColor, TerminalDamage,
     TerminalSize, TerminalSnapshot,
@@ -812,19 +818,42 @@ pub fn paint_grid(
                 continue;
             }
 
-            let text_pos = Pos2::new(rect.left(), y);
             let color = rgb(run.style.foreground);
-            painter.text(text_pos, Align2::LEFT_TOP, &run.text, font.clone(), color);
-            if run.style.bold {
-                // egui's bundled monospace face has one weight; a sub-pixel
-                // overdraw is the documented synthetic-bold fallback.
-                painter.text(
-                    text_pos + Vec2::new(0.6, 0.0),
-                    Align2::LEFT_TOP,
-                    &run.text,
-                    font.clone(),
-                    color,
+            let spans = cell_glyphs::layout_spans(run.start_col, run.cells, &run.text, run.wide);
+            for span in &spans {
+                let span_rect = Rect::from_min_size(
+                    Pos2::new(origin.x + span.col() as f32 * metrics.width, y),
+                    Vec2::new(span.cols() as f32 * metrics.width, metrics.height),
                 );
+                match span {
+                    Span::Graphic { graphic, .. } => {
+                        cell_glyphs::paint_graphic(
+                            &painter,
+                            span_rect,
+                            *graphic,
+                            color,
+                            rgb(run.style.background),
+                        );
+                    }
+                    Span::Text { start, end, .. } => {
+                        let text_painter = painter.with_clip_rect(span_rect);
+                        let text_pos = Pos2::new(span_rect.left(), y);
+                        let text = &run.text[*start..*end];
+                        text_painter.text(text_pos, Align2::LEFT_TOP, text, font.clone(), color);
+                        if run.style.bold {
+                            // egui's bundled monospace face has one weight; a
+                            // sub-pixel overdraw is the documented synthetic-bold
+                            // fallback. The span clip keeps it in these cells.
+                            text_painter.text(
+                                text_pos + Vec2::new(0.6, 0.0),
+                                Align2::LEFT_TOP,
+                                text,
+                                font.clone(),
+                                color,
+                            );
+                        }
+                    }
+                }
             }
             if run.style.underline {
                 let line_y = y + metrics.height - 1.5;

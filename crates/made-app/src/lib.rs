@@ -10,6 +10,7 @@
 //! runtime/scope guards. The egui shell composes these APIs.
 
 pub mod app;
+mod cell_glyphs;
 pub mod cli;
 pub mod diagnostics;
 pub mod explorer_icons;
