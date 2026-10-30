@@ -1,6 +1,6 @@
 # Architecture
 
-Made is a native Rust desktop application built on eframe/egui with one window and independent workspace tabs. Each tab is a live shell plus explorer; OpenCode v2 is an optional enhancement started by the user. This page describes the implemented structure and ownership boundaries. Product requirements stay in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); UI requirements stay in [`specs/changes/archive/20261029-made-ui-ux-v1/spec.md`](../specs/changes/archive/20261029-made-ui-ux-v1/spec.md).
+Made is a native Rust desktop application built on eframe/egui with one window and independent workspace tabs. Each tab is a live shell plus explorer; OpenCode v2 is an optional enhancement started by the user. This page describes the implemented structure and ownership boundaries. Product requirements stay in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); UI requirements stay in [`specs/made-ui-ux.md`](../specs/made-ui-ux.md) plus the active delta [`specs/changes/explorer-git-view/spec.md`](../specs/changes/explorer-git-view/spec.md).
 
 ## Crate map
 
@@ -32,7 +32,7 @@ Rules enforced across the workspace:
 4. OS-specific code and APIs live only in `made-platform`; test-only fixture selection is the exception.
 5. Only `made-bridge` binds a network socket.
 6. Only the plugin calls OpenCode APIs. `made-app` consumes normalized snapshots and never parses terminal output or talks to OpenCode.
-7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata is resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config.
+7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata and closed-allowlist status are resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config. Git observation is read-only.
 8. Owned values and events cross crate boundaries; the app event loop owns UI state and no cross-crate mutable singleton exists.
 
 Heavy UI/GPU dependencies are confined to `made-app`: eframe 0.37 brings egui, winit, and wgpu. Domain crates stay UI-free. `made-terminal` uses alacritty_terminal 0.26 behind `TerminalCore`; `made-explorer` uses notify and syntect; `made-bridge` uses tungstenite, serde, sha2, getrandom, and thiserror.
@@ -62,7 +62,7 @@ Module boundaries in `made-app`:
 | [`theme.rs`](../crates/made-app/src/theme.rs) | Tokens, style installation, glass painting, clear color and transparency switch. |
 | [`workbench.rs`](../crates/made-app/src/workbench.rs) | One workspace runtime: shell/PTY, root follow, bridge, optional OpenCode, diagnostics, metrics. |
 | [`terminal_view.rs`](../crates/made-app/src/terminal_view.rs), [`render.rs`](../crates/made-app/src/render.rs) | Terminal input/visibility, selection/copy/IME, damage-driven grid rendering. |
-| [`explorer_view.rs`](../crates/made-app/src/explorer_view.rs) | Full-height tree, full-left preview, per-workspace width/visibility. |
+| [`explorer_view.rs`](../crates/made-app/src/explorer_view.rs) | Full-height tree and source-control view, full-left preview, per-workspace width/visibility. |
 | [`session_follow.rs`](../crates/made-app/src/session_follow.rs) | Shell/OpenCode root precedence, generations, unavailable roots. |
 | [`session_map.rs`](../crates/made-app/src/session_map.rs), [`session_focus.rs`](../crates/made-app/src/session_focus.rs) | Optional session data and focus correlation/timeout. |
 | [`integration_status.rs`](../crates/made-app/src/integration_status.rs) | Inactive, connected, degraded, unsupported states and reasons. |
@@ -107,11 +107,15 @@ A snapshot or event from another workspace, an unauthenticated client, a foreign
 
 Explorer selection -> canonical path guard -> preview loader/refresh -> full-left read-only surface. The PTY keeps running with bounded hidden output while preview is visible. Root changes clear preview and stale reads. Explorer hide/restore/resize is per workspace and never touches the shell process.
 
+### Git observation
+
+[`made-app::worktree`](../crates/made-app/src/worktree.rs) also reads closed-allowlist git status (`GitCommand::Status`) off the UI thread. The explorer paints that snapshot and does not invoke git. There is no git write. Porcelain v1 paths are always relative to the repository root, even with pathspec `.`. `read_status` canonicalizes the explorer root and toplevel before `resolve_status_path` strips the prefix. On macOS, `/var` versus `/private/var` drops every entry otherwise.
+
 ## Threading and bounded work
 
 - The app event loop owns UI state; background workers report through bounded channels.
 - PTY reads and VT parsing run off the UI thread. Each pane is budgeted per frame; inactive workspaces consume bounded output but do not paint grids.
-- Tree loads and preview reads run off the UI thread, are cancellable, and carry root generations.
+- Tree loads and preview reads run off the UI thread, are cancellable, and carry root generations. Git status runs off the UI thread on `made-git-status` and is generation-gated; the path-prefix rule is under Git observation.
 - Active repaint cadence is 14 ms. Paint timing uses an end-of-pass callback so activation, cwd, preview, and layout metrics end at the first submitted paint pass.
 - Bridge socket/accept threads never block the event loop. One pending state snapshot per authenticated epoch is kept and replaced in place; lifecycle events outrank best-effort notices.
 - Hidden-tab queues and scrollback are bounded; final software measurements recorded zero hidden-grid paints.
@@ -128,6 +132,7 @@ Explorer selection -> canonical path guard -> preview loader/refresh -> full-lef
 | Terminal screen/render model | `made-terminal::emulation` | `made-app::render`, terminal view |
 | Platform capabilities, launch plans, app paths, backdrop status | `made-platform` | `made-terminal`, `made-app` |
 | OpenCode config composition and no-write guard | `made-bridge::config`, `config_guard` | app launch path |
+| Read-only git status and porcelain path prefix | `made-app::worktree` | explorer source-control view |
 
 `made-explorer` receives an already-validated canonical path plus a generation token, not an app-owned `WorkspaceRoot`. `made-app` keeps the richer root/source/display model.
 

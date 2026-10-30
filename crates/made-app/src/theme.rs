@@ -829,7 +829,14 @@ pub enum IconGlyph {
     Close,
     /// Small terminal window with a prompt chevron.
     Terminal,
+    /// Branch with three nodes: read-only source control.
+    SourceControl,
+    /// Forked chevrons: linked-worktree mark in the REPOS header.
+    LinkedWorktree,
 }
+
+/// Linked-worktree mark beside the worktree name. Not the source-control toggle.
+pub const LINKED_WORKTREE_ICON: f32 = 12.0;
 
 /// Widest app-drawn header glyph (Explorer panel/Diagnostics).
 pub const ICON_GLYPH_WIDTH: f32 = 14.0;
@@ -890,7 +897,12 @@ pub fn icon_action(
     }
 }
 
-fn paint_icon(painter: &egui::Painter, rect: egui::Rect, glyph: IconGlyph, color: Color32) {
+pub(crate) fn paint_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    glyph: IconGlyph,
+    color: Color32,
+) {
     let center = rect.center();
     let point = |x: f32, y: f32| center + egui::vec2(x, y);
     let stroke = Stroke::new(1.5, color);
@@ -935,6 +947,62 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, glyph: IconGlyph, color
             painter.rect_stroke(panel, CornerRadius::same(2), stroke, StrokeKind::Middle);
             line(vec![point(-3.5, -2.5), point(-1.0, 0.0), point(-3.5, 2.5)]);
             line(vec![point(-0.25, 2.5), point(2.75, 2.5)]);
+        }
+        IconGlyph::SourceControl => {
+            // Hollow rings. `circle_stroke` paints outside the radius, so this
+            // inner radius keeps the 1.5 stroke inside the 14px glyph box.
+            let ring = 1.25;
+            let join = ring + stroke.width * 0.5;
+            let top = point(-3.25, -4.25);
+            let bottom = point(-3.25, 4.25);
+            let right = point(3.75, -1.0);
+            // Stem only between the top and bottom rings, stopping in the ring
+            // stroke so a cap cannot cross the hollow center.
+            line(vec![point(-3.25, -4.25 + join), point(-3.25, 4.25 - join)]);
+            // Branch leaves the middle of the stem and meets the right ring
+            // along its radius, one bend, no extra node.
+            let start = point(-3.25 + stroke.width * 0.5, 0.35);
+            let outward = start - right;
+            let outward = outward / outward.length();
+            let end = right + outward * join;
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [
+                    start,
+                    start + egui::vec2(2.2, -0.15),
+                    end + outward * 2.0,
+                    end,
+                ],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+            for center in [top, bottom, right] {
+                painter.circle_stroke(center, ring, stroke);
+            }
+        }
+        IconGlyph::LinkedWorktree => {
+            // Worktree-compact: a short stem forks into two right-pointing
+            // chevrons. Cap-sized dots stand in for round ends; egui lines
+            // have no cap style. Not the three-ring source-control toggle.
+            let cap = stroke.width * 0.5;
+            let fork = point(-0.7, 0.0);
+            line(vec![point(-4.6, 0.0), fork]);
+            painter.circle_filled(point(-4.6, 0.0), cap, color);
+            painter.circle_filled(fork, cap, color);
+            for through_y in [-2.2, 2.2] {
+                let through = egui::vec2(2.0, through_y);
+                let from_fork = through - egui::vec2(-0.7, 0.0);
+                let unit = from_fork / from_fork.length();
+                let perp = egui::vec2(-unit.y, unit.x);
+                let tip = through + unit * 3.2;
+                let back = tip - unit * 1.7;
+                line(vec![fork, point(through.x, through.y), point(tip.x, tip.y)]);
+                for barb in [back + perp * 1.15, back - perp * 1.15] {
+                    line(vec![point(barb.x, barb.y), point(tip.x, tip.y)]);
+                    painter.circle_filled(point(barb.x, barb.y), cap, color);
+                }
+                painter.circle_filled(point(tip.x, tip.y), cap, color);
+            }
         }
     }
 }

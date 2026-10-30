@@ -28,7 +28,7 @@ use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
     MAX_LOG_FILE_BYTES,
 };
-use crate::explorer_view::ExplorerPane;
+use crate::explorer_view::{ExplorerGitChrome, ExplorerPane, GitHeader};
 use crate::integration_status::{IntegrationState, IntegrationStatus};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -39,7 +39,9 @@ use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
 use crate::tui::TerminalTarget;
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
-use crate::worktree::{GitRunner, MetadataStatus, WorktreeMetadata};
+use crate::worktree::{
+    GitRunner, GitStatusRead, GitStatusSnapshot, MetadataStatus, WorktreeMetadata,
+};
 use crate::{APP_NAME, APP_VERSION};
 
 /// Default application title.
@@ -57,6 +59,9 @@ const NOTICE_TTL: Duration = Duration::from_secs(8);
 /// deliberately much slower than terminal pumping: a deleted/renamed directory
 /// does not need 60 Hz polling to be reported honestly.
 const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Coalesce explorer watcher bursts before reading git status again.
+const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
 
@@ -211,6 +216,9 @@ pub struct Workbench {
     pub(crate) worktree: WorktreeState,
     worktree_worker: WorktreeWorker,
     pending_worktree: PendingWorktreeRequest,
+    git_status_worker: GitStatusWorker,
+    pending_git_status: PendingGitStatusRequest,
+    git_status: GitStatusRuntime,
     shell_capability: Option<made_platform::ShellCwdCapability>,
     shell_root_worker: ShellRootWorker,
     shell_root_unavailable: Option<ShellRootUnavailable>,
@@ -343,6 +351,9 @@ impl Workbench {
             worktree: WorktreeState::default(),
             worktree_worker: WorktreeWorker::start(),
             pending_worktree: PendingWorktreeRequest::default(),
+            git_status_worker: GitStatusWorker::start(),
+            pending_git_status: PendingGitStatusRequest::default(),
+            git_status: GitStatusRuntime::default(),
             shell_capability: None,
             shell_root_worker: ShellRootWorker::start(),
             shell_root_unavailable: None,
@@ -1325,13 +1336,20 @@ impl Workbench {
             self.last_activity = now;
         }
 
-        if let Some(explorer) = self.explorer.as_mut() {
+        let fs_activity = if let Some(explorer) = self.explorer.as_mut() {
             explorer.tick(self.diag.log_mut());
+            let fs_activity = explorer.take_fs_activity();
             if let Some(latency) = explorer.take_switch_latency() {
                 self.metrics.record_session_switch(latency);
                 self.last_activity = now;
                 active = true;
             }
+            fs_activity
+        } else {
+            false
+        };
+        if fs_activity {
+            self.note_git_fs_activity(now);
         }
 
         self.poll_shell_root_revalidation(now);
@@ -1341,6 +1359,15 @@ impl Workbench {
         if self.poll_worktree() {
             active = true;
         }
+        self.sync_git_status_scope();
+        self.try_send_pending_git_status();
+        if self.poll_git_status() {
+            active = true;
+        }
+        if self.maybe_debounce_git_status(now) {
+            active = true;
+        }
+        self.push_git_chrome();
 
         let bridge_counters = self
             .bridge
@@ -1965,6 +1992,183 @@ impl Workbench {
         changed
     }
 
+    fn is_git_repo(&self) -> bool {
+        self.worktree
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_known() && metadata.is_worktree)
+    }
+
+    fn note_git_fs_activity(&mut self, now: Instant) {
+        if self.is_git_repo() {
+            self.git_status.dirty_at = Some(now);
+        }
+    }
+
+    fn sync_git_status_scope(&mut self) {
+        if !self.is_git_repo() {
+            self.git_status.clear();
+            self.pending_git_status.clear();
+            return;
+        }
+        let generation = self.worktree.generation;
+        if self.git_status.generation != generation {
+            self.git_status.clear();
+            self.git_status.generation = generation;
+        }
+        if !self.git_status.attempted && !self.git_status.loading {
+            self.request_git_status();
+        }
+    }
+
+    fn request_git_status(&mut self) {
+        if !self.is_git_repo() {
+            return;
+        }
+        let Some(root) = self
+            .explorer
+            .as_ref()
+            .and_then(ExplorerPane::root)
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let toplevel = self
+            .worktree
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.toplevel.clone());
+        let generation = self.worktree.generation;
+        self.git_status.generation = generation;
+        self.git_status.loading = true;
+        self.git_status.attempted = true;
+        self.git_status.request_started_at = Some(Instant::now());
+        self.pending_git_status.offer(GitStatusJob {
+            root,
+            toplevel,
+            generation,
+        });
+        self.try_send_pending_git_status();
+    }
+
+    /// Refresh when the user opens source control and the snapshot is stale.
+    pub(crate) fn refresh_git_status_if_stale(&mut self) {
+        if !self.is_git_repo() {
+            return;
+        }
+        let stale = self.git_status.snapshot.is_none()
+            || self.git_status.failed
+            || self.git_status.dirty_at.is_some();
+        if !stale {
+            return;
+        }
+        if self.git_status.loading {
+            return;
+        }
+        self.git_status.dirty_at = None;
+        self.request_git_status();
+    }
+
+    fn try_send_pending_git_status(&mut self) {
+        let worker = &self.git_status_worker;
+        if self
+            .pending_git_status
+            .try_send(|job| worker.request(job.clone()))
+        {
+            self.git_status.loading = true;
+        }
+    }
+
+    fn poll_git_status(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(result) = self.git_status_worker.try_recv() {
+            if result.generation != self.worktree.generation || !self.is_git_repo() {
+                continue;
+            }
+            self.git_status.loading = false;
+            changed = true;
+            match result.read {
+                GitStatusRead::Ready(snapshot) => {
+                    let count: usize = snapshot.groups.iter().map(|group| group.rows.len()).sum();
+                    self.git_status.snapshot = Some(snapshot);
+                    self.git_status.failed = false;
+                    self.diag
+                        .log_mut()
+                        .record(LogLevel::Info, format!("git status: {count} change(s)"));
+                }
+                GitStatusRead::Failed { reason } | GitStatusRead::Unavailable { reason } => {
+                    if self.git_status.snapshot.is_none() {
+                        self.git_status.failed = true;
+                    }
+                    self.diag.log_mut().record(
+                        LogLevel::Warn,
+                        format!("git status unavailable; explorer continues ({reason})"),
+                    );
+                }
+            }
+            let watch_after_request = self.git_status.dirty_at.is_some_and(|dirty| {
+                self.git_status
+                    .request_started_at
+                    .is_some_and(|started| dirty > started)
+            });
+            if !watch_after_request {
+                self.git_status.dirty_at = None;
+            }
+        }
+        changed
+    }
+
+    fn maybe_debounce_git_status(&mut self, now: Instant) -> bool {
+        let Some(dirty_at) = self.git_status.dirty_at else {
+            return false;
+        };
+        if !self.is_git_repo() {
+            self.git_status.dirty_at = None;
+            return false;
+        }
+        if now.saturating_duration_since(dirty_at) < GIT_STATUS_DEBOUNCE {
+            return false;
+        }
+        if self.git_status.loading {
+            if self
+                .git_status
+                .request_started_at
+                .is_some_and(|started| started >= dirty_at)
+            {
+                self.git_status.dirty_at = None;
+            }
+            return false;
+        }
+        self.git_status.dirty_at = None;
+        self.request_git_status();
+        true
+    }
+
+    fn push_git_chrome(&mut self) {
+        let Some(explorer) = self.explorer.as_mut() else {
+            return;
+        };
+        let metadata = self.worktree.metadata.as_ref();
+        let show_icon =
+            metadata.is_some_and(|metadata| metadata.is_known() && metadata.is_worktree);
+        let header = GitHeader {
+            show_icon,
+            branch: metadata.and_then(|metadata| metadata.branch.clone()),
+            detached: metadata.is_some_and(|metadata| metadata.detached),
+            commit_abbrev: metadata.and_then(|metadata| metadata.commit_abbrev.clone()),
+            commit_subject: metadata.and_then(|metadata| metadata.commit_subject.clone()),
+            is_linked_worktree: metadata.is_some_and(|metadata| metadata.is_linked_worktree),
+            directory_name: metadata.and_then(|metadata| metadata.directory_name.clone()),
+        };
+        let loading = self.git_status.loading && self.git_status.snapshot.is_none();
+        explorer.apply_git_chrome(ExplorerGitChrome {
+            header,
+            status: self.git_status.snapshot.clone(),
+            failed: self.git_status.failed && self.git_status.snapshot.is_none(),
+            loading,
+        });
+    }
+
     fn update_window_title(&mut self, ctx: &egui::Context) {
         let workspace = self
             .plan
@@ -2281,6 +2485,117 @@ struct WorktreeResult {
 struct WorktreeWorker {
     jobs: SyncSender<WorktreeRequest>,
     results: Receiver<WorktreeResult>,
+}
+
+struct GitStatusRuntime {
+    generation: RootGeneration,
+    snapshot: Option<GitStatusSnapshot>,
+    failed: bool,
+    loading: bool,
+    attempted: bool,
+    dirty_at: Option<Instant>,
+    request_started_at: Option<Instant>,
+}
+
+impl Default for GitStatusRuntime {
+    fn default() -> Self {
+        Self {
+            generation: RootGeneration::INITIAL,
+            snapshot: None,
+            failed: false,
+            loading: false,
+            attempted: false,
+            dirty_at: None,
+            request_started_at: None,
+        }
+    }
+}
+
+impl GitStatusRuntime {
+    fn clear(&mut self) {
+        *self = Self {
+            generation: self.generation,
+            ..Self::default()
+        };
+    }
+}
+
+#[derive(Clone)]
+struct GitStatusJob {
+    root: PathBuf,
+    toplevel: Option<PathBuf>,
+    generation: RootGeneration,
+}
+
+struct GitStatusResult {
+    generation: RootGeneration,
+    read: GitStatusRead,
+}
+
+struct GitStatusWorker {
+    jobs: SyncSender<GitStatusJob>,
+    results: Receiver<GitStatusResult>,
+}
+
+impl GitStatusWorker {
+    fn start() -> Self {
+        let (jobs, job_rx) = mpsc::sync_channel::<GitStatusJob>(1);
+        let (result_tx, results) = mpsc::sync_channel::<GitStatusResult>(4);
+        thread::Builder::new()
+            .name("made-git-status".to_owned())
+            .spawn(move || {
+                let runner = GitRunner::from_env();
+                while let Ok(job) = job_rx.recv() {
+                    let read = runner.read_status(&job.root, job.toplevel.as_deref());
+                    if result_tx
+                        .send(GitStatusResult {
+                            generation: job.generation,
+                            read,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self { jobs, results }
+    }
+
+    fn request(&self, job: GitStatusJob) -> bool {
+        self.jobs.try_send(job).is_ok()
+    }
+
+    fn try_recv(&self) -> Option<GitStatusResult> {
+        self.results.try_recv().ok()
+    }
+}
+
+#[derive(Default)]
+struct PendingGitStatusRequest {
+    pending: Option<GitStatusJob>,
+}
+
+impl PendingGitStatusRequest {
+    fn offer(&mut self, job: GitStatusJob) {
+        self.pending = Some(job);
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    fn try_send(&mut self, mut send: impl FnMut(&GitStatusJob) -> bool) -> bool {
+        let Some(job) = self.pending.as_ref() else {
+            return false;
+        };
+        if send(job) {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl WorktreeWorker {

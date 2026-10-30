@@ -1633,6 +1633,9 @@ impl Workbench {
             }
         }
 
+        let opened_source_control = explorer
+            .as_mut()
+            .is_some_and(ExplorerPane::take_source_control_opened);
         if explorer
             .as_mut()
             .is_some_and(ExplorerPane::take_preview_opened)
@@ -1696,6 +1699,11 @@ impl Workbench {
                 }
             });
         self.explorer = explorer;
+        if opened_source_control {
+            self.refresh_git_status_if_stale();
+            ui.ctx()
+                .request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
+        }
     }
 
     fn terminal_card(&mut self, ui: &mut Ui, layout: &Layout, preview_loaded: bool) -> bool {

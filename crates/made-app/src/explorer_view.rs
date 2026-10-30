@@ -10,6 +10,7 @@
 //! [`PREVIEW_ACTIONS`] contains only read-only actions. Preview shortcuts are
 //! scoped to preview focus; the terminal keeps Ctrl+S as XOFF.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
@@ -34,6 +35,7 @@ use crate::diagnostics::{DiagnosticLog, LogLevel};
 use crate::explorer_icons;
 use crate::sanitize::sanitize_display;
 use crate::theme;
+use crate::worktree::{ChangeKind, FolderMark, GitStatusRow, GitStatusSnapshot};
 
 /// Edge of the square icon slot that file and folder rows reserve, in points.
 const ENTRY_ICON_SIZE: f32 = 16.0;
@@ -544,6 +546,38 @@ pub enum PreviewUiAction {
     ShowTerminal,
 }
 
+/// Branch and worktree facts the explorer header needs. Made never invents a branch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitHeader {
+    /// Icon is shown only when metadata is known and the root is a worktree.
+    pub show_icon: bool,
+    /// Attached branch, when metadata reported one.
+    pub branch: Option<String>,
+    /// Whether HEAD is detached.
+    pub detached: bool,
+    /// `rev-parse --short=8 HEAD` when detached. May be longer than 8 characters.
+    pub commit_abbrev: Option<String>,
+    /// Commit subject when detached. Empty means the subject was empty.
+    pub commit_subject: Option<String>,
+    /// Whether this directory is a linked worktree.
+    pub is_linked_worktree: bool,
+    /// Worktree directory name. Shown only when it differs from the visible head.
+    pub directory_name: Option<String>,
+}
+
+/// Status snapshot pushed in from the workbench worker. The explorer never runs git.
+#[derive(Debug, Clone, Default)]
+pub struct ExplorerGitChrome {
+    /// Header facts for the icon and branch line.
+    pub header: GitHeader,
+    /// Latest successful status, if any.
+    pub status: Option<GitStatusSnapshot>,
+    /// The last read failed and there is no snapshot to keep.
+    pub failed: bool,
+    /// A status read is in flight and no snapshot is ready yet.
+    pub loading: bool,
+}
+
 /// Explorer + preview surface for one active root.
 pub struct ExplorerPane {
     root: Option<PathBuf>,
@@ -574,6 +608,14 @@ pub struct ExplorerPane {
     root_ready: bool,
     scroll_to_selection: bool,
     native_backdrop_applied: bool,
+    source_control_open: bool,
+    source_control_opened: bool,
+    fs_activity: bool,
+    git_header: GitHeader,
+    git_status: Option<GitStatusSnapshot>,
+    git_status_failed: bool,
+    git_status_loading: bool,
+    git_selected: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ExplorerPane {
@@ -620,6 +662,14 @@ impl ExplorerPane {
             root_ready: false,
             scroll_to_selection: false,
             native_backdrop_applied: false,
+            source_control_open: false,
+            source_control_opened: false,
+            fs_activity: false,
+            git_header: GitHeader::default(),
+            git_status: None,
+            git_status_failed: false,
+            git_status_loading: false,
+            git_selected: None,
         };
         pane.install_root(root.as_ref());
         pane
@@ -1166,6 +1216,7 @@ impl ExplorerPane {
         if events.is_empty() {
             return;
         }
+        self.fs_activity = true;
         let reload_dirs = {
             let Some(tree) = self.tree.as_mut() else {
                 return;
@@ -1381,6 +1432,32 @@ impl ExplorerPane {
         self.native_backdrop_applied = applied;
     }
 
+    /// Replace the read-only git chrome. Leaving a repository returns to the file tree.
+    pub fn apply_git_chrome(&mut self, chrome: ExplorerGitChrome) {
+        if !chrome.header.show_icon {
+            self.source_control_open = false;
+        }
+        self.git_header = chrome.header;
+        self.git_status = chrome.status;
+        self.git_status_failed = chrome.failed;
+        self.git_status_loading = chrome.loading;
+    }
+
+    /// Whether the source-control view is showing. Per workspace, in memory.
+    pub fn source_control_open(&self) -> bool {
+        self.source_control_open && self.git_header.show_icon
+    }
+
+    /// Take the "user just opened source control" edge so the workbench can refresh.
+    pub fn take_source_control_opened(&mut self) -> bool {
+        std::mem::take(&mut self.source_control_opened)
+    }
+
+    /// Take filesystem activity observed since the last poll.
+    pub fn take_fs_activity(&mut self) -> bool {
+        std::mem::take(&mut self.fs_activity)
+    }
+
     /// Selected preview path, including loading and guarded error states.
     pub fn preview_path(&self) -> Option<&Path> {
         self.preview.path.as_deref()
@@ -1412,28 +1489,107 @@ impl ExplorerPane {
         );
         theme::paint_glass_card_header(ui, header_rect, layout, self.native_backdrop_applied);
         let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
+        let show_icon = self.git_header.show_icon;
+        let spacing = ui.spacing().item_spacing.x;
+        let icon_extent = theme::icon_action_extent(24.0);
+        // The name stops before the 8px gap and the 24×24 icon. A character
+        // estimate cannot do that: wide glyphs would paint into the icon.
+        let icon_reserve = if show_icon {
+            icon_extent + spacing
+        } else {
+            0.0
+        };
+        let left_rect = egui::Rect::from_min_max(
+            content.min,
+            egui::pos2(
+                (content.right() - icon_reserve).max(content.left()),
+                content.bottom(),
+            ),
+        );
         let mut left = ui.new_child(
             UiBuilder::new()
-                .max_rect(content)
+                .max_rect(left_rect)
                 .layout(egui::Layout::left_to_right(Align::Center)),
         );
-        theme::section_label(&mut left, "EXPLORER");
-        if let Some(root) = &self.root {
+        let git_open = self.source_control_open();
+        // Owned before the label is painted: the aside width is measured from
+        // the section label's right edge, and the git view must not fall back
+        // to the root name when the head line is empty.
+        let aside = if git_open {
+            let head = source_control_head_label(
+                self.git_header.branch.as_deref(),
+                self.git_header.detached,
+                self.git_header.commit_abbrev.as_deref(),
+            );
+            let folder = linked_worktree_folder(
+                self.git_header.is_linked_worktree,
+                self.git_header.directory_name.as_deref(),
+            );
+            let shown_name = source_control_worktree_name(
+                &head,
+                self.git_header.is_linked_worktree,
+                self.git_header.directory_name.as_deref(),
+            );
+            if head.is_empty() && folder.is_none() {
+                None
+            } else {
+                let hover = source_control_head_hover(
+                    &head,
+                    self.git_header.detached,
+                    self.git_header.commit_abbrev.as_deref(),
+                    self.git_header.commit_subject.as_deref(),
+                );
+                Some((head, hover, folder, shown_name))
+            }
+        } else if let Some(root) = &self.root {
             let full = root.display().to_string();
             let name = root
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| full.clone());
-            let remaining = (content.right() - left.min_rect().right() - 6.0).max(0.0);
-            let chars = ((remaining / 6.0).floor() as usize).min(layout.root_name_chars);
-            if chars >= 4 {
-                left.label(theme::mono(
-                    theme::truncate_end(&sanitize_display(&name, 160), chars),
-                    10.5,
-                    theme::TEXT_TERTIARY,
-                ))
-                .on_hover_text(sanitize_display(&full, 600));
+            Some((name, full, None, None))
+        } else {
+            None
+        };
+        theme::section_label(&mut left, if git_open { "REPOS" } else { "EXPLORER" });
+        if let Some((text, hover, folder, shown_name)) = aside {
+            let name_width = root_name_width(
+                left.min_rect().right(),
+                content.right(),
+                spacing,
+                icon_extent,
+                show_icon,
+            );
+            if name_width >= 1.0 {
+                let name_left = left.min_rect().right() + spacing;
+                let name_rect = egui::Rect::from_min_size(
+                    egui::pos2(name_left, left_rect.top()),
+                    egui::vec2(name_width, left_rect.height()),
+                );
+                if git_open {
+                    self.paint_repos_aside(
+                        ui,
+                        name_rect,
+                        &text,
+                        &hover,
+                        folder.as_deref(),
+                        shown_name.as_deref(),
+                    );
+                } else {
+                    paint_clipped_label(
+                        ui,
+                        name_rect,
+                        name_left,
+                        &text,
+                        name_width,
+                        self.ui_scope.with("explorer-root-name"),
+                        Some(&hover),
+                    );
+                }
             }
+        }
+        if show_icon {
+            self.source_control_icon(ui, content);
         }
         theme::paint_card_border(ui, card_rect, layout);
 
@@ -1455,7 +1611,196 @@ impl ExplorerPane {
             );
             body.add_space(4.0);
         }
-        self.tree_rows_ui(&mut body, log, layout);
+        if self.source_control_open() {
+            self.git_view_ui(&mut body);
+        } else {
+            self.tree_rows_ui(&mut body, log, layout);
+        }
+    }
+
+    fn paint_repos_aside(
+        &self,
+        ui: &mut Ui,
+        clip: egui::Rect,
+        head: &str,
+        head_hover: &str,
+        folder_name: Option<&str>,
+        shown_name: Option<&str>,
+    ) {
+        let head = sanitize_display(head, 160);
+        let folder = folder_name
+            .map(|name| sanitize_display(name, 160))
+            .filter(|name| !name.is_empty());
+        let shown = shown_name
+            .map(|name| sanitize_display(name, 160))
+            .filter(|name| !name.is_empty());
+        let Some(folder) = folder else {
+            if !head.is_empty() {
+                paint_clipped_label(
+                    ui,
+                    clip,
+                    clip.left(),
+                    &head,
+                    clip.width(),
+                    self.ui_scope.with("source-control-head"),
+                    Some(head_hover),
+                );
+            }
+            return;
+        };
+        let gap = 4.0;
+        let icon = theme::LINKED_WORKTREE_ICON;
+        let mut head_w = if head.is_empty() {
+            0.0
+        } else {
+            mono_width(ui, &head)
+        };
+        let mut name_w = shown
+            .as_ref()
+            .map(|name| mono_width(ui, name))
+            .unwrap_or(0.0);
+        let leading = if head_w > 0.0 { gap } else { 0.0 };
+        let trailing = if shown.is_some() { gap } else { 0.0 };
+        let block = leading + icon + trailing;
+        let overflow = (head_w + block + name_w - clip.width()).max(0.0);
+        if overflow > 0.0 {
+            let name_cut = overflow.min((name_w - 1.0).max(0.0));
+            name_w -= name_cut;
+            head_w = (head_w - (overflow - name_cut)).max(0.0);
+        }
+        let mut x = clip.left();
+        if head_w >= 1.0 && !head.is_empty() {
+            paint_clipped_label(
+                ui,
+                clip,
+                x,
+                &head,
+                head_w,
+                self.ui_scope.with("source-control-head"),
+                Some(head_hover),
+            );
+            x += head_w + gap;
+        }
+        if x + icon > clip.right() {
+            return;
+        }
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(x + icon * 0.5, clip.center().y),
+            egui::vec2(icon, icon),
+        );
+        theme::paint_icon(
+            &ui.painter().with_clip_rect(clip),
+            icon_rect,
+            theme::IconGlyph::LinkedWorktree,
+            theme::TEXT_TERTIARY,
+        );
+        let hover = linked_worktree_hover(&folder);
+        let Some(name) = shown else {
+            ui.interact(
+                icon_rect,
+                self.ui_scope.with("linked-worktree"),
+                Sense::hover(),
+            )
+            .on_hover_text(sanitize_display(&hover, 600));
+            return;
+        };
+        x += icon + gap;
+        name_w = name_w.min((clip.right() - x).max(0.0));
+        if name_w < 1.0 {
+            ui.interact(
+                icon_rect,
+                self.ui_scope.with("linked-worktree"),
+                Sense::hover(),
+            )
+            .on_hover_text(sanitize_display(&hover, 600));
+            return;
+        }
+        let text_rect = paint_clipped_label(ui, clip, x, &name, name_w, self.ui_scope, None);
+        ui.interact(
+            icon_rect.union(text_rect),
+            self.ui_scope.with("linked-worktree"),
+            Sense::hover(),
+        )
+        .on_hover_text(sanitize_display(&hover, 600));
+    }
+
+    fn source_control_icon(&mut self, ui: &mut Ui, content: egui::Rect) {
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(content.right() - 24.0, content.top()),
+            egui::vec2(24.0, content.height()),
+        );
+        let mut icon_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(icon_rect)
+                .layout(egui::Layout::right_to_left(Align::Center)),
+        );
+        let open = self.source_control_open;
+        let label = if open { "Explorer" } else { "Source Control" };
+        let action = theme::icon_action(
+            &mut icon_ui,
+            self.ui_scope.with("source-control"),
+            theme::IconGlyph::SourceControl,
+            label,
+            open,
+            24.0,
+            theme::explorer_header_glass(self.native_backdrop_applied),
+        );
+        if action.activated {
+            self.source_control_open = !open;
+            if self.source_control_open {
+                self.source_control_opened = true;
+            }
+        }
+    }
+
+    fn git_view_ui(&mut self, ui: &mut Ui) {
+        if self.git_status.is_none() {
+            let message = if self.git_status_failed {
+                "Git status unavailable"
+            } else {
+                "Reading changes…"
+            };
+            ui.label(quiet_line(message));
+            return;
+        }
+        let Some(status) = self.git_status.clone() else {
+            return;
+        };
+        if status.groups.is_empty() {
+            ui.label(quiet_line("No changes"));
+            return;
+        }
+        let mut action = None;
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for group in &status.groups {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(group.title)
+                            .font(FontId::proportional(10.5))
+                            .color(theme::TEXT_TERTIARY),
+                    );
+                    for (index, row) in group.rows.iter().enumerate() {
+                        if let Some(clicked) = git_status_row_ui(
+                            ui,
+                            self.ui_scope.with((group.title, index)),
+                            row,
+                            self.git_selected.as_deref() == Some(row.path.as_path()),
+                        ) {
+                            action = Some(clicked);
+                        }
+                    }
+                }
+            });
+        if let Some(row) = action {
+            self.git_selected = Some(row.path.clone());
+            if row.opens_preview() {
+                self.open_preview(row.path);
+            }
+        }
     }
 
     fn tree_rows_ui(&mut self, ui: &mut Ui, _log: &mut DiagnosticLog, layout: &theme::Layout) {
@@ -1513,6 +1858,16 @@ impl ExplorerPane {
         }
         let rows = &self.rows;
         let row_icons = &self.row_icons;
+        let folders = self
+            .git_status
+            .as_ref()
+            .map(|status| status.folders.clone())
+            .unwrap_or_default();
+        let files = self
+            .git_status
+            .as_ref()
+            .map(file_status_marks)
+            .unwrap_or_default();
 
         ui.spacing_mut().item_spacing.y = 0.0;
         ScrollArea::vertical()
@@ -1561,7 +1916,21 @@ impl ExplorerPane {
                     };
                     let name = sanitize_display(&row.name, 200);
                     let text_left = rect.left() + 28.0 + row.depth as f32 * 14.0;
-                    let width = (rect.right() - text_left - 6.0).max(1.0);
+                    // Folders use ancestor marks. Files use only their own kinds,
+                    // and only when that path is already a tree row.
+                    let status_mark = match row.kind {
+                        EntryKind::Directory => folders.get(&row.path),
+                        EntryKind::File => files.get(&row.path),
+                        _ => None,
+                    };
+                    // A 6px dot sits 8px in from the row's right edge. Text stops
+                    // before it so the label never covers the mark.
+                    let dot_center =
+                        status_mark.map(|_| egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y));
+                    let text_right = dot_center
+                        .map(|center| center.x - 3.0 - 6.0)
+                        .unwrap_or(rect.right() - 6.0);
+                    let width = (text_right - text_left).max(1.0);
                     theme::paint_ellipsized_centered(
                         ui.painter(),
                         text_left,
@@ -1610,11 +1979,22 @@ impl ExplorerPane {
                         }
                     }
 
-                    let tooltip = if let Some(error) = &row.error {
+                    if let (Some(mark), Some(center)) = (status_mark, dot_center) {
+                        ui.painter()
+                            .circle_filled(center, 3.0, folder_mark_color(mark));
+                    }
+                    let path_tooltip = if let Some(error) = &row.error {
                         sanitize_display(error, 600)
                     } else {
                         sanitize_display(&row.path.display().to_string(), 600)
                     };
+                    let tooltip = response
+                        .hover_pos()
+                        .zip(dot_center)
+                        .zip(status_mark)
+                        .filter(|((pos, center), _)| pos.distance(*center) <= 8.0)
+                        .map(|((_, _), mark)| mark.tooltip())
+                        .unwrap_or(path_tooltip);
                     let response = response.on_hover_text(tooltip);
                     if scroll_to_selection && row.selected {
                         response.scroll_to_me(Some(Align::Center));
@@ -1945,6 +2325,274 @@ impl ExplorerPane {
     }
 }
 
+/// Pixel width left for the root name after the section label, the item gap,
+/// and — when shown — the source-control icon plus the gap before it.
+fn root_name_width(
+    label_right: f32,
+    content_right: f32,
+    spacing: f32,
+    icon_extent: f32,
+    show_icon: bool,
+) -> f32 {
+    let reserve = if show_icon {
+        icon_extent + spacing
+    } else {
+        0.0
+    };
+    let name_left = label_right + spacing;
+    let name_right = content_right - reserve;
+    (name_right - name_left).max(0.0)
+}
+
+fn mono_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            FontId::monospace(10.5),
+            theme::TEXT_TERTIARY,
+        )
+        .size()
+        .x
+}
+
+/// Paint one ellipsized header string inside `clip`. Returns the text hit rect.
+///
+/// `hover` attaches the tooltip. Pass `None` when a wider hit target owns it.
+fn paint_clipped_label(
+    ui: &mut Ui,
+    clip: egui::Rect,
+    left: f32,
+    text: &str,
+    max_width: f32,
+    id: egui::Id,
+    hover: Option<&str>,
+) -> egui::Rect {
+    if max_width < 1.0 || text.is_empty() {
+        return egui::Rect::from_min_size(egui::pos2(left, clip.center().y), egui::Vec2::ZERO);
+    }
+    let painter = ui.painter().with_clip_rect(clip);
+    let galley = theme::paint_ellipsized_centered(
+        &painter,
+        left,
+        clip.center().y,
+        text,
+        FontId::monospace(10.5),
+        theme::TEXT_TERTIARY,
+        max_width,
+    );
+    let text_rect = egui::Rect::from_min_size(
+        egui::pos2(left, clip.center().y - galley.size().y / 2.0),
+        galley.size(),
+    );
+    if let Some(hover) = hover {
+        ui.interact(text_rect, id, Sense::hover())
+            .on_hover_text(sanitize_display(hover, 600));
+    }
+    text_rect
+}
+
+/// First 8 characters of `rev-parse --short=8 HEAD`, or the whole string if shorter.
+fn visible_commit_id(abbrev: Option<&str>) -> String {
+    abbrev
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(8).collect())
+        .unwrap_or_default()
+}
+
+fn source_control_head_label(
+    branch: Option<&str>,
+    detached: bool,
+    commit_abbrev: Option<&str>,
+) -> String {
+    if detached {
+        visible_commit_id(commit_abbrev)
+    } else {
+        branch
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or("")
+            .to_owned()
+    }
+}
+
+/// Folder name for the linked-worktree icon, even when it repeats the head.
+fn linked_worktree_folder(linked: bool, directory_name: Option<&str>) -> Option<String> {
+    if !linked {
+        return None;
+    }
+    directory_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// Extra folder name beside the head. Omitted when it repeats the visible
+/// branch or 8-character id. The icon still uses [`linked_worktree_folder`].
+fn source_control_worktree_name(
+    head: &str,
+    linked: bool,
+    directory_name: Option<&str>,
+) -> Option<String> {
+    let name = linked_worktree_folder(linked, directory_name)?;
+    if !head.is_empty() && head == name {
+        return None;
+    }
+    Some(name)
+}
+
+fn linked_worktree_hover(name: &str) -> String {
+    format!("{name} is a linked worktree")
+}
+
+/// Hover text for the head line.
+///
+/// An attached line hovers as itself. A detached line shows the commit subject,
+/// or the visible id when the subject is empty. A longer abbreviation and the
+/// full visible line stay in the hover when they add text the subject does not.
+fn source_control_head_hover(
+    line: &str,
+    detached: bool,
+    commit_abbrev: Option<&str>,
+    commit_subject: Option<&str>,
+) -> String {
+    if !detached {
+        return line.to_owned();
+    }
+    let abbrev = commit_abbrev
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let id = visible_commit_id(abbrev);
+    let subject = commit_subject
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(subject) = subject {
+        parts.push(subject.to_owned());
+    } else if !id.is_empty() {
+        parts.push(id);
+    }
+    if let Some(abbrev) = abbrev {
+        if abbrev.chars().count() > 8 && !parts.iter().any(|part| part.contains(abbrev)) {
+            parts.push(abbrev.to_owned());
+        }
+    }
+    if !line.is_empty() && !parts.iter().any(|part| part.contains(line)) {
+        parts.push(line.to_owned());
+    }
+    parts.join("\n")
+}
+
+fn quiet_line(text: &str) -> RichText {
+    RichText::new(text)
+        .font(FontId::proportional(12.5))
+        .color(theme::TEXT_TERTIARY)
+}
+
+fn change_kind_color(kind: ChangeKind) -> Color32 {
+    match kind {
+        ChangeKind::New => theme::SUCCESS,
+        ChangeKind::Modified => theme::WARNING,
+        ChangeKind::Deleted | ChangeKind::Conflict => theme::ERROR,
+        ChangeKind::Renamed => theme::INFO,
+    }
+}
+
+/// Kinds for file paths that already appear in the status list.
+///
+/// Directory entries stay on the folder map. A deleted path that is not a
+/// tree row is recorded here only as a mark; the tree never inserts a row.
+fn file_status_marks(status: &GitStatusSnapshot) -> BTreeMap<PathBuf, FolderMark> {
+    let mut kinds: BTreeMap<PathBuf, BTreeSet<ChangeKind>> = BTreeMap::new();
+    for group in &status.groups {
+        for row in &group.rows {
+            if row.is_directory {
+                continue;
+            }
+            kinds.entry(row.path.clone()).or_default().insert(row.kind);
+        }
+    }
+    kinds
+        .into_iter()
+        .map(|(path, kinds)| {
+            (
+                path,
+                FolderMark {
+                    kinds: kinds.into_iter().collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn folder_mark_color(mark: &FolderMark) -> Color32 {
+    if mark.is_mixed() {
+        theme::ACCENT
+    } else {
+        mark.single()
+            .map(change_kind_color)
+            .unwrap_or(theme::ACCENT)
+    }
+}
+
+fn git_status_row_ui(
+    ui: &mut Ui,
+    id: egui::Id,
+    row: &GitStatusRow,
+    selected: bool,
+) -> Option<GitStatusRow> {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+    let response = ui.interact(rect, id, Sense::CLICK);
+    let fill = if selected {
+        theme::BG_SELECTED
+    } else if response.hovered() {
+        theme::BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
+    if fill != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(row_rect, CornerRadius::same(6), fill);
+    }
+    let letter = row.letter.to_string();
+    let letter_color = change_kind_color(row.kind);
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        &letter,
+        FontId::monospace(12.0),
+        letter_color,
+    );
+    let relative = sanitize_display(&row.relative.display().to_string(), 240);
+    let text_left = rect.left() + 28.0;
+    let width = (rect.right() - text_left - 6.0).max(1.0);
+    let name_color = if selected {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    theme::paint_ellipsized_centered(
+        ui.painter(),
+        text_left,
+        rect.center().y,
+        relative,
+        FontId::proportional(12.5),
+        name_color,
+        width,
+    );
+    let mut tooltip = sanitize_display(&row.path.display().to_string(), 600);
+    if let Some(original) = &row.original_relative {
+        tooltip = format!(
+            "{tooltip}\nrenamed from {}",
+            sanitize_display(&original.display().to_string(), 400)
+        );
+    }
+    let clicked = response.clicked();
+    response.on_hover_text(tooltip);
+    clicked.then(|| row.clone())
+}
+
 fn paint_card_header(ui: &Ui, rect: egui::Rect, layout: &theme::Layout, fill: Color32) {
     let radius = CornerRadius {
         nw: layout.card_radius,
@@ -2268,6 +2916,25 @@ mod tests {
         }
     }
 
+    fn header_circles(output: &egui::FullOutput) -> Vec<egui::epaint::CircleShape> {
+        fn visit(shape: &egui::Shape, circles: &mut Vec<egui::epaint::CircleShape>) {
+            match shape {
+                egui::Shape::Circle(circle) => circles.push(*circle),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, circles);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut circles = Vec::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut circles);
+        }
+        circles
+    }
+
     fn output_text(output: &egui::FullOutput) -> String {
         fn visit(shape: &egui::Shape, text: &mut String) {
             match shape {
@@ -2288,6 +2955,998 @@ mod tests {
             visit(&clipped.shape, &mut text);
         }
         text
+    }
+
+    #[test]
+    fn root_name_width_stops_before_the_icon_and_its_gap() {
+        let width = root_name_width(80.0, 200.0, 8.0, 24.0, true);
+        assert_eq!(width, 200.0 - 24.0 - 8.0 - 80.0 - 8.0);
+        assert!(width + 80.0 + 8.0 <= 200.0 - 24.0 - 8.0);
+        assert_eq!(root_name_width(80.0, 200.0, 8.0, 24.0, false), 112.0);
+        assert_eq!(root_name_width(190.0, 200.0, 8.0, 24.0, true), 0.0);
+    }
+
+    #[test]
+    fn source_control_head_uses_branch_or_commit_id_and_linked_label_only() {
+        assert_eq!(source_control_head_label(Some("main"), false, None), "main");
+        assert_eq!(
+            source_control_worktree_name("feature", true, Some("linked")).as_deref(),
+            Some("linked")
+        );
+        assert_eq!(
+            source_control_worktree_name("feature", true, Some("feature")),
+            None
+        );
+        assert_eq!(
+            linked_worktree_folder(true, Some("feature")).as_deref(),
+            Some("feature")
+        );
+        assert_eq!(
+            source_control_worktree_name("main", false, Some("main")),
+            None
+        );
+        assert_eq!(
+            source_control_head_label(None, true, Some("fb16d0ee")),
+            "fb16d0ee"
+        );
+        assert!(!source_control_head_label(None, true, Some("fb16d0ee")).contains("Detached HEAD"));
+        assert_eq!(
+            source_control_worktree_name("fb16d0ee", true, Some("linked")).as_deref(),
+            Some("linked")
+        );
+        assert_eq!(
+            source_control_worktree_name("fb16d0ee", true, Some("fb16d0ee")),
+            None
+        );
+        assert_eq!(
+            linked_worktree_folder(true, Some("fb16d0ee")).as_deref(),
+            Some("fb16d0ee")
+        );
+        assert_eq!(source_control_worktree_name("", false, Some("nope")), None);
+        let hover = linked_worktree_hover("linked");
+        assert!(hover.contains("linked"));
+        assert!(hover.contains("linked worktree"));
+        assert!(!hover.contains(" · "));
+    }
+
+    #[test]
+    fn detached_head_hover_shows_subject_or_id_and_keeps_the_visible_line() {
+        let line = source_control_head_label(None, true, Some("fb16d0ee"));
+        let hover =
+            source_control_head_hover(&line, true, Some("fb16d0ee"), Some("Fix the header"));
+        assert_eq!(line, "fb16d0ee");
+        assert!(hover.contains("Fix the header"));
+        assert!(hover.contains("fb16d0ee"));
+        assert!(!hover.contains("Detached HEAD"));
+        assert!(!hover.contains("is a linked worktree"));
+
+        let empty = source_control_head_hover(&line, true, Some("fb16d0ee"), Some("  "));
+        assert!(empty.contains("fb16d0ee"));
+        assert!(!empty.contains("Fix the header"));
+
+        let linked = source_control_head_label(None, true, Some("fb16d0eeabcd"));
+        let linked_hover =
+            source_control_head_hover(&linked, true, Some("fb16d0eeabcd"), Some("Fix the header"));
+        assert_eq!(linked, "fb16d0ee");
+        assert_eq!(
+            source_control_worktree_name(&linked, true, Some("linked")).as_deref(),
+            Some("linked")
+        );
+        assert!(linked_hover.contains("Fix the header"));
+        assert!(linked_hover.contains("fb16d0eeabcd"));
+        assert!(!linked_hover.contains(" · "));
+        assert!(!linked_hover.contains("Detached HEAD"));
+        assert!(!linked_hover.contains("is a linked worktree"));
+    }
+
+    #[test]
+    fn git_view_header_shows_repos_and_does_not_repeat_the_head_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace-root");
+        fs::create_dir(&root).unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let head = "feature";
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("feature".to_owned()),
+                detached: false,
+                commit_abbrev: None,
+                commit_subject: None,
+                is_linked_worktree: true,
+                directory_name: Some("linked".to_owned()),
+            },
+            status: Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![GitStatusRow {
+                        letter: 'M',
+                        kind: ChangeKind::Modified,
+                        path: root.join("notes.txt"),
+                        relative: PathBuf::from("notes.txt"),
+                        is_directory: false,
+                        original_relative: None,
+                    }],
+                }],
+                ..Default::default()
+            }),
+            ..ExplorerGitChrome::default()
+        });
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("repos-header"));
+        let mut render =
+            |pane: &mut ExplorerPane, width: f32, height: f32, events: Vec<egui::Event>| {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(raw, |ui| {
+                    pane.tree_ui(ui, &mut log, &theme::Layout::for_window(width, height));
+                });
+                output.textures_delta.clear();
+                output
+            };
+
+        let tree = render(&mut pane, 900.0, 620.0, Vec::new());
+        let tree_text = output_text(&tree);
+        assert!(tree_text.contains("EXPLORER"), "{tree_text}");
+        assert!(tree_text.contains("workspace-root"), "{tree_text}");
+        assert!(!tree_text.contains("REPOS"), "{tree_text}");
+        assert!(!tree_text.contains(head), "{tree_text}");
+
+        pane.source_control_open = true;
+        let git = render(&mut pane, 900.0, 620.0, Vec::new());
+        let git_text = output_text(&git);
+        assert!(git_text.contains("REPOS"), "{git_text}");
+        assert!(!git_text.contains("EXPLORER"), "{git_text}");
+        assert!(
+            !git_text.contains("workspace-root"),
+            "git view must not show the root name: {git_text}"
+        );
+        assert_eq!(
+            git_text.matches(head).count(),
+            1,
+            "head line must be painted once, not repeated in the body: {git_text}"
+        );
+        assert!(git_text.contains("linked"), "{git_text}");
+        assert!(!git_text.contains(" · "), "{git_text}");
+        assert!(git_text.contains("Changes"), "{git_text}");
+        assert!(git_text.contains("notes.txt"), "{git_text}");
+
+        pane.git_header.detached = true;
+        pane.git_header.branch = None;
+        pane.git_header.commit_abbrev = Some("fb16d0ee".to_owned());
+        pane.git_header.commit_subject = Some("Fix the header".to_owned());
+        let detached = render(&mut pane, 900.0, 620.0, Vec::new());
+        let detached_text = output_text(&detached);
+        assert_eq!(detached_text.matches("fb16d0ee").count(), 1);
+        assert!(detached_text.contains("linked"), "{detached_text}");
+        assert!(!detached_text.contains(" · "), "{detached_text}");
+        assert!(!detached_text.contains("Detached HEAD"), "{detached_text}");
+        assert!(!detached_text.contains("feature"), "{detached_text}");
+        let id_shape = detached
+            .shapes
+            .iter()
+            .find(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains("fb16d0ee"),
+                _ => false,
+            })
+            .expect("commit id");
+        let egui::Shape::Text(id_text) = &id_shape.shape else {
+            unreachable!("commit id");
+        };
+        let id_at = id_text.pos + id_text.galley.size() * 0.5;
+        let moved = vec![egui::Event::PointerMoved(id_at)];
+        let _ = render(&mut pane, 900.0, 620.0, moved.clone());
+        let _ = render(&mut pane, 900.0, 620.0, moved);
+        let hovered = render(&mut pane, 900.0, 620.0, Vec::new());
+        let hovered_text = output_text(&hovered);
+        assert!(
+            hovered_text.contains("Fix the header"),
+            "hover must show the commit subject: {hovered_text}"
+        );
+        assert!(
+            hovered_text.contains("fb16d0ee"),
+            "hover must keep the commit id: {hovered_text}"
+        );
+        assert!(
+            !hovered_text.contains("is a linked worktree"),
+            "commit-id hover must not become the worktree hover: {hovered_text}"
+        );
+        pane.git_header.commit_subject = Some(String::new());
+        let _ = render(&mut pane, 900.0, 620.0, Vec::new());
+        let empty_moved = vec![egui::Event::PointerMoved(id_at)];
+        let _ = render(&mut pane, 900.0, 620.0, empty_moved.clone());
+        let _ = render(&mut pane, 900.0, 620.0, empty_moved);
+        let empty_hover = output_text(&render(&mut pane, 900.0, 620.0, Vec::new()));
+        assert!(
+            empty_hover.contains("fb16d0ee"),
+            "empty subject hover must show the id: {empty_hover}"
+        );
+        assert!(
+            !empty_hover.contains("Fix the header"),
+            "empty subject must not keep the previous subject: {empty_hover}"
+        );
+
+        let marker = "hover-marker";
+        let branch = format!("branch-{}-{marker}", "x".repeat(170));
+        pane.git_header.detached = false;
+        pane.git_header.is_linked_worktree = false;
+        pane.git_header.branch = Some(branch);
+        pane.git_header.directory_name = None;
+        let long_head = source_control_head_label(pane.git_header.branch.as_deref(), false, None);
+        assert!(long_head.chars().count() > 160);
+        assert!(long_head.contains(marker));
+        // Leave the previous commit-id hover so its tooltip cannot leak the marker.
+        let narrow = render(
+            &mut pane,
+            280.0,
+            400.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 390.0))],
+        );
+        let head_shape = narrow
+            .shapes
+            .iter()
+            .find(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => text.galley.job.text.starts_with("branch-"),
+                _ => false,
+            })
+            .expect("head line");
+        let egui::Shape::Text(text) = &head_shape.shape else {
+            unreachable!("head line");
+        };
+        assert!(text.galley.elided, "long head line must truncate");
+        let icon_left = 280.0 - theme::Layout::for_window(280.0, 400.0).header_padding_x - 24.0;
+        assert!(
+            head_shape.clip_rect.right() <= icon_left - 8.0 + 0.5,
+            "head clip {:?} must stop before the icon at {icon_left}",
+            head_shape.clip_rect
+        );
+        assert!(
+            !output_text(&narrow).contains(marker),
+            "the painted head line must not include the tail"
+        );
+        let hover_at = text.pos + text.galley.size() * 0.5;
+        // The widget rect comes from the previous pass. The tooltip Area is
+        // painted on the pass after hover begins.
+        let moved = vec![egui::Event::PointerMoved(hover_at)];
+        let _ = render(&mut pane, 280.0, 400.0, moved.clone());
+        let _ = render(&mut pane, 280.0, 400.0, moved);
+        let hovered = render(&mut pane, 280.0, 400.0, Vec::new());
+        assert!(
+            output_text(&hovered).contains(marker),
+            "hover must keep the full head line at {hover_at:?}: {}",
+            output_text(&hovered)
+        );
+    }
+
+    #[test]
+    fn attached_linked_worktree_header_uses_the_folder_name_not_the_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let linked = temp.path().join("checkout-dir");
+        fs::create_dir_all(&main).unwrap();
+        let run_git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_AUTHOR_NAME", "Made Test")
+                .env("GIT_AUTHOR_EMAIL", "made@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Made Test")
+                .env("GIT_COMMITTER_EMAIL", "made@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&main, &["init", "-q", "-b", "main"]);
+        fs::write(main.join("README.md"), "# fixture\n").unwrap();
+        run_git(&main, &["add", "README.md"]);
+        run_git(&main, &["commit", "-q", "-m", "initial"]);
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let metadata = crate::worktree::GitRunner::with_program("git").read_metadata(&linked);
+        assert_eq!(metadata.branch.as_deref(), Some("feature"));
+        assert_eq!(
+            metadata.worktree_label.as_deref(),
+            Some("feature"),
+            "diagnostics label stays the branch"
+        );
+        assert_eq!(metadata.directory_name.as_deref(), Some("checkout-dir"));
+        assert!(metadata.is_linked_worktree);
+
+        let mut pane = ExplorerPane::new(&linked, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: metadata.is_known() && metadata.is_worktree,
+                branch: metadata.branch.clone(),
+                detached: metadata.detached,
+                commit_abbrev: metadata.commit_abbrev.clone(),
+                commit_subject: metadata.commit_subject.clone(),
+                is_linked_worktree: metadata.is_linked_worktree,
+                directory_name: metadata.directory_name.clone(),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        pane.set_ui_scope(egui::Id::unique("folder-name-header"));
+        let mut render = |pane: &mut ExplorerPane| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let attached = render(&mut pane);
+        let attached_text = output_text(&attached);
+        assert!(attached_text.contains("feature"), "{attached_text}");
+        assert!(
+            attached_text.contains("checkout-dir"),
+            "header name must be the folder, not the branch: {attached_text}"
+        );
+        assert!(!attached_text.contains(" · "), "{attached_text}");
+        let name = attached
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("checkout-dir") => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("folder name");
+        assert!(
+            header_circles(&attached).iter().any(|circle| {
+                circle.center.x < name.pos.x && name.pos.x - circle.center.x < 18.0
+            }),
+            "folder name needs the worktree icon"
+        );
+
+        run_git(&linked, &["checkout", "-q", "--detach"]);
+        let detached_meta = crate::worktree::GitRunner::with_program("git").read_metadata(&linked);
+        assert!(detached_meta.detached);
+        assert_eq!(
+            detached_meta.directory_name.as_deref(),
+            Some("checkout-dir")
+        );
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: detached_meta.branch.clone(),
+                detached: true,
+                commit_abbrev: detached_meta.commit_abbrev.clone(),
+                commit_subject: detached_meta.commit_subject.clone(),
+                is_linked_worktree: true,
+                directory_name: detached_meta.directory_name.clone(),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let detached = render(&mut pane);
+        let detached_text = output_text(&detached);
+        let id = visible_commit_id(detached_meta.commit_abbrev.as_deref());
+        assert_eq!(id.chars().count(), 8);
+        assert!(detached_text.contains(&id), "{detached_text}");
+        assert!(detached_text.contains("checkout-dir"), "{detached_text}");
+        assert!(!detached_text.contains("Detached HEAD"), "{detached_text}");
+        assert!(!detached_text.contains(" · "), "{detached_text}");
+    }
+
+    #[test]
+    fn matching_worktree_name_still_shows_the_icon() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace-root");
+        fs::create_dir(&root).unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("matching-worktree-icon"));
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        fn hover_icon(
+            render: &mut impl FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+            pane: &mut ExplorerPane,
+            output: &egui::FullOutput,
+            label: &str,
+        ) -> String {
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text.contains(label) => Some(text),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {label}"));
+            let mark = header_circles(output)
+                .into_iter()
+                .find(|circle| {
+                    circle.center.x > text.pos.x + text.galley.size().x
+                        && circle.center.x < text.pos.x + text.galley.size().x + 20.0
+                        && (circle.center.y - (text.pos.y + text.galley.size().y * 0.5)).abs()
+                            < 10.0
+                })
+                .unwrap_or_else(|| panic!("{label} has no worktree icon"));
+            let moved = vec![egui::Event::PointerMoved(mark.center)];
+            let _ = render(pane, moved.clone());
+            let _ = render(pane, moved);
+            output_text(&render(pane, Vec::new()))
+        }
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("feature".to_owned()),
+                detached: false,
+                commit_abbrev: None,
+                commit_subject: None,
+                is_linked_worktree: true,
+                directory_name: Some("feature".to_owned()),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let attached = render(&mut pane, Vec::new());
+        let attached_text = output_text(&attached);
+        assert_eq!(
+            attached_text.matches("feature").count(),
+            1,
+            "branch must not be printed again: {attached_text}"
+        );
+        let attached_hover = hover_icon(&mut render, &mut pane, &attached, "feature");
+        assert!(
+            attached_hover.contains("is a linked worktree"),
+            "{attached_hover}"
+        );
+        assert!(attached_hover.contains("feature"), "{attached_hover}");
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: None,
+                detached: true,
+                commit_abbrev: Some("fb16d0ee".to_owned()),
+                commit_subject: Some("Fix the header".to_owned()),
+                is_linked_worktree: true,
+                directory_name: Some("fb16d0ee".to_owned()),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let detached = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let detached_text = output_text(&detached);
+        assert_eq!(
+            detached_text.matches("fb16d0ee").count(),
+            1,
+            "id must not be printed again: {detached_text}"
+        );
+        assert!(!detached_text.contains("Detached HEAD"), "{detached_text}");
+        let detached_hover = hover_icon(&mut render, &mut pane, &detached, "fb16d0ee");
+        assert!(
+            detached_hover.contains("is a linked worktree"),
+            "{detached_hover}"
+        );
+        assert!(detached_hover.contains("fb16d0ee"), "{detached_hover}");
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                detached: false,
+                commit_abbrev: None,
+                commit_subject: None,
+                is_linked_worktree: false,
+                directory_name: Some("main".to_owned()),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let plain = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let plain_text = output_text(&plain);
+        assert_eq!(plain_text.matches("main").count(), 1, "{plain_text}");
+        assert!(
+            header_circles(&plain)
+                .iter()
+                .all(|circle| circle.center.x > 800.0),
+            "a non-linked checkout has no worktree icon"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_name_has_an_icon_and_a_non_linked_checkout_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace-root");
+        fs::create_dir(&root).unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: None,
+                detached: true,
+                commit_abbrev: Some("fb16d0ee".to_owned()),
+                commit_subject: Some("Fix the header".to_owned()),
+                is_linked_worktree: true,
+                directory_name: Some("feat-git-repos".to_owned()),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("linked-worktree-icon"));
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+
+        let linked = render(&mut pane, Vec::new());
+        let linked_text = output_text(&linked);
+        assert!(linked_text.contains("fb16d0ee"), "{linked_text}");
+        assert!(linked_text.contains("feat-git-repos"), "{linked_text}");
+        assert!(!linked_text.contains(" · "), "{linked_text}");
+        assert!(!linked_text.contains("Detached HEAD"), "{linked_text}");
+        let name = linked
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("feat-git-repos") => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("worktree name");
+        let circles = header_circles(&linked);
+        let mark = circles
+            .iter()
+            .find(|circle| {
+                circle.center.x < name.pos.x
+                    && name.pos.x - circle.center.x < 18.0
+                    && (circle.center.y - (name.pos.y + name.galley.size().y * 0.5)).abs() < 10.0
+            })
+            .expect("icon immediately before the worktree name");
+        assert!(
+            mark.radius < 1.2,
+            "worktree mark is the small glyph, not a status dot"
+        );
+
+        let name_at = name.pos + name.galley.size() * 0.5;
+        let moved = vec![egui::Event::PointerMoved(name_at)];
+        let _ = render(&mut pane, moved.clone());
+        let _ = render(&mut pane, moved);
+        let name_hover = output_text(&render(&mut pane, Vec::new()));
+        assert!(
+            name_hover.contains("feat-git-repos"),
+            "name hover includes the worktree name: {name_hover}"
+        );
+        assert!(
+            name_hover.contains("is a linked worktree"),
+            "name hover says it is a linked worktree: {name_hover}"
+        );
+
+        let id = linked
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("fb16d0ee") => Some(text),
+                _ => None,
+            })
+            .expect("commit id");
+        let id_at = id.pos + id.galley.size() * 0.5;
+        let id_moved = vec![egui::Event::PointerMoved(id_at)];
+        let _ = render(&mut pane, Vec::new());
+        let _ = render(&mut pane, id_moved.clone());
+        let _ = render(&mut pane, id_moved);
+        let id_hover = output_text(&render(&mut pane, Vec::new()));
+        assert!(
+            id_hover.contains("Fix the header"),
+            "commit-id hover keeps the subject: {id_hover}"
+        );
+        assert!(
+            !id_hover.contains("is a linked worktree"),
+            "commit-id hover must not become the worktree hover: {id_hover}"
+        );
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                detached: false,
+                commit_abbrev: None,
+                commit_subject: None,
+                is_linked_worktree: false,
+                directory_name: Some("feat-git-repos".to_owned()),
+            },
+            ..ExplorerGitChrome::default()
+        });
+        let plain = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let plain_text = output_text(&plain);
+        assert!(plain_text.contains("main"), "{plain_text}");
+        assert!(!plain_text.contains("feat-git-repos"), "{plain_text}");
+        assert!(
+            header_circles(&plain)
+                .iter()
+                .all(|circle| circle.center.x > 800.0),
+            "a non-linked checkout has no worktree icon in the header text"
+        );
+    }
+
+    #[test]
+    fn new_file_rows_show_a_success_dot_including_inside_an_untracked_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Made Test")
+                .env("GIT_AUTHOR_EMAIL", "made@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Made Test")
+                .env("GIT_COMMITTER_EMAIL", "made@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        fs::create_dir(root.join("tracked")).unwrap();
+        fs::create_dir(root.join("edited")).unwrap();
+        fs::write(root.join("tracked").join("keep.txt"), "keep\n").unwrap();
+        fs::write(root.join("edited").join("keep.txt"), "keep\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        run_git(&["add", "tracked/keep.txt", "edited/keep.txt", ".gitignore"]);
+        run_git(&["commit", "-q", "-m", "base"]);
+        fs::write(root.join("tracked").join("fresh.txt"), "new\n").unwrap();
+        fs::create_dir(root.join("newdir")).unwrap();
+        fs::write(root.join("newdir").join("inside.txt"), "nested\n").unwrap();
+        fs::create_dir(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored").join("skip.log"), "secret\n").unwrap();
+        fs::write(root.join("edited").join("keep.txt"), "changed\n").unwrap();
+
+        let mut pane = ExplorerPane::new(root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let canonical = pane.root().expect("root").to_path_buf();
+        for name in ["tracked", "edited", "newdir"] {
+            pane.toggle_dir(canonical.join(name));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && {
+            let _ = pane.visible_row_count();
+            !pane.rows.iter().any(|row| row.name == "inside.txt")
+        } {
+            pane.tick(&mut log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = pane.visible_row_count();
+        assert!(
+            pane.rows.iter().any(|row| row.name == "inside.txt"),
+            "untracked file must already be a tree row: {:?}",
+            pane.rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let snapshot = match crate::worktree::GitRunner::with_program("git")
+            .read_status(&canonical, Some(canonical.as_path()))
+        {
+            crate::worktree::GitStatusRead::Ready(snapshot) => snapshot,
+            other => panic!("status should be ready: {other:?}"),
+        };
+        let marks = file_status_marks(&snapshot);
+        let fresh = marks
+            .get(&canonical.join("tracked").join("fresh.txt"))
+            .expect("new file in a tracked directory");
+        assert_eq!(fresh.tooltip(), "New");
+        assert_eq!(folder_mark_color(fresh), theme::SUCCESS);
+        let inside = marks
+            .get(&canonical.join("newdir").join("inside.txt"))
+            .expect("file inside an untracked directory");
+        assert_eq!(inside.tooltip(), "New");
+        assert_eq!(folder_mark_color(inside), theme::SUCCESS);
+        let modified = marks
+            .get(&canonical.join("edited").join("keep.txt"))
+            .expect("modified file");
+        assert_eq!(modified.tooltip(), "Modified");
+        assert_eq!(folder_mark_color(modified), theme::WARNING);
+        assert!(marks
+            .get(&canonical.join("ignored").join("skip.log"))
+            .is_none());
+        assert_eq!(
+            snapshot
+                .folders
+                .get(&canonical.join("tracked"))
+                .expect("tracked parent")
+                .tooltip(),
+            "New"
+        );
+        assert_eq!(
+            snapshot
+                .folders
+                .get(&canonical.join("newdir"))
+                .expect("untracked parent")
+                .tooltip(),
+            "New"
+        );
+        assert_eq!(
+            snapshot
+                .folders
+                .get(&canonical.join("edited"))
+                .expect("modified parent")
+                .tooltip(),
+            "Modified"
+        );
+        assert!(!snapshot.folders.contains_key(&canonical.join("ignored")));
+        pane.apply_git_chrome(ExplorerGitChrome {
+            status: Some(snapshot),
+            ..ExplorerGitChrome::default()
+        });
+        assert!(pane.rows.iter().all(|row| row.name != "gone.txt"));
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        pane.set_ui_scope(egui::Id::unique("new-file-dot"));
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 620.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+        });
+        output.textures_delta.clear();
+        let text = output_text(&output);
+        assert!(text.contains("fresh.txt"));
+        assert!(text.contains("inside.txt"));
+        assert!(text.contains("keep.txt"));
+        assert!(!text.contains("skip.log"));
+        assert!(!text.contains("gone.txt"));
+        for letter in ["M", "A", "U", "D", "R", "C"] {
+            assert!(
+                !text_positions(&output)
+                    .iter()
+                    .any(|(painted, _)| painted == letter),
+                "file tree painted status letter {letter}"
+            );
+        }
+        let dots = status_dots(&output);
+        let positions = text_positions(&output);
+        assert_eq!(
+            dot_for_label(&positions, &dots, "fresh.txt").fill,
+            theme::SUCCESS
+        );
+        assert_eq!(
+            dot_for_label(&positions, &dots, "inside.txt").fill,
+            theme::SUCCESS
+        );
+        assert_eq!(
+            dot_for_label(&positions, &dots, "newdir").fill,
+            theme::SUCCESS
+        );
+        assert_eq!(
+            dot_for_label(&positions, &dots, "keep.txt").fill,
+            theme::WARNING
+        );
+        let ignored = positions
+            .iter()
+            .find(|(label, _)| label.contains("ignored"))
+            .expect("ignored directory is still a tree row")
+            .1;
+        assert!(
+            dots.iter()
+                .all(|dot| (dot.center.y - ignored.y).abs() > 12.0),
+            "an ignored-only directory must not show a status dot"
+        );
+    }
+
+    #[test]
+    fn changed_file_row_shows_one_dot_and_an_unchanged_file_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("changed.txt"), "edited\n").unwrap();
+        fs::write(temp.path().join("clean.txt"), "same\n").unwrap();
+        fs::write(temp.path().join("both.txt"), "partial\n").unwrap();
+        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let root = pane.root().expect("root").to_path_buf();
+        let snapshot = crate::worktree::group_status(
+            &crate::worktree::parse_porcelain_v1_z(" M changed.txt\0AM both.txt\0D  gone.txt\0"),
+            &root,
+            Some(root.as_path()),
+        );
+        let marks = file_status_marks(&snapshot);
+        let changed = marks
+            .get(&root.join("changed.txt"))
+            .expect("modified file mark");
+        assert_eq!(changed.tooltip(), "Modified");
+        assert_eq!(folder_mark_color(changed), theme::WARNING);
+        let mixed = marks.get(&root.join("both.txt")).expect("mixed file mark");
+        assert_eq!(mixed.tooltip(), "New, Modified");
+        assert_eq!(folder_mark_color(mixed), theme::ACCENT);
+        assert!(marks.get(&root.join("clean.txt")).is_none());
+        assert!(
+            marks.contains_key(&root.join("gone.txt")),
+            "a deleted path can be marked, but it must not become a row"
+        );
+        pane.apply_git_chrome(ExplorerGitChrome {
+            status: Some(snapshot),
+            ..ExplorerGitChrome::default()
+        });
+        assert_eq!(pane.visible_row_count(), 3);
+        assert!(pane.rows.iter().all(|row| row.name != "gone.txt"));
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        pane.set_ui_scope(egui::Id::unique("file-dot"));
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 620.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+        });
+        output.textures_delta.clear();
+        let text = output_text(&output);
+        assert!(text.contains("changed.txt"));
+        assert!(text.contains("clean.txt"));
+        assert!(text.contains("both.txt"));
+        assert!(!text.contains("gone.txt"));
+        for letter in ["M", "A", "U", "D", "R", "C"] {
+            assert!(
+                !text_positions(&output)
+                    .iter()
+                    .any(|(painted, _)| painted == letter),
+                "file tree painted status letter {letter}"
+            );
+        }
+        let dots = status_dots(&output);
+        let positions = text_positions(&output);
+        let changed_dot = dot_for_label(&positions, &dots, "changed.txt");
+        let mixed_dot = dot_for_label(&positions, &dots, "both.txt");
+        assert_eq!(changed_dot.fill, theme::WARNING);
+        assert_eq!(mixed_dot.fill, theme::ACCENT);
+        assert!((changed_dot.radius - 3.0).abs() < 0.01);
+        assert!((changed_dot.center.x - mixed_dot.center.x).abs() < 0.01);
+        let clean = positions
+            .iter()
+            .find(|(label, _)| label.contains("clean.txt"))
+            .expect("clean file")
+            .1;
+        assert!(
+            dots.iter().all(|dot| (dot.center.y - clean.y).abs() > 12.0),
+            "unchanged file must not show a status dot"
+        );
+    }
+
+    #[test]
+    fn folder_dot_and_letter_colors_use_existing_tokens() {
+        assert_eq!(change_kind_color(ChangeKind::New), theme::SUCCESS);
+        assert_eq!(change_kind_color(ChangeKind::Modified), theme::WARNING);
+        assert_eq!(change_kind_color(ChangeKind::Deleted), theme::ERROR);
+        assert_eq!(change_kind_color(ChangeKind::Conflict), theme::ERROR);
+        assert_eq!(change_kind_color(ChangeKind::Renamed), theme::INFO);
+        let mixed = FolderMark {
+            kinds: vec![ChangeKind::New, ChangeKind::Modified],
+        };
+        assert_eq!(folder_mark_color(&mixed), theme::ACCENT);
+        let single = FolderMark {
+            kinds: vec![ChangeKind::Deleted],
+        };
+        assert_eq!(folder_mark_color(&single), theme::ERROR);
+    }
+
+    #[test]
+    fn opening_a_missing_file_reaches_the_missing_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && pane.root().is_none() {
+            pane.tick(&mut log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let root = pane.root().expect("root").to_path_buf();
+        let missing = root.join("gone.txt");
+        pane.open_preview(missing);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && pane.preview_document().is_none() {
+            pane.tick(&mut log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let document = pane.preview_document().expect("missing preview");
+        assert_eq!(document.kind, PreviewKind::Missing);
+        assert!(document.lines.is_empty());
     }
 
     #[test]
@@ -2400,6 +4059,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(pane.preview_document().is_some());
+    }
+
+    fn status_dots(output: &egui::FullOutput) -> Vec<egui::epaint::CircleShape> {
+        fn visit(shape: &egui::Shape, dots: &mut Vec<egui::epaint::CircleShape>) {
+            match shape {
+                egui::Shape::Circle(circle) if (circle.radius - 3.0).abs() < 0.1 => {
+                    dots.push(*circle);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, dots);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut dots = Vec::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut dots);
+        }
+        dots
+    }
+
+    fn dot_for_label(
+        positions: &[(String, egui::Pos2)],
+        dots: &[egui::epaint::CircleShape],
+        label: &str,
+    ) -> egui::epaint::CircleShape {
+        let text = positions
+            .iter()
+            .find(|(painted, _)| painted.contains(label))
+            .unwrap_or_else(|| panic!("missing row {label}"))
+            .1;
+        *dots
+            .iter()
+            .find(|dot| (dot.center.y - text.y).abs() < 16.0)
+            .unwrap_or_else(|| panic!("{label} has no status dot; dots={dots:?} text={text:?}"))
     }
 
     fn text_positions(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
