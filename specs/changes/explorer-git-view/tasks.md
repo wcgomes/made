@@ -2,7 +2,7 @@
 
 Readiness: `analyze` must pass before implementation; review runs `verify` against the persisted spec.
 
-This file records work that shipped before plan and analyze. The checked tasks and checkpoints are that record only. They do not mean that analyze or verify passed. The shipped header shows a branch or an 8-character commit id, not the words "Detached HEAD". A linked worktree shows a small monochrome icon instead of " · ", including when the folder name matches that head text, and the duplicate name is omitted. A non-linked checkout shows no worktree icon.
+This file records work that shipped before plan and analyze. The checked tasks and checkpoints are that record only. They do not mean that analyze or verify passed. The shipped header shows a branch or an 8-character commit id, not the words "Detached HEAD". A linked worktree shows a small monochrome icon instead of " · ". A non-linked checkout shows no worktree icon. The checked section 8 and 9 lines record the rejected matching-name layouts: omitting the folder name, then painting the icon before the head text. Section 10 records the matching-name header. Checked letter-color lines record the painted letters. The unchecked follow-up replaces those letters with the file-tree icon and a right-side status dot, and anchors the status-dot tooltip at the dot. That follow-up does not mean that analyze or verify passed.
 
 ## 1. Closed read-only status
 
@@ -30,7 +30,7 @@ This file records work that shipped before plan and analyze. The checked tasks a
 - [x] verify Attached branch without a linked label
 - [x] verify Detached HEAD shows a short commit id
 - [x] verify Distinct linked-worktree label
-- [x] verify Repeated linked label is not duplicated
+- [x] shipped repeated linked label showed the branch once and omitted the folder name
 - [x] shipped detached linked worktree showed the words "Detached HEAD"
 - [x] verify Clean repository
 - [x] verify Letter and color identify the change
@@ -84,9 +84,9 @@ This file records work that shipped before plan and analyze. The checked tasks a
 - [x] verify Detached HEAD shows a short commit id
 - [x] verify Empty commit subject still shows the id
 - [x] verify Distinct linked-worktree label
-- [x] verify Repeated linked label is not duplicated
+- [x] shipped repeated linked label showed the branch once and omitted the folder name
 - [x] verify Detached linked worktree
-- [x] verify Repeated linked label matches the visible id
+- [x] shipped repeated linked label showed the commit id once and omitted the folder name
 - [x] verify Attached branch without a linked label
 
 ## 7. Linked-worktree icon
@@ -99,8 +99,8 @@ This file records work that shipped before plan and analyze. The checked tasks a
 - [x] verify Distinct linked-worktree label
 - [x] verify Detached linked worktree
 - [x] verify Attached branch without a linked label
-- [x] verify Repeated linked label is not duplicated
-- [x] verify Repeated linked label matches the visible id
+- [x] shipped repeated linked label showed the branch once and omitted the folder name
+- [x] shipped repeated linked label showed the commit id once and omitted the folder name
 
 ## 8. Linked icon when the name repeats
 
@@ -108,4 +108,33 @@ This file records work that shipped before plan and analyze. The checked tasks a
 
 ## Checkpoint
 
+- [x] shipped repeated name showed the branch or id once, kept the icon, and showed no icon on a non-linked checkout
+
+## 9. Icon before a repeated head text
+
+- [x] 9.1 Paint the linked-worktree icon before the branch or 8-character commit id when the folder name equals that text and is omitted, and keep head text, then icon, then folder name when the name is distinct (path: crates/made-app/src/explorer_view.rs)
+
+## Checkpoint
+
+- [x] shipped repeated name painted the icon before the head text
+
+## 10. Matching folder name replaces the head
+
+- [x] 10.1 When a linked-worktree folder name equals the branch or 8-character commit id, show the icon and that folder name only, not the branch or id and not an icon-before-head layout; on hover of the icon or the name, say it is a linked worktree and include the folder name; keep head text, then icon, then folder name when the name differs (path: crates/made-app/src/explorer_view.rs)
+
+## Checkpoint
+
+- [x] verify Repeated linked label is not duplicated
+- [x] verify Repeated linked label matches the visible id
 - [x] verify Repeated worktree name still shows the icon
+- [x] verify Matching folder name replaces the head text
+
+## 11. Git-view icon and status dot
+
+- [x] 11.1 Show the file-tree file or folder icon immediately before each git-view path, replace the painted status letter with one right-side kind dot, and anchor that dot's tooltip at the dot in both the git view and the file tree (path: crates/made-app/src/explorer_view.rs)
+
+## Checkpoint
+
+- [x] verify Git-view row shows an icon and a status dot
+- [x] verify Kind tooltip replaces the painted letter
+- [x] verify Status-dot tooltip is anchored at the dot

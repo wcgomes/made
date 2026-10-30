@@ -26,7 +26,7 @@ When the explorer root is a known git worktree, the explorer header MUST show an
 
 ### Requirement: Git view head label
 
-While the git view is showing, the head line MUST appear in the explorer header beside the `REPOS` title, and the git-view body MUST NOT repeat it. The head line MUST show the current branch name when HEAD is attached. When HEAD is detached, the head line MUST show an 8-character commit id and MUST NOT show the words "Detached HEAD". Hovering that head line MUST show the commit subject. If the subject is empty, the hover MUST still show the id. The commit subject MUST remain available on hover when the line is truncated. A linked worktree MUST show a small monochrome icon, including when its folder name equals the visible branch name or the 8-character commit id. That folder name MUST be omitted when it equals the visible head text, so the header does not show the same text twice. That comparison MUST use the visible branch or id, not the words "Detached HEAD". When the folder name is shown, it MUST be the linked-worktree name, not a branch name, and the icon MUST sit immediately before it. The " · " separator MUST NOT appear before the name. Hovering the icon MUST say that it is a linked worktree and MUST include the folder name, including when the duplicate name is omitted. When the name is shown, hovering the name MUST say the same. That hover MUST NOT replace the commit-subject hover on the commit id. A worktree that is not linked MUST NOT show a worktree icon or a worktree name. An attached branch and a detached commit id are otherwise unchanged. When the head line does not fit, it MUST truncate and MUST keep the full visible line available.
+While the git view is showing, the head line MUST appear in the explorer header beside the `REPOS` title, and the git-view body MUST NOT repeat it. When the checkout is not a linked worktree, the head line MUST show the current branch name when HEAD is attached, and an 8-character commit id when HEAD is detached. It MUST NOT show the words "Detached HEAD". Hovering a shown commit id MUST show the commit subject. If the subject is empty, the hover MUST still show the id. The commit subject MUST remain available on hover when that id line is truncated. A linked worktree MUST show a small monochrome icon. When its folder name differs from the branch or 8-character id, the order MUST be that head text, then the icon, then the folder name. When the folder name equals the branch or the 8-character id, the header MUST show the icon and that folder name only. It MUST NOT also show the branch or id, and it MUST NOT use a separate icon-before-head layout. The shown name MUST be the linked-worktree folder name, not a second copy of the branch. The " · " separator MUST NOT appear before the name. Hovering the icon or the name MUST say that it is a linked worktree and MUST include the folder name. That hover MUST NOT replace the commit-subject hover on a shown commit id. A worktree that is not linked MUST show the branch or id and MUST NOT show a worktree icon or a worktree name. When the head line does not fit, it MUST truncate and MUST keep the full visible line available.
 
 #### Scenario: Attached branch without a linked label
 
@@ -50,7 +50,7 @@ While the git view is showing, the head line MUST appear in the explorer header 
 
 - Given a linked worktree whose linked-worktree label is the same as its branch name
 - When the git view is shown
-- Then the header shows the branch name once, does not show the folder name again, and still shows the small monochrome icon; hovering the icon says it is a linked worktree and includes that folder name; the title is `REPOS`, the root name is not shown, and the git-view body does not repeat the head line
+- Then the header shows the small monochrome icon and that folder name only, does not also show the branch, and does not use a separate icon-before-head layout; hovering the icon or the name says it is a linked worktree and includes that folder name; the title is `REPOS`, the root name is not shown, and the git-view body does not repeat the head line
 
 #### Scenario: Detached linked worktree
 
@@ -68,13 +68,19 @@ While the git view is showing, the head line MUST appear in the explorer header 
 
 - Given a linked worktree whose HEAD is detached at `fb16d0ee` and whose linked-worktree label is `fb16d0ee`
 - When the git view is shown
-- Then the header shows `fb16d0ee` once, does not show that name again, and still shows the small monochrome icon; hovering the icon says it is a linked worktree and includes `fb16d0ee`
+- Then the header shows the small monochrome icon and the folder name `fb16d0ee` only, does not also show the commit id as a separate head, and does not use a separate icon-before-head layout; hovering the icon or the name says it is a linked worktree and includes `fb16d0ee`
 
 #### Scenario: Repeated worktree name still shows the icon
 
 - Given a linked worktree whose folder name equals its branch name, a linked worktree whose folder name equals its 8-character commit id `fb16d0ee`, and a checkout that is not a linked worktree
 - When each git-view header is shown and each linked icon is hovered
-- Then each linked header shows the branch or id once and does not repeat that text, each still shows the small monochrome icon, and the hover says it is a linked worktree and includes the folder name; the non-linked header shows no worktree icon and no worktree name
+- Then each linked header shows the small monochrome icon and that folder name only, does not also show the branch or id, and does not use a separate icon-before-head layout; the hover says it is a linked worktree and includes the folder name; the non-linked header shows the branch or id and no worktree icon
+
+#### Scenario: Matching folder name replaces the head text
+
+- Given a linked worktree whose folder name equals its branch, and a linked worktree whose folder name equals its 8-character commit id
+- When each header is shown and the icon or the name is hovered
+- Then the header shows the icon and that folder name only, does not also show the branch or id, and does not use a separate icon-before-head layout; the hover says it is a linked worktree and includes the folder name
 
 #### Scenario: Linked worktree name has an icon
 
@@ -90,7 +96,7 @@ While the git view is showing, the head line MUST appear in the explorer header 
 
 ### Requirement: Grouped changes
 
-The git view MUST present changes in the sections "Merge Changes", "Staged Changes", "Changes", and "Untracked", in that order. A section with no rows MUST be omitted. The view MUST NOT present the changes as one flat list and MUST NOT show a commit box. A repository with no listed changes MUST show "No changes". Ignored paths MUST NOT be listed and MUST NOT mark a folder or a file row. A path that is both staged and unstaged MUST appear in both "Staged Changes" and "Changes", each with that side's letter. A conflicted path MUST appear in "Merge Changes" with the letter C and MUST NOT also appear as an ordinary staged or unstaged row. Each row MUST show its path relative to the explorer root. The git view and the file-tree change dots MUST include only changes under the explorer root. A change outside that root MUST NOT be listed or marked.
+The git view MUST present changes in the sections "Merge Changes", "Staged Changes", "Changes", and "Untracked", in that order. A section with no rows MUST be omitted. The view MUST NOT present the changes as one flat list and MUST NOT show a commit box. A repository with no listed changes MUST show "No changes". Ignored paths MUST NOT be listed and MUST NOT mark a folder or a file row. A path that is both staged and unstaged MUST appear in both "Staged Changes" and "Changes", each with that side's status dot. A conflicted path MUST appear in "Merge Changes" with a Conflict dot and MUST NOT also appear as an ordinary staged or unstaged row. Each row MUST show its path relative to the explorer root. The git view and the file-tree change dots MUST include only changes under the explorer root. A change outside that root MUST NOT be listed or marked.
 
 #### Scenario: Non-empty sections stay in order
 
@@ -114,7 +120,7 @@ The git view MUST present changes in the sections "Merge Changes", "Staged Chang
 
 - Given a file that has a staged change and a separate unstaged change
 - When the git view is shown
-- Then that file appears in "Staged Changes" and in "Changes", each with the letter for that side
+- Then that file appears in "Staged Changes" and in "Changes", each with that side's status dot and kind tooltip
 
 #### Scenario: Ignored path is omitted
 
@@ -128,31 +134,31 @@ The git view MUST present changes in the sections "Merge Changes", "Staged Chang
 - When the git view and the file tree are shown
 - Then only the change under the explorer root is listed or marked
 
-### Requirement: Change letters and colors
+### Requirement: Git-view row icon and status dot
 
-Each git-view row MUST show one letter, and that letter MUST be the non-color cue for the change. The letters MUST be only U, A, M, D, C, or R. An untracked path MUST use U and an added path MUST use A, both in `SUCCESS`. A modified path, including a type change, MUST use M in `WARNING`. A deleted path MUST use D and a conflicted path MUST use C, both in `ERROR`. A renamed path, including a copied path, MUST use R in `INFO`. A copied path MUST NOT use C. These letters belong to the git view. They MUST NOT appear on file-tree rows, and they MUST NOT replace file-tree entry icons.
+Each git-view row MUST show the same file or folder icon used in the file tree, immediately before the path. It MUST NOT show a status letter. It MUST show one right-side status dot. A staged add and an untracked path MUST use New in `SUCCESS`. A modified path, including a type change, MUST use Modified in `WARNING`. A deleted path MUST use Deleted in `ERROR`. A conflicted path MUST use Conflict in `ERROR`. A renamed path, including a copied path, MUST use Renamed in `INFO`. A copied path MUST NOT use Conflict. The section title already separates a staged add from an untracked path. The dot tooltip MUST name that kind with "New", "Modified", "Deleted", "Renamed", or "Conflict", and that tooltip MUST be the non-color cue. The tooltip MUST be anchored at the dot, not at the far side of the row. Activating a file row MUST still open the existing preview. Activating a directory row MUST still not open a preview.
 
-#### Scenario: Letter and color identify the change
+#### Scenario: Git-view row shows an icon and a status dot
 
-- Given git-view rows for an untracked path, an added path, a modified path, a deleted path, a conflicted path, and a renamed path
-- When the rows are shown without relying on hue alone
-- Then the rows show U in `SUCCESS`, A in `SUCCESS`, M in `WARNING`, D in `ERROR`, C in `ERROR`, and R in `INFO`, and each letter remains readable as the non-color cue
+- Given a git-view file whose kind is Modified, and a git-view directory
+- When the rows are shown and the file's status dot is hovered
+- Then each row shows the same file or folder icon used in the file tree immediately before the path, shows no status letter, and shows one right-side dot; the file dot is `WARNING` and its tooltip, anchored at the dot, says "Modified"; activating the file opens the existing preview and activating the directory does not
 
-#### Scenario: Type change and copy use the existing letters
+#### Scenario: Kind tooltip replaces the painted letter
 
-- Given a type change and a copied path
+- Given an untracked path, a staged add, a type change, a deleted path, a conflicted path, and a copied path
 - When the git view shows them
-- Then the type change uses M and the copied path uses R, not C
+- Then the untracked path and the staged add use a New dot, the type change uses Modified, the deleted path uses Deleted, the conflicted path uses Conflict, and the copied path uses Renamed, not Conflict; none of the rows shows a status letter
 
-#### Scenario: File tree has no status letters
+#### Scenario: Status-dot tooltip is anchored at the dot
 
-- Given the file tree contains changed files and folders
-- When the file tree is shown
-- Then file rows show no status letter, and file and folder entry icons are unchanged
+- Given a file-tree row and a git-view row that each show a status dot
+- When each dot is hovered
+- Then each tooltip is anchored at that dot, not at the far side of the row
 
 ### Requirement: File-tree change dot
 
-A folder row in the file tree MUST show one right-side dot when that folder contains a change under the explorer root, including when the folder is collapsed. A file row that is already in the file tree and has a change under the explorer root MUST show one right-side dot with the same treatment as a folder. When the changes for that dot are one kind, it MUST use that kind's semantic color: New uses `SUCCESS`, Modified uses `WARNING`, Deleted and Conflict use `ERROR`, and Renamed uses `INFO`. When they are more than one kind, it MUST use `ACCENT`. The dot MUST expose a tooltip that names the present kinds using "New", "Modified", "Deleted", "Renamed", and "Conflict". A mixed tooltip MUST list only the present kinds, separated by ", ", in that order. The tooltip MUST be available so the dot is not the only cue. An unchanged file row MUST show no dot. A deleted path that is not already a file-tree row MUST NOT get a fabricated row. A file-tree row MUST NOT show a status letter. Letters remain git-view only.
+A folder row in the file tree MUST show one right-side dot when that folder contains a change under the explorer root, including when the folder is collapsed. A file row that is already in the file tree and has a change under the explorer root MUST show one right-side dot with the same treatment as a folder. When the changes for that dot are one kind, it MUST use that kind's semantic color: New uses `SUCCESS`, Modified uses `WARNING`, Deleted and Conflict use `ERROR`, and Renamed uses `INFO`. When they are more than one kind, it MUST use `ACCENT`. The dot MUST expose a tooltip that names the present kinds using "New", "Modified", "Deleted", "Renamed", and "Conflict". A mixed tooltip MUST list only the present kinds, separated by ", ", in that order. The tooltip MUST be available so the dot is not the only cue, and it MUST be anchored at the dot, not at the far side of the row. An unchanged file row MUST show no dot. A deleted path that is not already a file-tree row MUST NOT get a fabricated row. A file-tree row MUST NOT show a status letter.
 
 #### Scenario: Single-kind folder dot
 

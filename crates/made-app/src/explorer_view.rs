@@ -40,6 +40,9 @@ use crate::worktree::{ChangeKind, FolderMark, GitStatusRow, GitStatusSnapshot};
 /// Edge of the square icon slot that file and folder rows reserve, in points.
 const ENTRY_ICON_SIZE: f32 = 16.0;
 
+/// Status-dot hover strip width. Full row height, flush to the row's right edge.
+const STATUS_DOT_HIT_WIDTH: f32 = 28.0;
+
 const MAX_TREE_RESULTS_PER_FRAME: usize = 64;
 const MAX_WATCH_EVENTS_PER_FRAME: usize = 512;
 const MAX_RELOAD_DIRS_PER_EVENT: usize = 64;
@@ -1516,30 +1519,26 @@ impl ExplorerPane {
         // the section label's right edge, and the git view must not fall back
         // to the root name when the head line is empty.
         let aside = if git_open {
-            let head = source_control_head_label(
+            let raw_head = source_control_head_label(
                 self.git_header.branch.as_deref(),
                 self.git_header.detached,
                 self.git_header.commit_abbrev.as_deref(),
             );
-            let folder = linked_worktree_folder(
+            let (head, shown_name) = repos_aside_texts(
+                &raw_head,
                 self.git_header.is_linked_worktree,
                 self.git_header.directory_name.as_deref(),
             );
-            let shown_name = source_control_worktree_name(
-                &head,
-                self.git_header.is_linked_worktree,
-                self.git_header.directory_name.as_deref(),
-            );
-            if head.is_empty() && folder.is_none() {
+            if head.is_empty() && shown_name.is_none() {
                 None
             } else {
                 let hover = source_control_head_hover(
-                    &head,
+                    &raw_head,
                     self.git_header.detached,
                     self.git_header.commit_abbrev.as_deref(),
                     self.git_header.commit_subject.as_deref(),
                 );
-                Some((head, hover, folder, shown_name))
+                Some((head, hover, shown_name))
             }
         } else if let Some(root) = &self.root {
             let full = root.display().to_string();
@@ -1547,12 +1546,12 @@ impl ExplorerPane {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| full.clone());
-            Some((name, full, None, None))
+            Some((name, full, None))
         } else {
             None
         };
         theme::section_label(&mut left, if git_open { "REPOS" } else { "EXPLORER" });
-        if let Some((text, hover, folder, shown_name)) = aside {
+        if let Some((text, hover, shown_name)) = aside {
             let name_width = root_name_width(
                 left.min_rect().right(),
                 content.right(),
@@ -1567,14 +1566,7 @@ impl ExplorerPane {
                     egui::vec2(name_width, left_rect.height()),
                 );
                 if git_open {
-                    self.paint_repos_aside(
-                        ui,
-                        name_rect,
-                        &text,
-                        &hover,
-                        folder.as_deref(),
-                        shown_name.as_deref(),
-                    );
+                    self.paint_repos_aside(ui, name_rect, &text, &hover, shown_name.as_deref());
                 } else {
                     paint_clipped_label(
                         ui,
@@ -1624,17 +1616,13 @@ impl ExplorerPane {
         clip: egui::Rect,
         head: &str,
         head_hover: &str,
-        folder_name: Option<&str>,
         shown_name: Option<&str>,
     ) {
         let head = sanitize_display(head, 160);
-        let folder = folder_name
-            .map(|name| sanitize_display(name, 160))
-            .filter(|name| !name.is_empty());
         let shown = shown_name
             .map(|name| sanitize_display(name, 160))
             .filter(|name| !name.is_empty());
-        let Some(folder) = folder else {
+        let Some(name) = shown else {
             if !head.is_empty() {
                 paint_clipped_label(
                     ui,
@@ -1655,13 +1643,9 @@ impl ExplorerPane {
         } else {
             mono_width(ui, &head)
         };
-        let mut name_w = shown
-            .as_ref()
-            .map(|name| mono_width(ui, name))
-            .unwrap_or(0.0);
+        let mut name_w = mono_width(ui, &name);
         let leading = if head_w > 0.0 { gap } else { 0.0 };
-        let trailing = if shown.is_some() { gap } else { 0.0 };
-        let block = leading + icon + trailing;
+        let block = leading + icon + gap;
         let overflow = (head_w + block + name_w - clip.width()).max(0.0);
         if overflow > 0.0 {
             let name_cut = overflow.min((name_w - 1.0).max(0.0));
@@ -1694,18 +1678,9 @@ impl ExplorerPane {
             theme::IconGlyph::LinkedWorktree,
             theme::TEXT_TERTIARY,
         );
-        let hover = linked_worktree_hover(&folder);
-        let Some(name) = shown else {
-            ui.interact(
-                icon_rect,
-                self.ui_scope.with("linked-worktree"),
-                Sense::hover(),
-            )
-            .on_hover_text(sanitize_display(&hover, 600));
-            return;
-        };
         x += icon + gap;
         name_w = name_w.min((clip.right() - x).max(0.0));
+        let hover = linked_worktree_hover(&name);
         if name_w < 1.0 {
             ui.interact(
                 icon_rect,
@@ -1979,23 +1954,30 @@ impl ExplorerPane {
                         }
                     }
 
-                    if let (Some(mark), Some(center)) = (status_mark, dot_center) {
-                        ui.painter()
-                            .circle_filled(center, 3.0, folder_mark_color(mark));
-                    }
+                    let pointer_on_dot =
+                        if let (Some(mark), Some(center)) = (status_mark, dot_center) {
+                            paint_status_dot(
+                                ui,
+                                ui_scope.with(("tree-dot", index)),
+                                rect,
+                                center,
+                                folder_mark_color(mark),
+                                &mark.tooltip(),
+                            )
+                        } else {
+                            false
+                        };
                     let path_tooltip = if let Some(error) = &row.error {
                         sanitize_display(error, 600)
                     } else {
                         sanitize_display(&row.path.display().to_string(), 600)
                     };
-                    let tooltip = response
-                        .hover_pos()
-                        .zip(dot_center)
-                        .zip(status_mark)
-                        .filter(|((pos, center), _)| pos.distance(*center) <= 8.0)
-                        .map(|((_, _), mark)| mark.tooltip())
-                        .unwrap_or(path_tooltip);
-                    let response = response.on_hover_text(tooltip);
+                    // The kind strip owns the tooltip while the pointer is in it.
+                    let response = if pointer_on_dot {
+                        response
+                    } else {
+                        response.on_hover_text(path_tooltip)
+                    };
                     if scroll_to_selection && row.selected {
                         response.scroll_to_me(Some(Align::Center));
                     }
@@ -2427,8 +2409,8 @@ fn linked_worktree_folder(linked: bool, directory_name: Option<&str>) -> Option<
         .map(str::to_owned)
 }
 
-/// Extra folder name beside the head. Omitted when it repeats the visible
-/// branch or 8-character id. The icon still uses [`linked_worktree_folder`].
+/// Extra folder name beside a different head. Omitted when it repeats the
+/// visible branch or 8-character id.
 fn source_control_worktree_name(
     head: &str,
     linked: bool,
@@ -2439,6 +2421,24 @@ fn source_control_worktree_name(
         return None;
     }
     Some(name)
+}
+
+/// Head text and the folder name painted after the worktree icon.
+///
+/// A distinct folder name keeps the head. A folder name that repeats the head
+/// replaces it, so the painter shows the icon and that name only.
+fn repos_aside_texts(
+    head: &str,
+    linked: bool,
+    directory_name: Option<&str>,
+) -> (String, Option<String>) {
+    let folder = linked_worktree_folder(linked, directory_name);
+    let shown = source_control_worktree_name(head, linked, directory_name);
+    if folder.is_some() && shown.is_none() {
+        (String::new(), folder)
+    } else {
+        (head.to_owned(), shown)
+    }
 }
 
 fn linked_worktree_hover(name: &str) -> String {
@@ -2555,18 +2555,24 @@ fn git_status_row_ui(
         ui.painter()
             .rect_filled(row_rect, CornerRadius::same(6), fill);
     }
-    let letter = row.letter.to_string();
-    let letter_color = change_kind_color(row.kind);
-    ui.painter().text(
-        egui::pos2(rect.left() + 12.0, rect.center().y),
-        Align2::CENTER_CENTER,
-        &letter,
-        FontId::monospace(12.0),
-        letter_color,
-    );
+    let entry_kind = if row.is_directory {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    let icon_name = row
+        .relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if let Some(icon) = explorer_icons::resolve(icon_name, entry_kind, false) {
+        paint_entry_icon(ui, egui::pos2(rect.left() + 16.0, rect.center().y), icon);
+    }
+    let dot_center = egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y);
     let relative = sanitize_display(&row.relative.display().to_string(), 240);
     let text_left = rect.left() + 28.0;
-    let width = (rect.right() - text_left - 6.0).max(1.0);
+    let text_right = dot_center.x - 3.0 - 6.0;
+    let width = (text_right - text_left).max(1.0);
     let name_color = if selected {
         theme::TEXT_PRIMARY
     } else {
@@ -2581,6 +2587,14 @@ fn git_status_row_ui(
         name_color,
         width,
     );
+    let pointer_on_dot = paint_status_dot(
+        ui,
+        id.with("status-dot"),
+        rect,
+        dot_center,
+        change_kind_color(row.kind),
+        row.kind.label(),
+    );
     let mut tooltip = sanitize_display(&row.path.display().to_string(), 600);
     if let Some(original) = &row.original_relative {
         tooltip = format!(
@@ -2589,8 +2603,46 @@ fn git_status_row_ui(
         );
     }
     let clicked = response.clicked();
-    response.on_hover_text(tooltip);
+    if !pointer_on_dot {
+        response.on_hover_text(tooltip);
+    }
     clicked.then(|| row.clone())
+}
+
+/// 6px kind dot. The hover strip is the full row height and at least 28px wide,
+/// ending at the row's right edge. The tooltip is anchored at the dot, not the strip.
+///
+/// Returns whether the pointer is in that strip, so the row can skip its path tooltip.
+fn paint_status_dot(
+    ui: &mut Ui,
+    id: egui::Id,
+    row: egui::Rect,
+    center: egui::Pos2,
+    color: Color32,
+    tooltip: &str,
+) -> bool {
+    ui.painter().circle_filled(center, 3.0, color);
+    let width = STATUS_DOT_HIT_WIDTH.min(row.width());
+    let hit = egui::Rect::from_min_max(
+        egui::pos2(row.right() - width, row.top()),
+        row.right_bottom(),
+    );
+    let response = ui.interact(hit, id, Sense::hover());
+    let pointer_in_strip = response.contains_pointer();
+    if pointer_in_strip {
+        // `on_hover_text` would anchor to this strip. Pin the tooltip to the dot.
+        egui::Popup::from_response(&response)
+            .kind(egui::PopupKind::Tooltip)
+            .at_position(center)
+            .gap(4.0)
+            .sense(Sense::hover())
+            .interactable(false)
+            .show(|ui| {
+                ui.set_max_width(ui.spacing().tooltip_width);
+                ui.label(tooltip);
+            });
+    }
+    pointer_in_strip
 }
 
 fn paint_card_header(ui: &Ui, rect: egui::Rect, layout: &theme::Layout, fill: Color32) {
@@ -2978,8 +3030,8 @@ mod tests {
             None
         );
         assert_eq!(
-            linked_worktree_folder(true, Some("feature")).as_deref(),
-            Some("feature")
+            repos_aside_texts("feature", true, Some("feature")),
+            (String::new(), Some("feature".to_owned()))
         );
         assert_eq!(
             source_control_worktree_name("main", false, Some("main")),
@@ -2999,8 +3051,16 @@ mod tests {
             None
         );
         assert_eq!(
-            linked_worktree_folder(true, Some("fb16d0ee")).as_deref(),
-            Some("fb16d0ee")
+            repos_aside_texts("fb16d0ee", true, Some("fb16d0ee")),
+            (String::new(), Some("fb16d0ee".to_owned()))
+        );
+        assert_eq!(
+            repos_aside_texts("feature", true, Some("linked")),
+            ("feature".to_owned(), Some("linked".to_owned()))
+        );
+        assert_eq!(
+            repos_aside_texts("main", false, Some("main")),
+            ("main".to_owned(), None)
         );
         assert_eq!(source_control_worktree_name("", false, Some("nope")), None);
         let hover = linked_worktree_hover("linked");
@@ -3417,12 +3477,12 @@ mod tests {
             let mark = header_circles(output)
                 .into_iter()
                 .find(|circle| {
-                    circle.center.x > text.pos.x + text.galley.size().x
-                        && circle.center.x < text.pos.x + text.galley.size().x + 20.0
+                    circle.center.x < text.pos.x
+                        && text.pos.x - circle.center.x < 20.0
                         && (circle.center.y - (text.pos.y + text.galley.size().y * 0.5)).abs()
                             < 10.0
                 })
-                .unwrap_or_else(|| panic!("{label} has no worktree icon"));
+                .unwrap_or_else(|| panic!("{label} has no worktree icon before the text"));
             let moved = vec![egui::Event::PointerMoved(mark.center)];
             let _ = render(pane, moved.clone());
             let _ = render(pane, moved);
@@ -3455,6 +3515,26 @@ mod tests {
             "{attached_hover}"
         );
         assert!(attached_hover.contains("feature"), "{attached_hover}");
+        let name_at = attached
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("feature") => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("folder name");
+        let name_moved = vec![egui::Event::PointerMoved(name_at)];
+        let _ = render(&mut pane, Vec::new());
+        let _ = render(&mut pane, name_moved.clone());
+        let _ = render(&mut pane, name_moved);
+        let name_hover = output_text(&render(&mut pane, Vec::new()));
+        assert!(
+            name_hover.contains("is a linked worktree"),
+            "name hover: {name_hover}"
+        );
+        assert!(name_hover.contains("feature"), "{name_hover}");
 
         pane.apply_git_chrome(ExplorerGitChrome {
             header: GitHeader {
@@ -3825,6 +3905,280 @@ mod tests {
                 .all(|dot| (dot.center.y - ignored.y).abs() > 12.0),
             "an ignored-only directory must not show a status dot"
         );
+    }
+
+    #[test]
+    fn git_view_row_shows_an_icon_and_a_dot_whose_tooltip_sits_on_the_dot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "one\n").unwrap();
+        fs::create_dir(root.join("vendor")).unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+        let canonical = pane.root().expect("root").to_path_buf();
+        let notes = canonical.join("notes.txt");
+        let vendor = canonical.join("vendor");
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                ..GitHeader::default()
+            },
+            status: Some(GitStatusSnapshot {
+                groups: vec![
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_CHANGES,
+                        rows: vec![GitStatusRow {
+                            letter: 'M',
+                            kind: ChangeKind::Modified,
+                            path: notes.clone(),
+                            relative: PathBuf::from("notes.txt"),
+                            is_directory: false,
+                            original_relative: None,
+                        }],
+                    },
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_UNTRACKED,
+                        rows: vec![GitStatusRow {
+                            letter: 'U',
+                            kind: ChangeKind::New,
+                            path: vendor.clone(),
+                            relative: PathBuf::from("vendor"),
+                            is_directory: true,
+                            original_relative: None,
+                        }],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("git-row-icon-dot"));
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let click =
+            |render: &mut dyn FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+             pane: &mut ExplorerPane,
+             at: egui::Pos2| {
+                let _ = render(pane, vec![egui::Event::PointerMoved(at)]);
+                let _ = render(
+                    pane,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let _ = render(
+                    pane,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            };
+
+        let git = render(&mut pane, Vec::new());
+        let positions = text_positions(&git);
+        for letter in ["M", "A", "U", "D", "R", "C"] {
+            assert!(
+                !positions.iter().any(|(painted, _)| painted == letter),
+                "git view painted status letter {letter}"
+            );
+        }
+        let notes_text = positions
+            .iter()
+            .find(|(label, _)| label.contains("notes.txt"))
+            .expect("notes.txt")
+            .1;
+        let vendor_text = positions
+            .iter()
+            .find(|(label, _)| label.contains("vendor"))
+            .expect("vendor")
+            .1;
+        assert!(
+            (notes_text.y - vendor_text.y).abs() > 20.0,
+            "rows stay on separate 24px lines"
+        );
+        let icons = textured_rects(&git);
+        assert!(
+            icons.iter().any(|rect| {
+                rect.center().x < notes_text.x
+                    && notes_text.x - rect.center().x < 24.0
+                    && (rect.center().y - notes_text.y).abs() < 12.0
+            }),
+            "file icon must sit immediately before notes.txt"
+        );
+        assert!(
+            icons.iter().any(|rect| {
+                rect.center().x < vendor_text.x
+                    && vendor_text.x - rect.center().x < 24.0
+                    && (rect.center().y - vendor_text.y).abs() < 12.0
+            }),
+            "folder icon must sit immediately before vendor"
+        );
+        let dots = status_dots(&git);
+        let notes_dot = dot_for_label(&positions, &dots, "notes.txt");
+        let vendor_dot = dot_for_label(&positions, &dots, "vendor");
+        assert_eq!(notes_dot.fill, theme::WARNING);
+        assert_eq!(vendor_dot.fill, theme::SUCCESS);
+        assert!(notes_dot.center.x > notes_text.x + 40.0);
+        assert!(notes_dot.center.x > 800.0, "dot stays on the right");
+
+        let hover_at =
+            |render: &mut dyn FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+             pane: &mut ExplorerPane,
+             at: egui::Pos2| {
+                let moved = vec![egui::Event::PointerMoved(at)];
+                let _ = render(pane, moved.clone());
+                let _ = render(pane, moved);
+                render(pane, Vec::new())
+            };
+        // Outside the old 12px square (center ± 6) but inside the 28×24 right-edge strip.
+        let near_dot = notes_dot.center + egui::vec2(-10.0, -10.0);
+        let dot_hover = hover_at(&mut render, &mut pane, near_dot);
+        let modified = text_positions(&dot_hover)
+            .into_iter()
+            .find(|(label, _)| label == "Modified")
+            .expect("kind tooltip");
+        assert!(
+            (modified.1.x - notes_dot.center.x).abs() < 80.0,
+            "Modified tooltip must sit on the dot, not the far side of the row: {:?} vs {:?}",
+            modified.1,
+            notes_dot.center
+        );
+        assert!(
+            !output_text(&dot_hover).contains(&notes.display().to_string()),
+            "kind-strip hover must not also show the path"
+        );
+        let path_hover = hover_at(&mut render, &mut pane, notes_text);
+        let path_text = output_text(&path_hover);
+        assert!(
+            path_text.contains("notes.txt"),
+            "row hover keeps the path: {path_text}"
+        );
+        assert!(
+            !text_positions(&path_hover)
+                .iter()
+                .any(|(label, _)| label == "Modified"),
+            "path hover must not show the kind tooltip"
+        );
+
+        click(&mut render, &mut pane, notes_text);
+        assert!(pane.take_preview_opened(), "clicking a file opens preview");
+        click(&mut render, &mut pane, vendor_text);
+        assert!(
+            !pane.take_preview_opened(),
+            "clicking a directory does not open preview"
+        );
+
+        pane.source_control_open = false;
+        let tree_ctx = egui::Context::default();
+        theme::install(&tree_ctx);
+        tree_ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("file-tree-dot-tooltip"));
+        let mut render_tree = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = tree_ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let tree = render_tree(&mut pane, Vec::new());
+        let tree_positions = text_positions(&tree);
+        let tree_dot = dot_for_label(&tree_positions, &status_dots(&tree), "notes.txt");
+        let tree_near_dot = tree_dot.center + egui::vec2(-10.0, -10.0);
+        let tree_hover = hover_at(&mut render_tree, &mut pane, tree_near_dot);
+        let tree_modified = text_positions(&tree_hover)
+            .into_iter()
+            .find(|(label, _)| label == "Modified")
+            .unwrap_or_else(|| {
+                panic!(
+                    "file-tree kind tooltip at {:?}: {}",
+                    tree_dot.center,
+                    output_text(&tree_hover)
+                )
+            });
+        assert!(
+            (tree_modified.1.x - tree_dot.center.x).abs() < 80.0,
+            "file-tree tooltip must sit on the dot: {:?} vs {:?}",
+            tree_modified.1,
+            tree_dot.center
+        );
+        assert!(
+            !output_text(&tree_hover).contains(&notes.display().to_string()),
+            "file-tree kind-strip hover must not also show the path"
+        );
+        let tree_name = tree_positions
+            .iter()
+            .find(|(label, _)| label.contains("notes.txt"))
+            .expect("tree notes")
+            .1;
+        let tree_path = hover_at(&mut render_tree, &mut pane, tree_name);
+        assert!(output_text(&tree_path).contains(&notes.display().to_string()));
+        assert!(
+            !text_positions(&tree_path)
+                .iter()
+                .any(|(label, _)| label == "Modified"),
+            "hovering the file name shows the path, not the kind"
+        );
+    }
+
+    fn textured_rects(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        fn visit(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.fill_texture_id() != egui::TextureId::default() => {
+                    rects.push(rect.rect);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut rects);
+        }
+        rects
     }
 
     #[test]
