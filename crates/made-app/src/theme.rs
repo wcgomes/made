@@ -158,8 +158,10 @@ pub const TAB_SELECTED_FONT_SIZE: f32 = 13.0;
 
 /// Monospace wordmark shown in workspace and picker chrome.
 pub const WORDMARK: &str = "MADE";
-/// Wordmark hover text.
+/// Picker wordmark hover text.
 pub const WORDMARK_TOOLTIP: &str = "Minimal Agentic Development Environment";
+/// Tooltip and accessibility name of the header MADE wordmark trigger.
+pub const WORDMARK_ABOUT_TOOLTIP: &str = "About";
 /// Wordmark font size.
 pub const WORDMARK_SIZE: f32 = 14.0;
 /// Wordmark tracking in points.
@@ -293,6 +295,56 @@ pub fn wordmark(ui: &mut Ui) -> egui::Response {
     ui.painter().galley(rect.min, galley, TEXT_PRIMARY);
     ui.interact(rect, wordmark_id(), egui::Sense::hover())
         .on_hover_text(WORDMARK_TOOLTIP)
+}
+
+/// Paint the cached two-tone wordmark without interaction.
+///
+/// Used by the About card, which cannot reuse [`wordmark_id`] while the header
+/// trigger owns it.
+pub fn wordmark_brand(ui: &mut Ui) -> egui::Rect {
+    let galley = wordmark_galley(ui);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter().galley(rect.min, galley, TEXT_PRIMARY);
+    rect
+}
+
+/// Paint the two-tone wordmark as the header About trigger.
+///
+/// The trigger keeps the cached two-tone paint, paints no fill, owns the icon
+/// actions' minimum square target, exposes [`WORDMARK_ABOUT_TOOLTIP`] as both
+/// its tooltip and accessibility name, and reports pointer or Enter/Space
+/// activation. The caller gates the toggle on an active workspace.
+pub fn wordmark_about_action(ui: &mut Ui, height: f32, gap: Color32) -> ActionResponse {
+    let galley = wordmark_galley(ui);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x.max(24.0), icon_action_extent(height)),
+        egui::Sense::hover(),
+    );
+    let mut response = ui.interact(rect, wordmark_id(), egui::Sense::click());
+    let origin = egui::pos2(
+        rect.center().x - galley.size().x / 2.0,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(origin, galley, TEXT_PRIMARY);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.has_focus() {
+        paint_focus_ring(ui, rect, CornerRadius::same(6), gap);
+    }
+    let keyboard = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let activated = response.clicked() || keyboard;
+    response = response.on_hover_text(WORDMARK_ABOUT_TOOLTIP);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, true, WORDMARK_ABOUT_TOOLTIP)
+    });
+    ActionResponse {
+        response,
+        activated,
+    }
 }
 
 /// Normal body text.
@@ -821,8 +873,6 @@ pub enum IconGlyph {
     Plus,
     /// Outlined panel with a right column: show/hide the explorer.
     PanelRight,
-    /// Heartbeat line: workspace and integration diagnostics.
-    Diagnostics,
     /// List rows with markers: optional OpenCode sessions.
     SessionList,
     /// Small X: dismiss the picker or a chrome surface.
@@ -840,7 +890,7 @@ pub enum IconGlyph {
 /// Linked-worktree mark beside the worktree name. Not the source-control toggle.
 pub const LINKED_WORKTREE_ICON: f32 = 12.0;
 
-/// Widest app-drawn header glyph (Explorer panel/Diagnostics).
+/// Widest app-drawn header glyph (Explorer panel).
 pub const ICON_GLYPH_WIDTH: f32 = 14.0;
 
 /// Square hit target for an icon-only action at `height`.
@@ -982,19 +1032,6 @@ fn paint_icon_with(
             let panel = egui::Rect::from_center_size(center, egui::vec2(ICON_GLYPH_WIDTH, 11.0));
             painter.rect_stroke(panel, CornerRadius::same(2), stroke, StrokeKind::Middle);
             line(vec![point(2.0, -5.5), point(2.0, 5.5)]);
-        }
-        IconGlyph::Diagnostics => {
-            let half = ICON_GLYPH_WIDTH / 2.0;
-            line(vec![
-                point(-half, 0.0),
-                point(-4.0, 0.0),
-                point(-3.0, -4.0),
-                point(-1.5, 4.5),
-                point(0.5, -3.0),
-                point(2.0, 1.5),
-                point(3.5, 0.0),
-                point(half, 0.0),
-            ]);
         }
         IconGlyph::SessionList => {
             for y in [-4.5, 0.0, 4.5] {

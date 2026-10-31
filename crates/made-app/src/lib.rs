@@ -81,3 +81,6 @@ pub const APP_NAME: &str = "Made";
 
 /// Application crate version.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Short product description shown by About.
+pub const APP_DESCRIPTION: &str = "A native, terminal-first desktop workspace for developers.";

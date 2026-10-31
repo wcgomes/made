@@ -12,10 +12,10 @@ use made_app::cli::LaunchArgs;
 use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
 use made_app::ui::{
-    diagnostics_copy_id, diagnostics_previous_log_copy_id, diagnostics_previous_log_path_id,
-    explorer_splitter_id, left_surface_action_id, new_tab_menu_item_id, picker_control_id,
-    picker_current_target, picker_list_id, picker_path_id, top_action_id, top_workspace_action_id,
-    workspace_tab_close_id, workspace_tab_id,
+    about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
+    diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
+    new_tab_menu_item_id, picker_control_id, picker_current_target, picker_list_id, picker_path_id,
+    top_action_id, top_workspace_action_id, workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
@@ -285,6 +285,14 @@ impl Headless {
         let time = time.max(min_time);
         self.last_time = time;
         raw.time = Some(time);
+        let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Render the app UI without running model logic, keeping startup pending.
+    fn render_ui_only(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+        let raw = self.raw(events);
         let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
         output.textures_delta.clear();
         output
@@ -1171,6 +1179,23 @@ fn wait_explorer_ready(headless: &mut Headless, id: WorkspaceId) {
     });
 }
 
+/// Open About from the header wordmark and reveal its diagnostics detail.
+fn open_about_diagnostics(headless: &mut Headless, id: WorkspaceId) {
+    headless.click(made_app::theme::wordmark_id());
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    headless.click(about_diagnostics_toggle_id(&pane_id));
+    settle_about_animation(headless);
+}
+
+/// Advance the About reveal animation to its target.
+fn settle_about_animation(headless: &mut Headless) {
+    let mut time = headless.last_time;
+    for _ in 0..24 {
+        time += 1.0 / 60.0;
+        headless.render_events_at(Vec::new(), time);
+    }
+}
+
 fn fixture_workspace(temp: &Path, name: &str, file: &str) -> PathBuf {
     let path = temp.join(name);
     fs::create_dir(&path).unwrap();
@@ -1226,7 +1251,7 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     for icon in [
         top_action_id("open-folder"),
         top_workspace_action_id(id, "explorer"),
-        top_action_id("diagnostics"),
+        made_app::theme::wordmark_id(),
     ] {
         let response = headless.response(icon);
         assert!(
@@ -1246,6 +1271,13 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
             .read_response(top_workspace_action_id(id, "sessions"))
             .is_none(),
         "optional Sessions icon must stay absent without session data"
+    );
+    assert!(
+        headless
+            .ctx
+            .read_response(top_action_id("diagnostics"))
+            .is_none(),
+        "the header must not render a Diagnostics icon"
     );
     let workbench = headless.model.workbench().unwrap();
     assert_eq!(workbench.left_surface(), LeftSurface::Terminal);
@@ -1349,13 +1381,10 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
         "explorer must fill the main content height: {explorer_card:?}"
     );
 
-    let wordmark = output_text(&headless.hover_until_text(
-        made_app::theme::wordmark_id(),
-        made_app::theme::WORDMARK_TOOLTIP,
-    ));
+    let wordmark = output_text(&headless.hover_until_text(made_app::theme::wordmark_id(), "About"));
     assert!(
-        wordmark.contains(made_app::theme::WORDMARK_TOOLTIP),
-        "wordmark tooltip missing: {wordmark}"
+        wordmark.contains("About"),
+        "wordmark About tooltip missing: {wordmark}"
     );
 }
 
@@ -2408,15 +2437,22 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
     for action in [
         top_action_id("open-folder"),
         top_workspace_action_id(id, "explorer"),
-        top_action_id("diagnostics"),
+        made_app::theme::wordmark_id(),
     ] {
         let response = headless.response(action);
         assert!(
             response.rect.width() >= 24.0 && response.rect.height() >= 24.0,
-            "icon target below 24px: {action:?} {:?}",
+            "header action target below 24px: {action:?} {:?}",
             response.rect
         );
     }
+    assert!(
+        headless
+            .ctx
+            .read_response(top_action_id("diagnostics"))
+            .is_none(),
+        "the header must not render a Diagnostics icon"
+    );
     let open_folder_rect = headless.response(top_action_id("open-folder")).rect;
     let hovered_output = headless.hover_until_text(top_action_id("open-folder"), "Open folder");
     let hovered = output_text(&hovered_output);
@@ -2437,11 +2473,18 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
         hovered.contains("Hide explorer"),
         "Explorer tooltip missing: {hovered}"
     );
-    let hovered =
-        output_text(&headless.hover_until_text(top_action_id("diagnostics"), "Diagnostics"));
+    let hovered = headless.hover_until_text(made_app::theme::wordmark_id(), "About");
+    let hovered_text = output_text(&hovered);
     assert!(
-        hovered.contains("Diagnostics"),
-        "Diagnostics tooltip missing: {hovered}"
+        hovered_text.contains("About"),
+        "wordmark About tooltip missing: {hovered_text}"
+    );
+    let wordmark_rect = headless.response(made_app::theme::wordmark_id()).rect;
+    assert!(
+        !rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| rect.intersects(wordmark_rect)),
+        "the wordmark trigger must not paint a hover fill"
     );
     headless.focus(top_action_id("open-folder"));
     let focused = headless.render();
@@ -2449,6 +2492,206 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
         has_stroke_color(&focused, made_app::theme::FOCUS),
         "focused header icon must paint a visible focus ring"
     );
+    headless.focus(made_app::theme::wordmark_id());
+    let focused = headless.render();
+    assert!(
+        has_stroke_color(&focused, made_app::theme::FOCUS),
+        "focused wordmark trigger must paint a visible focus ring"
+    );
+}
+
+#[test]
+fn wordmark_about_trigger_opens_only_with_an_active_workspace() {
+    if isolated("wordmark_about_trigger_opens_only_with_an_active_workspace") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "wordmark-about", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let closed = output_text(&headless.render());
+    assert!(
+        !closed.contains("Show diagnostics"),
+        "About must start closed: {closed}"
+    );
+
+    headless.click(made_app::theme::wordmark_id());
+    let opened = output_text(&headless.render());
+    assert!(
+        opened.contains("Show diagnostics"),
+        "pointer activation must open About: {opened}"
+    );
+
+    headless.focus(made_app::theme::wordmark_id());
+    headless.press_key(egui::Key::Enter);
+    let closed = output_text(&headless.render());
+    assert!(
+        !closed.contains("Show diagnostics"),
+        "Enter must close About: {closed}"
+    );
+
+    headless.focus(made_app::theme::wordmark_id());
+    headless.press_key(egui::Key::Space);
+    let opened = output_text(&headless.render());
+    assert!(
+        opened.contains("Show diagnostics"),
+        "Space must open About: {opened}"
+    );
+
+    // Pre-start shell: a launch plan exists, but no workspace runtime is active.
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let model = AppModel::from_launch(WorkspaceLaunch::from_plan(plan), AppOptions::new());
+    assert!(model.active_workspace_id().is_none());
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.render_ui_only(Vec::new());
+    headless.render_ui_only(Vec::new());
+    let position = headless
+        .response(made_app::theme::wordmark_id())
+        .rect
+        .center();
+    headless.render_ui_only(vec![egui::Event::PointerMoved(position)]);
+    headless.render_ui_only(vec![pointer_button(position, true)]);
+    let output = headless.render_ui_only(vec![pointer_button(position, false)]);
+    assert!(headless.model.active_workspace_id().is_none());
+    assert!(
+        !output_text(&output).contains("Show diagnostics"),
+        "activation without an active workspace must not open About"
+    );
+}
+
+#[test]
+fn about_reveals_diagnostics_on_demand_and_resets_when_reopened() {
+    if isolated("about_reveals_diagnostics_on_demand_and_resets_when_reopened") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "about-screen", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(made_app::theme::wordmark_id());
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    let toggle_id = about_diagnostics_toggle_id(&pane_id);
+    let window_id = egui::Id::unique(("made-about-window", pane_id.as_str()));
+    let default_output = headless.render();
+    let text = output_text(&default_output);
+    for expected in [
+        "MADE",
+        &format!("{} {}", made_app::APP_NAME, made_app::APP_VERSION),
+        "Minimal Agentic Development Environment",
+        made_app::APP_DESCRIPTION,
+        "Show diagnostics",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    assert!(
+        rects_with_fill(&default_output, made_app::theme::ACCENT).is_empty(),
+        "the hidden diagnostics toggle must not use the active accent fill"
+    );
+    for hidden in [
+        "Copy diagnostics",
+        "Previous log",
+        "Copy log path",
+        "Effective root",
+    ] {
+        assert!(!text.contains(hidden), "About leaked {hidden:?}: {text}");
+    }
+    let collapsed_window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("About window rect");
+    assert!(
+        collapsed_window.height() < 300.0,
+        "collapsed About must stay compact: {collapsed_window:?}"
+    );
+
+    headless.click(toggle_id);
+    headless.render_events_at(Vec::new(), headless.last_time + 1.0 / 60.0);
+    let mid_window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("About window rect");
+    assert!(
+        mid_window.height() > collapsed_window.height() && mid_window.height() < 700.0,
+        "diagnostics reveal must animate through an intermediate height: collapsed {collapsed_window:?}, mid {mid_window:?}"
+    );
+    settle_about_animation(&mut headless);
+    let revealed_output = headless.render();
+    let text = output_text(&revealed_output);
+    for expected in [
+        "Hide diagnostics",
+        "Copy diagnostics",
+        "Previous log",
+        "Effective root",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text}");
+    }
+    assert!(!text.contains("Show diagnostics"));
+    assert!(
+        !rects_with_fill(&revealed_output, made_app::theme::ACCENT).is_empty(),
+        "the revealed diagnostics toggle must use the active accent fill"
+    );
+    let expanded_window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("About window rect");
+    assert!(
+        expanded_window.height() > collapsed_window.height() + 100.0,
+        "revealing diagnostics must grow About: collapsed {collapsed_window:?}, expanded {expanded_window:?}"
+    );
+    assert!(
+        expanded_window.height() >= 720.0,
+        "revealed About must use the available app height: {expanded_window:?}"
+    );
+
+    headless.click(toggle_id);
+    settle_about_animation(&mut headless);
+    let hidden_output = headless.render();
+    let text = output_text(&hidden_output);
+    assert!(text.contains("Show diagnostics"));
+    assert!(!text.contains("Copy diagnostics"));
+    assert!(
+        rects_with_fill(&hidden_output, made_app::theme::ACCENT).is_empty(),
+        "the closed diagnostics toggle must return to the secondary treatment"
+    );
+    let collapsed_again = headless
+        .ctx
+        .memory(|memory| memory.area_rect(window_id))
+        .expect("About window rect");
+    assert!(
+        collapsed_again.height() < 300.0,
+        "hiding diagnostics must return About to its compact height: {collapsed_again:?}"
+    );
+
+    let about_rect = headless
+        .ctx
+        .memory(|memory| {
+            memory.area_rect(egui::Id::unique(("made-about-window", pane_id.as_str())))
+        })
+        .expect("About window rect");
+    headless.focus(toggle_id);
+    let focused = headless.render();
+    assert!(
+        !focus_ring_rects(&focused, about_rect.expand(4.0)).is_empty(),
+        "About diagnostics toggle must paint a visible focus ring"
+    );
+    headless.focus(toggle_id);
+    headless.press_key(egui::Key::Enter);
+    assert!(output_text(&headless.render()).contains("Hide diagnostics"));
+    headless.focus(toggle_id);
+    headless.press_key(egui::Key::Space);
+    assert!(output_text(&headless.render()).contains("Show diagnostics"));
+
+    headless.click(made_app::theme::wordmark_id());
+    headless.render();
+    headless.click(made_app::theme::wordmark_id());
+    let text = output_text(&headless.render());
+    assert!(text.contains("Show diagnostics"));
+    assert!(!text.contains("Copy diagnostics"));
 }
 
 #[test]
@@ -2480,12 +2723,23 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         let first_tab = headless.response(workspace_tab_id(alpha_id)).rect;
         let last_tab = headless.response(workspace_tab_id(beta_id)).rect;
         let plus = headless.response(top_action_id("open-folder")).rect;
-        let diagnostics = headless.response(top_action_id("diagnostics")).rect;
         let explorer = headless
             .response(top_workspace_action_id(beta_id, "explorer"))
             .rect;
         let content_left = layout.gutter;
         let content_right = width - layout.gutter;
+
+        assert!(
+            headless
+                .ctx
+                .read_response(top_action_id("diagnostics"))
+                .is_none(),
+            "{width}px: the header must not render a Diagnostics icon"
+        );
+        assert!(
+            wordmark.width() >= 24.0 && wordmark.height() >= 24.0,
+            "{width}px: the wordmark trigger target must be at least 24x24: {wordmark:?}"
+        );
 
         assert_eq!(layout.top_height, top_height);
         assert_eq!(layout.tab_height, tab_height);
@@ -2558,12 +2812,12 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: tab strip must leave a {gap}px gap before the wordmark: plus {plus:?}, wordmark {wordmark:?}"
         );
         assert!(
-            (diagnostics.left() - wordmark.right() - gap).abs() < 0.75,
-            "{width}px: wordmark-to-icon gap must be {gap}px: wordmark {wordmark:?}, diagnostics {diagnostics:?}"
+            (explorer.left() - wordmark.right() - gap).abs() < 0.75,
+            "{width}px: wordmark-to-first-icon gap must be {gap}px: wordmark {wordmark:?}, explorer {explorer:?}"
         );
         assert!(
-            explorer.left() > diagnostics.left() && explorer.right() > diagnostics.right(),
-            "{width}px: Explorer toggle must be rightmost: diagnostics {diagnostics:?}, explorer {explorer:?}"
+            explorer.right() > wordmark.right(),
+            "{width}px: Explorer toggle must be rightmost: wordmark {wordmark:?}, explorer {explorer:?}"
         );
         assert!(
             plus.width() >= 24.0 && plus.height() >= 24.0,
@@ -2573,7 +2827,6 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         for (name, rect) in [
             ("wordmark", wordmark),
             ("plus", plus),
-            ("diagnostics", diagnostics),
             ("explorer", explorer),
             (
                 "active tab",
@@ -2594,7 +2847,7 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
                     .any(|rect| rect.intersects(wordmark)),
             "{width}px: the wordmark must not paint a tab fill"
         );
-        let icon_cluster_left = diagnostics.left();
+        let icon_cluster_left = explorer.left();
         assert!(
             wordmark.right() < icon_cluster_left,
             "{width}px: wordmark must sit before the icon group"
@@ -2610,19 +2863,29 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: the space above and below the strip must both equal the pane gap"
         );
 
-        let wordmark_hover = headless.hover_until_text(
-            made_app::theme::wordmark_id(),
-            made_app::theme::WORDMARK_TOOLTIP,
-        );
+        let wordmark_hover = headless.hover_until_text(made_app::theme::wordmark_id(), "About");
         assert!(
-            output_text(&wordmark_hover).contains(made_app::theme::WORDMARK_TOOLTIP),
-            "{width}px: wordmark tooltip missing"
+            output_text(&wordmark_hover).contains("About"),
+            "{width}px: wordmark About tooltip missing"
         );
+        for (name, fill) in [
+            ("BG_HOVER", made_app::theme::BG_HOVER),
+            ("BG_SELECTED", made_app::theme::BG_SELECTED),
+            ("BG_TAB_HOVER", made_app::theme::BG_TAB_HOVER),
+            ("BG_TAB_SELECTED", made_app::theme::BG_TAB_SELECTED),
+        ] {
+            assert!(
+                !rects_with_fill(&wordmark_hover, fill)
+                    .iter()
+                    .any(|rect| rect.intersects(wordmark)),
+                "{width}px: hovering the wordmark must not paint a {name} fill"
+            );
+        }
+        headless.focus(made_app::theme::wordmark_id());
+        let focused = headless.render();
         assert!(
-            !rects_with_fill(&wordmark_hover, made_app::theme::BG_TAB_HOVER)
-                .iter()
-                .any(|rect| rect.intersects(wordmark)),
-            "{width}px: hovering the wordmark must not paint a tab fill"
+            has_stroke_color(&focused, made_app::theme::FOCUS),
+            "{width}px: focused wordmark trigger must paint a visible focus ring"
         );
 
         // The selected Explorer keeps BG_SELECTED on hover; hide it to exercise
@@ -4590,7 +4853,6 @@ fn workspace_strip_budget_keeps_controls_inside_and_non_overlapping() {
             headless
                 .response(top_workspace_action_id(active, "explorer"))
                 .rect,
-            headless.response(top_action_id("diagnostics")).rect,
             headless.response(made_app::theme::wordmark_id()).rect,
         ];
         if let Some(response) = &overflow {
@@ -4676,7 +4938,7 @@ fn diagnostics_expose_workspace_shell_and_inactive_integration() {
     wait_explorer_ready(&mut headless, id);
     let token = bridge_token(headless.model.workspace(id).unwrap());
     headless.render();
-    headless.click(top_action_id("diagnostics"));
+    open_about_diagnostics(&mut headless, id);
     let text = output_text(&headless.render());
     for expected in [
         "WORKSPACE",
@@ -4732,7 +4994,7 @@ fn diagnostics_previous_log_row_reflects_existence_and_copies() {
         .expect("previous log path");
     assert!(!snapshot.previous_log_exists);
     headless.render();
-    headless.click(top_action_id("diagnostics"));
+    open_about_diagnostics(&mut headless, id);
     let text = output_text(&headless.render());
     for expected in ["Previous log", "Copy previous log path", "not yet rotated"] {
         assert!(text.contains(expected), "missing {expected:?} in {text}");
@@ -4741,14 +5003,19 @@ fn diagnostics_previous_log_row_reflects_existence_and_copies() {
     let previous_copy_id = diagnostics_previous_log_copy_id(pane_id);
     let response = headless.response(previous_copy_id);
     assert!(
-        !response.enabled(),
-        "copy action must be disabled without a previous log"
-    );
-    assert!(
         egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0))
             .contains_rect(response.rect),
         "previous-log action clipped at 720x480: {:?}",
         response.rect
+    );
+    let output = headless.click(previous_copy_id);
+    assert!(
+        !output
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::CopyText(_))),
+        "copy action must not copy without a previous log"
     );
 
     std::fs::write(&previous, b"previous record\n").unwrap();
@@ -4760,7 +5027,7 @@ fn diagnostics_previous_log_row_reflects_existence_and_copies() {
 
     let pane_id = headless.model.workspace(id).unwrap().pane_id();
     let path_id = diagnostics_previous_log_path_id(pane_id);
-    let window_id = egui::Id::unique(("made-diagnostics-window", pane_id));
+    let window_id = egui::Id::unique(("made-about-window", pane_id));
     let window = headless
         .ctx
         .memory(|memory| memory.area_rect(window_id))
@@ -4823,7 +5090,7 @@ fn diagnostics_degraded_state_keeps_previous_log_row_at_720() {
     });
 
     headless.render();
-    headless.click(top_action_id("diagnostics"));
+    open_about_diagnostics(&mut headless, id);
     let output = headless.render();
     let text = output_text(&output);
     for expected in ["degraded", "Previous log", "not yet rotated"] {
@@ -4833,7 +5100,7 @@ fn diagnostics_degraded_state_keeps_previous_log_row_at_720() {
     let copy_id = diagnostics_previous_log_copy_id(pane_id);
     let window = headless
         .ctx
-        .memory(|memory| memory.area_rect(egui::Id::unique(("made-diagnostics-window", pane_id))))
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane_id))))
         .expect("diagnostics window rect");
     assert!(window.contains_rect(headless.response(copy_id).rect));
     assert_text_clipped_inside(
@@ -4883,7 +5150,7 @@ fn diagnostics_warn_about_unsafe_previous_and_lock_paths_at_startup() {
     );
 
     headless.render();
-    headless.click(top_action_id("diagnostics"));
+    open_about_diagnostics(&mut headless, id);
     let text = output_text(&headless.render());
     assert!(text.contains("previous diagnostics log path is not a regular file"));
     assert!(text.contains("diagnostics log lock path is not a regular file"));
@@ -4960,7 +5227,7 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
     );
 
     headless.render();
-    headless.click(top_action_id("diagnostics"));
+    open_about_diagnostics(&mut headless, id);
     let output = headless.render();
     let text = output_text(&output);
     for expected in [
@@ -4976,7 +5243,7 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
     let pane_id = headless.model.workspace(id).unwrap().pane_id();
     let path_id = diagnostics_previous_log_path_id(pane_id);
     let copy_id = diagnostics_previous_log_copy_id(pane_id);
-    let window_id = egui::Id::unique(("made-diagnostics-window", pane_id));
+    let window_id = egui::Id::unique(("made-about-window", pane_id));
     let window = headless
         .ctx
         .memory(|memory| memory.area_rect(window_id))
@@ -5908,15 +6175,19 @@ fn optional_session_map_appears_only_after_session_data() {
     let sessions = headless
         .response(top_workspace_action_id(id, "sessions"))
         .rect;
-    let diagnostics = headless.response(top_action_id("diagnostics")).rect;
     let explorer = headless
         .response(top_workspace_action_id(id, "explorer"))
         .rect;
     assert!(
-        sessions.right() < diagnostics.left()
-            && diagnostics.right() < explorer.left()
-            && explorer.left() > sessions.left(),
-        "right icon order must be Sessions, Diagnostics, Explorer (Explorer rightmost): sessions {sessions:?}, diagnostics {diagnostics:?}, explorer {explorer:?}"
+        headless
+            .ctx
+            .read_response(top_action_id("diagnostics"))
+            .is_none(),
+        "the header must not render a Diagnostics icon"
+    );
+    assert!(
+        sessions.right() < explorer.left() && explorer.left() > sessions.left(),
+        "right icon order must be Sessions then Explorer (Explorer rightmost): sessions {sessions:?}, explorer {explorer:?}"
     );
     let hovered = output_text(
         &headless.hover_until_text(top_workspace_action_id(id, "sessions"), "Show sessions"),
@@ -5972,7 +6243,7 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
     wait_explorer_ready(&mut headless, id);
     let output = headless.render();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
-    for action in ["open-folder", "diagnostics"] {
+    for action in ["open-folder"] {
         let response = headless.response(top_action_id(action));
         assert!(
             screen.contains_rect(response.rect),
@@ -5981,6 +6252,20 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
         );
         assert!(response.rect.width() >= 24.0 && response.rect.height() >= 24.0);
     }
+    assert!(
+        headless
+            .ctx
+            .read_response(top_action_id("diagnostics"))
+            .is_none(),
+        "the header must not render a Diagnostics icon"
+    );
+    let wordmark = headless.response(made_app::theme::wordmark_id());
+    assert!(
+        screen.contains_rect(wordmark.rect),
+        "wordmark trigger is clipped: {:?}",
+        wordmark.rect
+    );
+    assert!(wordmark.rect.width() >= 24.0 && wordmark.rect.height() >= 24.0);
     {
         let response = headless.response(top_workspace_action_id(id, "explorer"));
         assert!(

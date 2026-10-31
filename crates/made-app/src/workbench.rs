@@ -232,6 +232,10 @@ pub struct Workbench {
     explorer_visible: bool,
     explorer_width: f32,
     sessions_visible: bool,
+    /// Whether the About card is revealing its diagnostics detail.
+    pub(crate) about_diagnostics_visible: bool,
+    /// Increments when About opens so its reveal animation starts hidden.
+    pub(crate) about_open_generation: u64,
     tick_count: u64,
     paint_count: u64,
     last_osc7_cwd: Option<PathBuf>,
@@ -371,6 +375,8 @@ impl Workbench {
             explorer_visible: true,
             explorer_width: EXPLORER_DEFAULT_WIDTH_WIDE,
             sessions_visible: false,
+            about_diagnostics_visible: false,
+            about_open_generation: 0,
             tick_count: 0,
             paint_count: 0,
             last_osc7_cwd: None,

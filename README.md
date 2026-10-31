@@ -20,7 +20,7 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **Full-height explorer** — hide, restore, and pointer-resize it without stopping the shell.
 - **Full-left read-only preview** — inspect a file over the still-running terminal, then return without relaunching anything.
 - **Home startup and inline folder picker** — no argument opens your home workspace; `--picker` browses an inline expandable folder tree; an explicit path wins over both.
-- **Diagnostics** — inspect workspace, cwd capability, effective root, integration state, logs, and metrics without routine status chrome.
+- **About and diagnostics** — open About from the MADE wordmark for the app identity and version, then reveal workspace, cwd capability, effective root, integration state, logs, and metrics on demand without routine status chrome.
 - **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Mica may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
 
 ## Quick start

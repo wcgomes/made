@@ -28,7 +28,7 @@ use crate::session_map::{truncate_end, truncate_path, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
 use crate::workbench::{LeftSurface, Workbench};
-use crate::APP_VERSION;
+use crate::{APP_DESCRIPTION, APP_NAME, APP_VERSION};
 use made_platform::{Clipboard, CompatibleTui, LogIssueSeverity, PlatformError};
 
 // ── Status tone mapping ─────────────────────────────────────────────────────
@@ -915,7 +915,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut launch_tui = None;
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
-    let mut diagnostics = false;
+    let mut about = false;
 
     let panel_height = layout.content_top();
     egui::Panel::top("made-workspaces")
@@ -950,12 +950,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 ));
             }
             if has_workbench {
-                right_specs.push((
-                    "diagnostics",
-                    theme::IconGlyph::Diagnostics,
-                    "Diagnostics",
-                    false,
-                ));
                 right_specs.push((
                     "explorer",
                     theme::IconGlyph::PanelRight,
@@ -1006,7 +1000,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 match *name {
                     "sessions" if action.activated => toggle_sessions = true,
                     "explorer" if action.activated => toggle_explorer = true,
-                    "diagnostics" if action.activated => diagnostics = true,
                     _ => {}
                 }
             }
@@ -1027,7 +1020,11 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     .max_rect(wordmark_rect)
                     .layout(egui::Layout::left_to_right(Align::Center)),
             );
-            theme::wordmark(&mut wordmark);
+            let trigger =
+                theme::wordmark_about_action(&mut wordmark, layout.tab_height, theme::BG_CLEAR);
+            if trigger.activated && active.is_some() {
+                about = true;
+            }
 
             let tabs_rect = egui::Rect::from_min_max(
                 content.min,
@@ -1196,7 +1193,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             workbench.set_sessions_visible(!sessions_visible);
         }
     }
-    diagnostics
+    about
 }
 
 fn new_tab_menu_item(
@@ -1357,9 +1354,12 @@ fn diagnostics_cache_id(pane_id: &str) -> egui::Id {
     egui::Id::unique(("made-diagnostics-cache", pane_id))
 }
 
-fn diagnostics_open_id() -> egui::Id {
-    egui::Id::unique("made-diagnostics-open")
+fn about_open_id() -> egui::Id {
+    egui::Id::unique("made-about-open")
 }
+
+/// Smooth reveal time for the About diagnostics detail.
+const ABOUT_REVEAL_TIME: f32 = 0.22;
 
 fn diagnostics_metrics_cache_id(pane_id: &str) -> egui::Id {
     egui::Id::unique(("made-diagnostics-metrics", pane_id))
@@ -1378,6 +1378,11 @@ fn heartbeat_age(
     now: std::time::Instant,
 ) -> Option<std::time::Duration> {
     last.map(|last| now.saturating_duration_since(last))
+}
+
+/// Stable id for the About diagnostics reveal toggle in one workspace.
+pub fn about_diagnostics_toggle_id(pane_id: &str) -> egui::Id {
+    egui::Id::unique(("made-about-diagnostics-toggle", pane_id))
 }
 
 /// Stable id for the diagnostics copy action in one workspace.
@@ -1419,7 +1424,7 @@ impl Workbench {
         &mut self,
         ui: &mut Ui,
         show_sessions: &mut bool,
-        show_diagnostics: &mut bool,
+        show_about: &mut bool,
         native_backdrop_applied: bool,
     ) {
         if !self.is_visible() {
@@ -1435,7 +1440,7 @@ impl Workbench {
             bottom: layout.gutter as i8,
         };
         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-            self.workspace_ui(ui, &layout, show_diagnostics, native_backdrop_applied);
+            self.workspace_ui(ui, &layout, show_about, native_backdrop_applied);
         });
         self.set_sessions_visible(*show_sessions);
     }
@@ -1444,7 +1449,7 @@ impl Workbench {
         &mut self,
         ui: &mut Ui,
         layout: &Layout,
-        show_diagnostics: &mut bool,
+        show_about: &mut bool,
         native_backdrop_applied: bool,
     ) {
         self.sync_terminal_visibility(ui.ctx());
@@ -1452,7 +1457,7 @@ impl Workbench {
         self.apply_terminal_focus_boost(ui.ctx());
         let ctx = ui.ctx().clone();
         self.toast(&ctx, layout);
-        self.diagnostics_window(&ctx, show_diagnostics, layout);
+        self.about_window(&ctx, show_about, layout);
     }
 
     fn sync_terminal_visibility(&mut self, ctx: &egui::Context) {
@@ -2116,26 +2121,17 @@ impl Workbench {
         cache
     }
 
-    fn diagnostics_window(
-        &mut self,
-        ctx: &egui::Context,
-        show_diagnostics: &mut bool,
-        layout: &Layout,
-    ) {
-        if !*show_diagnostics {
-            if ctx.data(|data| {
-                data.get_temp::<bool>(diagnostics_open_id())
-                    .unwrap_or(false)
-            }) {
-                ctx.data_mut(|data| data.insert_temp(diagnostics_open_id(), false));
+    fn about_window(&mut self, ctx: &egui::Context, show_about: &mut bool, layout: &Layout) {
+        if !*show_about {
+            if ctx.data(|data| data.get_temp::<bool>(about_open_id()).unwrap_or(false)) {
+                ctx.data_mut(|data| data.insert_temp(about_open_id(), false));
             }
             return;
         }
-        let was_open = ctx.data(|data| {
-            data.get_temp::<bool>(diagnostics_open_id())
-                .unwrap_or(false)
-        });
+        let was_open = ctx.data(|data| data.get_temp::<bool>(about_open_id()).unwrap_or(false));
         if !was_open {
+            self.about_diagnostics_visible = false;
+            self.about_open_generation = self.about_open_generation.wrapping_add(1);
             ctx.data_mut(|data| {
                 data.remove::<Arc<DiagnosticsUiCache>>(diagnostics_cache_id(self.pane_id()));
             });
@@ -2156,27 +2152,85 @@ impl Workbench {
         let reason = sanitize_display(&reason_full, 320);
         let content = ctx.content_rect();
         let width = (content.width() - 64.0).clamp(440.0, 680.0);
-        let height = (content.height() - 64.0).clamp(340.0, 560.0);
-        let position = content.center() - egui::vec2(width / 2.0, height / 2.0);
-        let mut open = *show_diagnostics;
+        let mut open = *show_about;
         let mut copy_requested = false;
         let mut previous_copy_requested = false;
+        let mut detail_visible = self.about_diagnostics_visible;
+        let collapsed_height = 220.0;
+        let expanded_height = (content.height() - 48.0).max(360.0);
+        let reveal_id = egui::Id::unique((
+            "made-about-diagnostics-reveal",
+            self.pane_id(),
+            self.about_open_generation,
+        ));
+        let reveal = ctx.animate_bool_with_time_and_easing(
+            reveal_id,
+            self.about_diagnostics_visible,
+            ABOUT_REVEAL_TIME,
+            egui::emath::easing::quadratic_out,
+        );
+        let window_height = collapsed_height + (expanded_height - collapsed_height) * reveal;
 
-        egui::Window::new("Diagnostics")
-            .id(egui::Id::unique((
-                "made-diagnostics-window",
-                self.pane_id(),
-            )))
+        egui::Window::new("About")
+            .id(egui::Id::unique(("made-about-window", self.pane_id())))
             .open(&mut open)
-            .resizable(true)
+            .resizable(false)
+            .movable(false)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .fixed_size(egui::vec2(width, window_height))
             .collapsible(false)
-            .default_pos(position)
-            .default_size(egui::vec2(width, height))
-            .min_size(egui::vec2(420.0, 320.0))
-            .max_width(width)
-            .max_height(height)
             .frame(theme::floating_frame())
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    theme::wordmark_brand(ui);
+                    ui.label(theme::mono(
+                        format!("{APP_NAME} {APP_VERSION}"),
+                        10.5,
+                        theme::TEXT_TERTIARY,
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        let label = if detail_visible {
+                            "Hide diagnostics"
+                        } else {
+                            "Show diagnostics"
+                        };
+                        let toggle = if detail_visible {
+                            theme::primary_action(
+                                ui,
+                                about_diagnostics_toggle_id(&pane_id),
+                                label,
+                                layout.button_height,
+                                true,
+                                theme::BG_CARD,
+                            )
+                        } else {
+                            theme::secondary_action(
+                                ui,
+                                about_diagnostics_toggle_id(&pane_id),
+                                label,
+                                layout.button_height,
+                                true,
+                                theme::BG_CARD,
+                            )
+                        };
+                        toggle.response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::Role::Button, true, label)
+                        });
+                        if toggle.activated {
+                            detail_visible = !detail_visible;
+                        }
+                    });
+                });
+                ui.label(theme::body("Minimal Agentic Development Environment"));
+                ui.label(theme::micro(APP_DESCRIPTION));
+                ui.add_space(6.0);
+                if reveal <= 0.001 {
+                    let remaining = ui.available_height().max(0.0);
+                    ui.add_space(remaining);
+                    return;
+                }
+                ui.multiply_opacity(reveal);
+                ui.separator();
                 ui.horizontal(|ui| {
                     status_pill_ui(ui, snapshot.status, &reason_full, layout);
                     ui.label(theme::micro(&reason)).on_hover_text(&reason_full);
@@ -2223,9 +2277,10 @@ impl Workbench {
                     );
                 }
 
+                let detail_height = (ui.available_height() - 90.0).max(120.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .max_height((height - 150.0).max(120.0))
+                    .max_height(detail_height)
                     .show(ui, |ui| {
                         diagnostics_section(ui, "WORKSPACE");
                         diagnostics_rows(
@@ -2549,9 +2604,12 @@ impl Workbench {
                         }
                     });
                 });
+                let remaining = ui.available_height().max(0.0);
+                ui.add_space(remaining);
             });
 
-        *show_diagnostics = open;
+        *show_about = open;
+        self.about_diagnostics_visible = detail_visible;
         if previous_copy_requested {
             let mut clipboard = UiClipboard { ctx: ctx.clone() };
             if let Err(error) = self.diag.copy_previous_log_path(&mut clipboard) {
@@ -2565,7 +2623,7 @@ impl Workbench {
             let fresh = self.diagnostics_cache(ctx);
             ctx.copy_text(fresh.copy.clone());
         }
-        ctx.data_mut(|data| data.insert_temp(diagnostics_open_id(), open));
+        ctx.data_mut(|data| data.insert_temp(about_open_id(), open));
     }
 }
 

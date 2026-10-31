@@ -164,7 +164,7 @@ pub struct AppModel {
     start_generation: u64,
     reset_ui_focus: bool,
     show_sessions: bool,
-    show_diagnostics: bool,
+    show_about: bool,
     shutdown_done: bool,
     frame_count: u64,
     ui_frames: u64,
@@ -183,7 +183,7 @@ impl std::fmt::Debug for AppModel {
             .field("launch", &self.launch)
             .field("start_pending", &self.start_pending)
             .field("sessions_open", &self.show_sessions)
-            .field("diagnostics_open", &self.show_diagnostics)
+            .field("about_open", &self.show_about)
             .field("workspaces", &self.workspaces)
             .finish_non_exhaustive()
     }
@@ -232,7 +232,7 @@ impl AppModel {
             start_generation: 0,
             reset_ui_focus: false,
             show_sessions: false,
-            show_diagnostics: false,
+            show_about: false,
             shutdown_done: false,
             frame_count: 0,
             ui_frames: 0,
@@ -814,7 +814,7 @@ impl AppModel {
             return;
         }
         if ui::workspace_strip(self, ui) {
-            self.show_diagnostics = !self.show_diagnostics;
+            self.show_about = !self.show_about;
         }
         if self.is_picker() {
             return;
@@ -830,7 +830,7 @@ impl AppModel {
                 workbench.ui(
                     ui,
                     &mut self.show_sessions,
-                    &mut self.show_diagnostics,
+                    &mut self.show_about,
                     native_backdrop_applied,
                 )
             });
