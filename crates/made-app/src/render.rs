@@ -403,6 +403,16 @@ impl GridPalette {
         }
     }
 
+    /// RGB to report for one color query. Indexed slots use [`Self::indexed`].
+    pub(crate) fn reply_rgb(&self, query: made_terminal::QueriedColor) -> [u8; 3] {
+        match query {
+            made_terminal::QueriedColor::Foreground => self.foreground,
+            made_terminal::QueriedColor::Background => self.background,
+            made_terminal::QueriedColor::Cursor => self.cursor,
+            made_terminal::QueriedColor::Indexed(index) => self.indexed(index),
+        }
+    }
+
     /// Resolve a terminal color to RGB.
     pub fn resolve(&self, color: TerminalColor, default: [u8; 3]) -> [u8; 3] {
         match color {
@@ -803,58 +813,87 @@ pub fn paint_grid(
     let painter = painter.with_clip_rect(grid_rect);
     let font = FontId::monospace(options.font_size);
     let metrics = options.metrics;
+    let ppp = painter.pixels_per_point();
 
     for row in rows {
-        let y = origin.y + row.row as f32 * metrics.height;
-        if y + metrics.height < grid_rect.top() || y > grid_rect.bottom() {
+        let y = row_top(origin.y, row.row, metrics.height, ppp);
+        let next_y = row_top(origin.y, row.row + 1, metrics.height, ppp);
+        if next_y < grid_rect.top() || y > grid_rect.bottom() {
             continue;
         }
+        let row_origin = Pos2::new(origin.x, y);
         for run in &row.runs {
-            let rect = run.background_rect(Pos2::new(origin.x, y), metrics);
             if run.style.background != palette.background {
+                let mut rect = run.background_rect(row_origin, metrics);
+                rect.max.y = next_y;
                 painter.rect_filled(rect, 0.0, rgb(run.style.background));
             }
+        }
+        for run in &row.runs {
             if run.style.is_invisible(&run.text) {
                 continue;
             }
-
             let color = rgb(run.style.foreground);
             let spans = cell_glyphs::layout_spans(run.start_col, run.cells, &run.text, run.wide);
             for span in &spans {
-                let span_rect = Rect::from_min_size(
-                    Pos2::new(origin.x + span.col() as f32 * metrics.width, y),
-                    Vec2::new(span.cols() as f32 * metrics.width, metrics.height),
-                );
                 match span {
                     Span::Graphic { graphic, .. } => {
+                        let span_rect = Rect::from_min_size(
+                            Pos2::new(origin.x + span.col() as f32 * metrics.width, y),
+                            Vec2::new(span.cols() as f32 * metrics.width, metrics.height),
+                        );
                         cell_glyphs::paint_graphic(
                             &painter,
                             span_rect,
+                            cell_glyphs::GlyphGrid {
+                                origin,
+                                col: span.col(),
+                                row: row.row,
+                                cols: span.cols(),
+                                width: metrics.width,
+                                height: metrics.height,
+                            },
                             *graphic,
                             color,
                             rgb(run.style.background),
                         );
                     }
-                    Span::Text { start, end, .. } => {
-                        let text_painter = painter.with_clip_rect(span_rect);
-                        let text_pos = Pos2::new(span_rect.left(), y);
+                    Span::Text {
+                        start, end, col, ..
+                    } => {
+                        // No per-run clip. Backgrounds for this row are already
+                        // filled, so a later highlight cannot cover this edge.
                         let text = &run.text[*start..*end];
-                        text_painter.text(text_pos, Align2::LEFT_TOP, text, font.clone(), color);
-                        if run.style.bold {
-                            // egui's bundled monospace face has one weight; a
-                            // sub-pixel overdraw is the documented synthetic-bold
-                            // fallback. The span clip keeps it in these cells.
-                            text_painter.text(
-                                text_pos + Vec2::new(0.6, 0.0),
-                                Align2::LEFT_TOP,
-                                text,
-                                font.clone(),
-                                color,
-                            );
+                        let bold = synthetic_bold_offset(span, run.style.bold);
+                        for (range, x) in
+                            text_glyph_places(origin.x, *col, text, run.wide, metrics.width, ppp)
+                        {
+                            let pos = Pos2::new(x, y);
+                            let glyph = &text[range];
+                            painter.text(pos, Align2::LEFT_TOP, glyph, font.clone(), color);
+                            if let Some(offset) = bold {
+                                painter.text(
+                                    pos + offset,
+                                    Align2::LEFT_TOP,
+                                    glyph,
+                                    font.clone(),
+                                    color,
+                                );
+                            }
                         }
                     }
                 }
             }
+        }
+        for run in &row.runs {
+            if run.style.is_invisible(&run.text) {
+                continue;
+            }
+            if !run.style.underline && !run.style.strikethrough {
+                continue;
+            }
+            let rect = run.background_rect(row_origin, metrics);
+            let color = rgb(run.style.foreground);
             if run.style.underline {
                 let line_y = y + metrics.height - 1.5;
                 painter.line_segment(
@@ -881,7 +920,7 @@ pub fn paint_grid(
     if cursor_painted(cursor, options) {
         let cursor_pos = Pos2::new(
             origin.x + cursor.col as f32 * metrics.width,
-            origin.y + cursor.row as f32 * metrics.height,
+            row_top(origin.y, cursor.row, metrics.height, ppp),
         );
         let cursor_rect = Rect::from_min_size(cursor_pos, Vec2::new(metrics.width, metrics.height));
         let color = rgb(palette.cursor);
@@ -925,6 +964,54 @@ pub fn paint_grid(
                 egui::StrokeKind::Inside,
             );
         }
+    }
+}
+
+/// Device-pixel top of a row. Same snap as a column edge.
+fn row_top(origin_y: f32, row: usize, cell_height: f32, pixels_per_point: f32) -> f32 {
+    cell_glyphs::grid_edge(origin_y, row as f32, cell_height, pixels_per_point)
+}
+
+/// Where each font glyph is drawn. A narrow character's x is the device-pixel
+/// edge of its own column, so a background split cannot move it.
+fn text_glyph_places(
+    origin_x: f32,
+    start_col: usize,
+    text: &str,
+    wide: bool,
+    cell_width: f32,
+    pixels_per_point: f32,
+) -> Vec<(std::ops::Range<usize>, f32)> {
+    let x_at =
+        |col: usize| cell_glyphs::grid_edge(origin_x, col as f32, cell_width, pixels_per_point);
+    if wide {
+        return vec![(0..text.len(), x_at(start_col))];
+    }
+    let mut places = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    let mut col = start_col;
+    while let Some((index, ch)) = chars.next() {
+        let mut end = index + ch.len_utf8();
+        while let Some(&(next_index, next)) = chars.peek() {
+            if !cell_glyphs::is_attached(next) {
+                break;
+            }
+            chars.next();
+            end = next_index + next.len_utf8();
+        }
+        places.push((index..end, x_at(col)));
+        col += 1;
+    }
+    places
+}
+
+/// Second draw for synthetic bold. Geometric marks return none so a 1px
+/// square is not drawn twice 0.6px apart.
+fn synthetic_bold_offset(span: &Span, bold: bool) -> Option<Vec2> {
+    if bold && matches!(span, Span::Text { .. }) {
+        Some(Vec2::new(0.6, 0.0))
+    } else {
+        None
     }
 }
 
@@ -1138,6 +1225,147 @@ mod tests {
         assert_eq!(runs[1].text, "b");
         assert!(runs[1].style.selected);
         assert_eq!(runs[1].style.background, palette.selection_background);
+    }
+
+    #[test]
+    fn opencode_spinner_row_keeps_sent_rgb_and_square_marks() {
+        use crate::cell_glyphs::{layout_spans, Graphic, Span};
+        use made_terminal::{TerminalCore, TerminalSize};
+
+        let palette = GridPalette::default();
+        let mut core = TerminalCore::with_size(TerminalSize { rows: 2, cols: 8 }, 100);
+        // Vivid secondary blue, then the muted grays a terminal that answered
+        // OSC 10/11 would already have blended. Neither is remapped.
+        let bytes = "\u{1b}[38;2;92;156;245m■\u{1b}[38;2;100;111;127m■\u{1b}[38;2;113;121;134m⬝\u{1b}[1;38;2;99;125;161m⬝";
+        core.feed(bytes.as_bytes());
+        let snapshot = core.snapshot();
+        let expect = [
+            ('■', [92, 156, 245], false),
+            ('■', [100, 111, 127], false),
+            ('⬝', [113, 121, 134], false),
+            ('⬝', [99, 125, 161], true),
+        ];
+        for (col, (ch, rgb, bold)) in expect.into_iter().enumerate() {
+            let cell = snapshot.cell(0, col).expect("spinner cell");
+            assert_eq!(cell.ch, ch);
+            assert!(!cell.wide, "spinner marks occupy one cell");
+            assert_eq!(cell.fg, TerminalColor::Rgb(rgb[0], rgb[1], rgb[2]));
+            assert_eq!(cell.attributes.bold, bold);
+            let style = palette.cell_style(cell, cell.attributes, false);
+            assert_eq!(
+                style.foreground, rgb,
+                "truecolor must reach the painter unchanged"
+            );
+            assert_ne!(style.foreground, palette.ansi[4]);
+            let text = cell.text();
+            let spans = layout_spans(0, 1, &text, false);
+            assert_eq!(spans.len(), 1, "one mark per cell");
+            assert!(
+                matches!(
+                    spans[0],
+                    Span::Graphic {
+                        graphic: Graphic::Square(_),
+                        ..
+                    }
+                ),
+                "font text is what fragments ⬝ and overflows ■"
+            );
+            assert_eq!(
+                synthetic_bold_offset(&spans[0], style.bold),
+                None,
+                "a geometric square must not be drawn twice"
+            );
+        }
+    }
+
+    #[test]
+    fn color_queries_use_the_palette_the_grid_paints() {
+        use made_terminal::{TerminalCore, TerminalSize};
+
+        let palette = crate::theme::terminal_palette();
+        let mut core = TerminalCore::with_size(TerminalSize { rows: 2, cols: 8 }, 100);
+        core.feed(
+            b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x1b\\\x1b]4;8;?\x07\x1b]4;21;?\x07\x1b]4;244;?\x07",
+        );
+        let replies = String::from_utf8(core.take_replies(|query| palette.reply_rgb(query)))
+            .expect("reply bytes");
+
+        let osc = |prefix: &str, rgb: [u8; 3], terminator: &str| {
+            format!(
+                "\u{1b}]{prefix};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}{terminator}",
+                rgb[0], rgb[0], rgb[1], rgb[1], rgb[2], rgb[2]
+            )
+        };
+        let expect = format!(
+            "{}{}{}{}{}{}",
+            osc("10", palette.foreground, "\u{7}"),
+            osc("11", palette.background, "\u{7}"),
+            osc("12", palette.cursor, "\u{1b}\\"),
+            osc("4;8", palette.indexed(8), "\u{7}"),
+            osc("4;21", palette.indexed(21), "\u{7}"),
+            osc("4;244", palette.indexed(244), "\u{7}"),
+        );
+        assert_eq!(replies, expect);
+    }
+
+    #[test]
+    fn row_origin_snaps_to_the_device_pixel() {
+        let origin_y = 3.7;
+        let height = 17.3;
+        let ppp = 2.0;
+        assert_eq!(row_top(origin_y, 0, height, ppp), 3.5);
+        assert_ne!(row_top(origin_y, 0, height, ppp), origin_y);
+        assert_eq!(row_top(origin_y, 2, height, ppp), 38.5);
+        assert_ne!(row_top(origin_y, 2, height, ppp), origin_y + 2.0 * height);
+        assert_eq!(
+            row_top(origin_y, 1, height, ppp),
+            cell_glyphs::grid_edge(origin_y, 1.0, height, ppp)
+        );
+    }
+
+    #[test]
+    fn narrow_glyph_x_depends_only_on_its_column() {
+        let origin_x = 10.2;
+        let width = 8.4;
+        let ppp = 2.0;
+        let alone = text_glyph_places(origin_x, 3, "c", false, width, ppp);
+        let run = text_glyph_places(origin_x, 1, "abc", false, width, ppp);
+        let expected = ((origin_x + 3.0 * width) * ppp).round() / ppp;
+        assert_eq!(alone.len(), 1);
+        assert_eq!(run.len(), 3);
+        assert_eq!(alone[0].1, expected);
+        assert_eq!(run[2].1, expected);
+        let from_run_start = ((origin_x + width) * ppp).round() / ppp + 2.0 * width;
+        assert_ne!(run[2].1, from_run_start);
+
+        let wide = text_glyph_places(origin_x, 2, "界", true, width, ppp);
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].0, 0.."界".len());
+        assert_eq!(wide[0].1, ((origin_x + 2.0 * width) * ppp).round() / ppp);
+
+        let marked = text_glyph_places(origin_x, 0, "a\u{0301}b", false, width, ppp);
+        assert_eq!(marked.len(), 2);
+        assert_eq!(marked[0].0, 0.."a\u{0301}".len());
+        assert_eq!(marked[1].1, ((origin_x + width) * ppp).round() / ppp);
+
+        let voiced = text_glyph_places(origin_x, 0, "a\u{3099}b", false, width, ppp);
+        assert_eq!(voiced.len(), 2);
+        assert_eq!(voiced[0].0, 0.."a\u{3099}".len());
+        assert_eq!(voiced[0].1, marked[0].1);
+        assert_eq!(voiced[1].1, ((origin_x + width) * ppp).round() / ppp);
+
+        assert!(cell_glyphs::is_attached('\u{3099}'));
+        assert!(cell_glyphs::is_attached('\u{309A}'));
+        let one_cell = cell_glyphs::layout_spans(0, 1, "か\u{3099}", false);
+        assert_eq!(one_cell.len(), 1);
+        assert_eq!(one_cell[0].cols(), 1);
+        let Span::Text { start, end, .. } = &one_cell[0] else {
+            panic!("dakuten stays on the base character");
+        };
+        assert!("か\u{3099}"[*start..*end].contains('\u{3099}'));
+        let with_next = cell_glyphs::layout_spans(0, 2, "か\u{3099}b", false);
+        assert_eq!(with_next.len(), 1);
+        assert_eq!(with_next[0].cols(), 2);
     }
 
     #[test]

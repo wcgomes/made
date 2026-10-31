@@ -2,7 +2,7 @@
 //! title, OSC 7 cwd, Unicode width, damage, resize, and selection/copy.
 
 use made_platform::{Clipboard, InMemoryClipboard};
-use made_terminal::{CellSnapshot, TerminalColor, TerminalCore, TerminalSize};
+use made_terminal::{CellSnapshot, QueriedColor, TerminalColor, TerminalCore, TerminalSize};
 
 fn terminal(rows: usize, cols: usize) -> TerminalCore {
     TerminalCore::with_size(TerminalSize { rows, cols }, 200)
@@ -201,7 +201,29 @@ fn bell_and_replies_are_surfaced_without_ui_state() {
 
     // Device status report (DSR 5) makes the emulator request a reply.
     core.feed(b"\x1b[5n");
-    assert!(!core.take_replies().is_empty());
+    assert!(!core.take_replies(|_| [0, 0, 0]).is_empty());
+}
+
+#[test]
+fn color_queries_encode_the_rgb_the_caller_supplies() {
+    let mut core = terminal(4, 20);
+    core.feed(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x1b\\\x1b]4;8;?\x07");
+    let replies = String::from_utf8(core.take_replies(|query| match query {
+        QueriedColor::Foreground => [1, 2, 3],
+        QueriedColor::Background => [4, 5, 6],
+        QueriedColor::Cursor => [7, 8, 9],
+        QueriedColor::Indexed(8) => [10, 11, 12],
+        QueriedColor::Indexed(_) => [0, 0, 0],
+    }))
+    .expect("reply bytes");
+    assert_eq!(
+        replies,
+        "\u{1b}]10;rgb:0101/0202/0303\u{7}\
+         \u{1b}]11;rgb:0404/0505/0606\u{7}\
+         \u{1b}]12;rgb:0707/0808/0909\u{1b}\\\
+         \u{1b}]4;8;rgb:0a0a/0b0b/0c0c\u{7}"
+    );
+    assert!(core.take_replies(|_| [0, 0, 0]).is_empty());
 }
 
 #[test]

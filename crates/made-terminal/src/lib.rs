@@ -43,7 +43,7 @@ pub mod pty;
 
 pub use emulation::{
     CellAttributes, CellSnapshot, CursorShape, CursorSnapshot, DamageLine, LineSnapshot,
-    TerminalColor, TerminalCore, TerminalDamage, TerminalSize, TerminalSnapshot,
+    QueriedColor, TerminalColor, TerminalCore, TerminalDamage, TerminalSize, TerminalSnapshot,
 };
 pub use input::{
     InputEncoder, InputModes, Key, Modifiers, MouseButton, MouseEvent, MouseEventKind, MouseMode,
