@@ -461,7 +461,8 @@ impl TerminalPane {
             }
         }
 
-        let replies = self.core.take_replies();
+        let palette = self.palette;
+        let replies = self.core.take_replies(|query| palette.reply_rgb(query));
         if !replies.is_empty() {
             self.write(&replies, log);
         }

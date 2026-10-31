@@ -35,7 +35,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell as VtCell, Flags as VtFlags};
 use alacritty_terminal::term::{Config as VtConfig, RenderableCursor, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color as VtColor, CursorShape as VtCursorShape, NamedColor, Processor,
+    Color as VtColor, CursorShape as VtCursorShape, NamedColor, Processor, Rgb,
 };
 
 use made_platform::{Clipboard, PlatformError};
@@ -505,10 +505,25 @@ impl TerminalCore {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Take VT replies (device attributes, mode reports, size reports) that
-    /// must be written back to the PTY.
-    pub fn take_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.listener_state_mut().replies)
+    /// Take VT replies (device attributes, mode reports, size reports, color
+    /// queries) that must be written back to the PTY.
+    ///
+    /// `color` is the palette the caller paints. OSC 10/11/12 and OSC 4 are
+    /// wrapped with those RGB values; this core has no palette of its own.
+    pub fn take_replies(&mut self, color: impl Fn(QueriedColor) -> [u8; 3]) -> Vec<u8> {
+        let pieces = std::mem::take(&mut self.listener_state_mut().replies);
+        let mut out = Vec::new();
+        for piece in pieces {
+            match piece {
+                Reply::Bytes(bytes) => out.extend_from_slice(&bytes),
+                Reply::Color(index, format) => {
+                    let [r, g, b] = color(queried_color(index));
+                    let reply = format(Rgb { r, g, b });
+                    out.extend_from_slice(reply.as_bytes());
+                }
+            }
+        }
+        out
     }
 
     /// Take and clear the bell flag.
@@ -751,10 +766,42 @@ impl VtDimensions for VtSize {
     }
 }
 
+/// Which painted color an OSC 10/11/12 or OSC 4 query is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueriedColor {
+    /// OSC 10, the default foreground.
+    Foreground,
+    /// OSC 11, the default background.
+    Background,
+    /// OSC 12, the cursor color.
+    Cursor,
+    /// OSC 4, an indexed palette slot. 0–15 are ANSI, 16–255 the cube and ramp.
+    Indexed(u8),
+}
+
+fn queried_color(index: usize) -> QueriedColor {
+    if index == NamedColor::Foreground as usize {
+        QueriedColor::Foreground
+    } else if index == NamedColor::Background as usize {
+        QueriedColor::Background
+    } else if index == NamedColor::Cursor as usize {
+        QueriedColor::Cursor
+    } else if let Ok(index) = u8::try_from(index) {
+        QueriedColor::Indexed(index)
+    } else {
+        QueriedColor::Foreground
+    }
+}
+
+enum Reply {
+    Bytes(Vec<u8>),
+    Color(usize, Arc<dyn Fn(Rgb) -> String + Send + Sync + 'static>),
+}
+
 #[derive(Default)]
 struct ListenerState {
     title: Option<String>,
-    replies: Vec<u8>,
+    replies: Vec<Reply>,
     bell: bool,
 }
 
@@ -769,7 +816,10 @@ impl EventListener for CoreListener {
             Event::Title(title) => state.title = Some(title),
             Event::ResetTitle => state.title = None,
             Event::Bell => state.bell = true,
-            Event::PtyWrite(text) => state.replies.extend_from_slice(text.as_bytes()),
+            Event::PtyWrite(text) => state.replies.push(Reply::Bytes(text.into_bytes())),
+            Event::ColorRequest(index, format) => {
+                state.replies.push(Reply::Color(index, format));
+            }
             _ => {}
         }
     }

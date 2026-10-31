@@ -1,9 +1,9 @@
 //! Cell geometry for terminal chrome.
 //!
-//! Box drawing, block elements, braille, and dingbat crosses are drawn to the
-//! cell instead of the monospace font. Font glyphs for those ranges overflow
-//! the cell on the bundled face and on macOS fallback fonts, which turns
-//! braille art into a solid rectangle and lets a border cover the next letter.
+//! Box drawing, block elements, braille, dingbat crosses, and the OpenCode
+//! spinner squares (U+25A0, U+2B1D) are drawn to the cell instead of the
+//! monospace font. Font glyphs for those ranges overflow the cell or shatter
+//! a one-pixel mark on the bundled face and on macOS fallback fonts.
 
 use eframe::egui::{self, pos2, vec2, Color32, Painter, Pos2, Rect, Stroke};
 
@@ -61,6 +61,9 @@ pub(crate) enum Graphic {
     Shade(f32),
     /// Inset X for dingbat crosses such as U+2715, the session-tab close mark.
     Cross,
+    /// One centered solid square. `scale` is the side as a fraction of the
+    /// shorter cell edge, so the mark stays square in pixels inside a tall cell.
+    Square(f32),
 }
 
 /// Up to three axis-aligned pieces of a block element.
@@ -217,10 +220,31 @@ fn span_for(col: usize, cols: usize, start: usize, end: usize, graphic: Option<G
     }
 }
 
+/// Grid placement for a glyph. Block edges use `origin + index * size`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GlyphGrid {
+    /// Top-left of cell (0, 0), in logical points.
+    pub origin: Pos2,
+    /// First column of this glyph.
+    pub col: usize,
+    /// Row of this glyph.
+    pub row: usize,
+    /// Columns the glyph occupies.
+    pub cols: usize,
+    /// Width of one column, in logical points.
+    pub width: f32,
+    /// Height of one row, in logical points.
+    pub height: f32,
+}
+
 /// Draw one geometric glyph inside `rect`.
+///
+/// `rect` is the logical span for font-like marks. Block and shade edges ignore
+/// it and use [`GlyphGrid`], so a neighbor's shared border is the same pixel.
 pub(crate) fn paint_graphic(
     painter: &Painter,
     rect: Rect,
+    grid: GlyphGrid,
     graphic: Graphic,
     fg: Color32,
     bg: Color32,
@@ -234,18 +258,41 @@ pub(crate) fn paint_graphic(
             let painter = painter.with_clip_rect(rect.expand(0.75));
             paint_box(&painter, rect, draw, fg, bg);
         }
-        Graphic::Fill(fill) => paint_fill(painter, rect, fill, fg),
+        Graphic::Fill(fill) => paint_fill(painter, grid, fill, fg),
         Graphic::Shade(alpha) => {
-            painter.rect_filled(rect, 0.0, fg.gamma_multiply(alpha.clamp(0.0, 1.0)));
+            let ppp = painter.pixels_per_point();
+            painter.rect_filled(
+                fill_piece_rect(grid, FULL_CELL, ppp),
+                0.0,
+                fg.gamma_multiply(alpha.clamp(0.0, 1.0)),
+            );
         }
         Graphic::Cross => {
             let painter = painter.with_clip_rect(rect);
             paint_cross(&painter, rect, fg);
         }
+        Graphic::Square(scale) => {
+            let ppp = painter.pixels_per_point();
+            let painter = painter.with_clip_rect(snap_rect(rect, ppp));
+            painter.rect_filled(snap_rect(centered_square(rect, scale), ppp), 0.0, fg);
+        }
     }
 }
 
+/// Side of U+25A0 as a fraction of the shorter cell edge.
+const BLACK_SQUARE_SCALE: f32 = 0.88;
+/// Side of U+2B1D as a fraction of the shorter cell edge.
+const TINY_SQUARE_SCALE: f32 = 1.0 / 3.0;
+
+fn centered_square(rect: Rect, scale: f32) -> Rect {
+    let side = rect.width().min(rect.height()) * scale;
+    Rect::from_center_size(rect.center(), vec2(side, side))
+}
+
 fn classify(ch: char) -> Option<Graphic> {
+    if let Some(square) = spinner_square(ch) {
+        return Some(square);
+    }
     if let Some(bits) = braille_bits(ch) {
         return Some(Graphic::Braille(bits));
     }
@@ -256,6 +303,14 @@ fn classify(ch: char) -> Option<Graphic> {
         return Some(Graphic::Box(draw));
     }
     block_graphic(ch)
+}
+
+fn spinner_square(ch: char) -> Option<Graphic> {
+    match ch {
+        '\u{25A0}' => Some(Graphic::Square(BLACK_SQUARE_SCALE)),
+        '\u{2B1D}' => Some(Graphic::Square(TINY_SQUARE_SCALE)),
+        _ => None,
+    }
 }
 
 /// Dingbat crosses. The bundled monospace face has U+00D7 but not these, so a
@@ -285,7 +340,7 @@ fn braille_bits(ch: char) -> Option<u8> {
     }
 }
 
-fn is_attached(ch: char) -> bool {
+pub(crate) fn is_attached(ch: char) -> bool {
     matches!(
         ch,
         '\u{0300}'..='\u{036F}'
@@ -295,6 +350,8 @@ fn is_attached(ch: char) -> bool {
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{FE20}'..='\u{FE2F}'
             | '\u{200D}'
+            | '\u{3099}'
+            | '\u{309A}'
     )
 }
 
@@ -304,7 +361,7 @@ fn paint_braille(painter: &Painter, rect: Rect, bits: u8, fg: Color32) {
     }
     let slot_w = rect.width() / 2.0;
     let slot_h = rect.height() / 4.0;
-    let radius = slot_w.min(slot_h) * 0.36;
+    let radius = braille_radius(slot_w, slot_h);
     if radius < 0.2 {
         return;
     }
@@ -331,31 +388,82 @@ fn paint_braille(painter: &Painter, rect: Rect, bits: u8, fg: Color32) {
     }
 }
 
-fn paint_fill(painter: &Painter, rect: Rect, fill: Fill, fg: Color32) {
-    let grow = 0.3;
-    let painter = painter.with_clip_rect(rect.expand(grow));
+/// Radius as a fraction of the smaller slot. Half the center spacing, so the
+/// edge gap is at least the diameter and antialiasing does not join the dots.
+fn braille_radius(slot_w: f32, slot_h: f32) -> f32 {
+    slot_w.min(slot_h) * 0.25
+}
+
+fn paint_fill(painter: &Painter, grid: GlyphGrid, fill: Fill, fg: Color32) {
+    let ppp = painter.pixels_per_point();
     for unit in fill.rects() {
-        let mut piece = Rect::from_min_size(
-            pos2(
-                rect.left() + rect.width() * unit.x,
-                rect.top() + rect.height() * unit.y,
-            ),
-            vec2(rect.width() * unit.w, rect.height() * unit.h),
-        );
-        if unit.x <= 0.001 {
-            piece.min.x -= grow;
-        }
-        if unit.y <= 0.001 {
-            piece.min.y -= grow;
-        }
-        if unit.x + unit.w >= 0.999 {
-            piece.max.x += grow;
-        }
-        if unit.y + unit.h >= 0.999 {
-            piece.max.y += grow;
-        }
-        painter.rect_filled(piece, 0.0, fg);
+        painter.rect_filled(fill_piece_rect(grid, *unit, ppp), 0.0, fg);
     }
+}
+
+const FULL_CELL: UnitRect = UnitRect {
+    x: 0.0,
+    y: 0.0,
+    w: 1.0,
+    h: 1.0,
+};
+
+/// Snap `origin + index * size` onto a physical pixel.
+fn snap_device_px(logical: f32, pixels_per_point: f32) -> f32 {
+    (logical * pixels_per_point).round() / pixels_per_point
+}
+
+pub(crate) fn grid_edge(origin: f32, index: f32, size: f32, pixels_per_point: f32) -> f32 {
+    snap_device_px(origin + index * size, pixels_per_point)
+}
+
+fn snap_rect(rect: Rect, pixels_per_point: f32) -> Rect {
+    Rect::from_min_max(
+        pos2(
+            snap_device_px(rect.min.x, pixels_per_point),
+            snap_device_px(rect.min.y, pixels_per_point),
+        ),
+        pos2(
+            snap_device_px(rect.max.x, pixels_per_point),
+            snap_device_px(rect.max.y, pixels_per_point),
+        ),
+    )
+}
+
+/// One block piece. The border index is `col + fraction`, not `left + width`,
+/// because those two f32 sums can round a device pixel apart.
+fn fill_piece_rect(grid: GlyphGrid, unit: UnitRect, pixels_per_point: f32) -> Rect {
+    let span = grid.cols as f32;
+    Rect::from_min_max(
+        pos2(
+            grid_edge(
+                grid.origin.x,
+                grid.col as f32 + unit.x * span,
+                grid.width,
+                pixels_per_point,
+            ),
+            grid_edge(
+                grid.origin.y,
+                grid.row as f32 + unit.y,
+                grid.height,
+                pixels_per_point,
+            ),
+        ),
+        pos2(
+            grid_edge(
+                grid.origin.x,
+                grid.col as f32 + (unit.x + unit.w) * span,
+                grid.width,
+                pixels_per_point,
+            ),
+            grid_edge(
+                grid.origin.y,
+                grid.row as f32 + unit.y + unit.h,
+                grid.height,
+                pixels_per_point,
+            ),
+        ),
+    )
 }
 
 fn paint_box(painter: &Painter, rect: Rect, draw: BoxDraw, fg: Color32, bg: Color32) {
@@ -983,6 +1091,45 @@ mod tests {
         }
     }
 
+    fn at(origin: Pos2, col: usize, row: usize, width: f32, height: f32) -> GlyphGrid {
+        GlyphGrid {
+            origin,
+            col,
+            row,
+            cols: 1,
+            width,
+            height,
+        }
+    }
+
+    fn painted_piece(grid: GlyphGrid, ch: char, pixels_per_point: f32) -> Rect {
+        let fill = fill_of(ch);
+        assert_eq!(fill.rects().len(), 1, "{ch} is one rectangle");
+        fill_piece_rect(grid, fill.rects()[0], pixels_per_point)
+    }
+
+    #[test]
+    fn braille_dots_keep_a_gap_of_at_least_one_diameter() {
+        let cell = Rect::from_min_size(pos2(0.0, 0.0), vec2(8.0, 16.0));
+        let slot_w = cell.width() / 2.0;
+        let slot_h = cell.height() / 4.0;
+        let radius = braille_radius(slot_w, slot_h);
+        let diameter = radius * 2.0;
+        assert!(radius <= slot_w.min(slot_h) * 0.25);
+        let center = |col: f32, row: f32| {
+            pos2(
+                cell.left() + (col + 0.5) * slot_w,
+                cell.top() + (row + 0.5) * slot_h,
+            )
+        };
+        let dot1 = center(0.0, 0.0);
+        let dot2 = center(0.0, 1.0);
+        let dot4 = center(1.0, 0.0);
+        let gap = |a: Pos2, b: Pos2| (a - b).length() - diameter;
+        assert!(gap(dot1, dot2) >= diameter);
+        assert!(gap(dot1, dot4) >= diameter);
+    }
+
     #[test]
     fn braille_blank_full_and_open_center() {
         assert_eq!(braille_bits('\u{2800}'), Some(0));
@@ -1101,6 +1248,137 @@ mod tests {
                 matches!(classify(ch), Some(Graphic::Braille(_))),
                 "U+{code:04X} missing"
             );
+        }
+    }
+
+    #[test]
+    fn opencode_spinner_squares_are_one_centered_mark() {
+        let cell = Rect::from_min_size(pos2(0.0, 0.0), vec2(8.0, 16.0));
+        let next = cell.translate(vec2(cell.width(), 0.0));
+        let black = centered_square(cell, BLACK_SQUARE_SCALE);
+        let neighbor = centered_square(next, BLACK_SQUARE_SCALE);
+        let tiny = centered_square(cell, TINY_SQUARE_SCALE);
+        let shorter = cell.width().min(cell.height());
+
+        let Some(Graphic::Square(scale)) = classify('■') else {
+            panic!("U+25A0 is a square");
+        };
+        assert!(near(scale, 0.88));
+        assert!(near(black.width(), shorter * 0.88));
+        assert!(matches!(
+            classify('⬝'),
+            Some(Graphic::Square(scale)) if near(scale, TINY_SQUARE_SCALE)
+        ));
+
+        let spans = layout_spans(0, 2, "■⬝", false);
+        assert_eq!(spans.len(), 2);
+        assert!(matches!(
+            spans[0],
+            Span::Graphic {
+                cols: 1,
+                graphic: Graphic::Square(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            spans[1],
+            Span::Graphic {
+                cols: 1,
+                graphic: Graphic::Square(_),
+                ..
+            }
+        ));
+
+        assert!(near(black.width(), black.height()));
+        assert!(near(tiny.width(), tiny.height()));
+        assert!(near(tiny.width() / shorter, 1.0 / 3.0));
+        assert!(black.min.x >= cell.min.x && black.max.x <= cell.max.x);
+        assert!(black.min.y >= cell.min.y && black.max.y <= cell.max.y);
+        assert!(tiny.min.x >= cell.min.x && tiny.max.x <= cell.max.x);
+        assert!(tiny.min.y >= cell.min.y && tiny.max.y <= cell.max.y);
+        assert!(near(black.center().x, cell.center().x));
+        assert!(near(black.center().y, cell.center().y));
+        assert!(near(tiny.center().x, cell.center().x));
+        assert!(near(tiny.center().y, cell.center().y));
+        let gap = neighbor.min.x - black.max.x;
+        assert!(
+            gap >= 0.0,
+            "a black square must not cross into the next cell"
+        );
+        assert!(
+            gap < black.width() * 0.25,
+            "adjacent black squares should read as one bar, gap {gap}"
+        );
+    }
+
+    #[test]
+    fn block_edges_share_one_device_pixel() {
+        let ppp = 1.5;
+        let width = 8.4;
+        let height = 17.3;
+        let origin = pos2(10.2, 3.7);
+        let piece = |col: usize, row: usize, ch: char| {
+            painted_piece(at(origin, col, row, width, height), ch, ppp)
+        };
+        let border =
+            |index: f32, size: f32, start: f32| ((start + index * size) * ppp).round() / ppp;
+
+        for col in 0..6 {
+            let left = piece(col, 0, '█');
+            let right = piece(col + 1, 0, '█');
+            let shared = border((col + 1) as f32, width, origin.x);
+            assert_eq!(left.max.x, right.min.x, "column {col}");
+            assert_eq!(left.max.x, shared, "column {col}");
+        }
+
+        // (origin + col * size) + size is not origin + (col + 1) * size.
+        // At column 1 that gap used to snap to two device pixels.
+        let stale = (((origin.x + width) + width) * ppp).round() / ppp;
+        let shared = border(2.0, width, origin.x);
+        assert_ne!(stale, shared);
+        assert_eq!(piece(1, 0, '█').max.x, shared);
+        assert_eq!(piece(2, 0, '█').min.x, shared);
+
+        let shade = fill_piece_rect(at(origin, 1, 0, width, height), FULL_CELL, ppp);
+        assert_eq!(shade, piece(1, 0, '█'));
+        assert_eq!(shade.max.x, piece(2, 0, '█').min.x);
+
+        let left_half = piece(1, 0, '▀');
+        let right_half = piece(2, 0, '▀');
+        assert_eq!(left_half.max.x, right_half.min.x);
+
+        let left_quad = piece(1, 0, '▝');
+        let right_quad = piece(2, 0, '▘');
+        assert_eq!(left_quad.max.x, right_quad.min.x);
+
+        let upper = piece(0, 0, '▀');
+        let lower = piece(0, 0, '▄');
+        let mid = border(0.5, height, origin.y);
+        assert_eq!(upper.max.y, lower.min.y);
+        assert_eq!(upper.max.y, mid);
+
+        let below = piece(0, 1, '▀');
+        assert_eq!(lower.max.y, below.min.y);
+        assert_eq!(lower.max.y, border(1.0, height, origin.y));
+    }
+
+    #[test]
+    fn spinner_square_edges_snap_without_changing_scale() {
+        let cell = Rect::from_min_size(pos2(10.2, 3.7), vec2(8.4, 17.3));
+        let ppp = 2.0;
+        let shorter = cell.width().min(cell.height());
+        let black = centered_square(cell, BLACK_SQUARE_SCALE);
+        let tiny = centered_square(cell, TINY_SQUARE_SCALE);
+        assert!(near(black.width(), shorter * 0.88));
+        assert!(near(tiny.width(), shorter / 3.0));
+        for square in [snap_rect(black, ppp), snap_rect(tiny, ppp)] {
+            for edge in [square.min.x, square.max.x, square.min.y, square.max.y] {
+                let px = edge * ppp;
+                assert!(
+                    (px - px.round()).abs() < 1e-4,
+                    "spinner edge {edge} is off the device grid"
+                );
+            }
         }
     }
 
