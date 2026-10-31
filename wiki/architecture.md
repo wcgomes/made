@@ -1,6 +1,6 @@
 # Architecture
 
-Made is a native Rust desktop application built on eframe/egui with one window and independent workspace tabs. Each tab is a live shell plus explorer; OpenCode v2 is an optional enhancement started by the user. This page describes the implemented structure and ownership boundaries. Product requirements stay in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); UI requirements stay in [`specs/made-ui-ux.md`](../specs/made-ui-ux.md) plus the active delta [`specs/changes/explorer-git-view/spec.md`](../specs/changes/explorer-git-view/spec.md).
+Made is a native Rust desktop application built on eframe/egui with one window and independent workspace tabs. Each tab is a live shell plus explorer; OpenCode v2 is an optional enhancement started by the user. This page describes the implemented structure and ownership boundaries. Product requirements stay in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); UI requirements stay in [`specs/made-ui-ux.md`](../specs/made-ui-ux.md). The explorer git view delta is archived at [`specs/changes/archive/20261031-explorer-git-view/spec.md`](../specs/changes/archive/20261031-explorer-git-view/spec.md).
 
 ## Crate map
 

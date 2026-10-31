@@ -831,6 +831,8 @@ pub enum IconGlyph {
     Terminal,
     /// Branch with three nodes: read-only source control.
     SourceControl,
+    /// Two offset rounded sheets: the file tree, beside source control.
+    Folders,
     /// Forked chevrons: linked-worktree mark in the REPOS header.
     LinkedWorktree,
 }
@@ -846,6 +848,20 @@ pub fn icon_action_extent(height: f32) -> f32 {
     height.max(24.0)
 }
 
+/// Optional colors for the three source-control rings.
+///
+/// `None` keeps the icon's current color, including hover and selected.
+/// The stem and curve are not part of this and always use that color.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SourceControlRings {
+    /// Highest ring, about y=-4.25. New changes use [`SUCCESS`].
+    pub highest: Option<Color32>,
+    /// Vertically middle ring, the branch tip. Modified changes use [`WARNING`].
+    pub middle: Option<Color32>,
+    /// Lowest ring, about y=4.25. Deleted and conflicted changes use [`ERROR`].
+    pub lowest: Option<Color32>,
+}
+
 /// Icon-only ghost action with a caller-supplied stable id.
 ///
 /// The square target is at least 24 points, uses the same selected/hover/focus
@@ -859,6 +875,42 @@ pub fn icon_action(
     selected: bool,
     height: f32,
     gap: Color32,
+) -> ActionResponse {
+    icon_action_with(ui, id, glyph, label, selected, height, gap, None)
+}
+
+/// Source-control toggle. Ring overrides do not replace the stem, the curve,
+/// or a ring whose change type is absent.
+pub fn source_control_action(
+    ui: &mut Ui,
+    id: egui::Id,
+    label: &str,
+    selected: bool,
+    height: f32,
+    gap: Color32,
+    rings: SourceControlRings,
+) -> ActionResponse {
+    icon_action_with(
+        ui,
+        id,
+        IconGlyph::SourceControl,
+        label,
+        selected,
+        height,
+        gap,
+        Some(rings),
+    )
+}
+
+fn icon_action_with(
+    ui: &mut Ui,
+    id: egui::Id,
+    glyph: IconGlyph,
+    label: &str,
+    selected: bool,
+    height: f32,
+    gap: Color32,
+    rings: Option<SourceControlRings>,
 ) -> ActionResponse {
     let extent = icon_action_extent(height);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(extent, extent), egui::Sense::hover());
@@ -877,7 +929,7 @@ pub fn icon_action(
     } else {
         inactive_icon_color()
     };
-    paint_icon(ui.painter(), rect, glyph, color);
+    paint_icon_with(ui.painter(), rect, glyph, color, rings, hovered, selected);
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -902,6 +954,18 @@ pub(crate) fn paint_icon(
     rect: egui::Rect,
     glyph: IconGlyph,
     color: Color32,
+) {
+    paint_icon_with(painter, rect, glyph, color, None, false, false);
+}
+
+fn paint_icon_with(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    glyph: IconGlyph,
+    color: Color32,
+    rings: Option<SourceControlRings>,
+    hovered: bool,
+    selected: bool,
 ) {
     let center = rect.center();
     let point = |x: f32, y: f32| center + egui::vec2(x, y);
@@ -976,9 +1040,72 @@ pub(crate) fn paint_icon(
                 Color32::TRANSPARENT,
                 stroke,
             ));
-            for center in [top, bottom, right] {
-                painter.circle_stroke(center, ring, stroke);
-            }
+            // Stem and curve stay on `stroke`. Only the three existing rings
+            // may take a change color; an absent type keeps the icon color.
+            // A status color fills the interior while hovered or selected.
+            // The 1.5 stroke sits outside this radius, so the fill stops at
+            // the hollow edge. An absent type stays hollow.
+            let rings = rings.unwrap_or_default();
+            let paint_ring = |at: egui::Pos2, tint: Option<Color32>| {
+                let ring_color = tint.unwrap_or(color);
+                if (hovered || selected) && tint.is_some() {
+                    painter.circle_filled(at, ring, ring_color);
+                }
+                painter.circle_stroke(at, ring, Stroke::new(stroke.width, ring_color));
+            };
+            paint_ring(top, rings.highest);
+            paint_ring(right, rings.middle);
+            paint_ring(bottom, rings.lowest);
+        }
+        IconGlyph::Folders => {
+            // Two portrait pages. `front` is already absolute; do not pass
+            // its edges back through `point()`.
+            let front = egui::Rect::from_min_max(point(-2.5, -3.5), point(5.5, 5.5));
+            let back = front.translate(egui::vec2(-2.0, -2.0));
+            let pad = 2.0;
+            let left_of_front = egui::Rect::from_min_max(
+                egui::pos2(back.left() - pad, back.top() - pad),
+                egui::pos2(front.left(), back.bottom() + pad),
+            );
+            let above_front = egui::Rect::from_min_max(
+                egui::pos2(front.left(), back.top() - pad),
+                egui::pos2(back.right() + pad, front.top()),
+            );
+            let radius = CornerRadius::same(2);
+            painter.with_clip_rect(left_of_front).rect_stroke(
+                back,
+                radius,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.with_clip_rect(above_front).rect_stroke(
+                back,
+                radius,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.rect_stroke(front, radius, stroke, StrokeKind::Middle);
+            let fold = 2.2;
+            let right = front.right();
+            let top = front.top();
+            painter.line_segment(
+                [egui::pos2(right - fold, top), egui::pos2(right, top + fold)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right - fold, top),
+                    egui::pos2(right - fold, top + fold),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(right - fold, top + fold),
+                    egui::pos2(right, top + fold),
+                ],
+                stroke,
+            );
         }
         IconGlyph::LinkedWorktree => {
             // Worktree-compact: a short stem forks into two right-pointing

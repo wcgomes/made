@@ -1,6 +1,6 @@
 # Design System
 
-Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one mint-green accent, layered surfaces, and high-contrast reading surfaces. The terminal is the hero; chrome recedes. The normative visual contract is [`specs/made-ui-ux.md`](../../specs/made-ui-ux.md) plus the active delta [`specs/changes/explorer-git-view/spec.md`](../../specs/changes/explorer-git-view/spec.md). Implementation lives in [`theme.rs`](../../crates/made-app/src/theme.rs) and the views under [`crates/made-app/src`](../../crates/made-app/src).
+Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one mint-green accent, layered surfaces, and high-contrast reading surfaces. The terminal is the hero; chrome recedes. The normative visual contract is [`specs/made-ui-ux.md`](../../specs/made-ui-ux.md). Implementation lives in [`theme.rs`](../../crates/made-app/src/theme.rs) and the views under [`crates/made-app/src`](../../crates/made-app/src).
 
 ## Intent
 
@@ -154,7 +154,7 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 - Picker keyboard: Up/Down selects visible rows; Right expands or selects the first child; Left collapses or selects the parent; Enter toggles expansion; Cmd/Ctrl+Enter confirms; Backspace or Up re-roots to the parent and clears expansion/selection. Refresh preserves valid expansion/selection, each directory keeps the 1000-entry cap, and an unreadable child stays collapsed with an error. Minimal scrolling reveals the selected row and its visible ancestors without centering.
 - Scrollbars are hidden at rest. The floating overlay fades in as a thumb over about 120–160 ms when the scroll area is hovered, expands and strengthens on bar hover/drag with a faint track only then, and fades out on leave. They allocate zero width and never shift layout. The custom terminal scrollback bar matches this behavior: full 8px hit area, thumb only on pane hover, and a track only on bar hover/drag.
 - Status uses shape + text + color: busy spinner, attention `!`, unread number, renaming `*`, tree error `!`, and shell state text. Success is a cooler teal than the mint accent, and no status relies on hue alone.
-- Git status colors reuse existing tokens. Letters and folder-dot colors are [`specs/changes/explorer-git-view/spec.md`](../../specs/changes/explorer-git-view/spec.md), painted by `change_kind_color` and `folder_mark_color` in [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
+- Git status colors reuse existing tokens. Letters and folder-dot colors are in the [UI spec](../../specs/made-ui-ux.md), painted by `change_kind_color` and `folder_mark_color` in [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
 - Close hover carries the `ERROR` tone plus the parent hover/selected fill and label; visibility is driven by hover/focus, not motion, so the state is not cue-only. The pointer-only Explorer divider is not a keyboard stop; its fade is independent of the 8px hit area, resize cursor, and tooltip, and the window-header Explorer toggle remains the keyboard hide/restore path.
 - `accesskit` is not enabled in `Cargo.toml`. Icon actions set tooltip and `Response::widget_info` names, but platform screen-reader exposure is not claimed.
 
@@ -169,4 +169,4 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 - Terminal card border is overpainted after content so the inset body fill cannot cover it; the body is transparent on the primary screen and opaque `BG_TERMINAL` on the alternate screen.
 - `native_options.clipboard_shortcuts = false` so terminal copy/paste semantics are not consumed by egui-winit.
 
-Related: [Layout and controls](layout-and-controls.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [UI spec](../../specs/made-ui-ux.md), [Source control](../../specs/changes/explorer-git-view/spec.md).
+Related: [Layout and controls](layout-and-controls.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [UI spec](../../specs/made-ui-ux.md), [Git view archive](../../specs/changes/archive/20261031-explorer-git-view/spec.md).

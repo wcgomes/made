@@ -1495,13 +1495,9 @@ impl ExplorerPane {
         let show_icon = self.git_header.show_icon;
         let spacing = ui.spacing().item_spacing.x;
         let icon_extent = theme::icon_action_extent(24.0);
-        // The name stops before the 8px gap and the 24×24 icon. A character
-        // estimate cannot do that: wide glyphs would paint into the icon.
-        let icon_reserve = if show_icon {
-            icon_extent + spacing
-        } else {
-            0.0
-        };
+        // The name stops before the gap and both 24×24 icons. A character
+        // estimate cannot do that: wide glyphs would paint into the icons.
+        let icon_reserve = header_icon_reserve(icon_extent, spacing, show_icon);
         let left_rect = egui::Rect::from_min_max(
             content.min,
             egui::pos2(
@@ -1581,7 +1577,7 @@ impl ExplorerPane {
             }
         }
         if show_icon {
-            self.source_control_icon(ui, content);
+            self.header_view_icons(ui, content);
         }
         theme::paint_card_border(ui, card_rect, layout);
 
@@ -1699,32 +1695,59 @@ impl ExplorerPane {
         .on_hover_text(sanitize_display(&hover, 600));
     }
 
-    fn source_control_icon(&mut self, ui: &mut Ui, content: egui::Rect) {
-        let icon_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - 24.0, content.top()),
-            egui::vec2(24.0, content.height()),
+    fn header_view_icons(&mut self, ui: &mut Ui, content: egui::Rect) {
+        let extent = 24.0;
+        let gap = theme::explorer_header_glass(self.native_backdrop_applied);
+        let open = self.source_control_open;
+        let folders_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                content.right() - extent * 2.0 - HEADER_ICON_GAP,
+                content.top(),
+            ),
+            egui::vec2(extent, content.height()),
         );
-        let mut icon_ui = ui.new_child(
+        let git_rect = egui::Rect::from_min_size(
+            egui::pos2(content.right() - extent, content.top()),
+            egui::vec2(extent, content.height()),
+        );
+        let mut folders_ui = ui.new_child(
             UiBuilder::new()
-                .max_rect(icon_rect)
+                .max_rect(folders_rect)
                 .layout(egui::Layout::right_to_left(Align::Center)),
         );
-        let open = self.source_control_open;
-        let label = if open { "Explorer" } else { "Source Control" };
-        let action = theme::icon_action(
-            &mut icon_ui,
-            self.ui_scope.with("source-control"),
-            theme::IconGlyph::SourceControl,
-            label,
-            open,
-            24.0,
-            theme::explorer_header_glass(self.native_backdrop_applied),
+        let folders = theme::icon_action(
+            &mut folders_ui,
+            self.ui_scope.with("explorer-view"),
+            theme::IconGlyph::Folders,
+            "Explorer",
+            !open,
+            extent,
+            gap,
         );
-        if action.activated {
-            self.source_control_open = !open;
-            if self.source_control_open {
-                self.source_control_opened = true;
-            }
+        let mut git_ui = ui.new_child(
+            UiBuilder::new()
+                .max_rect(git_rect)
+                .layout(egui::Layout::right_to_left(Align::Center)),
+        );
+        let git = theme::source_control_action(
+            &mut git_ui,
+            self.ui_scope.with("source-control"),
+            &source_control_tooltip(self.git_status.as_ref()),
+            open,
+            extent,
+            gap,
+            source_control_rings(self.git_status.as_ref()),
+        );
+        // The tooltip may include a count. The accessible name does not.
+        git.response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Source Control"));
+        // The active icon does not switch. The other icon switches only the body.
+        if folders.activated && open {
+            self.source_control_open = false;
+        }
+        if git.activated && !open {
+            self.source_control_open = true;
+            self.source_control_opened = true;
         }
     }
 
@@ -1741,7 +1764,7 @@ impl ExplorerPane {
         let Some(status) = self.git_status.clone() else {
             return;
         };
-        if status.groups.is_empty() {
+        if open_change_count(Some(&status)) == 0 {
             ui.label(quiet_line("No changes"));
             return;
         }
@@ -1752,9 +1775,12 @@ impl ExplorerPane {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for group in &status.groups {
+                    if group.rows.is_empty() {
+                        continue;
+                    }
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(group.title)
+                        RichText::new(format!("{} ({})", group.title, group.rows.len()))
                             .font(FontId::proportional(10.5))
                             .color(theme::TEXT_TERTIARY),
                     );
@@ -2307,8 +2333,21 @@ impl ExplorerPane {
     }
 }
 
+/// Empty space between the folders target and the source-control target.
+const HEADER_ICON_GAP: f32 = 4.0;
+
+/// Width reserved at the header's right edge for the view icons, the gap
+/// between them, and the gap before them. Otherwise nothing.
+fn header_icon_reserve(icon_extent: f32, spacing: f32, show_icon: bool) -> f32 {
+    if show_icon {
+        icon_extent * 2.0 + HEADER_ICON_GAP + spacing
+    } else {
+        0.0
+    }
+}
+
 /// Pixel width left for the root name after the section label, the item gap,
-/// and — when shown — the source-control icon plus the gap before it.
+/// and — when shown — both header icons plus the gap before them.
 fn root_name_width(
     label_right: f32,
     content_right: f32,
@@ -2316,11 +2355,7 @@ fn root_name_width(
     icon_extent: f32,
     show_icon: bool,
 ) -> f32 {
-    let reserve = if show_icon {
-        icon_extent + spacing
-    } else {
-        0.0
-    };
+    let reserve = header_icon_reserve(icon_extent, spacing, show_icon);
     let name_left = label_right + spacing;
     let name_right = content_right - reserve;
     (name_right - name_left).max(0.0)
@@ -2487,6 +2522,62 @@ fn quiet_line(text: &str) -> RichText {
     RichText::new(text)
         .font(FontId::proportional(12.5))
         .color(theme::TEXT_TERTIARY)
+}
+
+/// Highest ring is new, middle is modified, lowest is deleted or conflict.
+/// A rename lights nothing. Directory rows count. A missing snapshot leaves
+/// every ring on the icon color.
+fn open_change_count(status: Option<&GitStatusSnapshot>) -> usize {
+    status
+        .map(|status| status.groups.iter().map(|group| group.rows.len()).sum())
+        .unwrap_or(0)
+}
+
+fn source_control_tooltip(status: Option<&GitStatusSnapshot>) -> String {
+    let Some(status) = status else {
+        return "Source Control".to_owned();
+    };
+    const ORDER: [&str; 4] = [
+        crate::worktree::GROUP_MERGE,
+        crate::worktree::GROUP_STAGED,
+        crate::worktree::GROUP_CHANGES,
+        crate::worktree::GROUP_UNTRACKED,
+    ];
+    let mut parts = Vec::new();
+    for title in ORDER {
+        let count: usize = status
+            .groups
+            .iter()
+            .filter(|group| group.title == title)
+            .map(|group| group.rows.len())
+            .sum();
+        if count > 0 {
+            parts.push(format!("{title} ({count})"));
+        }
+    }
+    if parts.is_empty() {
+        "Source Control".to_owned()
+    } else {
+        format!("Source Control - {}", parts.join(" · "))
+    }
+}
+
+fn source_control_rings(status: Option<&GitStatusSnapshot>) -> theme::SourceControlRings {
+    let Some(status) = status else {
+        return theme::SourceControlRings::default();
+    };
+    let mut rings = theme::SourceControlRings::default();
+    for group in &status.groups {
+        for row in &group.rows {
+            match row.kind {
+                ChangeKind::New => rings.highest = Some(theme::SUCCESS),
+                ChangeKind::Modified => rings.middle = Some(theme::WARNING),
+                ChangeKind::Deleted | ChangeKind::Conflict => rings.lowest = Some(theme::ERROR),
+                ChangeKind::Renamed => {}
+            }
+        }
+    }
+    rings
 }
 
 fn change_kind_color(kind: ChangeKind) -> Color32 {
@@ -3012,8 +3103,8 @@ mod tests {
     #[test]
     fn root_name_width_stops_before_the_icon_and_its_gap() {
         let width = root_name_width(80.0, 200.0, 8.0, 24.0, true);
-        assert_eq!(width, 200.0 - 24.0 - 8.0 - 80.0 - 8.0);
-        assert!(width + 80.0 + 8.0 <= 200.0 - 24.0 - 8.0);
+        assert_eq!(width, 200.0 - 52.0 - 8.0 - 80.0 - 8.0);
+        assert!(width + 80.0 + 8.0 <= 200.0 - 52.0 - 8.0);
         assert_eq!(root_name_width(80.0, 200.0, 8.0, 24.0, false), 112.0);
         assert_eq!(root_name_width(190.0, 200.0, 8.0, 24.0, true), 0.0);
     }
@@ -3268,10 +3359,10 @@ mod tests {
             unreachable!("head line");
         };
         assert!(text.galley.elided, "long head line must truncate");
-        let icon_left = 280.0 - theme::Layout::for_window(280.0, 400.0).header_padding_x - 24.0;
+        let icons_left = 280.0 - theme::Layout::for_window(280.0, 400.0).header_padding_x - 52.0;
         assert!(
-            head_shape.clip_rect.right() <= icon_left - 8.0 + 0.5,
-            "head clip {:?} must stop before the icon at {icon_left}",
+            head_shape.clip_rect.right() <= icons_left - 8.0 + 0.5,
+            "head clip {:?} must stop before both icons at {icons_left}",
             head_shape.clip_rect
         );
         assert!(
@@ -3730,6 +3821,882 @@ mod tests {
                 .iter()
                 .all(|circle| circle.center.x > 800.0),
             "a non-linked checkout has no worktree icon in the header text"
+        );
+    }
+
+    #[test]
+    fn source_control_rings_follow_open_changes_and_leave_the_others_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        pane.set_ui_scope(egui::Id::unique("source-control-rings"));
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let away = vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))];
+        let paint =
+            |render: &mut dyn FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+             pane: &mut ExplorerPane| { render(pane, away.clone()) };
+        let row = |kind: ChangeKind, letter: char, directory: bool| GitStatusRow {
+            letter,
+            kind,
+            path: root.join(if directory { "vendor" } else { "notes.txt" }),
+            relative: PathBuf::from(if directory { "vendor" } else { "notes.txt" }),
+            is_directory: directory,
+            original_relative: None,
+        };
+        let show = |pane: &mut ExplorerPane,
+                    status: Option<GitStatusSnapshot>,
+                    linked: bool,
+                    open: bool| {
+            pane.apply_git_chrome(ExplorerGitChrome {
+                header: GitHeader {
+                    show_icon: true,
+                    branch: Some("main".to_owned()),
+                    detached: false,
+                    commit_abbrev: None,
+                    commit_subject: None,
+                    is_linked_worktree: linked,
+                    directory_name: linked.then(|| "linked".to_owned()),
+                },
+                status,
+                ..ExplorerGitChrome::default()
+            });
+            pane.source_control_open = open;
+        };
+        let rings = |output: &egui::FullOutput| {
+            let mut found: Vec<_> = header_circles(output)
+                .into_iter()
+                .filter(|circle| {
+                    (circle.radius - 1.25).abs() < 0.05
+                        && circle.stroke.width > 1.0
+                        && circle.center.x > 800.0
+                })
+                .collect();
+            found.sort_by(|a, b| a.center.y.total_cmp(&b.center.y));
+            assert_eq!(found.len(), 3, "the three source-control rings");
+            assert!(
+                (found[0].center.x - found[2].center.x).abs() < 0.5,
+                "highest and lowest rings stay on the stem"
+            );
+            assert!(
+                found[1].center.x > found[0].center.x + 5.0,
+                "middle ring is the branch tip"
+            );
+            [found[0], found[1], found[2]]
+        };
+        let ring_fill = |output: &egui::FullOutput, at: egui::Pos2| {
+            header_circles(output).into_iter().find(|circle| {
+                (circle.radius - 1.25).abs() < 0.05
+                    && circle.fill != Color32::TRANSPARENT
+                    && circle.center.distance(at) < 0.5
+            })
+        };
+        let assert_stem_and_curve = |output: &egui::FullOutput, expected: Color32| {
+            let [highest, middle, lowest] = rings(output);
+            let anchor = egui::pos2(
+                (highest.center.x + lowest.center.x) * 0.5,
+                (highest.center.y + lowest.center.y) * 0.5,
+            );
+            let near =
+                |pos: egui::Pos2| pos.distance(anchor) < 10.0 || pos.distance(middle.center) < 10.0;
+            let solid = |stroke: &egui::epaint::PathStroke| match stroke.color {
+                egui::epaint::ColorMode::Solid(color) => color,
+                _ => panic!("glyph stroke should be a solid color"),
+            };
+            let mut stem = false;
+            let mut curve = false;
+            fn walk(
+                shape: &egui::Shape,
+                near: &dyn Fn(egui::Pos2) -> bool,
+                solid: &dyn Fn(&egui::epaint::PathStroke) -> Color32,
+                expected: Color32,
+                stem: &mut bool,
+                curve: &mut bool,
+            ) {
+                match shape {
+                    egui::Shape::Path(path)
+                        if path.stroke.width > 1.2 && path.points.iter().any(|pos| near(*pos)) =>
+                    {
+                        assert_eq!(solid(&path.stroke), expected, "stem keeps the icon color");
+                        *stem = true;
+                    }
+                    egui::Shape::CubicBezier(curve_shape)
+                        if curve_shape.stroke.width > 1.2
+                            && curve_shape.points.iter().any(|pos| near(*pos)) =>
+                    {
+                        assert_eq!(
+                            solid(&curve_shape.stroke),
+                            expected,
+                            "curve keeps the icon color"
+                        );
+                        *curve = true;
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, near, solid, expected, stem, curve);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &output.shapes {
+                walk(
+                    &clipped.shape,
+                    &near,
+                    &solid,
+                    expected,
+                    &mut stem,
+                    &mut curve,
+                );
+            }
+            assert!(stem, "stem must still be painted");
+            assert!(curve, "curve must still be painted");
+        };
+        let rest = theme::inactive_icon_color();
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![row(ChangeKind::Modified, 'M', false)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let modified = paint(&mut render, &mut pane);
+        let [highest, middle, lowest] = rings(&modified);
+        assert_eq!(middle.stroke.color, theme::WARNING);
+        assert_eq!(highest.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+        assert_stem_and_curve(&modified, rest);
+        assert!(
+            ring_fill(&modified, middle.center).is_none(),
+            "off hover a colored ring stays hollow"
+        );
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_UNTRACKED,
+                    rows: vec![row(ChangeKind::New, 'U', true)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(
+            highest.stroke.color,
+            theme::SUCCESS,
+            "a directory row counts as new"
+        );
+        assert_eq!(middle.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_STAGED,
+                    rows: vec![row(ChangeKind::New, 'A', false)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(highest.stroke.color, theme::SUCCESS, "a staged add is new");
+        assert_eq!(middle.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![row(ChangeKind::Deleted, 'D', false)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(lowest.stroke.color, theme::ERROR);
+        assert_eq!(highest.stroke.color, rest);
+        assert_eq!(middle.stroke.color, rest);
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_MERGE,
+                    rows: vec![row(ChangeKind::Conflict, 'C', false)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(
+            lowest.stroke.color,
+            theme::ERROR,
+            "a conflict lights only the lowest ring"
+        );
+        assert_eq!(highest.stroke.color, rest);
+        assert_eq!(middle.stroke.color, rest);
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![row(ChangeKind::Renamed, 'R', false)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(highest.stroke.color, rest, "a rename does not light a ring");
+        assert_eq!(middle.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+
+        show(&mut pane, Some(GitStatusSnapshot::default()), false, false);
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(
+            highest.stroke.color, rest,
+            "a clean snapshot leaves the rings original"
+        );
+        assert_eq!(middle.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+
+        show(&mut pane, None, false, false);
+        let [highest, middle, lowest] = rings(&paint(&mut render, &mut pane));
+        assert_eq!(
+            highest.stroke.color, rest,
+            "a missing snapshot leaves the rings original"
+        );
+        assert_eq!(middle.stroke.color, rest);
+        assert_eq!(lowest.stroke.color, rest);
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![row(ChangeKind::Modified, 'M', false)],
+                }],
+                ..Default::default()
+            }),
+            true,
+            true,
+        );
+        let selected = paint(&mut render, &mut pane);
+        let [highest, middle, lowest] = rings(&selected);
+        assert_eq!(
+            middle.stroke.color,
+            theme::WARNING,
+            "selected treatment must not replace a lit ring"
+        );
+        assert_eq!(highest.stroke.color, theme::TEXT_PRIMARY);
+        assert_eq!(lowest.stroke.color, theme::TEXT_PRIMARY);
+        assert_stem_and_curve(&selected, theme::TEXT_PRIMARY);
+        let selected_fill =
+            ring_fill(&selected, middle.center).expect("selected colored ring stays filled");
+        assert_eq!(selected_fill.fill, theme::WARNING);
+        assert!((selected_fill.radius - 1.25).abs() < 0.05);
+        assert!(
+            ring_fill(&selected, highest.center).is_none(),
+            "an original-color ring stays hollow when selected"
+        );
+        assert!(ring_fill(&selected, lowest.center).is_none());
+        let selected_fills = header_circles(&selected)
+            .into_iter()
+            .filter(|circle| {
+                (circle.radius - 1.25).abs() < 0.05 && circle.fill != Color32::TRANSPARENT
+            })
+            .count();
+        assert_eq!(
+            selected_fills, 1,
+            "selected fill covers only the colored ring, not the stem or curve"
+        );
+        let worktree = header_circles(&selected)
+            .into_iter()
+            .filter(|circle| circle.radius < 1.2 && circle.fill != Color32::TRANSPARENT)
+            .collect::<Vec<_>>();
+        assert!(
+            !worktree.is_empty(),
+            "linked-worktree icon is still painted"
+        );
+        assert!(
+            worktree
+                .iter()
+                .all(|circle| circle.fill == theme::TEXT_TERTIARY),
+            "linked-worktree icon stays uncolored: {worktree:?}"
+        );
+
+        show(
+            &mut pane,
+            Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_UNTRACKED,
+                    rows: vec![row(ChangeKind::New, 'U', true)],
+                }],
+                ..Default::default()
+            }),
+            false,
+            false,
+        );
+        let placed = paint(&mut render, &mut pane);
+        let hover_at = rings(&placed)[0].center;
+        let moved = vec![egui::Event::PointerMoved(hover_at)];
+        let _ = render(&mut pane, moved.clone());
+        let hovered = render(&mut pane, moved);
+        let [highest, middle, lowest] = rings(&hovered);
+        assert_eq!(
+            highest.stroke.color,
+            theme::SUCCESS,
+            "hover must not replace a lit ring"
+        );
+        assert_eq!(middle.stroke.color, theme::TEXT_PRIMARY);
+        assert_eq!(lowest.stroke.color, theme::TEXT_PRIMARY);
+        assert_stem_and_curve(&hovered, theme::TEXT_PRIMARY);
+        let filled = ring_fill(&hovered, highest.center).expect("hovered colored ring is filled");
+        assert_eq!(filled.fill, theme::SUCCESS);
+        assert!((filled.radius - 1.25).abs() < 0.05);
+        assert!(
+            ring_fill(&hovered, middle.center).is_none(),
+            "an original-color ring stays hollow on hover"
+        );
+        assert!(ring_fill(&hovered, lowest.center).is_none());
+        let fills = header_circles(&hovered)
+            .into_iter()
+            .filter(|circle| {
+                (circle.radius - 1.25).abs() < 0.05 && circle.fill != Color32::TRANSPARENT
+            })
+            .count();
+        assert_eq!(
+            fills, 1,
+            "hover fills only the colored ring, not the stem or curve"
+        );
+    }
+
+    #[test]
+    fn known_worktree_shows_both_header_icons_and_a_non_repo_shows_neither() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "one\n").unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("two-header-icons"));
+        let mut frame = 0.0;
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            frame += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                time: Some(frame),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let hover_at =
+            |render: &mut dyn FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+             pane: &mut ExplorerPane,
+             at: egui::Pos2| {
+                let moved = vec![egui::Event::PointerMoved(at)];
+                let _ = render(pane, moved.clone());
+                let _ = render(pane, moved);
+                render(pane, Vec::new())
+            };
+        let click_at =
+            |render: &mut dyn FnMut(&mut ExplorerPane, Vec<egui::Event>) -> egui::FullOutput,
+             pane: &mut ExplorerPane,
+             at: egui::Pos2| {
+                let _ = render(pane, vec![egui::Event::PointerMoved(at)]);
+                let _ = render(
+                    pane,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let _ = render(
+                    pane,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            };
+        let has_label = |output: &egui::FullOutput, label: &str| {
+            text_positions(output).iter().any(|(text, _)| text == label)
+        };
+        let header_selected_center = |output: &egui::FullOutput| {
+            fn visit(shape: &egui::Shape, found: &mut Option<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == theme::BG_SELECTED
+                            && (rect.rect.width() - 24.0).abs() < 1.0
+                            && rect.rect.center().y < 40.0 =>
+                    {
+                        *found = Some(rect.rect.center());
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            visit(shape, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            for clipped in &output.shapes {
+                visit(&clipped.shape, &mut found);
+            }
+            found.expect("folders selected fill")
+        };
+        let selected_at = |output: &egui::FullOutput, at: egui::Pos2| {
+            fn visit(shape: &egui::Shape, at: egui::Pos2, found: &mut bool) {
+                match shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == theme::BG_SELECTED
+                            && rect.rect.width() < 28.0
+                            && rect.rect.center().distance(at) < 8.0 =>
+                    {
+                        *found = true;
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            visit(shape, at, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = false;
+            for clipped in &output.shapes {
+                visit(&clipped.shape, at, &mut found);
+            }
+            found
+        };
+        let status_near = |output: &egui::FullOutput, at: egui::Pos2| {
+            header_circles(output).into_iter().any(|circle| {
+                circle.center.distance(at) < 16.0
+                    && (circle.fill == theme::SUCCESS
+                        || circle.fill == theme::WARNING
+                        || circle.fill == theme::ERROR
+                        || circle.stroke.color == theme::SUCCESS
+                        || circle.stroke.color == theme::WARNING
+                        || circle.stroke.color == theme::ERROR)
+            })
+        };
+
+        let plain = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let plain_text = output_text(&plain);
+        assert!(plain_text.contains("EXPLORER"), "{plain_text}");
+        assert!(plain_text.contains("notes.txt"), "{plain_text}");
+        assert!(!plain_text.contains("Source Control"), "{plain_text}");
+        assert!(
+            !has_label(&plain, "Explorer"),
+            "a non-repo must not show the folders tooltip"
+        );
+        assert!(
+            header_circles(&plain)
+                .iter()
+                .all(|circle| (circle.radius - 1.25).abs() > 0.05),
+            "a non-repo has no source-control rings"
+        );
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                ..GitHeader::default()
+            },
+            status: Some(GitStatusSnapshot {
+                groups: vec![crate::worktree::GitStatusGroup {
+                    title: crate::worktree::GROUP_CHANGES,
+                    rows: vec![GitStatusRow {
+                        letter: 'M',
+                        kind: ChangeKind::Modified,
+                        path: root.join("notes.txt"),
+                        relative: PathBuf::from("notes.txt"),
+                        is_directory: false,
+                        original_relative: None,
+                    }],
+                }],
+                ..Default::default()
+            }),
+            failed: true,
+            ..ExplorerGitChrome::default()
+        });
+        let explorer = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        assert!(output_text(&explorer).contains("notes.txt"));
+        assert!(!pane.source_control_open());
+        let rings = header_circles(&explorer)
+            .into_iter()
+            .filter(|circle| (circle.radius - 1.25).abs() < 0.05 && circle.center.x > 800.0)
+            .collect::<Vec<_>>();
+        assert_eq!(rings.len(), 3, "source-control icon keeps its three rings");
+        let stem_x = rings
+            .iter()
+            .map(|circle| circle.center.x)
+            .fold(f32::MAX, f32::min);
+        let mut stem_y = rings
+            .iter()
+            .filter(|circle| (circle.center.x - stem_x).abs() < 0.5)
+            .map(|circle| circle.center.y);
+        let git_center = egui::pos2(
+            stem_x + 3.25,
+            (stem_y.next().unwrap() + stem_y.next().unwrap()) * 0.5,
+        );
+        let folders_center = header_selected_center(&explorer);
+        assert!(
+            (git_center.x - folders_center.x - 28.0).abs() < 0.5,
+            "icon centers must be 28px apart, not 24: {:?} vs {:?}",
+            folders_center,
+            git_center
+        );
+        assert!(selected_at(&explorer, folders_center));
+        assert!(!selected_at(&explorer, git_center));
+        assert!(
+            !status_near(&explorer, folders_center),
+            "the folders icon is not recolored"
+        );
+        assert!(
+            rings
+                .iter()
+                .any(|circle| circle.stroke.color == theme::WARNING),
+            "ring color stays on the source-control icon"
+        );
+
+        let explorer_tip = hover_at(&mut render, &mut pane, folders_center);
+        let git_tip = hover_at(&mut render, &mut pane, git_center);
+        assert!(
+            has_label(&explorer_tip, "Explorer"),
+            "folders tooltip: {}",
+            output_text(&explorer_tip)
+        );
+        assert!(
+            has_label(&git_tip, "Source Control - Changes (1)"),
+            "source-control tooltip: {}",
+            output_text(&git_tip)
+        );
+
+        click_at(&mut render, &mut pane, folders_center);
+        let still = render(&mut pane, Vec::new());
+        assert!(output_text(&still).contains("EXPLORER"));
+        assert!(output_text(&still).contains("notes.txt"));
+        assert!(!pane.source_control_open());
+
+        click_at(&mut render, &mut pane, git_center);
+        let git = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let git_text = output_text(&git);
+        assert!(git_text.contains("REPOS"), "{git_text}");
+        assert!(!git_text.contains("EXPLORER"), "{git_text}");
+        assert!(pane.source_control_open());
+        assert!(selected_at(&git, git_center));
+        assert!(!selected_at(&git, folders_center));
+        let git_tip = hover_at(&mut render, &mut pane, git_center);
+        let explorer_tip = hover_at(&mut render, &mut pane, folders_center);
+        assert!(has_label(&git_tip, "Source Control - Changes (1)"));
+        assert!(
+            has_label(&explorer_tip, "Explorer"),
+            "names do not swap when the git view is open"
+        );
+        assert!(
+            header_circles(&git)
+                .iter()
+                .any(|circle| circle.stroke.color == theme::WARNING),
+            "rings stay colored in the git view"
+        );
+        assert!(!status_near(&git, folders_center));
+
+        click_at(&mut render, &mut pane, git_center);
+        assert!(
+            pane.source_control_open(),
+            "the active icon does not switch"
+        );
+        click_at(&mut render, &mut pane, folders_center);
+        let back = render(&mut pane, Vec::new());
+        assert!(!pane.source_control_open());
+        assert!(output_text(&back).contains("EXPLORER"));
+        assert!(output_text(&back).contains("notes.txt"));
+        assert!(!output_text(&back).contains("REPOS"));
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            failed: true,
+            ..ExplorerGitChrome::default()
+        });
+        let left = render(&mut pane, Vec::new());
+        let left_text = output_text(&left);
+        assert!(left_text.contains("EXPLORER"), "{left_text}");
+        assert!(left_text.contains("notes.txt"), "{left_text}");
+        assert!(!left_text.contains("REPOS"));
+        assert!(!pane.source_control_open());
+        assert!(
+            header_circles(&left)
+                .iter()
+                .all(|circle| (circle.radius - 1.25).abs() > 0.05),
+            "leaving a worktree removes both icons"
+        );
+    }
+
+    #[test]
+    fn repos_sections_and_source_control_tooltip_show_row_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("notes.txt"), "one\n").unwrap();
+        let mut pane = ExplorerPane::new(&root, RootGeneration::INITIAL);
+        let mut log = DiagnosticLog::new();
+        wait_for_root(&mut pane, &mut log);
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        pane.set_ui_scope(egui::Id::unique("repos-counts"));
+        let mut frame = 0.0;
+        let mut render = |pane: &mut ExplorerPane, events: Vec<egui::Event>| {
+            frame += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 620.0),
+                )),
+                time: Some(frame),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| {
+                pane.tree_ui(ui, &mut log, &theme::Layout::for_window(900.0, 620.0));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let row = |name: &str, directory: bool| GitStatusRow {
+            letter: 'M',
+            kind: ChangeKind::Modified,
+            path: root.join(name),
+            relative: PathBuf::from(name),
+            is_directory: directory,
+            original_relative: None,
+        };
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                ..GitHeader::default()
+            },
+            status: Some(GitStatusSnapshot {
+                groups: vec![
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_CHANGES,
+                        rows: vec![row("notes.txt", false), row("vendor", true)],
+                    },
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_STAGED,
+                        rows: Vec::new(),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let git = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let git_text = output_text(&git);
+        assert!(
+            git_text.contains("Changes (2)"),
+            "section count includes a directory row: {git_text}"
+        );
+        assert!(
+            !git_text.contains("Staged Changes") && !git_text.contains("(0)"),
+            "an empty section is omitted: {git_text}"
+        );
+        let rings = header_circles(&git)
+            .into_iter()
+            .filter(|circle| {
+                (circle.radius - 1.25).abs() < 0.05
+                    && circle.stroke.width > 1.0
+                    && circle.center.x > 800.0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rings.len(), 3);
+        let stem_x = rings
+            .iter()
+            .map(|circle| circle.center.x)
+            .fold(f32::MAX, f32::min);
+        let mut stem_y = rings
+            .iter()
+            .filter(|circle| (circle.center.x - stem_x).abs() < 0.5)
+            .map(|circle| circle.center.y);
+        let git_center = egui::pos2(
+            stem_x + 3.25,
+            (stem_y.next().unwrap() + stem_y.next().unwrap()) * 0.5,
+        );
+        let moved = vec![egui::Event::PointerMoved(git_center)];
+        let _ = render(&mut pane, moved.clone());
+        let _ = render(&mut pane, moved);
+        let tip = render(&mut pane, Vec::new());
+        assert!(
+            text_positions(&tip)
+                .iter()
+                .any(|(text, _)| text == "Source Control - Changes (2)"),
+            "one-section tooltip: {}",
+            output_text(&tip)
+        );
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                ..GitHeader::default()
+            },
+            status: Some(GitStatusSnapshot {
+                groups: vec![
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_CHANGES,
+                        rows: vec![row("notes.txt", false), row("vendor", true)],
+                    },
+                    crate::worktree::GitStatusGroup {
+                        title: crate::worktree::GROUP_UNTRACKED,
+                        rows: vec![row("extra.txt", false)],
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let both = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let both_text = output_text(&both);
+        assert!(both_text.contains("Changes (2)"), "{both_text}");
+        assert!(both_text.contains("Untracked (1)"), "{both_text}");
+        let moved = vec![egui::Event::PointerMoved(git_center)];
+        let _ = render(&mut pane, moved.clone());
+        let _ = render(&mut pane, moved);
+        let both_tip = render(&mut pane, Vec::new());
+        assert!(
+            text_positions(&both_tip)
+                .iter()
+                .any(|(text, _)| { text == "Source Control - Changes (2) · Untracked (1)" }),
+            "two-section tooltip: {}",
+            output_text(&both_tip)
+        );
+        let folders_center = git_center - egui::vec2(28.0, 0.0);
+        let folders_moved = vec![egui::Event::PointerMoved(folders_center)];
+        let _ = render(&mut pane, folders_moved.clone());
+        let _ = render(&mut pane, folders_moved);
+        let folders_tip = render(&mut pane, Vec::new());
+        assert!(
+            text_positions(&folders_tip)
+                .iter()
+                .any(|(text, _)| text == "Explorer"),
+            "folders name stays Explorer: {}",
+            output_text(&folders_tip)
+        );
+
+        pane.apply_git_chrome(ExplorerGitChrome {
+            header: GitHeader {
+                show_icon: true,
+                branch: Some("main".to_owned()),
+                ..GitHeader::default()
+            },
+            status: Some(GitStatusSnapshot::default()),
+            ..ExplorerGitChrome::default()
+        });
+        pane.source_control_open = true;
+        let clean = render(
+            &mut pane,
+            vec![egui::Event::PointerMoved(egui::pos2(1.0, 600.0))],
+        );
+        let clean_text = output_text(&clean);
+        assert!(clean_text.contains("No changes"), "{clean_text}");
+        assert!(!clean_text.contains("(0)"), "{clean_text}");
+        let moved = vec![egui::Event::PointerMoved(git_center)];
+        let _ = render(&mut pane, moved.clone());
+        let _ = render(&mut pane, moved);
+        let clean_tip = render(&mut pane, Vec::new());
+        assert!(
+            text_positions(&clean_tip)
+                .iter()
+                .any(|(text, _)| text == "Source Control"),
+            "a clean tree tooltip is only the name: {}",
+            output_text(&clean_tip)
+        );
+        assert!(
+            !text_positions(&clean_tip)
+                .iter()
+                .any(|(text, _)| text.starts_with("Source Control -")),
+            "a clean tree tooltip has no count: {}",
+            output_text(&clean_tip)
         );
     }
 

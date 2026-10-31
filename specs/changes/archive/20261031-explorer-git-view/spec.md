@@ -2,27 +2,79 @@
 
 ## ADDED Requirements
 
-### Requirement: Source Control view toggle
+### Requirement: Explorer and source-control icons
 
-When the explorer root is a known git worktree, the explorer header MUST show an icon-only control that switches the explorer body between the file tree and the git view. The control MUST be absent when the folder is not a known git worktree. Its tooltip and accessible name MUST be "Source Control" while the file tree is showing and "Explorer" while the git view is showing. While the git view is showing, the icon MUST use the existing selected icon treatment. While the file tree is showing, the header title MUST be `EXPLORER` and the header MUST show the root name. While the git view is showing, the header title MUST be `REPOS` in the same section-label treatment as `EXPLORER`, the header MUST show the head line in place of the root name, and the root name MUST NOT be shown. Activating the icon MUST NOT hide the explorer, MUST NOT change the left surface, and MUST NOT replace the header Explorer toggle, which remains the hide and restore control. The icon MUST remain an icon-only action with a visible focus state and MUST NOT be a text button.
+When the explorer root is a known git worktree, the explorer header MUST show two icon-only controls: a files mark of two offset rounded sheets, the back sheet up-left and the front sheet down-right, whose tooltip and accessible name are "Explorer", and the existing source-control icon whose accessible name is "Source Control". That mark MUST NOT be a folder and MUST NOT be a tree. That accessible name MUST remain "Source Control". Its tooltip MUST always include the text "Source Control". When no changes are open, the tooltip MUST be exactly "Source Control". When changes are open, the tooltip MUST be "Source Control - " followed by each visible section as "{title} ({count})", joined by " · ", in section order. Empty sections MUST be omitted from the tooltip. The accessible name MUST stay exactly "Source Control". The files mark's tooltip and accessible name MUST stay "Explorer". Those names MUST NOT swap. The source-control icon MUST stay the rightmost, and the files mark MUST sit immediately to its left with a 4px gap. The head line and the root name MUST clip before both icons. The active view's icon MUST use the existing selected fill, and the other icon MUST NOT. Activating the active icon MUST NOT switch away. Activating the other icon MUST switch only the explorer body. While the file tree is showing, the header title MUST be `EXPLORER` and the header MUST show the root name. While the git view is showing, the header title MUST be `REPOS` in the same section-label treatment as `EXPLORER`, the header MUST show the head line in place of the root name, and the root name MUST NOT be shown. Each icon MUST NOT hide the explorer, change the left surface, or replace the window Explorer toggle, which remains the hide and restore control. Both icons MUST remain icon-only actions with a visible focus state and MUST NOT be text buttons. When the folder is not a known git worktree, the header MUST show neither icon. Ring colors MUST still apply to the source-control icon in both views. The files mark MUST NOT be recolored by those rings.
 
-#### Scenario: Known worktree shows the icon
+#### Scenario: Known worktree shows both icons
 
 - Given the explorer root is a known git worktree and the file tree is showing
 - When the explorer header is inspected
-- Then an icon-only control is present, its tooltip and accessible name are "Source Control", the header title is `EXPLORER`, and no text action button is shown
+- Then a files mark named "Explorer" sits immediately left of the source-control icon named "Source Control" with a 4px gap, the source-control icon is rightmost, the files mark uses the selected fill, the source-control icon does not, the names do not swap, the root name clips before both icons, the header title is `EXPLORER`, and no text action button is shown
 
-#### Scenario: Toggle switches only the explorer body
+#### Scenario: Explorer header icon is a files mark
 
-- Given the icon is visible and the file tree is showing
-- When the user activates the icon, then activates it again
-- Then the body becomes the git view, the header title becomes `REPOS` with the head line in place of the root name, and the icon name becomes "Explorer" with the selected treatment; activating it again returns the body to the file tree, restores the `EXPLORER` title and the root name, and returns the icon name to "Source Control"; the explorer stays visible, the left surface is unchanged, the git-view body does not repeat the head line, and the header Explorer toggle still hides and restores the explorer
+- Given a known git worktree
+- When the explorer header is shown
+- Then the left icon is two offset rounded sheets, the back sheet up-left and the front sheet down-right, not a folder and not a tree; its tooltip and accessible name are "Explorer"; and it sits immediately left of the source-control icon with a 4px gap
 
-#### Scenario: Unknown folder has no icon
+#### Scenario: The other icon switches only the explorer body
+
+- Given both icons are visible and the file tree is showing
+- When the user activates the files mark, then activates the source-control icon, then activates the source-control icon again
+- Then the first activation does not switch away; the second makes the body the git view, gives the source-control icon the selected fill, and leaves the files mark without that fill, with the title `REPOS` and the head line in place of the root name, and that head line clips before both icons; the third activation does not switch away; the names stay "Explorer" and "Source Control"; the explorer stays visible; the left surface is unchanged; and the window Explorer toggle still hides and restores the explorer
+
+#### Scenario: Unknown folder has neither icon
 
 - Given the explorer root is not a known git worktree
 - When the explorer is shown
-- Then the icon is absent, the body is the file tree, and the header title remains `EXPLORER`
+- Then neither the files mark nor the source-control icon is present, the body is the file tree, and the header title remains `EXPLORER`
+
+#### Scenario: Ring colors stay on the source-control icon
+
+- Given a known git worktree with a new change, first while the file tree is showing and then while the git view is showing
+- When the header icons are shown
+- Then only the source-control icon uses the ring colors in both views, and the files mark is not recolored
+
+### Requirement: Source-control ring colors
+
+The source-control toggle is the three-ring branch glyph, not the linked-worktree icon. Its highest ring MUST use `SUCCESS` only when at least one new change is open. A new change is an untracked path or a staged add. Its vertically middle ring MUST use `WARNING` only when at least one modified change is open. Its lowest ring MUST use `ERROR` only when at least one deleted change is open. A ring with no open change of its type MUST keep the icon's original color. The three rings MUST be colored independently. A clean repository MUST leave all three rings in the original color. The stem and curve MUST stay the original color. A renamed change MUST NOT light a ring. A conflict MUST light the lowest ring in `ERROR`, because that kind already uses `ERROR` and the glyph has no fourth ring. These ring colors MUST remain visible when the icon is selected or at rest, and the selected treatment MUST NOT replace them. A ring that uses `SUCCESS`, `WARNING`, or `ERROR` MUST fill its center while the source-control icon is hovered or while it has the selected fill. A ring that kept the original color MUST stay hollow in both states. When the icon is neither hovered nor selected, every ring MUST be hollow. The stem and curve MUST stay unfilled. The linked-worktree icon and the files mark MUST NOT be recolored by this rule. Ring colors MUST still apply to the source-control icon while either view is showing.
+
+#### Scenario: Source-control rings follow open changes
+
+- Given a known worktree with a new change, a modified change, and a deleted change, then the same worktree with only a modified change, then a clean repository
+- When the source-control icon is shown
+- Then the highest ring is `SUCCESS` only while a new change is open, the vertically middle ring is `WARNING` only while a modified change is open, and the lowest ring is `ERROR` only while a deleted change is open; each other ring keeps the original color; the clean repository leaves all three rings in the original color; and the stem and curve stay the original color
+
+#### Scenario: Rename and conflict use the existing rings
+
+- Given only a renamed change, then only a conflict
+- When the source-control icon is shown
+- Then a rename leaves all three rings in the original color, and a conflict lights only the lowest ring in `ERROR`
+
+#### Scenario: Linked-worktree icon stays uncolored
+
+- Given a linked worktree with open changes
+- When the linked-worktree icon and the source-control icon are shown
+- Then only the source-control rings use the status colors, and the linked-worktree icon keeps its original color
+
+#### Scenario: Hover fills a colored ring
+
+- Given a source-control icon whose highest ring uses `SUCCESS`, whose vertically middle ring kept the original color, and whose lowest ring uses `ERROR`
+- When the icon is hovered, then the pointer leaves it while the icon stays selected
+- Then only the `SUCCESS` and `ERROR` rings fill their centers during the hover and while the selected fill remains after the pointer leaves; the original-color ring stays hollow; and the stem and curve stay unfilled
+
+#### Scenario: Selected fill keeps a colored ring filled
+
+- Given a source-control icon with the selected fill, a `SUCCESS` ring, and a ring that kept the original color, and that icon is not hovered
+- When the icon is shown, then the selected fill is removed
+- Then the `SUCCESS` ring stays filled while the selected fill is active, the original-color ring stays hollow, every ring is hollow once the icon is neither hovered nor selected, and the stem and curve stay unfilled
+
+#### Scenario: Selected treatment keeps the ring colors
+
+- Given a known worktree with a new change, a modified change, and a deleted change, first with the source-control icon at rest and then with that icon selected while the git view is showing
+- When the source-control icon is shown in each state
+- Then both states keep the highest ring `SUCCESS`, the vertically middle ring `WARNING`, and the lowest ring `ERROR`, and the selected treatment does not replace those colors
 
 ### Requirement: Git view head label
 
@@ -92,11 +144,11 @@ While the git view is showing, the head line MUST appear in the explorer header 
 
 - Given the file tree is showing for a known git worktree whose HEAD is attached to a branch
 - When the user opens the git view, then returns to the file tree
-- Then the git-view header title is `REPOS` in the same section-label treatment as `EXPLORER`, the header shows the branch head line and does not show the root name, the git-view body does not repeat the head line, the file tree restores the `EXPLORER` title and the root name, and the icon tooltip and accessible name are "Explorer" while the git view is showing and "Source Control" after the return
+- Then the git-view header title is `REPOS` in the same section-label treatment as `EXPLORER`, the header shows the branch head line and does not show the root name, the git-view body does not repeat the head line, and the file tree restores the `EXPLORER` title and the root name
 
 ### Requirement: Grouped changes
 
-The git view MUST present changes in the sections "Merge Changes", "Staged Changes", "Changes", and "Untracked", in that order. A section with no rows MUST be omitted. The view MUST NOT present the changes as one flat list and MUST NOT show a commit box. A repository with no listed changes MUST show "No changes". Ignored paths MUST NOT be listed and MUST NOT mark a folder or a file row. A path that is both staged and unstaged MUST appear in both "Staged Changes" and "Changes", each with that side's status dot. A conflicted path MUST appear in "Merge Changes" with a Conflict dot and MUST NOT also appear as an ordinary staged or unstaged row. Each row MUST show its path relative to the explorer root. The git view and the file-tree change dots MUST include only changes under the explorer root. A change outside that root MUST NOT be listed or marked.
+The git view MUST present changes in the sections "Merge Changes", "Staged Changes", "Changes", and "Untracked", in that order. A section with no rows MUST be omitted and MUST NOT show a zero. Each visible section title MUST be "{title} ({count})", for example "Changes (5)". The view MUST NOT present the changes as one flat list and MUST NOT show a commit box. A repository with no listed changes MUST show "No changes". Ignored paths MUST NOT be listed and MUST NOT mark a folder or a file row. A path that is both staged and unstaged MUST appear in both "Staged Changes" and "Changes", each with that side's status dot. A conflicted path MUST appear in "Merge Changes" with a Conflict dot and MUST NOT also appear as an ordinary staged or unstaged row. Each row MUST show its path relative to the explorer root. The git view and the file-tree change dots MUST include only changes under the explorer root. A change outside that root MUST NOT be listed or marked.
 
 #### Scenario: Non-empty sections stay in order
 
@@ -114,7 +166,25 @@ The git view MUST present changes in the sections "Merge Changes", "Staged Chang
 
 - Given a known git worktree with no listed changes
 - When the git view is shown
-- Then the view shows "No changes" and shows no change section
+- Then the view shows "No changes" and shows no change section, and the source-control tooltip is exactly "Source Control"
+
+#### Scenario: Visible sections show their row counts
+
+- Given the git view has two staged rows and one untracked row, and no other changes
+- When the git view and the source-control tooltip are shown
+- Then the visible titles are "Staged Changes (2)" and "Untracked (1)", empty sections are omitted from the view and the tooltip, the tooltip is exactly "Source Control - Staged Changes (2) · Untracked (1)", and the accessible name is exactly "Source Control"
+
+#### Scenario: Tooltip lists visible section counts
+
+- Given five rows in "Changes" and two rows in "Untracked", and no other changes
+- When the git view and the source-control tooltip are shown
+- Then the titles are "Changes (5)" and "Untracked (2)", and the tooltip is exactly "Source Control - Changes (5) · Untracked (2)"
+
+#### Scenario: Tooltip uses parentheses and a middle dot
+
+- Given one visible section with five rows, then that section plus an untracked section with two rows
+- When each source-control tooltip is shown
+- Then the first tooltip is exactly "Source Control - Changes (5)", the second is exactly "Source Control - Changes (5) · Untracked (2)", and the accessible name stays exactly "Source Control"
 
 #### Scenario: Partially staged file appears twice
 
@@ -208,13 +278,13 @@ Activating a file row in the git view MUST open that file in the existing full-l
 
 ### Requirement: Status failure does not block the file tree
 
-A failed, missing, or unfinished status read MUST NOT block, replace, or disable the file tree. The file tree MUST remain usable, and the user MUST be able to return to it. When the git view is showing and no status snapshot is available yet, the view MUST show "Reading changes…". When the git view is showing and no status snapshot is available because the read failed, the view MUST show "Git status unavailable". Those messages MUST appear in the git view, not as a blocker over the file tree. When the folder is not a known git worktree, the icon MUST be absent and the file tree MUST be shown.
+A failed, missing, or unfinished status read MUST NOT block, replace, or disable the file tree. The file tree MUST remain usable, and the user MUST be able to return to it. When the git view is showing and no status snapshot is available yet, the view MUST show "Reading changes…". When the git view is showing and no status snapshot is available because the read failed, the view MUST show "Git status unavailable". Those messages MUST appear in the git view, not as a blocker over the file tree. When the folder is not a known git worktree, the header MUST show neither icon and the file tree MUST be shown.
 
 #### Scenario: Pending read leaves the file tree available
 
 - Given a known git worktree whose status snapshot is not yet available
 - When the git view is showing
-- Then the git view shows "Reading changes…", and activating the icon returns to a usable file tree
+- Then the git view shows "Reading changes…", and the user can return to a usable file tree
 
 #### Scenario: Failed read leaves the file tree available
 
@@ -226,7 +296,7 @@ A failed, missing, or unfinished status read MUST NOT block, replace, or disable
 
 - Given the status cannot be read because the folder is not a known git worktree
 - When the explorer is shown
-- Then the icon is absent, the file tree is shown, and no status failure blocks the tree
+- Then neither icon is present, the file tree is shown, and no status failure blocks the tree
 
 ### Requirement: Read-only source control
 
@@ -246,7 +316,7 @@ The git view MUST be read-only. It MUST NOT offer or perform stage, unstage, dis
 
 ### Requirement: Per-workspace view choice
 
-The choice between the file tree and the git view MUST be remembered separately for each open workspace. Switching to another workspace and back, or hiding and restoring the explorer, MUST keep that workspace's choice. The choice MUST NOT be restored after that workspace is closed or after the application restarts. If the explorer root stops being a known git worktree, the body MUST return to the file tree and the icon MUST disappear.
+The choice between the file tree and the git view MUST be remembered separately for each open workspace. Switching to another workspace and back, or hiding and restoring the explorer, MUST keep that workspace's choice. The choice MUST NOT be restored after that workspace is closed or after the application restarts. If the explorer root stops being a known git worktree, the body MUST return to the file tree and the header MUST show neither icon.
 
 #### Scenario: Each workspace keeps its own choice
 
@@ -270,4 +340,4 @@ The choice between the file tree and the git view MUST be remembered separately 
 
 - Given the git view is showing and the explorer root then stops being a known git worktree
 - When the explorer updates
-- Then the icon is absent and the body is the file tree
+- Then neither icon is present and the body is the file tree
