@@ -486,23 +486,34 @@ impl TerminalPane {
     }
 
     /// Resize both the emulator and the PTY.
+    ///
+    /// Pending PTY output is drained before the grid changes, so bytes the
+    /// child already laid out for the old width are parsed against that width.
     pub fn resize(&mut self, rows: usize, cols: usize, log: &mut DiagnosticLog) {
         let size = self.core.size();
         if size.rows == rows && size.cols == cols {
             return;
         }
-        self.core.resize(rows, cols);
-        let clamped = self.core.size();
+        // Output still in flight was laid out for the old size. Consume it
+        // before changing the grid: zsh's PROMPT_SP padding only erases its
+        // end-of-line marker when the grid is at least as wide as the padding,
+        // so shrinking first can strand an inverse "%" on row 0.
+        //
+        // Residual: this drains once, capped at `MAX_PTY_EVENTS_PER_FRAME`
+        // events and `MAX_PTY_BYTES_PER_FRAME` bytes, so bytes the reader thread
+        // has not forwarded yet are still parsed at the new width.
+        self.pump(log);
+        let requested = PtySize {
+            rows: rows.clamp(1, u16::MAX as usize) as u16,
+            cols: cols.clamp(2, u16::MAX as usize) as u16,
+        };
         if let Some(pty) = self.pty.as_mut() {
-            let requested = PtySize {
-                rows: clamped.rows.min(u16::MAX as usize) as u16,
-                cols: clamped.cols.min(u16::MAX as usize) as u16,
-            };
             if let Err(error) = pty.resize(requested.rows, requested.cols) {
                 log.record(LogLevel::Warn, format!("terminal resize failed: {error}"));
             }
             self.options.size = requested;
         }
+        self.core.resize(rows, cols);
     }
 
     /// Remember visible user text so input latency can wait for its echo.
@@ -1727,6 +1738,116 @@ mod tests {
             pane.blink_epoch >= before_input,
             "input must reset the blink epoch to the on phase"
         );
+    }
+
+    /// zsh's `PROMPT_SP` heuristic writes an inverse-video end-of-line marker
+    /// followed by enough padding to fill the width it currently believes it
+    /// has. If the first layout pass shrinks the grid before that padding is
+    /// parsed, the padding wraps and strands the marker on the top row. Resizing
+    /// must consume output produced at the old width first.
+    #[cfg(unix)]
+    #[test]
+    fn resize_parses_pending_zsh_startup_output_at_the_old_width() {
+        use std::{fs, process::Command};
+
+        let available = Command::new("zsh")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !available {
+            eprintln!("PENDING (not passed): zsh executable unavailable");
+            return;
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        fs::write(
+            home.path().join(".zshrc"),
+            "setopt PROMPT_SP\n\
+             PROMPT_EOL_MARK='%S%%%s'\n\
+             PROMPT='PROMPT> '\n\
+             function made_record_columns { print -r -- \"$COLUMNS\" > \"$HOME/columns\"; }\n\
+             precmd_functions+=(made_record_columns)\n",
+        )
+        .unwrap();
+
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(home.path())
+                .with_shell("zsh")
+                .with_env("HOME", home.path())
+                .without_env("ZDOTDIR")
+                .with_size(made_platform::PtySize {
+                    rows: 36,
+                    cols: 120,
+                })
+                .with_channel_capacity(256),
+        )
+        .expect("spawn zsh");
+
+        // `precmd` runs before zsh paints the prompt, so the `columns` file
+        // appearing proves the first prompt will be laid out at the spawn
+        // width: the PTY has not been resized yet.
+        let columns_path = home.path().join("columns");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_columns = String::new();
+        loop {
+            if let Ok(value) = fs::read_to_string(&columns_path) {
+                if value.trim() == "120" {
+                    break;
+                }
+                last_columns = value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "zsh did not report a first prompt at the spawn width; last columns file: {last_columns:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Let the reader thread forward the prompt and its PROMPT_SP padding
+        // into the bounded channel.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let ctx = egui::Context::default();
+        let mut metrics = Metrics::new();
+        let mut log = DiagnosticLog::new();
+        let _ = run_terminal_frame(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        assert!(
+            pane.size().cols < 120,
+            "the test viewport must be narrower than the spawn width: {:?}",
+            pane.size()
+        );
+        // Anything that arrived after the layout resize is parsed at the new
+        // width and cannot resurrect the old padding.
+        let _ = pane.pump(&mut log);
+        let snapshot = pane.core.snapshot();
+        let first = snapshot.cell(0, 0).unwrap();
+        assert!(
+            !(first.ch == '%' && first.attributes.inverse),
+            "zsh's PROMPT_EOL_MARK survived the first layout resize: row0={:?} row1={:?}",
+            snapshot.row_text(0),
+            snapshot.row_text(1)
+        );
+        assert!(
+            snapshot.row_text(0).starts_with("PROMPT>"),
+            "the prompt must start on row 0 without a blank line: row0={:?} row1={:?}",
+            snapshot.row_text(0),
+            snapshot.row_text(1)
+        );
+        let canonical_home = home.path().canonicalize().unwrap();
+        assert_eq!(
+            pane.cwd.as_deref(),
+            Some(canonical_home.as_path()),
+            "the launch-local OSC 7 report must still arrive"
+        );
+        pane.terminate(&mut log);
     }
 
     #[test]
