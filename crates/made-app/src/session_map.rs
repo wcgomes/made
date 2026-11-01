@@ -96,6 +96,31 @@ impl SessionRow {
             self.subpath.as_deref(),
         )
     }
+
+    /// Activity shown by this session's status dot.
+    pub(crate) fn activity(&self) -> SessionActivity {
+        if self.attention {
+            SessionActivity::Attention
+        } else if self.busy {
+            SessionActivity::Busy
+        } else {
+            SessionActivity::Idle
+        }
+    }
+}
+
+/// Activity shown for one OpenCode session.
+///
+/// Attention takes precedence over busy for that session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SessionActivity {
+    /// The session is idle or stopped.
+    #[default]
+    Idle,
+    /// The session is processing.
+    Busy,
+    /// The session needs the user.
+    Attention,
 }
 
 /// One model update, suitable for driving a view diff.
@@ -356,4 +381,58 @@ pub fn truncate_path(text: &str, max_chars: usize) -> String {
     let tail: String = text.chars().skip(count - tail_len).collect();
     let tail = tail.trim_start_matches(['/', '\\']);
     format!("…/{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(sessions: &[(bool, bool)]) -> SessionSnapshot {
+        SessionSnapshot {
+            revision: 1,
+            active_session_id: Some("s0".to_owned()),
+            tabs_enabled: true,
+            view_directory: None,
+            sessions: sessions
+                .iter()
+                .enumerate()
+                .map(|(index, (busy, attention))| SessionInfo {
+                    session_id: format!("s{index}"),
+                    title: format!("Session {index}"),
+                    active: index == 0,
+                    busy: *busy,
+                    attention: *attention,
+                    unread: false,
+                    prompt_pulse: 0,
+                    renaming: false,
+                    directory: Some(PathBuf::from("/tmp/workspace")),
+                    subpath: None,
+                    project_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn row_activity_prefers_attention_over_busy() {
+        let mut map = SessionMap::new();
+        map.apply_snapshot(&snapshot(&[
+            (false, false),
+            (true, false),
+            (false, true),
+            (true, true),
+        ]));
+        let activities: Vec<SessionActivity> =
+            map.rows().iter().map(SessionRow::activity).collect();
+        assert_eq!(
+            activities,
+            [
+                SessionActivity::Idle,
+                SessionActivity::Busy,
+                SessionActivity::Attention,
+                SessionActivity::Attention,
+            ],
+            "each row resolves attention before busy"
+        );
+    }
 }

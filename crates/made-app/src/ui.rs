@@ -24,9 +24,10 @@ use crate::diagnostics::DiagnosticsSnapshot;
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
-use crate::session_map::{truncate_end, truncate_path, SessionRow};
+use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
+use crate::tui::TerminalTarget;
 use crate::workbench::{LeftSurface, Workbench};
 use crate::{APP_DESCRIPTION, APP_NAME, APP_VERSION};
 use made_platform::{Clipboard, CompatibleTui, LogIssueSeverity, PlatformError};
@@ -777,6 +778,10 @@ pub fn workspace_tab_close_id(id: WorkspaceId) -> egui::Id {
     egui::Id::unique(("made-workspace-close", id.get()))
 }
 
+fn workspace_tab_close_reveal_id(id: WorkspaceId) -> egui::Id {
+    workspace_tab_id(id).with("close-reveal")
+}
+
 /// Stable id for a global top-bar control.
 pub fn top_action_id(action: &str) -> egui::Id {
     egui::Id::unique(("made-top-action", action))
@@ -802,12 +807,177 @@ pub fn explorer_splitter_id(pane_id: &str) -> egui::Id {
     egui::Id::unique(("made-explorer-splitter", pane_id))
 }
 
-fn workspace_tab_width(label: &str, layout: &Layout) -> f32 {
-    let chars = label.chars().count() as f32;
-    (chars * 6.2 + 38.0).clamp(
-        if layout.compact { 84.0 } else { 96.0 },
-        if layout.compact { 150.0 } else { 190.0 },
+/// Horizontal inset before the first tab glyph or label.
+const WORKSPACE_TAB_INSET: f32 = 10.0;
+/// Space kept from a label's right edge to the tab's right edge. This covers
+/// the reserved 24px close target plus its optical gap.
+const WORKSPACE_TAB_CLOSE_SLOT: f32 = 26.0;
+/// 16px icon plus a 6px gap before the label.
+const WORKSPACE_TAB_ICON_SIZE: f32 = 16.0;
+const WORKSPACE_TAB_ICON_GAP: f32 = 6.0;
+const WORKSPACE_TAB_ICON_SLOT: f32 = WORKSPACE_TAB_ICON_SIZE + WORKSPACE_TAB_ICON_GAP;
+/// Extra right-edge allowance retained in the tab-width and label budget so the
+/// approved geometry stays unchanged as indicators appear.
+const WORKSPACE_TAB_RIGHT_EDGE_ALLOWANCE: f32 = 14.0;
+/// Fixed text growth kept beyond the old layout after the icon slot and
+/// right-edge allowance.
+const WORKSPACE_TAB_TEXT_GROWTH: f32 = 12.0;
+/// Corner inset for the right-aligned session status dots.
+const WORKSPACE_TAB_STATUS_CORNER_INSET: f32 = 10.0;
+/// Session status dot radius for a 4px diameter.
+const WORKSPACE_TAB_STATUS_DOT_RADIUS: f32 = 2.0;
+/// Gap between session status dots.
+const WORKSPACE_TAB_STATUS_DOT_GAP: f32 = 3.0;
+/// Gap kept between the dot row and the label.
+const WORKSPACE_TAB_STATUS_LABEL_GAP: f32 = 8.0;
+/// Maximum number of session status dots shown on one tab.
+const WORKSPACE_TAB_MAX_SESSION_DOTS: usize = 8;
+/// Existing right padding: close target plus its retained allowance.
+const WORKSPACE_TAB_RIGHT_PADDING: f32 =
+    WORKSPACE_TAB_CLOSE_SLOT + WORKSPACE_TAB_RIGHT_EDGE_ALLOWANCE;
+/// Gentle busy pulse: 1.8s period and a 0.35 minimum opacity.
+const WORKSPACE_TAB_BUSY_PULSE_PERIOD: f64 = 1.8;
+const WORKSPACE_TAB_BUSY_PULSE_MIN: f32 = 0.35;
+/// Crossfade time between session dots and the close glyph.
+const WORKSPACE_TAB_CLOSE_FADE_TIME: f32 = 0.15;
+
+fn fade_color(color: Color32, opacity: f32) -> Color32 {
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(
+        r,
+        g,
+        b,
+        (a as f32 * opacity.clamp(0.0, 1.0))
+            .round()
+            .clamp(0.0, 255.0) as u8,
     )
+}
+
+/// Busy-dot opacity as an 8-bit alpha value. One full sine period is
+/// [`WORKSPACE_TAB_BUSY_PULSE_PERIOD`], with no movement or size change.
+fn workspace_busy_status_alpha(time: f64) -> u8 {
+    let phase = (time * std::f64::consts::TAU / WORKSPACE_TAB_BUSY_PULSE_PERIOD).sin();
+    let opacity = WORKSPACE_TAB_BUSY_PULSE_MIN
+        + (1.0 - WORKSPACE_TAB_BUSY_PULSE_MIN) * (phase as f32 * 0.5 + 0.5);
+    (opacity * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn workspace_tab_visible_session_count(sessions: &[SessionActivity]) -> usize {
+    sessions.len().min(WORKSPACE_TAB_MAX_SESSION_DOTS)
+}
+
+fn workspace_tab_dot_row_width(session_count: usize) -> f32 {
+    let shown = session_count.min(WORKSPACE_TAB_MAX_SESSION_DOTS);
+    if shown == 0 {
+        0.0
+    } else {
+        shown as f32 * WORKSPACE_TAB_STATUS_DOT_RADIUS * 2.0
+            + (shown - 1) as f32 * WORKSPACE_TAB_STATUS_DOT_GAP
+    }
+}
+
+/// Extra right-side room needed once the session dots outgrow the existing
+/// close-target padding. Zero up to three dots.
+fn workspace_tab_dot_excess(session_count: usize) -> f32 {
+    let row_width = workspace_tab_dot_row_width(session_count);
+    if row_width == 0.0 {
+        return 0.0;
+    }
+    (WORKSPACE_TAB_STATUS_CORNER_INSET + row_width + WORKSPACE_TAB_STATUS_LABEL_GAP
+        - WORKSPACE_TAB_RIGHT_PADDING)
+        .max(0.0)
+}
+
+fn workspace_tab_base_width(label: &str, layout: &Layout) -> f32 {
+    let chars = label.chars().count() as f32;
+    (chars * 6.2
+        + 38.0
+        + WORKSPACE_TAB_ICON_SLOT
+        + WORKSPACE_TAB_RIGHT_EDGE_ALLOWANCE
+        + WORKSPACE_TAB_TEXT_GROWTH)
+        .clamp(
+            if layout.compact { 84.0 } else { 96.0 },
+            if layout.compact { 198.0 } else { 238.0 },
+        )
+}
+
+fn workspace_tab_width(label: &str, layout: &Layout, session_count: usize) -> f32 {
+    workspace_tab_base_width(label, layout) + workspace_tab_dot_excess(session_count)
+}
+
+/// Text width left after the close slot, right-edge allowance, icon slot, and
+/// any extra room reserved for the session dot row. The label area itself
+/// stays unchanged as dots appear, so the row never overlaps it.
+fn workspace_tab_label_width(width: f32, session_count: usize) -> f32 {
+    let base_width = width - workspace_tab_dot_excess(session_count);
+    (base_width
+        - WORKSPACE_TAB_INSET
+        - WORKSPACE_TAB_CLOSE_SLOT
+        - WORKSPACE_TAB_RIGHT_EDGE_ALLOWANCE
+        - WORKSPACE_TAB_ICON_SLOT)
+        .max(8.0)
+}
+
+/// Whether OpenCode is active in a workspace tab.
+///
+/// A connected bridge covers both a directly launched TUI and a shell where
+/// the user ran `opencode` manually. A directly launched TUI also counts while
+/// its process is alive, even before the bridge handshakes.
+fn workspace_opencode_active(target: TerminalTarget, connected: bool, running: bool) -> bool {
+    connected || (matches!(target, TerminalTarget::Tui(CompatibleTui::OpenCode)) && running)
+}
+
+/// Non-color summary across all open sessions. Counts include sessions beyond
+/// the eight-dot visual cap.
+fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
+    if sessions.is_empty() {
+        return None;
+    }
+    let busy = sessions
+        .iter()
+        .filter(|activity| **activity == SessionActivity::Busy)
+        .count();
+    let attention = sessions
+        .iter()
+        .filter(|activity| **activity == SessionActivity::Attention)
+        .count();
+    let idle = sessions
+        .iter()
+        .filter(|activity| **activity == SessionActivity::Idle)
+        .count();
+    let mut parts = Vec::new();
+    if busy > 0 {
+        parts.push(format!("{busy} processing"));
+    }
+    if attention > 0 {
+        parts.push(if attention == 1 {
+            "1 needs attention".to_owned()
+        } else {
+            format!("{attention} need attention")
+        });
+    }
+    if idle > 0 {
+        parts.push(format!("{idle} idle"));
+    }
+    Some(format!("Sessions: {}", parts.join(", ")))
+}
+
+/// Vendored OpenCode tab icon, resolved once per process.
+fn opencode_icon() -> crate::explorer_icons::IconId {
+    static ICON: std::sync::OnceLock<crate::explorer_icons::IconId> = std::sync::OnceLock::new();
+    *ICON.get_or_init(|| {
+        crate::explorer_icons::icon_by_file_name("opencode.svg")
+            .expect("opencode.svg is vendored with the explorer icons")
+    })
+}
+
+/// Accessible tab name, including the non-color session summary when present.
+fn workspace_tab_accessible_label(label: &str, summary: Option<&str>) -> String {
+    let label = sanitize_display(label, 80);
+    match summary {
+        Some(summary) => format!("{label} — {summary}"),
+        None => label,
+    }
 }
 
 /// Choose bounded visible tab indices while keeping the active tab visible.
@@ -868,6 +1038,8 @@ struct WorkspaceTabInfo {
     id: WorkspaceId,
     label: String,
     path: std::path::PathBuf,
+    opencode: bool,
+    sessions: Vec<SessionActivity>,
 }
 
 /// Global workspace tabs; OpenCode sessions remain a separate optional map.
@@ -879,15 +1051,44 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         .filter_map(|id| {
             let workbench = model.workspace(id)?;
             let path = workbench.shell_cwd().to_path_buf();
-            let label = workbench
-                .launch_plan()
-                .map(|plan| plan.workspace.display_name().to_owned())
-                .unwrap_or_else(|| {
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Workspace".to_owned())
-                });
-            Some(WorkspaceTabInfo { id, label, path })
+            let opencode = workspace_opencode_active(
+                workbench.terminal_target(),
+                workbench.is_connected(),
+                workbench
+                    .terminal()
+                    .is_some_and(|terminal| terminal.is_running()),
+            );
+            let label = if opencode {
+                "OpenCode".to_owned()
+            } else {
+                workbench
+                    .launch_plan()
+                    .map(|plan| plan.workspace.display_name().to_owned())
+                    .unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Workspace".to_owned())
+                    })
+            };
+            // Session dots follow the icon, so stale rows cannot paint status
+            // after a disconnect or fatal protocol failure.
+            let sessions = if opencode {
+                workbench
+                    .session_map()
+                    .rows()
+                    .iter()
+                    .map(SessionRow::activity)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Some(WorkspaceTabInfo {
+                id,
+                label,
+                path,
+                opencode,
+                sessions,
+            })
         })
         .collect();
     let has_workbench = model.workbench().is_some();
@@ -1036,7 +1237,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             let active_index = tabs.iter().position(|tab| Some(tab.id) == active);
             let widths: Vec<f32> = tabs
                 .iter()
-                .map(|tab| workspace_tab_width(&tab.label, &layout))
+                .map(|tab| workspace_tab_width(&tab.label, &layout, tab.sessions.len()))
                 .collect();
             let plus_extent = theme::icon_action_extent(layout.tab_height);
             let tabs_available = tabs_rect.width().max(0.0);
@@ -1106,11 +1307,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                         for tui in &compatible_tuis {
                             let leading = match tui {
                                 CompatibleTui::OpenCode => {
-                                    let icon =
-                                        crate::explorer_icons::icon_by_file_name("opencode.svg")
-                                            .expect(
-                                                "opencode.svg is vendored with the explorer icons",
-                                            );
+                                    let icon = opencode_icon();
                                     theme::MenuLeading::Image {
                                         uri: icon.uri(),
                                         bytes: icon.bytes(),
@@ -1210,6 +1407,62 @@ fn new_tab_menu_item(
     action.activated
 }
 
+fn paint_workspace_tab_session_dots(
+    ui: &mut Ui,
+    tab: egui::Rect,
+    sessions: &[SessionActivity],
+    fade: f32,
+) {
+    let shown = workspace_tab_visible_session_count(sessions);
+    if shown == 0 || fade <= 0.0 {
+        return;
+    }
+    let fade = fade.clamp(0.0, 1.0);
+    let busy_alpha = workspace_busy_status_alpha(ui.input(|input| input.time)) as f32 * fade;
+    let mut has_busy = false;
+    for (index, activity) in sessions.iter().take(shown).enumerate() {
+        let offset = (shown - 1 - index) as f32
+            * (WORKSPACE_TAB_STATUS_DOT_RADIUS * 2.0 + WORKSPACE_TAB_STATUS_DOT_GAP);
+        let center = egui::pos2(
+            tab.right() - WORKSPACE_TAB_STATUS_CORNER_INSET - offset,
+            tab.center().y,
+        );
+        match activity {
+            SessionActivity::Idle => {
+                ui.painter().circle_filled(
+                    center,
+                    WORKSPACE_TAB_STATUS_DOT_RADIUS,
+                    fade_color(theme::TEXT_TERTIARY, fade),
+                );
+            }
+            SessionActivity::Attention => {
+                ui.painter().circle_filled(
+                    center,
+                    WORKSPACE_TAB_STATUS_DOT_RADIUS,
+                    fade_color(theme::WARNING, fade),
+                );
+            }
+            SessionActivity::Busy => {
+                has_busy = true;
+                let [r, g, b, _] = theme::ACCENT.to_srgba_unmultiplied();
+                ui.painter().circle_filled(
+                    center,
+                    WORKSPACE_TAB_STATUS_DOT_RADIUS,
+                    Color32::from_rgba_unmultiplied(
+                        r,
+                        g,
+                        b,
+                        busy_alpha.round().clamp(0.0, 255.0) as u8,
+                    ),
+                );
+            }
+        }
+    }
+    if has_busy {
+        ui.request_repaint();
+    }
+}
+
 fn workspace_tab_ui(
     ui: &mut Ui,
     tab: &WorkspaceTabInfo,
@@ -1234,6 +1487,12 @@ fn workspace_tab_ui(
     let close_hovered = close_response.hovered();
     let hovered = response.hovered() || close_hovered;
     let close_visible = hovered || response.has_focus() || close_response.has_focus();
+    let close_reveal = ui.ctx().animate_bool_with_time_and_easing(
+        workspace_tab_close_reveal_id(tab.id),
+        close_visible,
+        WORKSPACE_TAB_CLOSE_FADE_TIME,
+        egui::emath::easing::quadratic_out,
+    );
     let fill = if active {
         theme::BG_TAB_SELECTED
     } else if hovered {
@@ -1253,12 +1512,35 @@ fn workspace_tab_ui(
         stroke,
         StrokeKind::Inside,
     );
-    let label_width = (rect.width() - 36.0).max(8.0);
+    let session_summary = opencode_sessions_summary(&tab.sessions);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::Role::Tab,
+            true,
+            active,
+            workspace_tab_accessible_label(&tab.label, session_summary.as_deref()),
+        )
+    });
+    let label_left = rect.left() + WORKSPACE_TAB_INSET + WORKSPACE_TAB_ICON_SLOT;
+    let label_width = workspace_tab_label_width(rect.width(), tab.sessions.len());
     let color = if active || hovered {
         theme::TEXT_PRIMARY
     } else {
         theme::inactive_tab_text()
     };
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + WORKSPACE_TAB_INSET + WORKSPACE_TAB_ICON_SIZE * 0.5,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(WORKSPACE_TAB_ICON_SIZE),
+    );
+    if tab.opencode {
+        let icon = opencode_icon();
+        egui::Image::from_bytes(icon.uri(), icon.bytes()).paint_at(ui, icon_rect);
+    } else {
+        theme::paint_icon(ui.painter(), icon_rect, theme::IconGlyph::Terminal, color);
+    }
     let font = FontId::proportional(if active {
         theme::TAB_SELECTED_FONT_SIZE
     } else {
@@ -1267,21 +1549,26 @@ fn workspace_tab_ui(
     let job = theme::ellipsized_job(sanitize_display(&tab.label, 80), font, color, label_width);
     let galley = ui.painter().layout_job(job);
     ui.painter().galley(
-        egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0),
+        egui::pos2(label_left, rect.center().y - galley.size().y / 2.0),
         galley,
         color,
     );
-    if close_visible {
+    let dots_fade = 1.0 - close_reveal;
+    if dots_fade > 0.0 {
+        paint_workspace_tab_session_dots(ui, rect, &tab.sessions, dots_fade);
+    }
+    if close_reveal > 0.0 {
+        let close_color = if close_hovered {
+            theme::ERROR
+        } else {
+            theme::inactive_icon_color()
+        };
         ui.painter().text(
             close_rect.center(),
             Align2::CENTER_CENTER,
             "×",
             FontId::proportional(theme::CLOSE_GLYPH_SIZE),
-            if close_hovered {
-                theme::ERROR
-            } else {
-                theme::inactive_icon_color()
-            },
+            fade_color(close_color, close_reveal),
         );
     }
     if response.has_focus() {
@@ -1290,10 +1577,17 @@ fn workspace_tab_ui(
     if close_response.has_focus() {
         theme::paint_inside_focus_ring(ui.painter(), close_rect.shrink(1.0), CornerRadius::same(4));
     }
+    let tooltip = if tab.opencode {
+        session_summary.clone()
+    } else {
+        Some(sanitize_display(&tab.path.display().to_string(), 900))
+    };
     let tab_response = if close_hovered {
         response
+    } else if let Some(tooltip) = tooltip {
+        response.on_hover_text(tooltip)
     } else {
-        response.on_hover_text(sanitize_display(&tab.path.display().to_string(), 900))
+        response
     };
     let keyboard = tab_response.has_focus()
         && ui.input(|input| {
@@ -3789,6 +4083,150 @@ mod tests {
             log_issue_tone(LogIssueSeverity::Error),
             (theme::ERROR_TINT, theme::ERROR)
         );
+    }
+
+    #[test]
+    fn workspace_tab_icon_follows_connection_or_a_live_direct_tui() {
+        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        assert!(
+            !workspace_opencode_active(TerminalTarget::Shell, false, true),
+            "a running shell is not OpenCode"
+        );
+        assert!(
+            workspace_opencode_active(TerminalTarget::Shell, true, false),
+            "a connected integration covers a manually launched OpenCode"
+        );
+        assert!(
+            workspace_opencode_active(opencode, false, true),
+            "a directly launched TUI shows the icon before the bridge connects"
+        );
+        assert!(
+            !workspace_opencode_active(opencode, false, false),
+            "the icon disappears when a direct TUI exits or the integration disconnects"
+        );
+    }
+
+    #[test]
+    fn workspace_busy_status_pulse_is_subtle_and_periodic() {
+        let period = WORKSPACE_TAB_BUSY_PULSE_PERIOD;
+        assert!(
+            (1.5..=2.0).contains(&period),
+            "the busy pulse period must stay gentle: {period}"
+        );
+        let bright = workspace_busy_status_alpha(period * 0.25);
+        let dim = workspace_busy_status_alpha(period * 0.75);
+        assert_eq!(bright, 255, "the pulse must reach full opacity");
+        let dim_opacity = dim as f32 / 255.0;
+        assert!(
+            (dim_opacity - WORKSPACE_TAB_BUSY_PULSE_MIN).abs() < 0.01,
+            "the pulse minimum must stay around 0.35: {dim_opacity}"
+        );
+        assert!(dim < bright, "the pulse must change opacity");
+        let sample = 0.137;
+        assert_eq!(
+            workspace_busy_status_alpha(sample),
+            workspace_busy_status_alpha(sample + period),
+            "the pulse must repeat with its period"
+        );
+    }
+
+    #[test]
+    fn workspace_tab_width_keeps_long_labels_wider_than_before() {
+        assert_eq!(workspace_tab_dot_excess(0), 0.0);
+        assert_eq!(workspace_tab_dot_excess(3), 0.0);
+        assert_eq!(workspace_tab_dot_excess(4), 3.0);
+        assert_eq!(workspace_tab_dot_excess(8), 31.0);
+        assert_eq!(
+            workspace_tab_dot_excess(9),
+            31.0,
+            "the eighth dot caps the width excess"
+        );
+
+        for (width, height, base_max, expected_max, old_label) in [
+            (720.0, 480.0, 198.0, 229.0, 114.0),
+            (1280.0, 800.0, 238.0, 269.0, 154.0),
+        ] {
+            let layout = Layout::for_window(width, height);
+            let long_label = "workspace-with-a-long-label-that-clamps";
+            assert!(
+                (workspace_tab_base_width(long_label, &layout) - base_max).abs() < f32::EPSILON,
+                "{width}px: long label base must clamp at exactly {base_max}"
+            );
+            let tab_width = workspace_tab_width(long_label, &layout, 8);
+            assert!(
+                (tab_width - expected_max).abs() < f32::EPSILON,
+                "{width}px: eight dots must clamp at exactly {expected_max}: {tab_width}"
+            );
+            let label_width = workspace_tab_label_width(tab_width, 8);
+            let base_label_width =
+                workspace_tab_label_width(workspace_tab_base_width(long_label, &layout), 0);
+            assert!(
+                (label_width - base_label_width).abs() < f32::EPSILON,
+                "{width}px: eight dots must not shrink the label area: {label_width} vs {base_label_width}"
+            );
+            assert!(
+                label_width - old_label >= 12.0 - f32::EPSILON,
+                "{width}px: eight dots must leave at least 12px more text: {label_width} vs {old_label}"
+            );
+
+            let typical_label = "typical-label";
+            let chars = typical_label.chars().count() as f32;
+            let typical_width = workspace_tab_width(typical_label, &layout, 8);
+            let old_typical_label = chars * 6.2 + 38.0 - 36.0;
+            let typical_label_width = workspace_tab_label_width(typical_width, 8);
+            assert!(
+                typical_label_width - old_typical_label >= 12.0 - f32::EPSILON,
+                "{width}px: a typical label must gain at least 12px of text: {typical_label_width} vs {old_typical_label}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_tab_accessible_name_includes_session_summary() {
+        let busy = opencode_sessions_summary(&[SessionActivity::Busy, SessionActivity::Idle])
+            .expect("busy summary");
+        assert_eq!(busy, "Sessions: 1 processing, 1 idle");
+
+        let attention = opencode_sessions_summary(&[
+            SessionActivity::Attention,
+            SessionActivity::Idle,
+            SessionActivity::Busy,
+        ])
+        .expect("attention summary");
+        assert_eq!(
+            attention,
+            "Sessions: 1 processing, 1 needs attention, 1 idle"
+        );
+        assert_eq!(
+            opencode_sessions_summary(&[SessionActivity::Attention]),
+            Some("Sessions: 1 needs attention".to_owned())
+        );
+        assert_eq!(
+            opencode_sessions_summary(&[
+                SessionActivity::Attention,
+                SessionActivity::Attention,
+                SessionActivity::Busy,
+            ]),
+            Some("Sessions: 1 processing, 2 need attention".to_owned())
+        );
+        assert_eq!(
+            opencode_sessions_summary(&[SessionActivity::Busy; 9]),
+            Some("Sessions: 9 processing".to_owned()),
+            "the summary counts sessions beyond the eight painted dots"
+        );
+        assert_eq!(opencode_sessions_summary(&[]), None);
+
+        let accessible = workspace_tab_accessible_label("OpenCode", Some(&attention));
+        assert_eq!(accessible, format!("OpenCode — {attention}"));
+        assert!(
+            accessible.contains("OpenCode — Sessions: 1 processing"),
+            "{accessible}"
+        );
+        assert!(
+            accessible.contains("1 needs attention"),
+            "attention summary missing: {accessible}"
+        );
+        assert_eq!(workspace_tab_accessible_label("alpha", None), "alpha");
     }
 
     #[test]

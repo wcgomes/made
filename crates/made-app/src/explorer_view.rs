@@ -4782,9 +4782,7 @@ mod tests {
             .expect("modified file");
         assert_eq!(modified.tooltip(), "Modified");
         assert_eq!(folder_mark_color(modified), theme::WARNING);
-        assert!(marks
-            .get(&canonical.join("ignored").join("skip.log"))
-            .is_none());
+        assert!(!marks.contains_key(&canonical.join("ignored").join("skip.log")));
         assert_eq!(
             snapshot
                 .folders
@@ -5172,7 +5170,7 @@ mod tests {
         let mixed = marks.get(&root.join("both.txt")).expect("mixed file mark");
         assert_eq!(mixed.tooltip(), "New, Modified");
         assert_eq!(folder_mark_color(mixed), theme::ACCENT);
-        assert!(marks.get(&root.join("clean.txt")).is_none());
+        assert!(!marks.contains_key(&root.join("clean.txt")));
         assert!(
             marks.contains_key(&root.join("gone.txt")),
             "a deleted path can be marked, but it must not become a row"

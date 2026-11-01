@@ -603,6 +603,45 @@ fn send_state(socket: &mut WebSocket<TcpStream>, revision: u64, directory: &Path
     );
 }
 
+/// Send a session snapshot with explicit `(id, busy, attention)` rows.
+fn send_sessions_state(
+    socket: &mut WebSocket<TcpStream>,
+    revision: u64,
+    directory: &Path,
+    sessions: &[(&str, bool, bool)],
+) {
+    let active_session_id = sessions.first().map(|(id, _, _)| *id);
+    let sessions: Vec<Value> = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, (id, busy, attention))| {
+            json!({
+                "sessionID": id,
+                "title": format!("Session {index}"),
+                "active": index == 0,
+                "busy": busy,
+                "attention": attention,
+                "unread": false,
+                "promptPulse": 0,
+                "renaming": false,
+                "directory": directory,
+                "subpath": null,
+                "projectID": null
+            })
+        })
+        .collect();
+    send(
+        socket,
+        json!({
+            "type": "state",
+            "revision": revision,
+            "activeSessionID": active_session_id,
+            "tabsEnabled": true,
+            "sessions": sessions
+        }),
+    );
+}
+
 fn assert_text_clipped_inside(output: &egui::FullOutput, screen: egui::Rect) {
     fn visit(shape: &egui::Shape, clip: egui::Rect, screen: egui::Rect) {
         match shape {
@@ -793,6 +832,55 @@ fn circle_shapes(output: &egui::FullOutput) -> Vec<egui::epaint::CircleShape> {
         visit(&clipped.shape, &mut circles);
     }
     circles
+}
+
+/// Center of the last (rightmost) session status dot.
+fn status_corner_center(tab: egui::Rect) -> egui::Pos2 {
+    egui::pos2(tab.right() - 10.0, tab.center().y)
+}
+
+/// Session dots painted in the tab's right corner, ordered left to right.
+fn tab_session_dots(output: &egui::FullOutput, tab: egui::Rect) -> Vec<egui::epaint::CircleShape> {
+    let corner = status_corner_center(tab);
+    let mut dots: Vec<_> = circle_shapes(output)
+        .into_iter()
+        .filter(|circle| {
+            (circle.radius - 2.0).abs() < 0.1
+                && (circle.center.y - corner.y).abs() < 0.75
+                && circle.center.x <= corner.x + 0.75
+                && circle.center.x >= corner.x - 7.0 * 7.0 - 0.75
+        })
+        .collect();
+    dots.sort_by(|left, right| left.center.x.total_cmp(&right.center.x));
+    dots
+}
+
+/// Center of dot `index` in a right-aligned row of `count` dots.
+fn session_dot_center(tab: egui::Rect, index: usize, count: usize) -> egui::Pos2 {
+    egui::pos2(
+        tab.right() - 10.0 - (count - 1 - index) as f32 * 7.0,
+        tab.center().y,
+    )
+}
+
+fn session_dot_rgb(dot: &egui::epaint::CircleShape) -> (u8, u8, u8) {
+    let [r, g, b, _] = dot.fill.to_srgba_unmultiplied();
+    (r, g, b)
+}
+
+fn session_dot_alpha(dot: &egui::epaint::CircleShape) -> u8 {
+    dot.fill.to_srgba_unmultiplied()[3]
+}
+
+fn assert_session_dot_color(dot: &egui::epaint::CircleShape, tone: egui::Color32, label: &str) {
+    let (r, g, b) = session_dot_rgb(dot);
+    let [expected_r, expected_g, expected_b, _] = tone.to_srgba_unmultiplied();
+    assert!(
+        (r as i32 - expected_r as i32).abs() <= 1
+            && (g as i32 - expected_g as i32).abs() <= 1
+            && (b as i32 - expected_b as i32).abs() <= 1,
+        "{label} must use its documented tone: ({r},{g},{b}) vs ({expected_r},{expected_g},{expected_b})"
+    );
 }
 
 fn path_center(path: &egui::epaint::PathShape) -> egui::Pos2 {
@@ -1535,7 +1623,9 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
 
     let inactive_tab = headless.response(workspace_tab_id(alpha_id)).rect;
     let full_path = fs::canonicalize(&alpha).unwrap().display().to_string();
-    let output = headless.hover_until_text(workspace_tab_close_id(alpha_id), "Close workspace");
+    headless.hover_until_text(workspace_tab_close_id(alpha_id), "Close workspace");
+    headless.advance(0.2);
+    let output = headless.render();
     assert!(
         output_text(&output).contains("Close workspace"),
         "close affordance must keep its tooltip"
@@ -1573,8 +1663,9 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
     let active_tab = headless.response(workspace_tab_id(beta_id)).rect;
     let active_path = fs::canonicalize(&beta).unwrap().display().to_string();
     let active_close = headless.response(workspace_tab_close_id(beta_id)).rect;
-    let active_output =
-        headless.hover_until_text(workspace_tab_close_id(beta_id), "Close workspace");
+    headless.hover_until_text(workspace_tab_close_id(beta_id), "Close workspace");
+    headless.advance(0.2);
+    let active_output = headless.render();
     let active_text = output_text(&active_output);
     assert!(
         active_text.contains("Close workspace"),
@@ -1624,6 +1715,663 @@ fn workspace_tab_close_hover_lights_parent_and_reddens_icon() {
     assert!(
         text_colors(&active_output, "×", 55.0).contains(&made_app::theme::ERROR),
         "selected-tab close hover must keep the red glyph"
+    );
+}
+
+#[test]
+fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
+    if isolated("workspace_tab_opencode_activity_updates_live_for_background_workspaces") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = fixture_workspace(
+        temp.path(),
+        "opencode-activity-alpha-with-a-long-name",
+        "a.txt",
+    );
+    let beta = fixture_workspace(temp.path(), "activity-beta", "b.txt");
+    let alpha_path = alpha.display().to_string();
+    let beta_path = beta.display().to_string();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let alpha_id = open_workspace(&mut model, &alpha);
+    let beta_id = open_workspace(&mut model, &beta);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, alpha_id);
+    wait_explorer_ready(&mut headless, beta_id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    assert_eq!(
+        headless.model.active_workspace_id(),
+        Some(beta_id),
+        "the OpenCode workspace must stay in the background"
+    );
+    let initial_output = headless.render();
+    let initial_alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let initial_beta_tab = headless.response(workspace_tab_id(beta_id)).rect;
+    for tab in [initial_alpha_tab, initial_beta_tab] {
+        assert!(
+            tab_session_dots(&initial_output, tab).is_empty(),
+            "an idle session map must paint no status dot: {tab:?}"
+        );
+    }
+    assert!(
+        text_rects(
+            &initial_output,
+            "opencode-activity-alpha-with-a-long-name",
+            55.0,
+        )
+        .iter()
+        .any(|rect| initial_alpha_tab.contains_rect(*rect)),
+        "a closed OpenCode tab must keep its folder label"
+    );
+
+    let options =
+        bridge_options(headless.model.workspace(alpha_id).unwrap()).expect("bridge options");
+    let mut socket = connect(&options);
+    headless.pump_until(|model| model.workspace(alpha_id).unwrap().is_connected());
+    headless.render();
+    let connected_idle_output = headless.render();
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&connected_idle_output, alpha_tab).is_empty(),
+        "a connected OpenCode tab with no sessions must paint no status dot"
+    );
+    assert!(
+        text_rects(&connected_idle_output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "a connected OpenCode tab must be labeled OpenCode"
+    );
+    headless.hover(workspace_tab_id(alpha_id));
+    headless.advance(0.2);
+    let no_session_hover = headless.render();
+    let no_session_text = output_text(&no_session_hover);
+    assert!(
+        !no_session_text.contains(&alpha_path) && !no_session_text.contains("Sessions:"),
+        "an OpenCode tab with no sessions must show no parent tooltip: {no_session_text}"
+    );
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.advance(0.2);
+
+    send_sessions_state(
+        &mut socket,
+        1,
+        &alpha,
+        &[
+            ("busy-session", true, false),
+            ("idle-session", false, false),
+        ],
+    );
+    headless.pump_until(|model| {
+        model
+            .workspace(alpha_id)
+            .unwrap()
+            .session_map()
+            .rows()
+            .len()
+            == 2
+    });
+
+    // The extra pass also lets the lazily loaded SVG reach the texture cache.
+    headless.render();
+    let busy_output = headless.render_events_at(Vec::new(), headless.last_time + 0.5);
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let beta_tab = headless.response(workspace_tab_id(beta_id)).rect;
+    let busy_dots = tab_session_dots(&busy_output, alpha_tab);
+    assert_eq!(
+        busy_dots.len(),
+        2,
+        "busy and idle sessions must each paint one dot"
+    );
+    assert!(
+        tab_session_dots(&busy_output, beta_tab).is_empty(),
+        "a plain shell workspace must stay free of OpenCode session dots"
+    );
+
+    let opencode_icon = icon_named("opencode.svg");
+    let icon_image = painted_images(&busy_output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && alpha_tab.contains_rect(image.rect)
+        })
+        .expect("a connected workspace must paint opencode.svg in its tab");
+    assert_eq!(
+        icon_image.texture,
+        icon_texture(&headless.ctx, opencode_icon),
+        "the tab must reuse the vendored opencode.svg bytes"
+    );
+    assert_eq!(
+        icon_image.tint,
+        egui::Color32::WHITE,
+        "the tab icon keeps the shipped SVG colors"
+    );
+    let alpha_label = text_rects(&busy_output, "OpenCode", 55.0)
+        .into_iter()
+        .find(|rect| alpha_tab.contains_rect(*rect))
+        .expect("the OpenCode label must be painted");
+    assert!(
+        icon_image.rect.right() < alpha_label.left(),
+        "the OpenCode icon must precede the label: {:?} vs {:?}",
+        icon_image.rect,
+        alpha_label
+    );
+    assert!(
+        (alpha_label.left() - (alpha_tab.left() + 10.0 + 22.0)).abs() < 1.0,
+        "the label follows the 16px icon and its 6px gap: {:?} in {alpha_tab:?}",
+        alpha_label
+    );
+    let busy_dot = &busy_dots[0];
+    let idle_dot = &busy_dots[1];
+    assert!(
+        (busy_dot.radius - 2.0).abs() < 0.1 && (idle_dot.radius - 2.0).abs() < 0.1,
+        "session dots must keep the 4px diameter: {busy_dot:?} {idle_dot:?}"
+    );
+    assert!(
+        (busy_dot.center - session_dot_center(alpha_tab, 0, 2)).length() < 0.75
+            && (idle_dot.center - session_dot_center(alpha_tab, 1, 2)).length() < 0.75,
+        "dots must be right-aligned in row order: {busy_dot:?} {idle_dot:?}"
+    );
+    assert_session_dot_color(busy_dot, made_app::theme::ACCENT, "the busy dot");
+    assert_session_dot_color(idle_dot, made_app::theme::TEXT_TERTIARY, "the idle dot");
+    let busy_opacity = session_dot_alpha(busy_dot) as f32 / 255.0;
+    assert!(
+        (0.34..=1.0).contains(&busy_opacity),
+        "the busy dot opacity must stay between the pulse bounds: {busy_opacity}"
+    );
+    assert_eq!(
+        session_dot_alpha(idle_dot),
+        255,
+        "the idle dot must be static"
+    );
+    let last_inset = alpha_tab.right() - (idle_dot.center.x + idle_dot.radius);
+    assert!(
+        (last_inset - 8.0).abs() < 0.75,
+        "the last dot must keep the documented right inset: {last_inset}"
+    );
+    assert!(
+        busy_dot.center.x - busy_dot.radius >= alpha_label.right() - 0.75,
+        "the dot row must not overlap the label: dot {:?}, label {alpha_label:?}",
+        busy_dot.center
+    );
+    assert!(
+        !text_rects(&busy_output, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "the close glyph must stay hidden at rest while session dots are visible"
+    );
+
+    let period = 1.8_f64;
+    let next_period = ((headless.last_time / period).floor() + 1.0) * period;
+    let bright_output = headless.render_events_at(Vec::new(), next_period + period * 0.25);
+    let bright_dots = tab_session_dots(&bright_output, alpha_tab);
+    let bright_alpha = session_dot_alpha(&bright_dots[0]);
+    let dim_output = headless.render_events_at(Vec::new(), next_period + period * 0.75);
+    let dim_dots = tab_session_dots(&dim_output, alpha_tab);
+    let dim_alpha = session_dot_alpha(&dim_dots[0]);
+    assert!(
+        bright_alpha > dim_alpha,
+        "the busy session dot must pulse in opacity: bright {bright_alpha}, dim {dim_alpha}"
+    );
+    assert!(
+        (bright_alpha as i32 - 255).abs() <= 1,
+        "the busy dot must reach full opacity: {bright_alpha}"
+    );
+    let dim_opacity = dim_alpha as f32 / 255.0;
+    assert!(
+        (dim_opacity - 0.35).abs() < 0.02,
+        "the busy dot must dim to about 0.35 opacity: {dim_opacity}"
+    );
+    assert_eq!(
+        session_dot_alpha(&bright_dots[1]),
+        session_dot_alpha(&dim_dots[1]),
+        "non-busy session dots must not pulse"
+    );
+
+    let close_target = headless.response(workspace_tab_close_id(alpha_id)).rect;
+    assert!(
+        close_target.width() >= 24.0 && close_target.height() >= 24.0,
+        "the close target must stay at least 24x24: {close_target:?}"
+    );
+    assert!(
+        (close_target.center().x - (alpha_tab.right() - 13.0)).abs() < 0.75
+            && (close_target.center().y - alpha_tab.center().y).abs() < 0.75,
+        "the close target must stay centered at right - 13: target {close_target:?}, tab {alpha_tab:?}"
+    );
+    assert!(
+        (alpha_tab.width() - 135.6).abs() < 0.75,
+        "two dots on the OpenCode label must keep the base width: {alpha_tab:?}"
+    );
+    assert!(
+        (initial_alpha_tab.width() - 238.0).abs() < 0.75,
+        "the disconnected folder tab must keep its long-label clamp: {initial_alpha_tab:?}"
+    );
+    // Usable label area ends 26px (close slot) + 14px (right-edge allowance) from the right.
+    let label_area = alpha_tab.right() - 40.0 - alpha_label.left();
+    assert!(
+        (label_area - 63.6).abs() < 0.75,
+        "the OpenCode label must keep its base text area: {label_area} (tab {alpha_tab:?}, label {alpha_label:?})"
+    );
+    assert!(
+        !painted_images(&busy_output).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && beta_tab.contains_rect(image.rect)
+        }),
+        "a plain shell workspace must not paint the OpenCode icon"
+    );
+    let beta_label = text_rects(&busy_output, "activity-beta", 55.0)
+        .into_iter()
+        .find(|rect| beta_tab.contains_rect(*rect))
+        .expect("the shell tab label");
+    assert!(
+        (beta_label.left() - (beta_tab.left() + 10.0 + 22.0)).abs() < 1.0,
+        "the shell label must start after the leading icon slot: {beta_label:?} in {beta_tab:?}"
+    );
+    let beta_expected_width = "activity-beta".chars().count() as f32 * 6.2 + 86.0;
+    assert!(
+        (beta_tab.width() - beta_expected_width).abs() < 0.75,
+        "the shell tab width must not change for its icon: {beta_tab:?}"
+    );
+    let terminal_window = rect_shapes(&busy_output)
+        .into_iter()
+        .find(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && (shape.stroke.width - 1.5).abs() < 0.05
+                && shape.stroke.color == made_app::theme::TEXT_PRIMARY
+                && beta_tab.contains_rect(shape.rect)
+                && shape.rect.right() <= beta_label.left() - 2.0
+        })
+        .map(|shape| shape.rect)
+        .expect("shell tab terminal window glyph");
+    assert!(
+        (terminal_window.center().x - (beta_tab.left() + 10.0 + 8.0)).abs() < 1.0
+            && (terminal_window.center().y - beta_tab.center().y).abs() < 1.0,
+        "the terminal glyph must be centered in the 16px slot: {terminal_window:?} in {beta_tab:?}"
+    );
+    let terminal_paths: Vec<_> = path_shapes(&busy_output)
+        .into_iter()
+        .filter(|path| {
+            let bounds = egui::Rect::from_points(&path.points);
+            beta_tab.contains_rect(bounds)
+                && bounds.right() <= beta_label.left() - 1.0
+                && matches!(
+                    path.stroke.color,
+                    egui::epaint::ColorMode::Solid(color)
+                        if color == made_app::theme::TEXT_PRIMARY
+                )
+        })
+        .collect();
+    assert_eq!(
+        terminal_paths.len(),
+        2,
+        "the shell tab terminal glyph must keep its chevron and cursor: {terminal_paths:?}"
+    );
+    assert!(
+        terminal_window.contains_rect(egui::Rect::from_points(&terminal_paths[0].points))
+            && terminal_window.contains_rect(egui::Rect::from_points(&terminal_paths[1].points)),
+        "the shell tab prompt strokes must sit inside its terminal window"
+    );
+
+    headless.hover_until_text(workspace_tab_id(alpha_id), "Sessions: 1 processing, 1 idle");
+    headless.advance(0.2);
+    let busy_hover = headless.render();
+    let busy_text = output_text(&busy_hover);
+    assert!(
+        busy_text.contains("Sessions: 1 processing, 1 idle"),
+        "the busy tab tooltip must summarize every session: {busy_text}"
+    );
+    assert!(
+        !busy_text.contains(&alpha_path),
+        "the OpenCode tab tooltip must omit the workspace path: {busy_text}"
+    );
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&busy_hover, alpha_tab).is_empty(),
+        "hover must hide all session dots"
+    );
+    assert!(
+        text_rects(&busy_hover, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "hover must show only the close glyph in place of the dots"
+    );
+
+    let beta_hover = headless.hover_until_text(workspace_tab_id(beta_id), &beta_path);
+    assert!(
+        output_text(&beta_hover).contains(&beta_path),
+        "a plain shell tab must keep its full-path tooltip"
+    );
+
+    send_sessions_state(
+        &mut socket,
+        2,
+        &alpha,
+        &[
+            ("attention-session", false, true),
+            ("idle-session", false, false),
+            ("busy-session", true, false),
+        ],
+    );
+    headless.pump_until(|model| {
+        model
+            .workspace(alpha_id)
+            .unwrap()
+            .session_map()
+            .rows()
+            .len()
+            == 3
+    });
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.advance(0.2);
+    let attention_output = headless.render_events_at(Vec::new(), headless.last_time + 0.25);
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let attention_dots = tab_session_dots(&attention_output, alpha_tab);
+    assert_eq!(
+        attention_dots.len(),
+        3,
+        "each of attention, idle, and busy must paint one dot"
+    );
+    for (index, dot) in attention_dots.iter().enumerate() {
+        assert!(
+            (dot.center - session_dot_center(alpha_tab, index, 3)).length() < 0.75,
+            "dot {index} must follow session order: {dot:?}"
+        );
+        assert!(
+            (dot.radius - 2.0).abs() < 0.1,
+            "dot {index} must keep the 4px diameter"
+        );
+    }
+    assert_session_dot_color(
+        &attention_dots[0],
+        made_app::theme::WARNING,
+        "the attention dot",
+    );
+    assert_session_dot_color(
+        &attention_dots[1],
+        made_app::theme::TEXT_TERTIARY,
+        "the idle dot",
+    );
+    assert_session_dot_color(&attention_dots[2], made_app::theme::ACCENT, "the busy dot");
+    assert!(
+        (0.34..=1.0).contains(&(session_dot_alpha(&attention_dots[2]) as f32 / 255.0)),
+        "attention must not suppress the busy dot"
+    );
+    assert!(
+        !text_rects(&attention_output, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "the close glyph must stay hidden at rest while session dots are visible"
+    );
+
+    // Crossfade mid-frame: both the dots and the X are partially painted.
+    headless.render_events_at(
+        vec![egui::Event::PointerMoved(alpha_tab.center())],
+        headless.last_time + 1.0 / 60.0,
+    );
+    let mid_transition = headless.render_events_at(Vec::new(), headless.last_time + 0.05);
+    let mid_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let mid_dots = tab_session_dots(&mid_transition, mid_tab);
+    assert_eq!(
+        mid_dots.len(),
+        3,
+        "mid-transition must keep the session dots painted"
+    );
+    assert!(
+        mid_dots.iter().all(|dot| {
+            let alpha = session_dot_alpha(dot);
+            alpha > 0 && alpha < 255
+        }),
+        "mid-transition dots must be partially faded: {mid_dots:?}"
+    );
+    let mid_close_alpha = text_colors(&mid_transition, "×", 55.0)
+        .into_iter()
+        .find(|color| color.a() > 0)
+        .expect("mid-transition close glyph");
+    let full_close_alpha = made_app::theme::inactive_icon_color().a();
+    assert!(
+        mid_close_alpha.a() < full_close_alpha,
+        "mid-transition X must be partially faded: {} vs {full_close_alpha}",
+        mid_close_alpha.a()
+    );
+
+    headless.advance(0.2);
+    let settled = headless.render();
+    let settled_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&settled, settled_tab).is_empty(),
+        "after the transition only the close glyph may remain"
+    );
+    assert!(
+        text_colors(&settled, "×", 55.0).contains(&made_app::theme::inactive_icon_color()),
+        "the settled close glyph must paint at full opacity"
+    );
+
+    headless.render_events_at(
+        vec![egui::Event::PointerMoved(egui::pos2(
+            4.0,
+            headless.height - 4.0,
+        ))],
+        headless.last_time + 1.0 / 60.0,
+    );
+    headless.advance(0.2);
+    let returned = headless.render();
+    let returned_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let returned_dots = tab_session_dots(&returned, returned_tab);
+    assert_eq!(
+        returned_dots.len(),
+        3,
+        "leaving the tab must fade every session dot back in"
+    );
+    assert!(
+        returned_dots
+            .iter()
+            .take(2)
+            .all(|dot| session_dot_alpha(dot) == 255),
+        "non-busy dots must return to full opacity"
+    );
+    assert!(
+        !text_rects(&returned, "×", 55.0)
+            .iter()
+            .any(|rect| returned_tab.contains_rect(*rect)),
+        "the close glyph must fade out after leaving the tab"
+    );
+
+    headless.hover_until_text(
+        workspace_tab_id(alpha_id),
+        "Sessions: 1 processing, 1 needs attention, 1 idle",
+    );
+    headless.advance(0.2);
+    let attention_hover = headless.render();
+    let attention_text = output_text(&attention_hover);
+    assert!(
+        attention_text.contains("Sessions: 1 processing, 1 needs attention, 1 idle"),
+        "the attention tooltip must summarize every session: {attention_text}"
+    );
+    assert!(
+        !attention_text.contains(&alpha_path),
+        "the OpenCode attention tooltip must omit the workspace path: {attention_text}"
+    );
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&attention_hover, alpha_tab).is_empty(),
+        "hover must hide all session dots for mixed activity"
+    );
+    assert!(
+        text_rects(&attention_hover, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "hover must show only the close glyph for mixed activity"
+    );
+
+    let many_sessions = [
+        ("many-busy-0", true, false),
+        ("many-busy-1", true, false),
+        ("many-busy-2", true, false),
+        ("many-busy-3", true, false),
+        ("many-busy-4", true, false),
+        ("many-busy-5", true, false),
+        ("many-busy-6", true, false),
+        ("many-busy-7", true, false),
+        ("many-attention-8", false, true),
+    ];
+    send_sessions_state(&mut socket, 3, &alpha, &many_sessions);
+    headless.pump_until(|model| {
+        model
+            .workspace(alpha_id)
+            .unwrap()
+            .session_map()
+            .rows()
+            .len()
+            == 9
+    });
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.advance(0.2);
+    let many_output = headless.render_events_at(Vec::new(), headless.last_time + 0.25);
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    let many_dots = tab_session_dots(&many_output, alpha_tab);
+    assert_eq!(
+        many_dots.len(),
+        8,
+        "only the first eight session dots may be visible"
+    );
+    for (index, dot) in many_dots.iter().enumerate() {
+        assert!(
+            (dot.center - session_dot_center(alpha_tab, index, 8)).length() < 0.75,
+            "capped dot {index} must keep session order: {dot:?}"
+        );
+        assert_session_dot_color(dot, made_app::theme::ACCENT, "a capped busy dot");
+    }
+    assert!(
+        many_dots
+            .iter()
+            .all(|dot| session_dot_rgb(dot) != session_dot_rgb(&attention_dots[0])),
+        "the ninth attention session must stay out of the eight-dot row"
+    );
+    assert!(
+        (alpha_tab.width() - 166.6).abs() < 0.75,
+        "eight dots must grow the OpenCode tab to exactly 166.6px: {alpha_tab:?}"
+    );
+    let many_label = text_rects(&many_output, "OpenCode", 55.0)
+        .into_iter()
+        .find(|rect| alpha_tab.contains_rect(*rect))
+        .expect("the capped-dot tab must keep its label");
+    let many_label_area = alpha_tab.right() - 40.0 - 31.0 - many_label.left();
+    assert!(
+        (many_label_area - label_area).abs() < 0.75,
+        "eight dots must grow the tab without shrinking the label: {many_label_area} vs {label_area}"
+    );
+    let many_hover = {
+        headless.hover_until_text(
+            workspace_tab_id(alpha_id),
+            "Sessions: 8 processing, 1 needs attention",
+        );
+        headless.advance(0.2);
+        headless.render()
+    };
+    let many_text = output_text(&many_hover);
+    assert!(
+        many_text.contains("Sessions: 8 processing, 1 needs attention"),
+        "the tooltip summary must count sessions beyond the dot cap: {many_text}"
+    );
+    assert!(
+        !many_text.contains(&alpha_path),
+        "the capped OpenCode tooltip must omit the workspace path: {many_text}"
+    );
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&many_hover, alpha_tab).is_empty(),
+        "hover must hide the capped dot row"
+    );
+    assert!(
+        text_rects(&many_hover, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "hover must show only the close glyph for the capped dot row"
+    );
+
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.focus(workspace_tab_id(alpha_id));
+    headless.advance(0.2);
+    let focused = headless.render();
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&focused, alpha_tab).is_empty(),
+        "keyboard focus must hide all session dots"
+    );
+    assert!(
+        text_rects(&focused, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "keyboard focus must show only the close glyph in place of the dots"
+    );
+
+    send(
+        &mut socket,
+        json!({"type":"goodbye", "reason":"normal exit"}),
+    );
+    headless.pump_until(|model| !model.workspace(alpha_id).unwrap().is_connected());
+    headless.render();
+    let disconnected = headless.render();
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        tab_session_dots(&disconnected, alpha_tab).is_empty(),
+        "a disconnected OpenCode tab must paint no session dots"
+    );
+    assert!(
+        !painted_images(&disconnected).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && alpha_tab.contains_rect(image.rect)
+        }),
+        "the icon must disappear when the integration disconnects"
+    );
+    assert!(
+        text_rects(
+            &disconnected,
+            "opencode-activity-alpha-with-a-long-name",
+            55.0,
+        )
+        .iter()
+        .any(|rect| alpha_tab.contains_rect(*rect)),
+        "the disconnected tab must revert to its folder label"
+    );
+    assert!(
+        (alpha_tab.width() - 238.0).abs() < 0.75,
+        "the reverted folder label must restore the long-label width: {alpha_tab:?}"
+    );
+    headless.hover_until_text(workspace_tab_id(alpha_id), &alpha_path);
+    headless.advance(0.2);
+    let idle_hover = headless.render();
+    let alpha_tab = headless.response(workspace_tab_id(alpha_id)).rect;
+    assert!(
+        text_rects(&idle_hover, "×", 55.0)
+            .iter()
+            .any(|rect| alpha_tab.contains_rect(*rect)),
+        "the idle close glyph must become visible on hover"
+    );
+    assert!(
+        tab_session_dots(&idle_hover, alpha_tab).is_empty(),
+        "an idle tab must keep the no-status close behavior"
+    );
+    assert!(
+        output_text(&idle_hover).contains(&alpha_path),
+        "the reverted folder tab must show its full-path tooltip"
     );
 }
 
@@ -3047,7 +3795,9 @@ fn workspace_tab_close_is_hidden_until_hover_or_focus_without_layout_growth() {
         .find(|rect| alpha_tab.contains_rect(*rect))
         .expect("idle tab label");
 
-    let hovered_tab = headless.hover(alpha_tab_id);
+    headless.hover(alpha_tab_id);
+    headless.advance(0.2);
+    let hovered_tab = headless.render();
     let hovered_glyphs = text_rects(&hovered_tab, "×", 55.0);
     assert_eq!(hovered_glyphs.len(), 1, "tab hover must reveal one X");
     assert!(
@@ -3074,7 +3824,9 @@ fn workspace_tab_close_is_hidden_until_hover_or_focus_without_layout_growth() {
         "showing the X must not move or resize the label"
     );
 
-    let hovered_close = headless.hover(alpha_close_id);
+    headless.hover(alpha_close_id);
+    headless.advance(0.2);
+    let hovered_close = headless.render();
     let close_glyphs = text_rects(&hovered_close, "×", 55.0);
     assert_eq!(close_glyphs.len(), 1, "close hover must keep one X visible");
     assert!(
@@ -3103,6 +3855,7 @@ fn workspace_tab_close_is_hidden_until_hover_or_focus_without_layout_growth() {
         headless.height - 4.0,
     ))]);
     headless.focus(alpha_tab_id);
+    headless.advance(0.2);
     let focused_tab = headless.render();
     assert_eq!(
         text_rects(&focused_tab, "×", 55.0).len(),
@@ -4822,6 +5575,16 @@ fn workspace_strip_budget_keeps_controls_inside_and_non_overlapping() {
                 "a".to_owned(),
                 "b".to_owned(),
                 "c".to_owned(),
+                "long-active-workspace-name".to_owned(),
+            ],
+        ),
+        (
+            720.0,
+            480.0,
+            vec![
+                "a".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
                 "d".to_owned(),
                 "long-active-workspace-name".to_owned(),
             ],
@@ -6243,15 +7006,13 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
     wait_explorer_ready(&mut headless, id);
     let output = headless.render();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
-    for action in ["open-folder"] {
-        let response = headless.response(top_action_id(action));
-        assert!(
-            screen.contains_rect(response.rect),
-            "{action} control is clipped: {:?}",
-            response.rect
-        );
-        assert!(response.rect.width() >= 24.0 && response.rect.height() >= 24.0);
-    }
+    let open_folder = headless.response(top_action_id("open-folder"));
+    assert!(
+        screen.contains_rect(open_folder.rect),
+        "open-folder control is clipped: {:?}",
+        open_folder.rect
+    );
+    assert!(open_folder.rect.width() >= 24.0 && open_folder.rect.height() >= 24.0);
     assert!(
         headless
             .ctx

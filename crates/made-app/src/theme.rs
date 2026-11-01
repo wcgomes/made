@@ -926,7 +926,18 @@ pub fn icon_action(
     height: f32,
     gap: Color32,
 ) -> ActionResponse {
-    icon_action_with(ui, id, glyph, label, selected, height, gap, None)
+    icon_action_with(
+        ui,
+        id,
+        IconActionOptions {
+            glyph,
+            label,
+            selected,
+            height,
+            gap,
+            rings: None,
+        },
+    )
 }
 
 /// Source-control toggle. Ring overrides do not replace the stem, the curve,
@@ -943,25 +954,35 @@ pub fn source_control_action(
     icon_action_with(
         ui,
         id,
-        IconGlyph::SourceControl,
-        label,
-        selected,
-        height,
-        gap,
-        Some(rings),
+        IconActionOptions {
+            glyph: IconGlyph::SourceControl,
+            label,
+            selected,
+            height,
+            gap,
+            rings: Some(rings),
+        },
     )
 }
 
-fn icon_action_with(
-    ui: &mut Ui,
-    id: egui::Id,
+struct IconActionOptions<'a> {
     glyph: IconGlyph,
-    label: &str,
+    label: &'a str,
     selected: bool,
     height: f32,
     gap: Color32,
     rings: Option<SourceControlRings>,
-) -> ActionResponse {
+}
+
+fn icon_action_with(ui: &mut Ui, id: egui::Id, options: IconActionOptions<'_>) -> ActionResponse {
+    let IconActionOptions {
+        glyph,
+        label,
+        selected,
+        height,
+        gap,
+        rings,
+    } = options;
     let extent = icon_action_extent(height);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(extent, extent), egui::Sense::hover());
     let mut response = ui.interact(rect, id, egui::Sense::click());
