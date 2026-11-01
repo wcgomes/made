@@ -947,7 +947,7 @@ fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
         .count();
     let mut parts = Vec::new();
     if busy > 0 {
-        parts.push(format!("{busy} processing"));
+        parts.push(format!("{busy} running"));
     }
     if attention > 0 {
         parts.push(if attention == 1 {
@@ -4185,7 +4185,7 @@ mod tests {
     fn workspace_tab_accessible_name_includes_session_summary() {
         let busy = opencode_sessions_summary(&[SessionActivity::Busy, SessionActivity::Idle])
             .expect("busy summary");
-        assert_eq!(busy, "Sessions: 1 processing, 1 idle");
+        assert_eq!(busy, "Sessions: 1 running, 1 idle");
 
         let attention = opencode_sessions_summary(&[
             SessionActivity::Attention,
@@ -4193,10 +4193,7 @@ mod tests {
             SessionActivity::Busy,
         ])
         .expect("attention summary");
-        assert_eq!(
-            attention,
-            "Sessions: 1 processing, 1 needs attention, 1 idle"
-        );
+        assert_eq!(attention, "Sessions: 1 running, 1 needs attention, 1 idle");
         assert_eq!(
             opencode_sessions_summary(&[SessionActivity::Attention]),
             Some("Sessions: 1 needs attention".to_owned())
@@ -4207,11 +4204,11 @@ mod tests {
                 SessionActivity::Attention,
                 SessionActivity::Busy,
             ]),
-            Some("Sessions: 1 processing, 2 need attention".to_owned())
+            Some("Sessions: 1 running, 2 need attention".to_owned())
         );
         assert_eq!(
             opencode_sessions_summary(&[SessionActivity::Busy; 9]),
-            Some("Sessions: 9 processing".to_owned()),
+            Some("Sessions: 9 running".to_owned()),
             "the summary counts sessions beyond the eight painted dots"
         );
         assert_eq!(opencode_sessions_summary(&[]), None);
@@ -4219,7 +4216,7 @@ mod tests {
         let accessible = workspace_tab_accessible_label("OpenCode", Some(&attention));
         assert_eq!(accessible, format!("OpenCode — {attention}"));
         assert!(
-            accessible.contains("OpenCode — Sessions: 1 processing"),
+            accessible.contains("OpenCode — Sessions: 1 running"),
             "{accessible}"
         );
         assert!(

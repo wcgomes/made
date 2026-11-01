@@ -2019,12 +2019,12 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the shell tab prompt strokes must sit inside its terminal window"
     );
 
-    headless.hover_until_text(workspace_tab_id(alpha_id), "Sessions: 1 processing, 1 idle");
+    headless.hover_until_text(workspace_tab_id(alpha_id), "Sessions: 1 running, 1 idle");
     headless.advance(0.2);
     let busy_hover = headless.render();
     let busy_text = output_text(&busy_hover);
     assert!(
-        busy_text.contains("Sessions: 1 processing, 1 idle"),
+        busy_text.contains("Sessions: 1 running, 1 idle"),
         "the busy tab tooltip must summarize every session: {busy_text}"
     );
     assert!(
@@ -2188,13 +2188,13 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
 
     headless.hover_until_text(
         workspace_tab_id(alpha_id),
-        "Sessions: 1 processing, 1 needs attention, 1 idle",
+        "Sessions: 1 running, 1 needs attention, 1 idle",
     );
     headless.advance(0.2);
     let attention_hover = headless.render();
     let attention_text = output_text(&attention_hover);
     assert!(
-        attention_text.contains("Sessions: 1 processing, 1 needs attention, 1 idle"),
+        attention_text.contains("Sessions: 1 running, 1 needs attention, 1 idle"),
         "the attention tooltip must summarize every session: {attention_text}"
     );
     assert!(
@@ -2276,14 +2276,14 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
     let many_hover = {
         headless.hover_until_text(
             workspace_tab_id(alpha_id),
-            "Sessions: 8 processing, 1 needs attention",
+            "Sessions: 8 running, 1 needs attention",
         );
         headless.advance(0.2);
         headless.render()
     };
     let many_text = output_text(&many_hover);
     assert!(
-        many_text.contains("Sessions: 8 processing, 1 needs attention"),
+        many_text.contains("Sessions: 8 running, 1 needs attention"),
         "the tooltip summary must count sessions beyond the dot cap: {many_text}"
     );
     assert!(
