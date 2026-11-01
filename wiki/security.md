@@ -1,6 +1,6 @@
 # Security
 
-Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, and untrusted text arriving from OpenCode or the terminal. This page records the implemented model and accepted v1 residuals. Normative requirements are in [`specs/changes/archive/20261029-opencode-session-follow-v1/spec.md`](../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md).
+Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, and untrusted text and clipboard content arriving from OpenCode or the terminal. This page records the implemented model and accepted v1 residuals. Normative requirements are in [OpenCode Session Follow](../specs/opencode-session-follow.md).
 
 ## Local bridge
 
@@ -41,7 +41,10 @@ Only `made-explorer` reads workspace file contents for display. Read-only git me
 
 - Session titles, paths, error strings, and log text are treated as untrusted. Central sanitization replaces controls/newlines with spaces and removes bidi/format controls before display/copy.
 - Embedded legacy/C1 bracketed-paste markers are replaced with spaces to a fixed point, so overlapping input cannot reconstruct a marker. This is input hardening, not a general escape filter; pasted control characters still reach the child unless the child handles them.
-- Terminal key semantics are preserved: Ctrl/Cmd+C copies only with a selection, otherwise Ctrl+C remains SIGINT on Linux/Windows; Ctrl+X remains CAN; Ctrl+S remains XOFF; macOS Cmd+C without selection is ignored. egui clipboard shortcuts stay disabled.
+- Terminal key semantics are preserved: Ctrl/Cmd+C copies only with a selection, otherwise Ctrl+C remains SIGINT on Linux/Windows; Ctrl+X remains CAN; Ctrl+S remains XOFF; macOS Cmd+C without selection is ignored. egui clipboard shortcuts stay disabled. Ctrl/Cmd+V forwards `0x16` when the clipboard holds an image so the child TUI reads it natively; Ctrl/Cmd+Shift+V saves the image as a private PNG and pastes its absolute path.
+- Clipboard images use the private temp directory: `clipboard-images/` is `0700`, each PNG is created `0600` with `create_new`/`O_NOFOLLOW` on Unix, and raw RGBA input is bounded to 128 MiB and 16384 px per side. Image bytes and clipboard text are never logged; `Debug` reports dimensions and byte length only.
+- App-generated clipboard PNGs are retained for at most 7 days and at most 64 files. Cleanup runs after a successful save and when a workbench starts, deletes oldest first, preserves the just-saved image, skips symlinks and unrelated files, and ignores deletion failures so the paste remains usable.
+- The image-path fallback is app-generated, absolute, and UTF-8; a non-UTF-8 temp path is refused instead of pasted lossily.
 - The shell is never asked to evaluate cwd report contents, and Made does not scrape prompts/titles or inject discovery commands into a running shell.
 
 ## Private state and lifecycle

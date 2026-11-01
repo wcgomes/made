@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Key, Rect, Sense, Ui, Vec2};
-use made_platform::{ExitStatus, ImeComposition, ImeEvent, Platform, PtySize};
+use made_platform::{
+    save_clipboard_image_png, ClipboardImage, ExitStatus, ImeComposition, ImeEvent, Platform,
+    PlatformFamily, PtySize,
+};
 use made_terminal::{
     InputEncoder, Key as TerminalKey, Modifiers as TerminalModifiers, MouseButton, MouseEvent,
     MouseEventKind, MouseMode, PtyError, PtyOptions, PtyProcess, TerminalCore, TerminalDamage,
@@ -162,6 +165,7 @@ pub struct TerminalPane {
     cwd_changed_at: Option<Instant>,
     pending_input: PendingInput,
     input_notice: Option<String>,
+    native_image_paste_hint_shown: bool,
     focus_on_next_frame: bool,
     wrote_input: bool,
     palette: GridPalette,
@@ -223,6 +227,7 @@ impl TerminalPane {
             cwd_changed_at: None,
             pending_input: PendingInput::default(),
             input_notice: None,
+            native_image_paste_hint_shown: false,
             focus_on_next_frame: false,
             wrote_input: false,
             palette: crate::theme::terminal_palette(),
@@ -690,28 +695,157 @@ impl TerminalPane {
         Some(text)
     }
 
-    /// Paste clipboard text as bracketed paste when the application enabled it.
+    /// Paste clipboard text, or forward Ctrl+V when the clipboard holds an
+    /// image so the child TUI can read the clipboard natively.
     pub fn paste_clipboard(&mut self, platform: &dyn Platform, log: &mut DiagnosticLog) -> bool {
-        let text = match platform.clipboard() {
-            Ok(mut clipboard) => match clipboard.get_text() {
-                Ok(text) => text,
-                Err(error) => {
-                    self.input_notice =
-                        Some("Clipboard read failed; nothing was pasted.".to_owned());
-                    log.record(LogLevel::Warn, format!("clipboard read failed: {error}"));
-                    return false;
-                }
-            },
+        self.paste_clipboard_with_mode(platform, log, PasteMode::Native)
+    }
+
+    /// Paste clipboard text or an image according to `mode`.
+    ///
+    /// Native mode forwards Ctrl+V for images so the child TUI can read the
+    /// clipboard itself. Path mode saves the image as a private PNG and pastes
+    /// its absolute path. Text-only clipboards keep the bracketed-paste path.
+    pub(crate) fn paste_clipboard_with_mode(
+        &mut self,
+        platform: &dyn Platform,
+        log: &mut DiagnosticLog,
+        mode: PasteMode,
+    ) -> bool {
+        let mut clipboard = match platform.clipboard() {
+            Ok(clipboard) => clipboard,
             Err(error) => {
                 self.input_notice = Some("Clipboard unavailable; nothing was pasted.".to_owned());
                 log.record(LogLevel::Warn, format!("clipboard unavailable: {error}"));
                 return false;
             }
         };
-        if text.is_empty() {
-            return false;
+
+        let image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(image_error) => {
+                let text = clipboard.get_text();
+                return self.paste_text_after_image_error(log, mode, text, image_error);
+            }
+        };
+
+        if let Some(image) = image {
+            return match mode {
+                PasteMode::Native => self.forward_native_image_paste(platform, log),
+                PasteMode::Path => self.paste_image_path(platform, &image, log),
+            };
         }
-        self.write_paste(&text, log)
+
+        match clipboard.get_text() {
+            Ok(text) if !text.is_empty() => self.write_paste(&text, log),
+            Ok(_) => {
+                self.input_notice =
+                    Some("Clipboard has no readable text or image; nothing was pasted.".to_owned());
+                log.record(LogLevel::Info, "clipboard is empty; nothing was pasted");
+                false
+            }
+            Err(error) => {
+                self.input_notice =
+                    Some("Clipboard has no readable text or image; nothing was pasted.".to_owned());
+                log.record(LogLevel::Warn, format!("clipboard read failed: {error}"));
+                false
+            }
+        }
+    }
+
+    fn paste_text_after_image_error(
+        &mut self,
+        log: &mut DiagnosticLog,
+        mode: PasteMode,
+        text: Result<String, made_platform::PlatformError>,
+        image_error: made_platform::PlatformError,
+    ) -> bool {
+        log.record(
+            LogLevel::Warn,
+            format!("clipboard image read failed: {image_error}"),
+        );
+        match text {
+            Ok(text) if !text.is_empty() => return self.write_paste(&text, log),
+            Ok(_) => {}
+            Err(error) => {
+                log.record(LogLevel::Warn, format!("clipboard read failed: {error}"));
+            }
+        }
+        if mode == PasteMode::Native {
+            self.input_notice = Some(
+                "Clipboard has no readable text or image; forwarded Ctrl+V to the shell."
+                    .to_owned(),
+            );
+            self.clear_selection_for_input();
+            self.write(&[0x16], log)
+        } else {
+            self.input_notice =
+                Some("Clipboard has no readable text or image; nothing was pasted.".to_owned());
+            false
+        }
+    }
+
+    fn forward_native_image_paste(
+        &mut self,
+        platform: &dyn Platform,
+        log: &mut DiagnosticLog,
+    ) -> bool {
+        self.clear_selection_for_input();
+        let wrote = self.write(&[0x16], log);
+        if wrote && !self.native_image_paste_hint_shown {
+            self.native_image_paste_hint_shown = true;
+            let shortcut = if platform.family() == PlatformFamily::MacOs {
+                "Cmd+Shift+V"
+            } else {
+                "Ctrl+Shift+V"
+            };
+            self.input_notice = Some(format!(
+                "Image paste sent to the terminal; use {shortcut} to paste its file path instead."
+            ));
+        }
+        wrote
+    }
+
+    fn paste_image_path(
+        &mut self,
+        platform: &dyn Platform,
+        image: &ClipboardImage,
+        log: &mut DiagnosticLog,
+    ) -> bool {
+        let paths = match platform.app_paths() {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.input_notice =
+                    Some("Clipboard image could not be saved; nothing was pasted.".to_owned());
+                log.record(
+                    LogLevel::Warn,
+                    format!("clipboard image path unavailable: {error}"),
+                );
+                return false;
+            }
+        };
+        let path = match save_clipboard_image_png(&paths.temp_dir, image) {
+            Ok(path) => path,
+            Err(error) => {
+                self.input_notice =
+                    Some("Clipboard image could not be saved; nothing was pasted.".to_owned());
+                log.record(
+                    LogLevel::Warn,
+                    format!("clipboard image save failed: {error}"),
+                );
+                return false;
+            }
+        };
+        let Some(path) = path.to_str() else {
+            self.input_notice =
+                Some("Clipboard image could not be saved; nothing was pasted.".to_owned());
+            log.record(
+                LogLevel::Warn,
+                "clipboard image path is not valid UTF-8; nothing was pasted",
+            );
+            return false;
+        };
+        self.write_paste(path, log)
     }
 
     /// Terminate and reap the child. Idempotent.
@@ -764,6 +898,7 @@ impl TerminalPane {
         self.ime_preedit.clear();
         self.pending_input.clear();
         self.input_notice = None;
+        self.native_image_paste_hint_shown = false;
         self.wrote_input = false;
         self.input_echo = None;
         self.recent_typed_text.clear();
@@ -1083,7 +1218,12 @@ impl TerminalPane {
             }
             KeyRoute::PasteClipboard => {
                 if !*pasted {
-                    *pasted = self.paste_clipboard(platform, log);
+                    *pasted = self.paste_clipboard_with_mode(platform, log, PasteMode::Native);
+                }
+            }
+            KeyRoute::PasteClipboardPath => {
+                if !*pasted {
+                    *pasted = self.paste_clipboard_with_mode(platform, log, PasteMode::Path);
                 }
             }
             KeyRoute::Ignore => {}
@@ -1521,10 +1661,19 @@ fn forward_mouse_report(mouse_mode: MouseMode, shift: bool) -> bool {
     mouse_mode != MouseMode::Off && !shift
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteMode {
+    /// Forward Ctrl+V so the child TUI reads the image clipboard itself.
+    Native,
+    /// Save the image and paste its absolute file path.
+    Path,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyRoute {
     CopySelection,
     PasteClipboard,
+    PasteClipboardPath,
     Ignore,
     Write(Vec<u8>),
 }
@@ -1548,7 +1697,11 @@ fn route_key(
         // character and must reach the child.
     }
     if command && key == Key::V {
-        return KeyRoute::PasteClipboard;
+        return if modifiers.shift {
+            KeyRoute::PasteClipboardPath
+        } else {
+            KeyRoute::PasteClipboard
+        };
     }
 
     // Super/Command combinations that are not explicitly handled must not leak
@@ -1699,6 +1852,14 @@ fn pointer_modifiers(modifiers: egui::Modifiers) -> TerminalModifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::io::{self, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    use made_platform::{
+        AppPaths, Clipboard, Environment, PlatformError, PluginDirSource, PtyRequest, PtySession,
+        ShellSpec, MAX_CLIPBOARD_IMAGE_SIDE,
+    };
     use made_terminal::InputModes;
 
     fn ctrl() -> egui::Modifiers {
@@ -2446,6 +2607,468 @@ mod tests {
         );
         assert!(copied.notice.as_deref().unwrap_or("").contains("copied"));
         pane.terminate(&mut log);
+    }
+
+    #[derive(Clone)]
+    struct TestClipboardState {
+        text: Result<String, String>,
+        image: Result<Option<ClipboardImage>, String>,
+    }
+
+    impl Default for TestClipboardState {
+        fn default() -> Self {
+            Self {
+                text: Ok(String::new()),
+                image: Ok(None),
+            }
+        }
+    }
+
+    struct TestClipboard {
+        state: Arc<Mutex<TestClipboardState>>,
+    }
+
+    impl Clipboard for TestClipboard {
+        fn get_text(&mut self) -> Result<String, PlatformError> {
+            self.state
+                .lock()
+                .unwrap()
+                .text
+                .clone()
+                .map_err(PlatformError::message)
+        }
+
+        fn set_text(&mut self, text: &str) -> Result<(), PlatformError> {
+            let mut state = self.state.lock().unwrap();
+            state.text = Ok(text.to_owned());
+            state.image = Ok(None);
+            Ok(())
+        }
+
+        fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+            self.state
+                .lock()
+                .unwrap()
+                .image
+                .clone()
+                .map_err(PlatformError::message)
+        }
+    }
+
+    struct TestPlatform {
+        clipboard: Arc<Mutex<TestClipboardState>>,
+        paths: AppPaths,
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Platform for TestPlatform {
+        fn family(&self) -> PlatformFamily {
+            PlatformFamily::current()
+        }
+
+        fn resolve_shell(&self, _requested: Option<&OsStr>) -> Result<ShellSpec, PlatformError> {
+            Ok(ShellSpec::new("sh"))
+        }
+
+        fn environment(
+            &self,
+            _overrides: &[(OsString, OsString)],
+            _removed: &[OsString],
+        ) -> Environment {
+            Environment::default()
+        }
+
+        fn app_paths(&self) -> Result<AppPaths, PlatformError> {
+            Ok(self.paths.clone())
+        }
+
+        fn clipboard(&self) -> Result<Box<dyn Clipboard>, PlatformError> {
+            Ok(Box::new(TestClipboard {
+                state: self.clipboard.clone(),
+            }))
+        }
+
+        fn spawn_pty(&self, _request: &PtyRequest) -> Result<Box<dyn PtySession>, PlatformError> {
+            Ok(Box::new(TestPtySession {
+                writes: self.writes.clone(),
+            }))
+        }
+    }
+
+    struct TestPtySession {
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl PtySession for TestPtySession {
+        fn take_reader(&self) -> Result<Box<dyn Read + Send>, PlatformError> {
+            Ok(Box::new(io::empty()))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>, PlatformError> {
+            Ok(Box::new(TestPtyWriter {
+                writes: self.writes.clone(),
+            }))
+        }
+
+        fn resize(&self, _size: PtySize) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn size(&self) -> Result<PtySize, PlatformError> {
+            Ok(PtySize::default())
+        }
+
+        fn try_wait(&self) -> Result<Option<ExitStatus>, PlatformError> {
+            Ok(Some(ExitStatus {
+                code: 0,
+                signal: None,
+            }))
+        }
+
+        fn kill(&self) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    struct TestPtyWriter {
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for TestPtyWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_app_paths(root: &Path) -> AppPaths {
+        AppPaths {
+            install_root: root.join("install"),
+            resource_dir: root.join("install"),
+            data_dir: root.join("data"),
+            plugin_root: root.join("plugin"),
+            plugin_dir: root.join("plugin").join("opencode-made"),
+            plugin_source: PluginDirSource::DevelopmentRepository,
+            opencode_config_path: root.join("config").join("opencode").join("cli.json"),
+            log_dir: root.join("log"),
+            temp_dir: root.join("temp"),
+        }
+    }
+
+    fn test_platform(temp: &tempfile::TempDir, clipboard: TestClipboardState) -> TestPlatform {
+        TestPlatform {
+            clipboard: Arc::new(Mutex::new(clipboard)),
+            paths: test_app_paths(temp.path()),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn spawn_test_pane(platform: &TestPlatform) -> TerminalPane {
+        TerminalPane::spawn(
+            platform,
+            PtyOptions::new(&platform.paths.temp_dir).with_size(PtySize { rows: 24, cols: 80 }),
+        )
+        .expect("spawn test PTY")
+    }
+
+    fn test_image(width: u32, height: u32) -> ClipboardImage {
+        ClipboardImage::new(width, height, vec![0xA5; (width * height * 4) as usize])
+            .expect("valid test image")
+    }
+
+    fn wait_for_writes(platform: &TestPlatform, done: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let writes = platform.writes.lock().unwrap().clone();
+            if done(&writes) {
+                return writes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "test PTY writes did not arrive: {writes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn paste_shortcuts_route_native_and_path_modes() {
+        let encoder = InputEncoder::new(InputModes::default());
+        let ctrl_shift = egui::Modifiers {
+            shift: true,
+            ..ctrl()
+        };
+        let cmd_shift = egui::Modifiers {
+            shift: true,
+            ..cmd()
+        };
+
+        assert_eq!(
+            route_key(Key::V, ctrl(), &encoder, false),
+            KeyRoute::PasteClipboard
+        );
+        assert_eq!(
+            route_key(Key::V, cmd(), &encoder, false),
+            KeyRoute::PasteClipboard
+        );
+        assert_eq!(
+            route_key(Key::V, ctrl_shift, &encoder, false),
+            KeyRoute::PasteClipboardPath
+        );
+        assert_eq!(
+            route_key(Key::V, cmd_shift, &encoder, false),
+            KeyRoute::PasteClipboardPath
+        );
+    }
+
+    #[test]
+    fn native_image_paste_forwards_ctrl_v_and_hints_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(
+            &temp,
+            TestClipboardState {
+                text: Ok("must not be pasted".to_owned()),
+                image: Ok(Some(test_image(2, 2))),
+            },
+        );
+        let mut pane = spawn_test_pane(&platform);
+        let mut log = DiagnosticLog::new();
+
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        let writes = wait_for_writes(&platform, |writes| !writes.is_empty());
+        assert_eq!(writes, vec![0x16]);
+        assert!(
+            !writes
+                .windows(b"must not be pasted".len())
+                .any(|window| window == b"must not be pasted"),
+            "image paste must not fall through to the text payload"
+        );
+
+        let notice = pane.input_notice.take().expect("native image paste hint");
+        let shortcut = if PlatformFamily::current() == PlatformFamily::MacOs {
+            "Cmd+Shift+V"
+        } else {
+            "Ctrl+Shift+V"
+        };
+        assert!(
+            notice.contains(shortcut),
+            "the one-time hint must name the path fallback: {notice}"
+        );
+        assert!(!notice.to_lowercase().contains("failed"));
+
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        let _ = wait_for_writes(&platform, |writes| writes.len() >= 2);
+        assert!(
+            pane.input_notice.is_none(),
+            "the fallback hint must not repeat on every paste"
+        );
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn path_image_paste_writes_a_bracketed_absolute_png_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(
+            &temp,
+            TestClipboardState {
+                text: Ok("must not be pasted".to_owned()),
+                image: Ok(Some(test_image(3, 2))),
+            },
+        );
+        let mut pane = spawn_test_pane(&platform);
+        pane.encoder.set_modes(InputModes {
+            bracketed_paste: true,
+            ..InputModes::default()
+        });
+        let mut log = DiagnosticLog::new();
+
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Path));
+        let writes = wait_for_writes(&platform, |writes| writes.ends_with(b"\x1b[201~"));
+        assert!(writes.starts_with(b"\x1b[200~"), "writes: {writes:?}");
+        let payload = &writes[b"\x1b[200~".len()..writes.len() - b"\x1b[201~".len()];
+        let path_text = std::str::from_utf8(payload).expect("UTF-8 pasted path");
+        assert!(!path_text.contains("must not be pasted"));
+        let path = PathBuf::from(path_text);
+        assert!(path.is_absolute(), "pasted path must be absolute: {path:?}");
+        assert!(
+            path.starts_with(&platform.paths.temp_dir),
+            "the image must stay under the app temp directory: {path:?}"
+        );
+        let png = std::fs::read(&path).expect("saved clipboard image");
+        assert!(
+            png.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "the saved fallback file must be a PNG"
+        );
+        assert!(pane.input_notice.is_none());
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn text_only_clipboard_still_pastes_text_in_both_modes() {
+        for mode in [PasteMode::Native, PasteMode::Path] {
+            let temp = tempfile::tempdir().unwrap();
+            let platform = test_platform(
+                &temp,
+                TestClipboardState {
+                    text: Ok("clipboard text".to_owned()),
+                    image: Ok(None),
+                },
+            );
+            let mut pane = spawn_test_pane(&platform);
+            let mut log = DiagnosticLog::new();
+
+            assert!(pane.paste_clipboard_with_mode(&platform, &mut log, mode));
+            let writes = wait_for_writes(&platform, |writes| !writes.is_empty());
+            assert_eq!(writes, b"clipboard text");
+            assert!(pane.input_notice.is_none());
+            pane.terminate(&mut log);
+        }
+    }
+
+    #[test]
+    fn image_read_failure_falls_back_to_readable_text() {
+        for mode in [PasteMode::Native, PasteMode::Path] {
+            let temp = tempfile::tempdir().unwrap();
+            let platform = test_platform(
+                &temp,
+                TestClipboardState {
+                    text: Ok("fallback text".to_owned()),
+                    image: Err("image read failed".to_owned()),
+                },
+            );
+            let mut pane = spawn_test_pane(&platform);
+            let mut log = DiagnosticLog::new();
+
+            assert!(pane.paste_clipboard_with_mode(&platform, &mut log, mode));
+            let writes = wait_for_writes(&platform, |writes| !writes.is_empty());
+            assert_eq!(writes, b"fallback text");
+            assert!(pane.input_notice.is_none());
+            pane.terminate(&mut log);
+        }
+    }
+
+    #[test]
+    fn path_fallback_refuses_an_oversized_image_without_writing() {
+        let oversize = ClipboardImage::new(MAX_CLIPBOARD_IMAGE_SIDE + 1, 1, vec![0; 4])
+            .expect_err("the test image must exceed the side limit")
+            .to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(
+            &temp,
+            TestClipboardState {
+                text: Ok(String::new()),
+                image: Err(oversize),
+            },
+        );
+        let mut pane = spawn_test_pane(&platform);
+        let mut log = DiagnosticLog::new();
+
+        assert!(!pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Path));
+        let notice = pane.input_notice.take().expect("oversized image notice");
+        assert!(notice.contains("nothing was pasted"), "notice: {notice}");
+        assert!(platform.writes.lock().unwrap().is_empty());
+        assert!(
+            !platform.paths.temp_dir.join("clipboard-images").exists(),
+            "an oversized image must not create the private image directory"
+        );
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn relaunch_allows_the_native_image_paste_hint_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(
+            &temp,
+            TestClipboardState {
+                text: Ok(String::new()),
+                image: Ok(Some(test_image(2, 2))),
+            },
+        );
+        let mut pane = spawn_test_pane(&platform);
+        let mut log = DiagnosticLog::new();
+        let shortcut = if PlatformFamily::current() == PlatformFamily::MacOs {
+            "Cmd+Shift+V"
+        } else {
+            "Ctrl+Shift+V"
+        };
+
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        assert!(pane
+            .input_notice
+            .take()
+            .expect("first hint")
+            .contains(shortcut));
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        assert!(
+            pane.input_notice.is_none(),
+            "the hint must not repeat before relaunch"
+        );
+
+        pane.relaunch(&platform, &mut log).expect("relaunch");
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        assert!(pane
+            .input_notice
+            .take()
+            .expect("hint after relaunch")
+            .contains(shortcut));
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn empty_and_unreadable_clipboards_show_a_notice_without_panicking() {
+        for mode in [PasteMode::Native, PasteMode::Path] {
+            let temp = tempfile::tempdir().unwrap();
+            let platform = test_platform(&temp, TestClipboardState::default());
+            let mut pane = spawn_test_pane(&platform);
+            let mut log = DiagnosticLog::new();
+
+            assert!(!pane.paste_clipboard_with_mode(&platform, &mut log, mode));
+            let notice = pane.input_notice.take().expect("empty clipboard notice");
+            assert!(
+                notice.contains("Clipboard has no readable text or image"),
+                "notice: {notice}"
+            );
+            assert!(platform.writes.lock().unwrap().is_empty());
+            pane.terminate(&mut log);
+        }
+
+        for mode in [PasteMode::Native, PasteMode::Path] {
+            let temp = tempfile::tempdir().unwrap();
+            let platform = test_platform(
+                &temp,
+                TestClipboardState {
+                    text: Err("text read failed".to_owned()),
+                    image: Err("image read failed".to_owned()),
+                },
+            );
+            let mut pane = spawn_test_pane(&platform);
+            let mut log = DiagnosticLog::new();
+
+            let _ = pane.paste_clipboard_with_mode(&platform, &mut log, mode);
+            let notice = pane
+                .input_notice
+                .take()
+                .expect("unreadable clipboard notice");
+            assert!(
+                notice.contains("Clipboard has no readable text or image"),
+                "notice: {notice}"
+            );
+            if mode == PasteMode::Native {
+                let writes = wait_for_writes(&platform, |writes| !writes.is_empty());
+                assert_eq!(writes, vec![0x16]);
+            } else {
+                assert!(platform.writes.lock().unwrap().is_empty());
+            }
+            pane.terminate(&mut log);
+        }
     }
 
     fn run_terminal_frame(

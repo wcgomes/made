@@ -110,10 +110,10 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -1772,28 +1772,311 @@ fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     }
 }
 
-/// Text clipboard behind a trait so tests never require a display server.
+/// Maximum RGBA byte length accepted from the clipboard before encoding.
+///
+/// 128 MiB covers 8K screenshots (7680x4320 RGBA is about 127 MiB) while still
+/// bounding the PNG encode and per-paste memory cost.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Maximum width or height accepted from the clipboard.
+pub const MAX_CLIPBOARD_IMAGE_SIDE: u32 = 16_384;
+
+/// RGBA8 clipboard image.
+///
+/// Construction validates the dimensions and exact byte length. Debug output
+/// reports dimensions and byte length only: clipboard pixels can contain
+/// sensitive screen content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClipboardImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+impl ClipboardImage {
+    /// Build an RGBA8 image after validating its dimensions and byte length.
+    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, PlatformError> {
+        let image = Self {
+            width,
+            height,
+            rgba,
+        };
+        image.validate()?;
+        Ok(image)
+    }
+
+    /// Image width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Image height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// RGBA8 pixel bytes, row-major.
+    pub fn rgba8(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    /// Encode this image as PNG.
+    pub fn to_png(&self) -> Result<Vec<u8>, PlatformError> {
+        use image::ImageEncoder as _;
+
+        self.validate()?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &self.rgba,
+                self.width,
+                self.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|error| {
+                PlatformError::message(format!("clipboard image PNG encoding failed: {error}"))
+            })?;
+        Ok(png)
+    }
+
+    fn validate(&self) -> Result<(), PlatformError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(PlatformError::message(format!(
+                "clipboard image has invalid dimensions {}x{}",
+                self.width, self.height
+            )));
+        }
+        if self.width > MAX_CLIPBOARD_IMAGE_SIDE || self.height > MAX_CLIPBOARD_IMAGE_SIDE {
+            return Err(PlatformError::message(format!(
+                "clipboard image {}x{} exceeds the {MAX_CLIPBOARD_IMAGE_SIDE}-pixel side limit",
+                self.width, self.height
+            )));
+        }
+        let expected = u64::from(self.width) * u64::from(self.height) * 4;
+        if expected > MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+            return Err(PlatformError::message(format!(
+                "clipboard image {}x{} exceeds the {MAX_CLIPBOARD_IMAGE_BYTES}-byte RGBA limit",
+                self.width, self.height
+            )));
+        }
+        if self.rgba.len() as u64 != expected {
+            return Err(PlatformError::message(format!(
+                "clipboard image {}x{} has {} RGBA bytes; expected {expected}",
+                self.width,
+                self.height,
+                self.rgba.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ClipboardImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClipboardImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("rgba_len", &self.rgba.len())
+            .finish()
+    }
+}
+
+/// Maximum attempts to allocate a unique clipboard image file name.
+const MAX_CLIPBOARD_IMAGE_SAVE_ATTEMPTS: usize = 16;
+
+/// Age after which app-generated clipboard PNGs are pruned.
+pub const CLIPBOARD_IMAGE_RETENTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Maximum number of app-generated clipboard PNGs kept on disk.
+pub const MAX_CLIPBOARD_IMAGES: usize = 64;
+
+static CLIPBOARD_IMAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Remove stale app-generated clipboard PNGs.
+///
+/// Deletes regular files named `clipboard-*.png` older than
+/// [`CLIPBOARD_IMAGE_RETENTION_AGE`] and then keeps at most
+/// [`MAX_CLIPBOARD_IMAGES`] of them, oldest first. Symlinks, directories, and
+/// unrelated names are ignored. A missing directory is not an error. Deletion
+/// failures are best effort: they are not returned as an error and never
+/// remove unrelated files.
+pub fn prune_clipboard_images(temp_dir: impl AsRef<Path>) -> Result<usize, PlatformError> {
+    prune_clipboard_images_except(temp_dir.as_ref(), None)
+}
+
+fn prune_clipboard_images_except(
+    temp_dir: &Path,
+    keep: Option<&Path>,
+) -> Result<usize, PlatformError> {
+    let directory = temp_dir.join("clipboard-images");
+    validate_private_temp_path(&directory)?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(PlatformError::io("read clipboard image directory", error)),
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(CLIPBOARD_IMAGE_RETENTION_AGE)
+        .unwrap_or(UNIX_EPOCH);
+    let keep_name = keep.and_then(Path::file_name);
+    let limit = if keep_name.is_some() {
+        MAX_CLIPBOARD_IMAGES.saturating_sub(1)
+    } else {
+        MAX_CLIPBOARD_IMAGES
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if keep_name == Some(name.as_os_str()) {
+            continue;
+        }
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_clipboard_image_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        candidates.push((path, metadata.modified().unwrap_or(UNIX_EPOCH)));
+    }
+    candidates.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let excess = candidates.len().saturating_sub(limit);
+    let mut removed = 0;
+    for (index, (path, modified)) in candidates.iter().enumerate() {
+        if index >= excess && *modified >= cutoff {
+            continue;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn is_clipboard_image_name(name: &str) -> bool {
+    name.starts_with("clipboard-") && name.ends_with(".png")
+}
+
+/// Save a clipboard image as a PNG in the app's private temp directory.
+///
+/// The file is created under `temp_dir/clipboard-images` with a unique name.
+/// On Unix the directory is mode 0700 and the file is mode 0600. The file is
+/// opened with `create_new` (plus `O_NOFOLLOW` where available), so an existing
+/// file or symlink is never overwritten. The absolute file path is returned so
+/// it can be pasted into a TUI that attaches local image paths. After a
+/// successful save, stale app-generated PNGs are pruned best-effort.
+pub fn save_clipboard_image_png(
+    temp_dir: impl AsRef<Path>,
+    image: &ClipboardImage,
+) -> Result<PathBuf, PlatformError> {
+    let directory = temp_dir.as_ref().join("clipboard-images");
+    validate_private_temp_path(&directory)?;
+    create_private_dir_all(&directory)?;
+    validate_private_temp_path(&directory)?;
+
+    let png = image.to_png()?;
+    for _ in 0..MAX_CLIPBOARD_IMAGE_SAVE_ATTEMPTS {
+        let path = directory.join(unique_clipboard_image_name());
+        match create_private_image_file(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&png) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(PlatformError::io("write clipboard image", error));
+                }
+                drop(file);
+                let path = absolute_clipboard_image_path(path)?;
+                let _ = prune_clipboard_images_except(temp_dir.as_ref(), Some(&path));
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(PlatformError::io("create clipboard image", error)),
+        }
+    }
+    Err(PlatformError::message(
+        "could not allocate a unique clipboard image file name",
+    ))
+}
+
+fn unique_clipboard_image_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = CLIPBOARD_IMAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("clipboard-{}-{nanos}-{counter}.png", std::process::id())
+}
+
+fn create_private_image_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+    }
+    Ok(file)
+}
+
+fn absolute_clipboard_image_path(path: PathBuf) -> Result<PathBuf, PlatformError> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::path::absolute(&path)
+        .map_err(|error| PlatformError::io("resolve clipboard image path", error))
+}
+
+/// Clipboard behind a trait so tests never require a display server.
 pub trait Clipboard: Send {
     /// Read UTF-8 text.
     fn get_text(&mut self) -> Result<String, PlatformError>;
 
     /// Replace the clipboard contents with UTF-8 text.
     fn set_text(&mut self, text: &str) -> Result<(), PlatformError>;
+
+    /// Read an RGBA8 image, or `None` when the clipboard has no image.
+    ///
+    /// The default implementation reports no image so text-only clipboard
+    /// implementors keep compiling.
+    fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+        Ok(None)
+    }
 }
 
 /// In-memory clipboard for tests and headless contexts.
 ///
-/// Debug output reports the text length, not the text: clipboard contents can
-/// include secrets copied by the user.
+/// Debug output reports the text length and image dimensions, never the text or
+/// pixels: clipboard contents can include secrets copied by the user.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct InMemoryClipboard {
     text: String,
+    image: Option<ClipboardImage>,
 }
 
 impl fmt::Debug for InMemoryClipboard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryClipboard")
             .field("text_len", &self.text.len())
+            .field("image", &self.image)
             .finish()
     }
 }
@@ -1804,7 +2087,26 @@ impl InMemoryClipboard {
     }
 
     pub fn with_text(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            image: None,
+        }
+    }
+
+    /// Build an image-only clipboard.
+    pub fn with_image(image: ClipboardImage) -> Self {
+        Self {
+            text: String::new(),
+            image: Some(image),
+        }
+    }
+
+    /// Build a clipboard that contains both text and an image.
+    pub fn with_text_and_image(text: impl Into<String>, image: ClipboardImage) -> Self {
+        Self {
+            text: text.into(),
+            image: Some(image),
+        }
     }
 }
 
@@ -1816,7 +2118,12 @@ impl Clipboard for InMemoryClipboard {
     fn set_text(&mut self, text: &str) -> Result<(), PlatformError> {
         self.text.clear();
         self.text.push_str(text);
+        self.image = None;
         Ok(())
+    }
+
+    fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+        Ok(self.image.clone())
     }
 }
 
@@ -1855,6 +2162,30 @@ impl Clipboard for SystemClipboard {
         self.inner
             .set_text(text.to_owned())
             .map_err(|err| PlatformError::message(format!("clipboard write failed: {err}")))
+    }
+
+    fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+        match self.inner.get_image() {
+            Ok(image) => {
+                let width = u32::try_from(image.width).map_err(|_| {
+                    PlatformError::message(format!(
+                        "clipboard image width {} exceeds u32",
+                        image.width
+                    ))
+                })?;
+                let height = u32::try_from(image.height).map_err(|_| {
+                    PlatformError::message(format!(
+                        "clipboard image height {} exceeds u32",
+                        image.height
+                    ))
+                })?;
+                ClipboardImage::new(width, height, image.bytes.into_owned()).map(Some)
+            }
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(error) => Err(PlatformError::message(format!(
+                "clipboard image read failed: {error}"
+            ))),
+        }
     }
 }
 

@@ -6,9 +6,16 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Text-only clipboard. X11 is used when available; wayland-data-control adds the
-# native Wayland clipboard path required by the Linux Wayland target.
-arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
+# Text and RGBA image clipboard. X11 is used when available;
+# wayland-data-control adds the native Wayland clipboard path required by the
+# Linux Wayland target, and image-data enables arboard's image read support.
+arboard = { version = "3.7", default-features = false, features = [
+    "wayland-data-control",
+    "image-data",
+] }
+# PNG encoding for clipboard images saved as private files. Kept in the platform
+# crate so the app never depends on the image crate directly.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # POSIX PTY and Windows ConPTY behind one cross-platform interface.
 portable-pty = "0.9"
 # Unix file modes, process-group signalling, and O_NOFOLLOW for local logs.

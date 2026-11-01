@@ -294,6 +294,9 @@ impl Workbench {
                 if let Err(error) = paths.ensure_directories() {
                     path_error = Some(format!("app directories: {error}"));
                 }
+                // Opportunistic retention: a new tab or app launch bounds the
+                // clipboard image directory even before the next image paste.
+                let _ = made_platform::prune_clipboard_images(&paths.temp_dir);
                 app_paths = Some(paths);
             }
             Err(error) => path_error = Some(format!("app paths: {error}")),

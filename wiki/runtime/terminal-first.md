@@ -1,6 +1,6 @@
 # Terminal-First Runtime
 
-A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md) and [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md).
+A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`specs/opencode-session-follow.md`](../../specs/opencode-session-follow.md) with the historical v1 design at [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) for rationale.
 
 ## Launch and default workspace
 
@@ -62,6 +62,10 @@ Process cleanup lives in `made-platform`:
 
 - Unix captures the shell's process group, re-queries `tcgetpgrp` at cleanup to catch a foreground job after shell exit, skips PID 1/Made's group, and sends SIGHUP then SIGKILL.
 - Windows workspace-scoped Job Object cleanup is implemented and cross-compiled; native runtime evidence is still pending. Immediate-child-only behavior is not claimed as full descendant cleanup.
+
+## Clipboard paste
+
+Terminals have no standard inbound image-clipboard channel, so Made cannot hand raw image bytes to the child process. `Cmd+V`/`Ctrl+V` with an image on the clipboard forwards `Ctrl+V` (`0x16`) so the child TUI — OpenCode, Claude Code, and similar agent TUIs — reads the image natively; text-only clipboards keep bracketed paste. `Cmd+Shift+V`/`Ctrl+Shift+V` saves the image as a PNG under `AppPaths::temp_dir/clipboard-images/` and pastes the absolute path, which agent TUIs that attach local image paths can consume. When both text and an image are present, the image wins, and the first native image forward shows a one-time hint naming the path fallback. Images are capped at 128 MiB RGBA and 16384 px per side. App-generated clipboard PNGs are pruned after 7 days and capped at 64 files; cleanup runs after a successful save and when a workbench starts, and the just-saved image survives. macOS is user-confirmed (2026-11-01); Linux X11/Wayland and Windows have not yet been tested, with no known defect. The contract is the Clipboard image paste and Clipboard image retention requirements in [OpenCode Session Follow](../../specs/opencode-session-follow.md).
 
 ## Bridge isolation
 

@@ -15,11 +15,13 @@ use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
     append_private_log_rotated_with_timeout, detect_compatible_tuis_in_path,
     find_executable_on_path, host_platform, install_root_for_executable, is_sensitive_env_key,
-    open_private_log, previous_private_log_path, private_log_lock_path, repository_plugin_dir,
-    repository_root, resolve_user_home, validate_user_home, AppPaths, Clipboard, CompatibleTui,
-    Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard,
-    LogAppendOutcome, LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily,
-    PluginDirSource, PtyRequest, PtySize, REDACTED_VALUE,
+    open_private_log, previous_private_log_path, private_log_lock_path, prune_clipboard_images,
+    repository_plugin_dir, repository_root, resolve_user_home, save_clipboard_image_png,
+    validate_user_home, AppPaths, Clipboard, ClipboardImage, CompatibleTui, Environment,
+    HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard, LogAppendOutcome,
+    LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest,
+    PtySize, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES, MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
 };
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -1520,6 +1522,322 @@ fn in_memory_clipboard_round_trips_without_a_display() {
     let debug = format!("{:?}", InMemoryClipboard::with_text("clipboard-secret"));
     assert!(!debug.contains("clipboard-secret"));
     assert!(debug.contains("text_len"));
+}
+
+fn test_clipboard_image(width: u32, height: u32) -> ClipboardImage {
+    ClipboardImage::new(width, height, vec![0xA5; (width * height * 4) as usize])
+        .expect("valid clipboard image")
+}
+
+#[test]
+fn in_memory_clipboard_round_trips_images_and_redacts_pixels() {
+    let image = test_clipboard_image(2, 2);
+    let mut image_only = InMemoryClipboard::with_image(image.clone());
+    assert_eq!(
+        image_only.get_image().expect("image read"),
+        Some(image.clone())
+    );
+    assert_eq!(image_only.get_text().expect("text read"), "");
+
+    let mut both = InMemoryClipboard::with_text_and_image("caption", image.clone());
+    assert_eq!(both.get_text().expect("text read"), "caption");
+    assert_eq!(both.get_image().expect("image read"), Some(image.clone()));
+
+    let debug = format!("{:?}", InMemoryClipboard::with_image(image));
+    assert!(
+        debug.contains("width") && debug.contains("height") && debug.contains("rgba_len"),
+        "image Debug must report dimensions and byte length: {debug}"
+    );
+    assert!(
+        !debug.contains("165"),
+        "image Debug must not print the 0xA5 pixel value: {debug}"
+    );
+}
+
+#[test]
+fn clipboard_image_validates_dimensions_and_byte_length() {
+    assert!(ClipboardImage::new(2, 2, vec![0; 16]).is_ok());
+    assert!(ClipboardImage::new(2, 2, vec![0; 15]).is_err());
+    assert!(ClipboardImage::new(0, 2, Vec::new()).is_err());
+    assert!(ClipboardImage::new(MAX_CLIPBOARD_IMAGE_SIDE + 1, 1, vec![0; 4]).is_err());
+    assert!(
+        ClipboardImage::new(
+            MAX_CLIPBOARD_IMAGE_SIDE,
+            MAX_CLIPBOARD_IMAGE_SIDE,
+            Vec::new()
+        )
+        .is_err(),
+        "a 16384x16384 RGBA image exceeds the byte cap before allocation"
+    );
+    assert!(
+        (u64::from(MAX_CLIPBOARD_IMAGE_SIDE) * u64::from(MAX_CLIPBOARD_IMAGE_SIDE) * 4)
+            > MAX_CLIPBOARD_IMAGE_BYTES as u64
+    );
+    assert!(
+        (6016_u64 * 3384 * 4) <= MAX_CLIPBOARD_IMAGE_BYTES as u64,
+        "6K screenshots must fit the clipboard image cap"
+    );
+    assert!(
+        (7680_u64 * 4320 * 4) <= MAX_CLIPBOARD_IMAGE_BYTES as u64,
+        "8K screenshots must fit the clipboard image cap"
+    );
+}
+
+#[test]
+fn clipboard_image_encodes_a_valid_png_with_expected_dimensions() {
+    let image = test_clipboard_image(3, 2);
+    let png = image.to_png().expect("PNG encoding");
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let width = u32::from_be_bytes(png[16..20].try_into().expect("PNG width"));
+    let height = u32::from_be_bytes(png[20..24].try_into().expect("PNG height"));
+    assert_eq!((width, height), (3, 2));
+}
+
+#[test]
+fn clipboard_image_save_is_private_unique_and_under_the_temp_directory() {
+    let root = unique_temp("clipboard-image-save");
+    let image = test_clipboard_image(3, 2);
+
+    let path = save_clipboard_image_png(&root, &image).expect("save clipboard image");
+    assert!(path.is_absolute(), "saved path must be absolute: {path:?}");
+    assert!(path.starts_with(&root), "saved path escaped the temp root");
+    assert_eq!(
+        path.parent().and_then(Path::file_name),
+        Some(OsStr::new("clipboard-images"))
+    );
+    let png = std::fs::read(&path).expect("read saved clipboard image");
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let second = save_clipboard_image_png(&root, &image).expect("save second clipboard image");
+    assert_ne!(path, second, "each paste must get a unique file name");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let file_mode = std::fs::metadata(&path)
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "saved image must be owner-only");
+        let directory = path.parent().expect("image parent");
+        let directory_mode = std::fs::metadata(directory)
+            .expect("directory metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            directory_mode, 0o700,
+            "clipboard image directory must be owner-only"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clipboard_image_save_prunes_to_the_retention_limit() {
+    let root = unique_temp("clipboard-image-bounded");
+    let image = test_clipboard_image(1, 1);
+    let mut last = None;
+    for _ in 0..(MAX_CLIPBOARD_IMAGES + 3) {
+        last = Some(save_clipboard_image_png(&root, &image).expect("save clipboard image"));
+    }
+    let last = last.expect("at least one save");
+    let paths = clipboard_files(&root);
+    assert_eq!(paths.len(), MAX_CLIPBOARD_IMAGES);
+    assert!(
+        last.exists(),
+        "the image from the latest paste must survive its own cleanup"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clipboard_image_save_keeps_the_new_image_when_it_is_oldest() {
+    let root = unique_temp("clipboard-image-keep-new");
+    let directory = root.join("clipboard-images");
+    std::fs::create_dir_all(&directory).expect("create clipboard image directory");
+    let future = SystemTime::now()
+        .checked_add(Duration::from_secs(3600))
+        .expect("future mtime");
+    for index in 0..MAX_CLIPBOARD_IMAGES {
+        let path = directory.join(format!("clipboard-future-{index:03}.png"));
+        std::fs::write(&path, b"png").expect("write future clipboard image");
+        set_modified(&path, future);
+    }
+
+    let image = test_clipboard_image(1, 1);
+    let saved = save_clipboard_image_png(&root, &image).expect("save new clipboard image");
+    assert!(
+        saved.exists(),
+        "the new image must survive even when every existing file sorts newer"
+    );
+    assert_eq!(
+        clipboard_files(&root).len(),
+        MAX_CLIPBOARD_IMAGES,
+        "the kept image must count toward the file cap"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clipboard_image_retention_removes_images_older_than_the_limit() {
+    let root = unique_temp("clipboard-image-age");
+    let image = test_clipboard_image(1, 1);
+    let old = save_clipboard_image_png(&root, &image).expect("save old clipboard image");
+    let fresh = save_clipboard_image_png(&root, &image).expect("save fresh clipboard image");
+    let old_time = SystemTime::now()
+        .checked_sub(CLIPBOARD_IMAGE_RETENTION_AGE)
+        .and_then(|time| time.checked_sub(Duration::from_secs(1)))
+        .expect("retention cutoff");
+    set_modified(&old, old_time);
+
+    let removed = prune_clipboard_images(&root).expect("prune clipboard images");
+    assert_eq!(removed, 1);
+    assert!(!old.exists(), "the expired image must be removed");
+    assert!(fresh.exists(), "the current image must remain");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clipboard_image_retention_preserves_unrelated_entries() {
+    let root = unique_temp("clipboard-image-unrelated");
+    let image = test_clipboard_image(1, 1);
+    let old = save_clipboard_image_png(&root, &image).expect("save old clipboard image");
+    let fresh = save_clipboard_image_png(&root, &image).expect("save fresh clipboard image");
+    let directory = root.join("clipboard-images");
+    let old_time = SystemTime::now()
+        .checked_sub(CLIPBOARD_IMAGE_RETENTION_AGE)
+        .and_then(|time| time.checked_sub(Duration::from_secs(1)))
+        .expect("retention cutoff");
+    set_modified(&old, old_time);
+
+    let other = directory.join("other.png");
+    std::fs::write(&other, b"other").expect("write unrelated PNG");
+    set_modified(&other, old_time);
+    let note = directory.join("note.txt");
+    std::fs::write(&note, b"note").expect("write unrelated text");
+    set_modified(&note, old_time);
+
+    #[cfg(unix)]
+    let (target, link) = {
+        let target = directory.join("target.png");
+        std::fs::write(&target, b"target").expect("write symlink target");
+        let link = directory.join("clipboard-link.png");
+        std::os::unix::fs::symlink(&target, &link).expect("create clipboard symlink");
+        (target, link)
+    };
+
+    let removed = prune_clipboard_images(&root).expect("prune clipboard images");
+    assert_eq!(removed, 1, "only the old app-generated PNG is removed");
+    assert!(!old.exists());
+    assert!(fresh.exists());
+    assert!(other.exists());
+    assert!(note.exists());
+    #[cfg(unix)]
+    {
+        assert!(link.exists(), "the symlink entry must be skipped");
+        assert!(target.exists(), "the symlink target must remain");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn clipboard_image_retention_ignores_deletion_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("PENDING (not passed): root can delete through a read-only directory");
+        return;
+    }
+
+    let root = unique_temp("clipboard-image-failure");
+    let image = test_clipboard_image(1, 1);
+    let old = save_clipboard_image_png(&root, &image).expect("save clipboard image");
+    let old_time = SystemTime::now()
+        .checked_sub(CLIPBOARD_IMAGE_RETENTION_AGE)
+        .and_then(|time| time.checked_sub(Duration::from_secs(1)))
+        .expect("retention cutoff");
+    set_modified(&old, old_time);
+    let directory = root.join("clipboard-images");
+    let original = std::fs::metadata(&directory)
+        .expect("directory metadata")
+        .permissions();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("make image directory read-only");
+
+    let result = prune_clipboard_images(&root);
+    std::fs::set_permissions(&directory, original).expect("restore image directory permissions");
+
+    assert!(
+        result.is_ok(),
+        "cleanup must not return a failure: {result:?}"
+    );
+    assert!(
+        old.exists(),
+        "an undeletable image remains for the next run"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn clipboard_files(root: &Path) -> Vec<PathBuf> {
+    let directory = root.join("clipboard-images");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("clipboard-") && name.ends_with(".png"))
+        })
+        .filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn set_modified(path: &Path, modified: SystemTime) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for mtime");
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .expect("set mtime");
+}
+
+#[test]
+fn clipboard_image_retention_prunes_old_and_excess_files() {
+    let root = unique_temp("clipboard-image-retention");
+    let directory = root.join("clipboard-images");
+    std::fs::create_dir_all(&directory).expect("create clipboard image directory");
+    let now = SystemTime::now();
+    let total = MAX_CLIPBOARD_IMAGES + 3;
+    for index in 0..total {
+        let path = directory.join(format!("clipboard-test-{index:03}.png"));
+        std::fs::write(&path, b"png").expect("write test clipboard image");
+        let modified = now - Duration::from_secs((MAX_CLIPBOARD_IMAGES + 3 - index) as u64 * 60);
+        set_modified(&path, modified);
+    }
+
+    let removed = prune_clipboard_images(&root).expect("prune clipboard images");
+    assert_eq!(removed, 3);
+    assert_eq!(clipboard_files(&root).len(), MAX_CLIPBOARD_IMAGES);
+    assert!(!directory.join("clipboard-test-000.png").exists());
+    assert!(directory
+        .join(format!(
+            "clipboard-test-{:03}.png",
+            MAX_CLIPBOARD_IMAGES + 2
+        ))
+        .exists());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
