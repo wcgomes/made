@@ -410,7 +410,14 @@ fn real_zsh_zdotdir_unset_and_reassignment_follow_user_startup_files() {
         writer.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && !home.join("final.txt").is_file() {
-            std::thread::sleep(Duration::from_millis(20));
+            // Keep draining the bounded reader channel: zsh's per-keystroke
+            // echo can otherwise fill it and block the child before the
+            // command runs.
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(bytes) => output.extend(bytes),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
         let final_zdotdir = std::fs::read_to_string(home.join("final.txt"))
             .expect("zsh must report the final ZDOTDIR state")
