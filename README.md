@@ -17,6 +17,7 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **Independent live workspace tabs** — switch folders, keep every shell running, and close only what you mean to close.
 - **Shell cwd follow** — launch-local bash, zsh, fish, and PowerShell hooks with spaces and Unicode support. Real bash is verified; other shell runs are pending.
 - **Optional OpenCode session follow** — run `opencode` yourself or start it from the `+` menu; Made follows the active session directory and worktree when available.
+- **Tabs that read at a glance** — a terminal or OpenCode icon leads every workspace tab, and session dots mark busy (pulsing), idle (neutral), and attention (yellow) states without opening a tab.
 - **Full-height explorer** — hide, restore, and pointer-resize it without stopping the shell.
 - **Full-left read-only preview** — inspect a file over the still-running terminal, then return without relaunching anything.
 - **Home startup and inline folder picker** — no argument opens your home workspace; `--picker` browses an inline expandable folder tree; an explicit path wins over both.
