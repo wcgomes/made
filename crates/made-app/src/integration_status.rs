@@ -871,11 +871,13 @@ pub fn is_supported_opencode_version(version: &str) -> bool {
     opencode_major(version).is_some_and(|major| major >= SUPPORTED_OPENCODE_MAJOR)
 }
 
-/// The only agent integration Made v1 offers.
+/// Agent integrations Made offers from the `+` menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentIntegration {
     /// OpenCode v2 through its TUI plugin.
     OpenCodeV2,
+    /// Grok Build session follow, offered when `grok` is on `PATH`.
+    GrokBuild,
 }
 
 impl AgentIntegration {
@@ -883,6 +885,7 @@ impl AgentIntegration {
     pub const fn id(self) -> &'static str {
         match self {
             Self::OpenCodeV2 => "opencode-v2",
+            Self::GrokBuild => "grok-build",
         }
     }
 
@@ -890,6 +893,7 @@ impl AgentIntegration {
     pub const fn name(self) -> &'static str {
         match self {
             Self::OpenCodeV2 => "OpenCode v2",
+            Self::GrokBuild => "Grok Build",
         }
     }
 }
@@ -909,7 +913,7 @@ pub struct ScopeBoundary {
 
 /// The v1 scope boundary.
 pub const V1_SCOPE: ScopeBoundary = ScopeBoundary {
-    agent_integrations: &[AgentIntegration::OpenCodeV2],
+    agent_integrations: &[AgentIntegration::OpenCodeV2, AgentIntegration::GrokBuild],
     chat_ui: false,
     worktree_management: false,
     separate_opencode_server: false,

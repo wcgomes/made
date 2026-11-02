@@ -2329,23 +2329,28 @@ pub enum CompatibleTui {
     /// OpenCode v2. Detection checks the executable name only; the version is
     /// not verified.
     OpenCode,
+    /// Grok Build. Detection checks the executable name only; the version is
+    /// not verified.
+    Grok,
 }
 
 impl CompatibleTui {
     /// Every TUI Made knows how to launch, in new-tab menu order.
-    pub const ALL: &'static [Self] = &[Self::OpenCode];
+    pub const ALL: &'static [Self] = &[Self::OpenCode, Self::Grok];
 
     /// Executable name resolved through `PATH`.
     pub const fn program(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
+            Self::Grok => "grok",
         }
     }
 
-    /// Display label for the new-tab menu.
+    /// Product label for the new-tab menu and an open workspace tab.
     pub const fn label(self) -> &'static str {
         match self {
             Self::OpenCode => "OpenCode",
+            Self::Grok => "Grok Build",
         }
     }
 }

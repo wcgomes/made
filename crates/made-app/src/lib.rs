@@ -15,6 +15,7 @@ pub mod cli;
 pub mod diagnostics;
 pub mod explorer_icons;
 pub mod explorer_view;
+mod grok_follow;
 pub mod integration_status;
 pub mod metrics;
 pub mod render;

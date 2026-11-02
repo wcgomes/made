@@ -180,6 +180,106 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
 }
 
 #[test]
+fn integrated_tui_catalog_is_opencode_then_grok() {
+    assert_eq!(
+        CompatibleTui::ALL,
+        &[CompatibleTui::OpenCode, CompatibleTui::Grok]
+    );
+    assert_eq!(CompatibleTui::OpenCode.program(), "opencode");
+    assert_eq!(CompatibleTui::OpenCode.label(), "OpenCode");
+    assert_eq!(CompatibleTui::Grok.program(), "grok");
+    assert_eq!(CompatibleTui::Grok.label(), "Grok Build");
+    assert!(detect_compatible_tuis_in_path(OsStr::new("")).is_empty());
+
+    let root = unique_temp("tui-catalog");
+    let empty = root.join("empty");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+
+    let relative_name = format!(
+        "{}-grok-relative",
+        root.file_name().unwrap().to_string_lossy()
+    );
+    let relative_dir = std::env::current_dir().unwrap().join(&relative_name);
+    std::fs::create_dir_all(&relative_dir).unwrap();
+    #[cfg(windows)]
+    let relative_executable = relative_dir.join("grok.exe");
+    #[cfg(not(windows))]
+    let relative_executable = relative_dir.join("grok");
+    std::fs::write(&relative_executable, b"not a real program").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&relative_executable, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let relative_path = std::env::join_paths([Path::new(""), Path::new(&relative_name)]).unwrap();
+    let relative_detected = detect_compatible_tuis_in_path(&relative_path);
+    let _ = std::fs::remove_dir_all(&relative_dir);
+    assert!(
+        relative_detected.is_empty(),
+        "empty and relative PATH segments must be ignored"
+    );
+
+    #[cfg(windows)]
+    let grok = bin.join("grok.exe");
+    #[cfg(not(windows))]
+    let grok = bin.join("grok");
+    #[cfg(unix)]
+    let sentinel = root.join("grok-launched");
+    #[cfg(unix)]
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" > '{}'\n",
+        sentinel.display()
+    );
+    #[cfg(not(unix))]
+    let body = "not a real program".to_owned();
+    std::fs::write(&grok, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let grok_only = std::env::join_paths([&empty, &bin]).unwrap();
+    assert_eq!(
+        detect_compatible_tuis_in_path(&grok_only),
+        vec![CompatibleTui::Grok]
+    );
+    assert_eq!(
+        find_executable_on_path(OsStr::new("grok"), &grok_only),
+        Some(grok.clone())
+    );
+    #[cfg(unix)]
+    assert!(
+        !sentinel.exists(),
+        "detection must not spawn grok or read its version"
+    );
+
+    #[cfg(windows)]
+    let opencode = bin.join("opencode.exe");
+    #[cfg(not(windows))]
+    let opencode = bin.join("opencode");
+    std::fs::write(&opencode, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        detect_compatible_tuis_in_path(&grok_only),
+        vec![CompatibleTui::OpenCode, CompatibleTui::Grok]
+    );
+    #[cfg(unix)]
+    assert!(
+        !sentinel.exists(),
+        "detecting both TUIs must not spawn either"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn home_resolution_prefers_userprofile_on_windows() {
     let home = resolve_user_home(
         PlatformFamily::Windows,

@@ -972,6 +972,28 @@ fn icon_texture_px(
     }
 }
 
+/// Texture for an SVG embedded outside the Material inventory. `uri` is the
+/// same `bytes://` key `Image::paint_at` uses, at the pixel size it requests.
+fn embedded_svg_texture(
+    ctx: &egui::Context,
+    uri: &'static str,
+    bytes: &'static [u8],
+    width: u32,
+    height: u32,
+) -> egui::TextureId {
+    ctx.include_bytes(uri, bytes);
+    let hint = egui::load::SizeHint::Size {
+        width,
+        height,
+        maintain_aspect_ratio: false,
+    };
+    match ctx.try_load_texture(uri, egui::TextureOptions::default(), hint) {
+        Ok(egui::load::TexturePoll::Ready { texture }) => texture.id,
+        Ok(egui::load::TexturePoll::Pending { .. }) => panic!("{uri} is still loading"),
+        Err(error) => panic!("{uri} failed to load: {error:?}"),
+    }
+}
+
 /// The vendored icon whose SVG file is `name`. Expectations name the file the
 /// theme maps, so they do not simply echo whatever the resolver returns.
 fn icon_named(name: &str) -> explorer_icons::IconId {
@@ -3956,11 +3978,12 @@ fn background_tui_detection_adopts_the_isolated_opencode() {
         "detection must not block construction"
     );
     let mut headless = Headless::new(model, 1100.0, 700.0);
-    headless.pump_until(|model| model.compatible_tuis() == [CompatibleTui::OpenCode].as_slice());
-    assert_eq!(
-        headless.model.compatible_tuis(),
-        &[CompatibleTui::OpenCode],
-        "the background worker must adopt the isolated PATH result"
+    headless.pump_until(|model| model.compatible_tuis().contains(&CompatibleTui::OpenCode));
+    let detected = headless.model.compatible_tuis();
+    assert!(
+        detected == [CompatibleTui::OpenCode]
+            || detected == [CompatibleTui::OpenCode, CompatibleTui::Grok],
+        "the background worker must adopt catalog order from the isolated PATH: {detected:?}"
     );
 }
 
@@ -7260,4 +7283,840 @@ fn picker_primary_names_the_current_target_and_empty_folders_confirm() {
         empty_picker.model.launch().explorer_root(),
         Some(empty.path().canonicalize().unwrap().as_path())
     );
+}
+
+fn grok_home_dir() -> PathBuf {
+    let dir = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join(".grok");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_grok_inventory(rows: &[Value]) {
+    fs::write(
+        grok_home_dir().join("active_sessions.json"),
+        serde_json::to_string(rows).unwrap(),
+    )
+    .unwrap();
+}
+
+fn append_grok_hook(line: &Value) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(grok_home_dir().join("made-grok-status.jsonl"))
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(line).unwrap()).unwrap();
+}
+
+#[test]
+fn grok_tab_paints_working_attention_and_idle_dots_with_grok_build() {
+    if isolated("grok_tab_paints_working_attention_and_idle_dots_with_grok_build") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "project-alpha", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    let pid = headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .and_then(made_app::TerminalPane::pid)
+        .expect("shell pid");
+    let row = |session_id: &str, opened_at: &str| {
+        json!({
+            "pid": pid,
+            "session_id": session_id,
+            "cwd": "/tmp/made-grok-missing",
+            "opened_at": opened_at
+        })
+    };
+    write_grok_inventory(&[
+        row("work", "2024-01-01T00:00:01Z"),
+        row("ask", "2024-01-01T00:00:02Z"),
+        row("idle", "2024-01-01T00:00:03Z"),
+    ]);
+    append_grok_hook(&json!({
+        "sessionId": "history",
+        "cwd": "/tmp/made-grok-history",
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    // The first read skips lines already on disk. Later lines are the live ones.
+    headless.render();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        headless.render();
+        let tab = headless.response(workspace_tab_id(id)).rect;
+        if tab_session_dots(&headless.render(), tab).len() == 3 || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let idle_output = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    let idle_dots = tab_session_dots(&idle_output, tab);
+    assert_eq!(
+        idle_dots.len(),
+        3,
+        "inventory-only sessions must show one idle dot each, and history must not add one"
+    );
+    for dot in &idle_dots {
+        assert_session_dot_color(dot, made_app::theme::TEXT_TERTIARY, "an inventory idle dot");
+        assert!((dot.radius - 2.0).abs() < 0.1, "dot diameter must stay 4px");
+    }
+
+    append_grok_hook(&json!({
+        "sessionId": "work",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    append_grok_hook(&json!({
+        "sessionId": "ask",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "PreToolUse",
+        "status": "attention"
+    }));
+    append_grok_hook(&json!({
+        "sessionId": "idle",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "SessionStart",
+        "status": "idle"
+    }));
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(dots.len(), 3, "each open Grok session paints one dot");
+    assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the working dot");
+    assert_session_dot_color(&dots[1], made_app::theme::WARNING, "the attention dot");
+    assert_session_dot_color(&dots[2], made_app::theme::TEXT_TERTIARY, "the idle dot");
+    for (index, dot) in dots.iter().enumerate() {
+        assert!(
+            (dot.center - session_dot_center(tab, index, 3)).length() < 0.75,
+            "dot {index} must keep the OpenCode row placement"
+        );
+    }
+    let label = text_rects(&output, "Grok Build", 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .expect("an open Grok tab must be labeled Grok Build");
+    assert!(
+        (label.left() - (tab.left() + 10.0 + 22.0)).abs() < 1.0,
+        "the label follows the 16px icon and its 6px gap: {label:?} in {tab:?}"
+    );
+    assert!(
+        text_rects(&output, "project-alpha", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "an open Grok tab must not keep the folder label"
+    );
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "a Grok tab must not take the OpenCode label"
+    );
+    let grok_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+                && image.rect.right() <= label.left() - 1.0
+        })
+        .expect("an open Grok tab must paint grok.svg in the 16px leading slot");
+    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
+    assert_eq!(
+        grok_image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://grok.svg",
+            include_bytes!("../assets/grok.svg"),
+            grok_px.x as u32,
+            grok_px.y as u32,
+        ),
+        "the tab's 16px image must match grok.svg bytes"
+    );
+    assert_eq!(
+        grok_image.tint,
+        egui::Color32::WHITE,
+        "the Grok mark keeps its shipped colors"
+    );
+    assert!(
+        (grok_image.rect.center().x - (tab.left() + 10.0 + 8.0)).abs() < 1.0
+            && (grok_image.rect.center().y - tab.center().y).abs() < 1.0,
+        "grok.svg must be centered in the leading slot: {:?}",
+        grok_image.rect
+    );
+    assert!(
+        !rect_shapes(&output).into_iter().any(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && tab.contains_rect(shape.rect)
+                && shape.rect.right() <= label.left() - 2.0
+        }),
+        "an open Grok tab must not keep the terminal glyph"
+    );
+
+    let period = 1.8_f64;
+    let next_period = ((headless.last_time / period).floor() + 1.0) * period;
+    let bright = session_dot_alpha(
+        &tab_session_dots(
+            &headless.render_events_at(Vec::new(), next_period + period * 0.25),
+            tab,
+        )[0],
+    );
+    let dim = session_dot_alpha(
+        &tab_session_dots(
+            &headless.render_events_at(Vec::new(), next_period + period * 0.75),
+            tab,
+        )[0],
+    );
+    assert!(
+        bright > dim,
+        "the working dot must pulse: bright {bright}, dim {dim}"
+    );
+
+    let path = root.display().to_string();
+    let hovered = output_text(&headless.hover_until_text(
+        workspace_tab_id(id),
+        "Sessions: 1 running, 1 needs attention, 1 idle",
+    ));
+    assert!(
+        hovered.contains("Sessions: 1 running, 1 needs attention, 1 idle"),
+        "the tooltip must count working, attention, and idle: {hovered}"
+    );
+    assert!(
+        !hovered.contains(&path),
+        "a Grok Build tab must omit the workspace path: {hovered}"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "ask",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "SessionEnd",
+        "status": "idle"
+    }));
+    std::thread::sleep(Duration::from_millis(1100));
+    let ended = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    let ended_dots = tab_session_dots(&ended, tab);
+    assert_eq!(
+        ended_dots.len(),
+        2,
+        "session end removes that session's dot and inventory must not put it back"
+    );
+    assert!(
+        text_rects(&ended, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a tab that still has Grok sessions stays labeled Grok Build"
+    );
+    assert_session_dot_color(
+        &ended_dots[0],
+        made_app::theme::ACCENT,
+        "work stays working",
+    );
+    assert_session_dot_color(
+        &ended_dots[1],
+        made_app::theme::TEXT_TERTIARY,
+        "idle stays idle",
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "idle",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "StopFailure",
+        "status": "error"
+    }));
+    let parallel = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    let parallel_dots = tab_session_dots(&parallel, tab);
+    assert_eq!(parallel_dots.len(), 2);
+    assert_session_dot_color(
+        &parallel_dots[0],
+        made_app::theme::ACCENT,
+        "another session's event must not change the working dot",
+    );
+    assert_session_dot_color(
+        &parallel_dots[1],
+        made_app::theme::WARNING,
+        "only the idle session becomes attention",
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "work",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "SessionEnd",
+        "status": "idle"
+    }));
+    append_grok_hook(&json!({
+        "sessionId": "idle",
+        "cwd": "/tmp/made-grok-missing",
+        "event": "SessionEnd",
+        "status": "idle"
+    }));
+    std::thread::sleep(Duration::from_millis(1100));
+    let closed = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        tab_session_dots(&closed, tab).is_empty(),
+        "ending every Grok session removes the dots"
+    );
+    let folder = text_rects(&closed, "project-alpha", 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .expect("a closed Grok tab must return to the folder label");
+    assert!(
+        text_rects(&closed, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "a closed Grok tab must not keep the Grok Build label"
+    );
+    assert!(
+        !painted_images(&closed).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        }),
+        "a closed Grok tab must drop grok.svg"
+    );
+    let terminal_window = rect_shapes(&closed)
+        .into_iter()
+        .find(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && shape.stroke.color == made_app::theme::TEXT_PRIMARY
+                && tab.contains_rect(shape.rect)
+                && shape.rect.right() <= folder.left() - 2.0
+        })
+        .map(|shape| shape.rect)
+        .expect("terminal glyph in the 16px leading slot");
+    assert!(
+        (terminal_window.center().x - (tab.left() + 10.0 + 8.0)).abs() < 1.0,
+        "the terminal glyph must return to the leading slot: {terminal_window:?}"
+    );
+    let restored = output_text(&headless.hover_until_text(workspace_tab_id(id), &path));
+    assert!(
+        restored.contains(&path),
+        "the folder tab must restore its path tooltip: {restored}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn running_grok_tui_shows_grok_build_before_a_session_and_reverts_on_exit() {
+    if isolated("running_grok_tui_shows_grok_build_before_a_session_and_reverts_on_exit") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join("bin");
+    let executable = bin.join("grok");
+    fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "project-alpha", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+    );
+    let shell_id = open_workspace(&mut model, &root);
+    model.begin_tui_workspace(CompatibleTui::Grok);
+    model.ensure_workbench();
+    let grok_id = model.active_workspace_id().expect("grok tab");
+    assert_ne!(grok_id, shell_id);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.pump_until(|model| {
+        model
+            .workspace(grok_id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(grok_id)).rect;
+    let label = text_rects(&output, "Grok Build", 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .expect("a running Grok TUI must be labeled Grok Build before any session");
+    let folder = {
+        let workbench = headless.model.workspace(grok_id).unwrap();
+        workbench
+            .launch_plan()
+            .map(|plan| plan.workspace.display_name().to_owned())
+            .unwrap_or_else(|| {
+                workbench
+                    .shell_cwd()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Workspace".to_owned())
+            })
+    };
+    let path = headless
+        .model
+        .workspace(grok_id)
+        .unwrap()
+        .shell_cwd()
+        .display()
+        .to_string();
+    assert_ne!(folder, "Grok Build");
+    assert!(
+        text_rects(&output, &folder, 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "a running Grok TUI must not keep the folder label {folder}"
+    );
+    let grok_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+                && image.rect.right() <= label.left() - 1.0
+        })
+        .expect("a running Grok TUI must paint grok.svg before any session");
+    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
+    assert_eq!(
+        grok_image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://grok.svg",
+            include_bytes!("../assets/grok.svg"),
+            grok_px.x as u32,
+            grok_px.y as u32,
+        ),
+        "the leading slot must use grok.svg"
+    );
+    headless.hover(workspace_tab_id(grok_id));
+    headless.advance(0.2);
+    let no_session = output_text(&headless.render());
+    assert!(
+        !no_session.contains(&path) && !no_session.contains("Sessions:"),
+        "a Grok Build tab with no sessions must show no parent tooltip: {no_session}"
+    );
+
+    let pid = headless
+        .model
+        .workspace(grok_id)
+        .and_then(Workbench::terminal)
+        .and_then(made_app::TerminalPane::pid)
+        .expect("grok pid");
+    let status = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .expect("kill grok");
+    assert!(status.success(), "the running Grok child must be stoppable");
+    headless.pump_until(|model| {
+        !model
+            .workspace(grok_id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
+    let closed = headless.render();
+    let tab = headless.response(workspace_tab_id(grok_id)).rect;
+    let folder_label = text_rects(&closed, &folder, 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .expect("an exited Grok TUI with no sessions must return to the folder label");
+    assert!(
+        text_rects(&closed, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "an exited Grok TUI must drop the Grok Build label"
+    );
+    assert!(
+        !painted_images(&closed).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        }),
+        "an exited Grok TUI must drop grok.svg"
+    );
+    let terminal_window = rect_shapes(&closed)
+        .into_iter()
+        .find(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && shape.stroke.color == made_app::theme::TEXT_PRIMARY
+                && tab.contains_rect(shape.rect)
+                && shape.rect.right() <= folder_label.left() - 2.0
+        })
+        .map(|shape| shape.rect)
+        .expect("terminal glyph after Grok exits");
+    assert!(
+        (terminal_window.center().x - (tab.left() + 10.0 + 8.0)).abs() < 1.0,
+        "the terminal glyph must return to the leading slot: {terminal_window:?}"
+    );
+    let restored = output_text(&headless.hover_until_text(workspace_tab_id(grok_id), &path));
+    assert!(
+        restored.contains(&path),
+        "the folder tab must restore its path tooltip: {restored}"
+    );
+}
+
+#[test]
+fn an_opencode_tab_keeps_its_dots_and_root_when_grok_events_arrive() {
+    if isolated("an_opencode_tab_keeps_its_dots_and_root_when_grok_events_arrive") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "opencode-owned", "main.rs");
+    let grok_dir = temp.path().join("grok-dir");
+    fs::create_dir(&grok_dir).unwrap();
+    let grok_dir = grok_dir.canonicalize().unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
+    let mut socket = connect(&options);
+    headless.pump_until(|model| model.workspace(id).unwrap().is_connected());
+    send_sessions_state(
+        &mut socket,
+        1,
+        &root,
+        &[
+            ("busy-session", true, false),
+            ("idle-session", false, false),
+        ],
+    );
+    headless.pump_until(|model| model.workspace(id).unwrap().session_map().rows().len() == 2);
+    append_grok_hook(&json!({
+        "sessionId": "grok-1",
+        "cwd": grok_dir,
+        "event": "UserPromptSubmit",
+        "status": "attention"
+    }));
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(dots.len(), 2, "OpenCode dots must ignore Grok events");
+    assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the OpenCode busy dot");
+    assert_session_dot_color(
+        &dots[1],
+        made_app::theme::TEXT_TERTIARY,
+        "the OpenCode idle dot",
+    );
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the connected tab must stay labeled OpenCode"
+    );
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "OpenCode must keep the tab when Grok sessions exist"
+    );
+    let opencode_icon = icon_named("opencode.svg");
+    let icon_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("the connected tab must keep opencode.svg");
+    assert_eq!(
+        icon_image.texture,
+        icon_texture(&headless.ctx, opencode_icon),
+        "Grok sessions must not replace the OpenCode icon"
+    );
+    assert_eq!(
+        headless.model.workspace(id).unwrap().explorer_root(),
+        Some(root.as_path()),
+        "Grok must not replace the OpenCode explorer root"
+    );
+}
+
+fn menu_model(root: &Path, tuis: &[CompatibleTui]) -> (Headless, WorkspaceId) {
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis(tuis.iter().copied()),
+    );
+    let id = open_workspace(&mut model, root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    (headless, id)
+}
+
+#[test]
+fn header_plus_without_a_detected_tui_shows_no_menu() {
+    if isolated("header_plus_without_a_detected_tui_shows_no_menu") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "no-tui", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[]);
+    headless.click(top_action_id("open-folder"));
+    assert!(headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(headless.model.workspace(id).is_some());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("terminal"))
+        .is_none());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("opencode"))
+        .is_none());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("grok"))
+        .is_none());
+}
+
+#[test]
+fn catalog_menu_lists_terminal_then_opencode_then_grok() {
+    if isolated("catalog_menu_lists_terminal_then_opencode_then_grok") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "both", "main.rs");
+    let (mut headless, _) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    let hovered =
+        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
+    assert!(
+        hovered.contains("Open folder"),
+        "the + tooltip and accessible name stay Open folder: {hovered}"
+    );
+    headless.click(top_action_id("open-folder"));
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    assert!(
+        terminal.top() < opencode.top() && opencode.top() < grok.top(),
+        "menu order must be Terminal, OpenCode, Grok: {terminal:?} {opencode:?} {grok:?}"
+    );
+    assert!(!headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+}
+
+#[test]
+fn only_grok_omits_opencode_from_the_menu() {
+    if isolated("only_grok_omits_opencode_from_the_menu") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "grok-only", "main.rs");
+    let (mut headless, _) = menu_model(&root, &[CompatibleTui::Grok]);
+    headless.click(top_action_id("open-folder"));
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    assert!(terminal.top() < grok.top());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("opencode"))
+        .is_none());
+    let text = output_text(&headless.render());
+    assert!(text.contains("Terminal"));
+    assert!(
+        text.contains("Grok Build"),
+        "the Grok row must show the full product label: {text}"
+    );
+}
+
+#[test]
+fn choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one() {
+    if isolated("choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one") {
+        return;
+    }
+    use made_platform::Platform;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "current", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[CompatibleTui::Grok]);
+    let home = made_platform::host_platform()
+        .home_dir()
+        .expect("test home")
+        .canonicalize()
+        .expect("canonical test home");
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("grok"));
+    assert!(!headless.model.is_picker());
+    assert_eq!(headless.model.active_workspace_id(), Some(id));
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(headless.model.start_pending());
+    assert_eq!(
+        headless.model.terminal_target(),
+        TerminalTarget::Tui(CompatibleTui::Grok)
+    );
+    assert_eq!(
+        headless.model.launch().source(),
+        WorkspaceSource::DefaultHome
+    );
+    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
+    assert!(headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .is_some());
+}
+
+#[test]
+fn terminal_row_still_opens_the_folder_picker_when_grok_is_listed() {
+    if isolated("terminal_row_still_opens_the_folder_picker_when_grok_is_listed") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "terminal-row", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("terminal"));
+    assert!(headless.model.is_picker());
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert!(headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .is_some());
+    assert_eq!(headless.model.terminal_target(), TerminalTarget::Shell);
+}
+
+#[test]
+fn grok_row_paints_the_terminal_glyph_and_opencode_keeps_its_svg() {
+    if isolated("grok_row_paints_the_terminal_glyph_and_opencode_keeps_its_svg") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "glyphs", "main.rs");
+    let (mut headless, _) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    headless.ctx.set_pixels_per_point(2.0);
+    headless.click(top_action_id("open-folder"));
+    headless.advance(0.3);
+    let output = headless.render();
+    let text = output_text(&output);
+    assert!(
+        text.contains("Grok Build"),
+        "missing Grok Build label: {text}"
+    );
+    assert!(text.contains("OpenCode"), "missing OpenCode label: {text}");
+    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    let grok_label = painted_menu_label(&output, "Grok Build", grok);
+    let grok_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && grok.contains_rect(image.rect)
+                && image.rect.right() <= grok_label.line.left() - 1.0
+        })
+        .expect("Grok row must paint the 16px official mark");
+    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
+    assert_eq!(
+        grok_image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://grok.svg",
+            include_bytes!("../assets/grok.svg"),
+            grok_px.x as u32,
+            grok_px.y as u32,
+        ),
+        "the Grok row's 16px image must match grok.svg bytes"
+    );
+    assert!(
+        !rect_shapes(&output).into_iter().any(|shape| {
+            (shape.rect.width() - 14.0).abs() < 0.75
+                && (shape.rect.height() - 11.0).abs() < 0.75
+                && (shape.stroke.width - 1.5).abs() < 0.05
+                && shape.corner_radius == egui::CornerRadius::same(2)
+                && grok.contains_rect(shape.rect)
+                && shape.rect.right() <= grok_label.line.left() - 2.0
+        }),
+        "the terminal-window glyph is not the Grok mark"
+    );
+    let opencode_icon =
+        explorer_icons::icon_by_file_name("opencode.svg").expect("opencode.svg is vendored");
+    let opencode_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && opencode.contains_rect(image.rect)
+        })
+        .expect("OpenCode row must keep the 16px opencode.svg");
+    let image_px = (output.pixels_per_point * opencode_image.rect.size()).round();
+    assert_eq!(
+        opencode_image.texture,
+        icon_texture_px(
+            &headless.ctx,
+            opencode_icon,
+            image_px.x as u32,
+            image_px.y as u32,
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn detection_does_not_launch_grok_or_block_shell_startup() {
+    if isolated("detection_does_not_launch_grok_or_block_shell_startup") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = PathBuf::from(std::env::var_os("HOME").expect("isolated home"));
+    let sentinel = home.join("grok-launched");
+    let bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .next()
+        .expect("isolated bin");
+    let grok = bin.join("grok");
+    std::fs::write(
+        &grok,
+        format!("#!/bin/sh\nprintf launched >> '{}'\n", sentinel.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    assert!(
+        model.compatible_tuis().is_empty(),
+        "detection must not block construction"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "shell", "main.rs");
+    let mut model = model;
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some(),
+        "the shell must start without waiting for TUI detection"
+    );
+    assert_eq!(
+        headless.model.workspace(id).unwrap().terminal_target(),
+        TerminalTarget::Shell,
+        "detection must not replace a shell tab with Grok"
+    );
+    headless.pump_until(|model| {
+        model.compatible_tuis() == [CompatibleTui::OpenCode, CompatibleTui::Grok].as_slice()
+    });
+    assert!(!sentinel.exists(), "detection must not spawn grok");
+    assert_eq!(headless.model.workspace_count(), 1);
 }

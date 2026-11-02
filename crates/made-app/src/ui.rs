@@ -927,6 +927,23 @@ fn workspace_opencode_active(target: TerminalTarget, connected: bool, running: b
     connected || (matches!(target, TerminalTarget::Tui(CompatibleTui::OpenCode)) && running)
 }
 
+/// Whether a non-OpenCode tab shows the Grok Build label and mark.
+///
+/// A directly launched Grok TUI counts while its process is alive, even
+/// before a session exists. A shell tab counts while that terminal still has
+/// open Grok sessions. An active OpenCode tab never does: its label, icon,
+/// and dots stay OpenCode's.
+fn workspace_grok_branded(
+    opencode: bool,
+    target: TerminalTarget,
+    running: bool,
+    open_grok_sessions: usize,
+) -> bool {
+    !opencode
+        && (open_grok_sessions > 0
+            || (matches!(target, TerminalTarget::Tui(CompatibleTui::Grok)) && running))
+}
+
 /// Non-color summary across all open sessions. Counts include sessions beyond
 /// the eight-dot visual cap.
 fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
@@ -969,6 +986,14 @@ fn opencode_icon() -> crate::explorer_icons::IconId {
         crate::explorer_icons::icon_by_file_name("opencode.svg")
             .expect("opencode.svg is vendored with the explorer icons")
     })
+}
+
+/// Official Grok mark from `assets/grok.svg`, outside the Material icon inventory.
+fn grok_mark() -> theme::MenuLeading {
+    theme::MenuLeading::Image {
+        uri: "bytes://grok.svg",
+        bytes: include_bytes!("../assets/grok.svg"),
+    }
 }
 
 /// Accessible tab name, including the non-color session summary when present.
@@ -1039,6 +1064,7 @@ struct WorkspaceTabInfo {
     label: String,
     path: std::path::PathBuf,
     opencode: bool,
+    grok: bool,
     sessions: Vec<SessionActivity>,
 }
 
@@ -1051,15 +1077,23 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         .filter_map(|id| {
             let workbench = model.workspace(id)?;
             let path = workbench.shell_cwd().to_path_buf();
-            let opencode = workspace_opencode_active(
-                workbench.terminal_target(),
-                workbench.is_connected(),
-                workbench
-                    .terminal()
-                    .is_some_and(|terminal| terminal.is_running()),
-            );
+            let target = workbench.terminal_target();
+            let running = workbench
+                .terminal()
+                .is_some_and(|terminal| terminal.is_running());
+            let opencode = workspace_opencode_active(target, workbench.is_connected(), running);
+            // Grok dots stay off an OpenCode tab. Using the OpenCode flag for
+            // them would paint Grok status from the OpenCode session map.
+            let grok_activities = if opencode {
+                Vec::new()
+            } else {
+                workbench.grok_tab_activities()
+            };
+            let grok = workspace_grok_branded(opencode, target, running, grok_activities.len());
             let label = if opencode {
                 "OpenCode".to_owned()
+            } else if grok {
+                CompatibleTui::Grok.label().to_owned()
             } else {
                 workbench
                     .launch_plan()
@@ -1080,13 +1114,14 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     .map(SessionRow::activity)
                     .collect()
             } else {
-                Vec::new()
+                grok_activities
             };
             Some(WorkspaceTabInfo {
                 id,
                 label,
                 path,
                 opencode,
+                grok,
                 sessions,
             })
         })
@@ -1313,6 +1348,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                         bytes: icon.bytes(),
                                     }
                                 }
+                                CompatibleTui::Grok => grok_mark(),
                             };
                             if new_tab_menu_item(
                                 ui,
@@ -1538,6 +1574,15 @@ fn workspace_tab_ui(
     if tab.opencode {
         let icon = opencode_icon();
         egui::Image::from_bytes(icon.uri(), icon.bytes()).paint_at(ui, icon_rect);
+    } else if tab.grok {
+        match grok_mark() {
+            theme::MenuLeading::Image { uri, bytes } => {
+                egui::Image::from_bytes(uri, bytes).paint_at(ui, icon_rect);
+            }
+            theme::MenuLeading::Glyph(glyph) => {
+                theme::paint_icon(ui.painter(), icon_rect, glyph, color);
+            }
+        }
     } else {
         theme::paint_icon(ui.painter(), icon_rect, theme::IconGlyph::Terminal, color);
     }
@@ -1577,7 +1622,9 @@ fn workspace_tab_ui(
     if close_response.has_focus() {
         theme::paint_inside_focus_ring(ui.painter(), close_rect.shrink(1.0), CornerRadius::same(4));
     }
-    let tooltip = if tab.opencode {
+    // OpenCode and Grok Build omit the workspace path. With no sessions the
+    // summary is empty, so the tab has no parent tooltip.
+    let tooltip = if tab.opencode || tab.grok || !tab.sessions.is_empty() {
         session_summary.clone()
     } else {
         Some(sanitize_display(&tab.path.display().to_string(), 900))
@@ -4224,6 +4271,31 @@ mod tests {
             "attention summary missing: {accessible}"
         );
         assert_eq!(workspace_tab_accessible_label("alpha", None), "alpha");
+        assert_eq!(
+            workspace_tab_accessible_label(CompatibleTui::Grok.label(), Some(&attention)),
+            format!("Grok Build — {attention}"),
+            "a branded Grok tab uses Grok Build and the same session summary"
+        );
+        assert_eq!(
+            workspace_tab_accessible_label("project-alpha", Some(&attention)),
+            format!("project-alpha — {attention}"),
+            "a tab with Grok closed keeps the folder name and the same session summary"
+        );
+    }
+
+    #[test]
+    fn grok_build_brand_follows_a_running_tui_or_open_sessions_and_yields_to_opencode() {
+        let grok = TerminalTarget::Tui(CompatibleTui::Grok);
+        let shell = TerminalTarget::Shell;
+        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        assert!(workspace_grok_branded(false, grok, true, 0));
+        assert!(workspace_grok_branded(false, shell, true, 2));
+        assert!(workspace_grok_branded(false, grok, false, 1));
+        assert!(!workspace_grok_branded(false, grok, false, 0));
+        assert!(!workspace_grok_branded(false, shell, true, 0));
+        assert!(!workspace_grok_branded(false, opencode, true, 0));
+        assert!(!workspace_grok_branded(true, grok, true, 3));
+        assert!(!workspace_grok_branded(true, shell, true, 3));
     }
 
     #[test]
