@@ -2382,6 +2382,14 @@ impl Workbench {
                 use made_remote::protocol::{RootResolver, SessionCommandSink};
                 let mut resolver = client.root_resolver();
                 while let Some(mut resolution) = resolver.poll() {
+                    self.diag.log_mut().record(
+                        LogLevel::Info,
+                        format!(
+                            "remote root reply: generation {} ok={}",
+                            resolution.generation,
+                            resolution.result.is_ok()
+                        ),
+                    );
                     if let Some(workspace_id) = remote.id_map.remove(&resolution.request_id) {
                         resolution.request_id = workspace_id;
                     } else {
@@ -2398,6 +2406,10 @@ impl Workbench {
                 }
                 let mut sessions = client.session_sink();
                 while let Some(mut reply) = sessions.poll() {
+                    self.diag.log_mut().record(
+                        LogLevel::Info,
+                        format!("remote session reply: {}", operation_name(&reply.operation)),
+                    );
                     if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
                         reply.request_id = workspace_id;
                     }
