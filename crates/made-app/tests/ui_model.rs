@@ -3972,7 +3972,15 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
     assert_eq!(headless.model.active_workspace_id(), Some(alpha_id));
 
     headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("terminal"));
+    // No local TUI and no saved server: + opens the picker and does not draw
+    // a Terminal item. When a menu is open, Terminal is still that choice.
+    if headless
+        .ctx
+        .read_response(new_tab_menu_item_id("terminal"))
+        .is_some()
+    {
+        headless.click(new_tab_menu_item_id("terminal"));
+    }
     assert!(headless.model.is_picker());
     assert_eq!(headless.model.workspace_count(), 1);
     let picker_text = output_text(&headless.render());

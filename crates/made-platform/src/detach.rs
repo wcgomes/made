@@ -905,7 +905,7 @@ mod unix {
         if !meta.is_file()
             || meta.uid() != current_euid()
             || meta.nlink() != 1
-            || meta.mode() & 0o777 != u32::from(mode)
+            || meta.mode() & 0o777 != mode as u32
         {
             return Err(denied("private file is not owner-only"));
         }

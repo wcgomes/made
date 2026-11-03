@@ -397,6 +397,31 @@ impl Drop for CwdReportSink {
         let _ = fs::remove_dir(&self.directory);
     }
 }
+
+/// Windows builds the headless companion, but cwd reports use a Unix datagram.
+/// The type stays available so that crate does not grow a host `cfg`. `poll`
+/// never returns a report, and no socket is bound.
+#[cfg(not(unix))]
+pub struct CwdReportSink {
+    path: PathBuf,
+}
+
+#[cfg(not(unix))]
+impl CwdReportSink {
+    pub fn new(parent: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            path: parent.join("cwd-report-unsupported"),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn poll(&self) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
 fn write_bootstrap(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     #[cfg(unix)]
     {
