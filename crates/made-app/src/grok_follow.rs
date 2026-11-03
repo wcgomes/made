@@ -31,7 +31,7 @@ pub(crate) fn open_sessions(terminal_pid: u32) -> Vec<OpenSession> {
 }
 
 fn open_sessions_at(path: &Path, terminal_pid: u32) -> Vec<OpenSession> {
-    open_sessions_matching(path, terminal_pid, parent_pid)
+    open_sessions_matching(path, terminal_pid, made_platform::process_parent)
 }
 
 fn open_sessions_matching(
@@ -212,7 +212,7 @@ fn sessions_file() -> Option<PathBuf> {
 }
 
 fn process_belongs_to(pid: u32, root: u32) -> bool {
-    process_belongs_to_with(pid, root, parent_pid)
+    process_belongs_to_with(pid, root, made_platform::process_parent)
 }
 
 fn process_belongs_to_with(
@@ -235,130 +235,6 @@ fn process_belongs_to_with(
     false
 }
 
-#[cfg(target_os = "macos")]
-fn parent_pid(pid: u32) -> Option<u32> {
-    #[repr(C)]
-    struct ProcBsdShortInfo {
-        pid: u32,
-        ppid: u32,
-        pgid: u32,
-        status: u32,
-        comm: [u8; 16],
-        flags: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        svuid: u32,
-        svgid: u32,
-        rfu: u32,
-    }
-
-    #[link(name = "proc", kind = "dylib")]
-    extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut std::ffi::c_void,
-            buffersize: i32,
-        ) -> i32;
-    }
-
-    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
-    let mut info = std::mem::MaybeUninit::<ProcBsdShortInfo>::zeroed();
-    let wrote = unsafe {
-        proc_pidinfo(
-            pid as i32,
-            PROC_PIDT_SHORTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            std::mem::size_of::<ProcBsdShortInfo>() as i32,
-        )
-    };
-    if wrote < 8 {
-        return None;
-    }
-    Some(unsafe { info.assume_init() }.ppid)
-}
-
-#[cfg(target_os = "linux")]
-fn parent_pid(pid: u32) -> Option<u32> {
-    // `comm` is wrapped in parentheses and may itself contain spaces or
-    // parentheses. The state and ppid are the first two fields after it.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let end = stat.rfind(')')?;
-    let mut fields = stat[end + 1..].split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse().ok()
-}
-
-#[cfg(windows)]
-fn parent_pid(pid: u32) -> Option<u32> {
-    #[repr(C)]
-    struct ProcessEntry32W {
-        size: u32,
-        cnt_usage: u32,
-        process_id: u32,
-        default_heap_id: usize,
-        module_id: u32,
-        threads: u32,
-        parent_process_id: u32,
-        pri_class_base: i32,
-        flags: u32,
-        exe_file: [u16; 260],
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut std::ffi::c_void;
-        fn Process32FirstW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
-        fn Process32NextW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
-        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-    }
-
-    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-    // SAFETY: snapshot of the process list; a null or invalid handle means the
-    // call failed and there is nothing to close.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() || snapshot == usize::MAX as *mut std::ffi::c_void {
-        return None;
-    }
-    let mut entry = ProcessEntry32W {
-        size: std::mem::size_of::<ProcessEntry32W>() as u32,
-        cnt_usage: 0,
-        process_id: 0,
-        default_heap_id: 0,
-        module_id: 0,
-        threads: 0,
-        parent_process_id: 0,
-        pri_class_base: 0,
-        flags: 0,
-        exe_file: [0; 260],
-    };
-    let mut found = None;
-    // SAFETY: `entry.size` is the struct size Toolhelp requires, and `snapshot`
-    // is a live process snapshot. The loop stops when Toolhelp returns false.
-    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
-    while ok != 0 {
-        if entry.process_id == pid {
-            found = Some(entry.parent_process_id);
-            break;
-        }
-        // SAFETY: same snapshot and entry as Process32FirstW.
-        ok = unsafe { Process32NextW(snapshot, &mut entry) };
-    }
-    // SAFETY: `snapshot` was returned by CreateToolhelp32Snapshot and is not
-    // invalid; CloseHandle releases that snapshot.
-    unsafe { CloseHandle(snapshot) };
-    found
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn parent_pid(_pid: u32) -> Option<u32> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,7 +246,6 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn inventory_keeps_this_terminal_and_orders_newest_attachment_last() {
         let root = tempfile::tempdir().unwrap();
@@ -388,18 +263,22 @@ mod tests {
             .spawn()
             .expect("sleep child");
         let child_pid = child.id();
-        let outside = parent_pid(terminal_pid).unwrap_or(1);
+        let outside = made_platform::process_parent(terminal_pid).unwrap_or(1);
+        // `json_string` honors JSON escapes. A raw Windows `display()` path
+        // (`\\?\C:\...`) would be decoded as `\?C:...` and fail the real-cwd
+        // comparison. Encode the fixture the same way a writer would.
+        let older_cwd = serde_json::to_string(&older.display().to_string())
+            .expect("older cwd encodes as a JSON string");
+        let newest_cwd = serde_json::to_string(&newest.display().to_string())
+            .expect("newest cwd encodes as a JSON string");
         let body = format!(
             r#"[
-            {{"pid":{outside},"session_id":"outside","cwd":"{outside_cwd}","opened_at":"2024-01-01T00:00:03Z"}},
-            {{"pid":{terminal_pid},"session_id":"","cwd":"{older_cwd}","opened_at":"2024-01-01T00:00:04Z"}},
-            {{"pid":{terminal_pid},"pid":{outside},"session_id":"ambiguous","cwd":"{older_cwd}","cwd":"{newest_cwd}","opened_at":"2024-01-01T00:00:05Z"}},
-            {{"pid":{terminal_pid},"session_id":"self","cwd":"{older_cwd}","opened_at":"2024-01-01T00:00:01Z"}},
-            {{"pid":{child_pid},"session_id":"child","cwd":"{newest_cwd}","opened_at":"2024-01-01T00:00:02Z"}}
-            ]"#,
-            outside_cwd = older.display(),
-            older_cwd = older.display(),
-            newest_cwd = newest.display(),
+            {{"pid":{outside},"session_id":"outside","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:03Z"}},
+            {{"pid":{terminal_pid},"session_id":"","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:04Z"}},
+            {{"pid":{terminal_pid},"pid":{outside},"session_id":"ambiguous","cwd":{older_cwd},"cwd":{newest_cwd},"opened_at":"2024-01-01T00:00:05Z"}},
+            {{"pid":{terminal_pid},"session_id":"self","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:01Z"}},
+            {{"pid":{child_pid},"session_id":"child","cwd":{newest_cwd},"opened_at":"2024-01-01T00:00:02Z"}}
+            ]"#
         );
         write(&sessions, &body);
 
@@ -431,6 +310,25 @@ mod tests {
             open_sessions_at(unreadable, terminal_pid).is_empty(),
             "a malformed inventory path must not invent a session"
         );
+    }
+
+    #[test]
+    fn windows_fixture_cwd_keeps_real_backslashes() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("active_sessions.json");
+        let cwd = r"\\?\C:\Users\runneradmin\AppData\Local\Temp\.tmpzeFZ5P\older";
+        let encoded = serde_json::to_string(cwd).expect("windows cwd encodes");
+        let body = format!(
+            r#"[{{"pid":1,"session_id":"self","cwd":{encoded},"opened_at":"2024-01-01T00:00:01Z"}}]"#
+        );
+        write(&sessions, &body);
+        let open = open_sessions_matching(&sessions, 1, |_| None);
+        assert_eq!(
+            open.len(),
+            1,
+            "the encoded fixture must stay one row: {body}"
+        );
+        assert_eq!(open[0].cwd, cwd);
     }
 
     #[test]
@@ -505,8 +403,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
         writeln!(
             file,
-            "{}",
-            "{\"sessionId\":\"new\",\"cwd\":\"/live\",\"event\":\"SessionStart\",\"status\":\"idle\"}"
+            "{{\"sessionId\":\"new\",\"cwd\":\"/live\",\"event\":\"SessionStart\",\"status\":\"idle\"}}"
         )
         .unwrap();
         drop(file);

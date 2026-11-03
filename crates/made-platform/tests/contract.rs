@@ -1811,8 +1811,13 @@ fn clipboard_image_save_prunes_to_the_retention_limit() {
 #[test]
 fn clipboard_image_save_keeps_the_new_image_when_it_is_oldest() {
     let root = unique_temp("clipboard-image-keep-new");
+    let image = test_clipboard_image(1, 1);
+    // Let the platform create the private directory so it is owned by the
+    // current user. `create_dir_all` would leave Administrators as owner on an
+    // elevated Windows runner.
+    let seed = save_clipboard_image_png(&root, &image).expect("create clipboard image directory");
+    std::fs::remove_file(&seed).expect("remove seed image");
     let directory = root.join("clipboard-images");
-    std::fs::create_dir_all(&directory).expect("create clipboard image directory");
     let future = SystemTime::now()
         .checked_add(Duration::from_secs(3600))
         .expect("future mtime");
@@ -1822,7 +1827,6 @@ fn clipboard_image_save_keeps_the_new_image_when_it_is_oldest() {
         set_modified(&path, future);
     }
 
-    let image = test_clipboard_image(1, 1);
     let saved = save_clipboard_image_png(&root, &image).expect("save new clipboard image");
     assert!(
         saved.exists(),

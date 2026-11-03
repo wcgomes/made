@@ -17,8 +17,15 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Companion builds are a dependency of packaging. A missing companion fails
+  # this workflow; the desktop app does not download one when connecting.
+  ssh-remote:
+    name: Build SSH companions
+    uses: ./.github/workflows/ci-ssh-remote.yml
+
   package:
     name: Package development build (${{ matrix.target }})
+    needs: ssh-remote
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -72,8 +79,9 @@ jobs:
           node-version: 24
 
       # Development artifacts only: debug binaries, the app-owned OpenCode
-      # plugin package, README, and version metadata. No signing, notarization,
-      # installer, or auto-update payload is produced.
+      # plugin package, README, and version metadata. Companions and the
+      # native askpass are added after this step; they do not replace it.
+      # No signing, notarization, installer, or auto-update payload is produced.
       - name: Stage the development artifact
         shell: bash
         env:
@@ -122,6 +130,17 @@ jobs:
             notarization: "none",
             installer: "none",
             auto_update: "none",
+            companions: {
+              layout: "remote/<target>/made-remote",
+              targets: [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-apple-darwin",
+                "aarch64-apple-darwin",
+              ],
+              askpass: process.env.EXE ? "made-askpass.exe" : "made-askpass",
+              runtime_download: "none",
+            },
           };
           fs.writeFileSync(
             path.join(stage, "version.json"),
@@ -130,6 +149,59 @@ jobs:
           NODE
 
           find "$stage" -maxdepth 3 -type f -print | sort
+
+      - name: Download Linux x64 companion
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-companion-x86_64-unknown-linux-gnu
+          path: companion-artifacts/x86_64-unknown-linux-gnu
+
+      - name: Download Linux arm64 companion
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-companion-aarch64-unknown-linux-gnu
+          path: companion-artifacts/aarch64-unknown-linux-gnu
+
+      - name: Download macOS x64 companion
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-companion-x86_64-apple-darwin
+          path: companion-artifacts/x86_64-apple-darwin
+
+      - name: Download macOS arm64 companion
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-companion-aarch64-apple-darwin
+          path: companion-artifacts/aarch64-apple-darwin
+
+      - name: Download the native askpass
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-askpass-${{ matrix.target }}
+          path: askpass-artifact
+
+      # Copies the four companions beside made-app. Missing, empty, or
+      # hash-mismatched artifacts fail this step. This is workflow-artifact
+      # assembly, not a download when the user connects.
+      - name: Assemble companions into the desktop package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            py=python3
+          else
+            py=python
+          fi
+          "$py" .github/scripts/assemble-desktop-package.py \
+            --stage "dist/made-development-${TARGET}" \
+            --companions companion-artifacts \
+            --askpass "askpass-artifact/made-askpass${EXE}" \
+            --askpass-manifest askpass-artifact/manifest.json \
+            --desktop-target "$TARGET"
+          find "dist/made-development-${TARGET}" -type f -print | sort
 
       - name: Upload the development artifact
         uses: actions/upload-artifact@v7

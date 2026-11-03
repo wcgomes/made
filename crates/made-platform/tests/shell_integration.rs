@@ -1,5 +1,114 @@
 use made_platform::{PtyRequest, ShellLaunchPlan};
 
+#[test]
+#[cfg(unix)]
+fn private_cwd_sink_reports_without_any_terminal_output_and_keeps_profiles() {
+    use made_platform::shell_integration::CwdReportSink;
+    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("spaces é")).unwrap();
+    let startup = b"PROMPT_COMMAND='printf USER_HOOK'\nPS1='USER_PROMPT>'\n";
+    std::fs::write(root.join(".bashrc"), startup).unwrap();
+    let sink = CwdReportSink::new(&root).unwrap();
+    let mut request = PtyRequest::new("/bin/bash", &root);
+    request.env = std::env::vars_os().filter(|(k, _)| k != "HOME").collect();
+    request
+        .env
+        .push(("HOME".into(), root.clone().into_os_string()));
+    let plan = ShellLaunchPlan::with_cwd_sink(
+        request,
+        env!("CARGO_BIN_EXE_made-askpass").into(),
+        sink.path().to_owned(),
+    );
+    assert!(plan.capability().supported, "{}", plan.capability().reason);
+    let request = plan.request();
+    // No terminal is attached. The report path does not depend on OSC
+    // passthrough or on any user multiplexer.
+    let bootstrap = plan.bootstrap_directory().expect("bootstrap directory");
+    assert_eq!(
+        std::fs::symlink_metadata(bootstrap)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for entry in std::fs::read_dir(bootstrap).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600,
+                "bootstrap file was not published owner-only"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::symlink_metadata(sink.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let mut child = Command::new(&request.program)
+        .args(&request.args)
+        .env_clear()
+        .envs(request.env.iter().cloned())
+        .current_dir(&request.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let wait = |expected: &std::path::Path| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if sink.poll().unwrap().as_deref() == Some(expected.as_os_str().as_encoded_bytes()) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    };
+    let initial = wait(&root);
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all("cd 'spaces é'\n".as_bytes())
+        .unwrap();
+    let changed = wait(&root.join("spaces é"));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(initial && changed, "out-of-band shell cwd was not received");
+    assert_eq!(std::fs::read(root.join(".bashrc")).unwrap(), startup);
+}
+
+#[test]
+#[cfg(unix)]
+fn cwd_datagrams_are_bounded_and_lossless_not_host_path_resolution() {
+    use made_platform::shell_integration::{emit_cwd_report, CwdReportSink};
+    let temp = tempfile::tempdir().unwrap();
+    let sink = CwdReportSink::new(temp.path()).unwrap();
+    let path = b"/not-a-host-path/\xff name";
+    emit_cwd_report(sink.path(), path).unwrap();
+    assert_eq!(sink.poll().unwrap().as_deref(), Some(path.as_slice()));
+    for bad in [b"relative".as_slice(), b"/escape/../path", b"/bad\0path"] {
+        assert!(emit_cwd_report(sink.path(), bad).is_err());
+    }
+    assert!(emit_cwd_report(sink.path(), &vec![b'/'; 4097]).is_err());
+}
+
 #[cfg(unix)]
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 #[cfg(unix)]

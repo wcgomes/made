@@ -490,6 +490,12 @@ impl Diagnostics {
             view_directory: None,
             view_directory_available: None,
             view_directory_reason: None,
+            ssh_authority: None,
+            remote_root: None,
+            ssh_transport: None,
+            ssh_integration: None,
+            remote_version: None,
+            cleanup_unconfirmed: None,
             active_session_id,
             active_session_title,
             active_subpath,
@@ -579,6 +585,18 @@ pub struct WorkspaceDiagnostics {
     pub view_directory_available: Option<bool>,
     /// Why the reported view directory cannot be used.
     pub view_directory_reason: Option<String>,
+    /// Saved SSH server display name. Never a key, token, or prompt answer.
+    pub ssh_authority: Option<String>,
+    /// Remote root as POSIX display text, not a host path.
+    pub remote_root: Option<String>,
+    /// `connecting`, `connected`, or `disconnected`. Independent of integration.
+    pub ssh_transport: Option<String>,
+    /// Optional OpenCode integration on that server, distinct from SSH transport.
+    pub ssh_integration: Option<String>,
+    /// Companion or probe version label. Not a secret.
+    pub remote_version: Option<String>,
+    /// Online close did not receive teardown confirmation.
+    pub cleanup_unconfirmed: Option<bool>,
 }
 
 /// Pill on the revealed Grok Build diagnostics row.
@@ -674,6 +692,18 @@ pub struct DiagnosticsSnapshot {
     pub view_directory_available: Option<bool>,
     /// Why the reported view directory cannot be used.
     pub view_directory_reason: Option<String>,
+    /// Saved SSH server display name.
+    pub ssh_authority: Option<String>,
+    /// Remote root display text.
+    pub remote_root: Option<String>,
+    /// SSH transport health, distinct from OpenCode integration.
+    pub ssh_transport: Option<String>,
+    /// Remote OpenCode integration health.
+    pub ssh_integration: Option<String>,
+    /// Companion or probe version.
+    pub remote_version: Option<String>,
+    /// Whether remote teardown was unconfirmed.
+    pub cleanup_unconfirmed: Option<bool>,
     /// Active session identifier.
     pub active_session_id: Option<String>,
     /// Active session title.
@@ -759,6 +789,22 @@ impl DiagnosticsSnapshot {
         self.view_directory_reason = workspace
             .view_directory_reason
             .map(|reason| sanitize_log_text(&redact_hex_secrets(&reason)));
+        self.ssh_authority = workspace
+            .ssh_authority
+            .map(|name| sanitize_display(&redact_hex_secrets(&name), 128));
+        self.remote_root = workspace
+            .remote_root
+            .map(|path| sanitize_log_text(&redact_hex_secrets(&path)));
+        self.ssh_transport = workspace
+            .ssh_transport
+            .map(|state| sanitize_log_text(&redact_hex_secrets(&state)));
+        self.ssh_integration = workspace
+            .ssh_integration
+            .map(|state| sanitize_log_text(&redact_hex_secrets(&state)));
+        self.remote_version = workspace
+            .remote_version
+            .map(|version| sanitize_log_text(&redact_hex_secrets(&version)));
+        self.cleanup_unconfirmed = workspace.cleanup_unconfirmed;
     }
 
     /// Record the Grok Build row. The sentence is a fixed product string.
@@ -826,6 +872,24 @@ impl DiagnosticsSnapshot {
         }
         if let Some(reason) = &self.view_directory_reason {
             push_line(&mut text, "view directory reason", reason);
+        }
+        if let Some(authority) = &self.ssh_authority {
+            push_line(&mut text, "ssh authority", authority);
+        }
+        if let Some(root) = &self.remote_root {
+            push_line(&mut text, "remote root", root);
+        }
+        if let Some(transport) = &self.ssh_transport {
+            push_line(&mut text, "ssh transport", transport);
+        }
+        if let Some(integration) = &self.ssh_integration {
+            push_line(&mut text, "ssh integration", integration);
+        }
+        if let Some(version) = &self.remote_version {
+            push_line(&mut text, "remote version", version);
+        }
+        if let Some(true) = self.cleanup_unconfirmed {
+            push_line(&mut text, "remote cleanup", "unconfirmed");
         }
         push_line(
             &mut text,

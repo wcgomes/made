@@ -86,7 +86,7 @@
 //!
 //! # Native backdrop
 //!
-//! [`native_backdrop`] optionally applies macOS vibrancy or Windows Mica to the
+//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Mica to the
 //! app window once at startup. Platforms without a portable native backdrop,
 //! disabled configurations, and failed attempts keep Made's current in-app
 //! glass. The module never uses Windows acrylic/blur, whose resize lag is a
@@ -115,10 +115,18 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod private_metadata;
+pub use private_metadata::{
+    private_dacl_is_owner_only, private_dacl_refusal, read_private_metadata,
+    write_private_metadata_atomic, PrivateAce, PrivateAceTrustee, PrivateDacl,
+    MAX_PRIVATE_METADATA_BYTES,
+};
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(feature = "desktop")]
 pub mod native_backdrop;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -1555,6 +1563,14 @@ fn rotate_current_log_with(
     rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), LogIssue> {
     inspect_backup_log(path)?;
+    // On Windows a file created before the directory was tightened keeps its
+    // old inherited DACL. Without an explicit owner-only DACL the rename can
+    // fail with access denied even though the directory is private.
+    tighten_private_log_permissions(path).map_err(|error| {
+        LogIssue::error(format!(
+            "diagnostics log rotation refused ({error}); active and previous logs left untouched"
+        ))
+    })?;
     rename(path, &previous_private_log_path(path)).map_err(|error| {
         LogIssue::error(format!(
             "diagnostics log rotation refused ({error}); active and previous logs left untouched"
@@ -1590,6 +1606,11 @@ pub fn tighten_private_log_permissions(path: impl AsRef<Path>) -> Result<(), Pla
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| PlatformError::io("set private log permissions", error))?;
+    }
+    #[cfg(windows)]
+    {
+        private_metadata::tighten_private_file(path)
             .map_err(|error| PlatformError::io("set private log permissions", error))?;
     }
     Ok(())
@@ -1700,6 +1721,10 @@ pub fn open_private_log(path: impl AsRef<Path>) -> Result<std::fs::File, Platfor
                     path.display()
                 )));
             }
+            // Windows: a file created before the parent directory was tightened
+            // keeps its old inherited DACL. Give it the owner-only DACL before
+            // the append open needs write access.
+            tighten_private_log_permissions(path)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(PlatformError::io("inspect private log path", error)),
@@ -1748,7 +1773,13 @@ fn open_append_private(path: &Path) -> Result<std::fs::File, PlatformError> {
         .map_err(|error| PlatformError::io("open private log", error))
 }
 
-/// Create a directory tree with owner-only permissions on Unix.
+/// Create a directory tree with owner-only permissions on the leaf.
+///
+/// Unix uses mode 0700. On Windows, missing parents are created normally and
+/// are not rewritten: an existing parent such as Temp or AppData may be owned
+/// by Administrators. Only the leaf Made creates receives the current user as
+/// owner and a protected full-allow DACL for that user. An existing leaf owned
+/// by someone else is refused.
 fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     #[cfg(unix)]
     {
@@ -1767,7 +1798,7 @@ fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(path)
+        private_metadata::create_or_tighten_private_directory(path)
             .map_err(|error| PlatformError::io("create app directory", error))
     }
 }
@@ -1821,6 +1852,7 @@ impl ClipboardImage {
     }
 
     /// Encode this image as PNG.
+    #[cfg(feature = "desktop")]
     pub fn to_png(&self) -> Result<Vec<u8>, PlatformError> {
         use image::ImageEncoder as _;
 
@@ -1837,6 +1869,14 @@ impl ClipboardImage {
                 PlatformError::message(format!("clipboard image PNG encoding failed: {error}"))
             })?;
         Ok(png)
+    }
+
+    /// PNG encoding requires the desktop feature; companions accept encoded PNGs.
+    #[cfg(not(feature = "desktop"))]
+    pub fn to_png(&self) -> Result<Vec<u8>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "PNG encoding disabled in headless build".into(),
+        ))
     }
 
     fn validate(&self) -> Result<(), PlatformError> {
@@ -2132,6 +2172,7 @@ impl Clipboard for InMemoryClipboard {
 /// Construction fails cleanly when no display server is available, which is
 /// why the platform contract tests use [`InMemoryClipboard`] instead.
 pub struct SystemClipboard {
+    #[cfg(feature = "desktop")]
     inner: arboard::Clipboard,
 }
 
@@ -2142,6 +2183,7 @@ impl fmt::Debug for SystemClipboard {
 }
 
 impl SystemClipboard {
+    #[cfg(feature = "desktop")]
     pub fn new() -> Result<Self, PlatformError> {
         arboard::Clipboard::new()
             .map(|inner| Self { inner })
@@ -2149,8 +2191,16 @@ impl SystemClipboard {
                 PlatformError::Unsupported(format!("system clipboard unavailable: {err}"))
             })
     }
+
+    #[cfg(not(feature = "desktop"))]
+    pub fn new() -> Result<Self, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
 }
 
+#[cfg(feature = "desktop")]
 impl Clipboard for SystemClipboard {
     fn get_text(&mut self) -> Result<String, PlatformError> {
         self.inner
@@ -2186,6 +2236,25 @@ impl Clipboard for SystemClipboard {
                 "clipboard image read failed: {error}"
             ))),
         }
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+impl Clipboard for SystemClipboard {
+    fn get_text(&mut self) -> Result<String, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
+    fn set_text(&mut self, _text: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
+    fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
     }
 }
 
@@ -2933,8 +3002,20 @@ fn map_exit_status(status: portable_pty::ExitStatus) -> ExitStatus {
 pub fn in_memory_clipboard() -> InMemoryClipboard {
     InMemoryClipboard::new()
 }
-mod shell_integration;
+mod detach;
+mod process;
+pub mod shell_integration;
+pub mod ssh;
+pub mod ssh_askpass;
+pub use detach::{
+    create_private_directory_new, create_private_file_new, ensure_private_directory,
+    exec_remote_child, lock_private_file, read_private_file, remote_path_bytes,
+    remote_path_from_bytes, remote_program_version_supported, remote_target,
+    spawn_detached_command,
+};
+pub use process::process_parent;
 pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
+pub use ssh_askpass::askpass_file_name;
 
 #[cfg(test)]
 mod diagnostics_log_tests {

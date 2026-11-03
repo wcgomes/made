@@ -15,7 +15,8 @@ use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
     diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
     new_tab_menu_item_id, picker_control_id, picker_current_target, picker_list_id, picker_path_id,
-    top_action_id, top_workspace_action_id, workspace_tab_close_id, workspace_tab_id,
+    ssh_field_id, ssh_servers_window_id, top_action_id, top_workspace_action_id,
+    workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
@@ -428,7 +429,10 @@ impl Headless {
     }
 
     fn pump_until(&mut self, mut predicate: impl FnMut(&AppModel) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(6);
+        // Hosted CI runners, especially macOS arm64, can take longer than the
+        // local machine to spawn the fixture PTY. The predicate still has to
+        // become true; only the observation window grows.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !predicate(&self.model) && Instant::now() < deadline {
             self.model.logic(&self.ctx);
             std::thread::sleep(Duration::from_millis(5));
@@ -3493,6 +3497,7 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         let first_tab = headless.response(workspace_tab_id(alpha_id)).rect;
         let last_tab = headless.response(workspace_tab_id(beta_id)).rect;
         let plus = headless.response(top_action_id("open-folder")).rect;
+        let ssh = headless.response(top_action_id("ssh-servers")).rect;
         let explorer = headless
             .response(top_workspace_action_id(beta_id, "explorer"))
             .rect;
@@ -3581,13 +3586,18 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             wordmark.left() - plus.right() >= gap - 0.75,
             "{width}px: tab strip must leave a {gap}px gap before the wordmark: plus {plus:?}, wordmark {wordmark:?}"
         );
+        let control_gap = if layout.compact { 4.0 } else { 6.0 };
         assert!(
-            (explorer.left() - wordmark.right() - gap).abs() < 0.75,
-            "{width}px: wordmark-to-first-icon gap must be {gap}px: wordmark {wordmark:?}, explorer {explorer:?}"
+            (ssh.left() - wordmark.right() - gap).abs() < 0.75,
+            "{width}px: wordmark-to-first-icon gap must be {gap}px: wordmark {wordmark:?}, ssh {ssh:?}"
         );
         assert!(
-            explorer.right() > wordmark.right(),
-            "{width}px: Explorer toggle must be rightmost: wordmark {wordmark:?}, explorer {explorer:?}"
+            (explorer.left() - ssh.right() - control_gap).abs() < 1.0,
+            "{width}px: Servidores SSH must sit immediately left of Explorer: ssh {ssh:?}, explorer {explorer:?}"
+        );
+        assert!(
+            explorer.right() > ssh.right() && explorer.right() > wordmark.right(),
+            "{width}px: Explorer toggle must be rightmost: wordmark {wordmark:?}, ssh {ssh:?}, explorer {explorer:?}"
         );
         assert!(
             plus.width() >= 24.0 && plus.height() >= 24.0,
@@ -3673,12 +3683,48 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: the hovered Explorer fill must end at the card right edge: {hover_fill:?}"
         );
 
+        headless.pump_until(|model| {
+            model
+                .workspace(beta_id)
+                .and_then(Workbench::terminal)
+                .is_some_and(made_app::TerminalPane::is_running)
+        });
+        let terminal_pid = headless
+            .model
+            .workspace(beta_id)
+            .and_then(Workbench::terminal)
+            .and_then(made_app::TerminalPane::pid);
         headless.focus(top_action_id("open-folder"));
         headless.press_key(egui::Key::Enter);
         headless.render();
+        // Enter already opened the picker when nothing else is offered. Do not
+        // send the menu chord into that picker: ArrowDown/Enter would navigate
+        // the folder list, not a terminal row that was never shown.
+        let menu_open = !headless.model.is_picker()
+            && headless
+                .ctx
+                .read_response(new_tab_menu_item_id("terminal"))
+                .is_some();
+        if menu_open {
+            headless.press_key(egui::Key::ArrowDown);
+            headless.render();
+            headless.press_key(egui::Key::Enter);
+            headless.render();
+        }
         assert!(
             headless.model.is_picker(),
-            "{width}px: Enter on the focused Open folder plus must activate the picker"
+            "{width}px: + must open the picker directly when nothing else is offered, or via Terminal when a menu is open"
+        );
+        let terminal = headless
+            .model
+            .workspace(beta_id)
+            .and_then(Workbench::terminal);
+        assert!(
+            terminal.is_some_and(made_app::TerminalPane::is_running),
+            "{width}px: opening the picker must leave the local terminal running (pid {terminal_pid:?}, status {})",
+            terminal
+                .map(made_app::TerminalPane::shell_status_label)
+                .unwrap_or_else(|| "absent".to_owned())
         );
     }
 }
@@ -3947,6 +3993,15 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
     assert_eq!(headless.model.active_workspace_id(), Some(alpha_id));
 
     headless.click(top_action_id("open-folder"));
+    // No local TUI and no saved server: + opens the picker and does not draw
+    // a Terminal item. When a menu is open, Terminal is still that choice.
+    if headless
+        .ctx
+        .read_response(new_tab_menu_item_id("terminal"))
+        .is_some()
+    {
+        headless.click(new_tab_menu_item_id("terminal"));
+    }
     assert!(headless.model.is_picker());
     assert_eq!(headless.model.workspace_count(), 1);
     let picker_text = output_text(&headless.render());
@@ -4013,11 +4068,355 @@ fn header_plus_without_a_detected_tui_opens_the_folder_picker() {
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
     wait_explorer_ready(&mut headless, id);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
 
     headless.click(top_action_id("open-folder"));
-    assert!(headless.model.is_picker());
+    assert!(
+        headless.model.is_picker(),
+        "without a local TUI and without a saved SSH server the + opens the picker"
+    );
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("terminal"))
+        .is_none());
     assert_eq!(headless.model.workspace_count(), 1);
     assert!(headless.model.workspace(id).is_some());
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "opening the picker must leave the local terminal running"
+    );
+}
+
+#[test]
+fn ssh_header_registration_and_remote_tab_keep_local_work() {
+    if isolated("ssh_header_registration_and_remote_tab_keep_local_work") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{
+        DirectoryEntry, EntryKind, Identity, Operation, RemotePath, TabCapability, WireEnvelope,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "local-stays", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let local_id = open_workspace(&mut model, &root);
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Development".into(),
+            host: "server-a".into(),
+            user: None,
+            port: Some(22),
+            key_file: Some("/keys/reference-only".into()),
+            initial_directory: None,
+        })
+        .expect("server metadata saves without credentials");
+    let registry_path = {
+        use made_platform::Platform;
+        made_platform::host_platform()
+            .app_paths()
+            .expect("isolated app paths")
+            .data_dir
+            .join("ssh-servers.json")
+    };
+    let encoded = std::fs::read_to_string(&registry_path).expect("registry file");
+    for forbidden in ["password", "token", "private_key", "prompt"] {
+        assert!(!encoded.contains(forbidden), "{encoded}");
+    }
+    assert!(encoded.contains("server-a"));
+
+    let mut workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    let list_path = RemotePath::new(b"/project".to_vec()).unwrap();
+    let request = workspace
+        .request(
+            Operation::List {
+                path: list_path.clone(),
+            },
+            None,
+        )
+        .unwrap();
+    workspace
+        .accept(WireEnvelope::new(
+            request.identity.clone(),
+            request.request_id,
+            Operation::Listed {
+                path: list_path,
+                entries: vec![DirectoryEntry {
+                    path: RemotePath::new(b"/project/readme.txt".to_vec()).unwrap(),
+                    kind: EntryKind::File,
+                }],
+                truncated: false,
+                done: true,
+            },
+        ))
+        .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model attaches without a host shell");
+    let remote_id = model.active_workspace_id().unwrap();
+    assert_ne!(remote_id, local_id);
+    assert!(model.workspace(local_id).is_some());
+    assert!(model.workspace(remote_id).unwrap().is_remote());
+    assert!(model
+        .workspace(remote_id)
+        .unwrap()
+        .terminal_target()
+        .is_remote());
+
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.advance(0.3);
+    let output = headless.render();
+    let text = output_text(&output);
+    assert!(text.contains("EXPLORER"), "{text}");
+    assert!(text.contains("SSH connected"), "{text}");
+    assert!(text.contains("readme.txt"), "{text}");
+    let ssh = headless.response(top_action_id("ssh-servers"));
+    assert!(ssh.rect.width() >= 24.0 && ssh.rect.height() >= 24.0);
+    let explorer = headless
+        .response(top_workspace_action_id(remote_id, "explorer"))
+        .rect;
+    assert!(
+        ssh.rect.right() <= explorer.left() && explorer.right() > ssh.rect.right(),
+        "Servidores SSH must sit beside Explorer: {:?} {explorer:?}",
+        ssh.rect
+    );
+    let hovered =
+        output_text(&headless.hover_until_text(top_action_id("ssh-servers"), "Servidores SSH"));
+    assert!(hovered.contains("Servidores SSH"), "{hovered}");
+    headless.click(top_action_id("open-folder"));
+    let menu = output_text(&headless.render());
+    assert!(menu.contains("Terminal"), "{menu}");
+    assert!(menu.contains("Terminal SSH"), "{menu}");
+    assert!(
+        !menu.contains("OpenCode SSH"),
+        "OpenCode SSH must wait for this server's detection: {menu}"
+    );
+}
+
+#[test]
+fn remote_open_prompt_refuses_changed_key_without_a_secret_field() {
+    if isolated("remote_open_prompt_refuses_changed_key_without_a_secret_field") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Changed".into(),
+            host: "server-b".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model");
+    let remote_id = model.active_workspace_id().unwrap();
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_open_failure(
+            made_app::remote_session::SshFailureClass::ChangedHostKey,
+            "the remote host key changed and was refused",
+            Some("SHA256:must-not-appear"),
+        );
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    headless.advance(0.2);
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("the remote host key changed and was refused"),
+        "changed key must use the static refusal: {text}"
+    );
+    assert!(
+        !text.contains("SHA256:must-not-appear"),
+        "a changed key must not show a fingerprint field: {text}"
+    );
+    assert!(
+        !text.contains("Approve host"),
+        "a changed key must not offer acceptance: {text}"
+    );
+    assert!(!text.contains("password"), "no secret field copy: {text}");
+}
+
+#[test]
+fn remote_open_unknown_host_shows_failure_fingerprint_and_requires_approval() {
+    if isolated("remote_open_unknown_host_shows_failure_fingerprint_and_requires_approval") {
+        return;
+    }
+    use made_app::remote_session::SshFailureClass;
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Unknown".into(),
+            host: "server-c".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model");
+    let remote_id = model.active_workspace_id().unwrap();
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_open_failure(
+            SshFailureClass::UnknownHost,
+            "the remote host key is not in the app trust file",
+            Some("SHA256:abcDEF123"),
+        );
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    headless.advance(0.2);
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("the remote host key is not in the app trust file"),
+        "unknown host must show the static detail: {text}"
+    );
+    assert!(
+        text.contains("SHA256:abcDEF123"),
+        "unknown host must show the failure fingerprint: {text}"
+    );
+    assert!(
+        text.contains("Approve host"),
+        "approval must be explicit: {text}"
+    );
+    assert!(!text.contains("password"), "no secret field: {text}");
+}
+
+#[test]
+fn stage_error_does_not_spawn_the_companion() {
+    if isolated("stage_error_does_not_spawn_the_companion") {
+        return;
+    }
+    use made_app::remote_session::SshFailureClass;
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::{AttemptError, ServerMetadata};
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Stage".into(),
+            host: "server-d".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model");
+    let remote_id = model.active_workspace_id().unwrap();
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(AttemptError {
+            class: SshFailureClass::UnknownHost,
+            detail: "the remote host key is not in the app trust file".to_owned(),
+            fingerprint: Some("SHA256:stageOnly".to_owned()),
+        }));
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(
+        !workbench.companion_spawn_requested(),
+        "a stage error must not start the companion"
+    );
+    assert!(workbench.remote_needs_host_approval());
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    headless.advance(0.2);
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("Approve host"),
+        "host approval must stay visible after a stage error: {text}"
+    );
+    assert!(text.contains("SHA256:stageOnly"), "{text}");
+    assert!(
+        !text.contains("Opening the authenticated session"),
+        "stage failure must not continue into the companion: {text}"
+    );
+
+    headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(AttemptError {
+            class: SshFailureClass::ChangedHostKey,
+            detail: "the remote host key changed and was refused".to_owned(),
+            fingerprint: Some("SHA256:must-not-appear".to_owned()),
+        }));
+    let workbench = headless.model.workspace(remote_id).unwrap();
+    assert!(!workbench.companion_spawn_requested());
+    assert!(!workbench.remote_needs_host_approval());
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("the remote host key changed and was refused"),
+        "{text}"
+    );
+    assert!(!text.contains("Approve host"), "{text}");
+    assert!(!text.contains("SHA256:must-not-appear"), "{text}");
 }
 
 #[test]
@@ -7297,6 +7696,186 @@ fn picker_primary_names_the_current_target_and_empty_folders_confirm() {
     );
 }
 
+#[test]
+fn ssh_servers_window_keeps_field_focus_and_has_no_collapse() {
+    if isolated("ssh_servers_window_keeps_field_focus_and_has_no_collapse") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-focus", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    let opened = headless.render();
+    let text = output_text(&opened);
+    assert!(text.contains("Servidores SSH"), "{text}");
+    assert!(text.contains("Display name"), "{text}");
+    assert!(text.contains("Host or SSH alias"), "{text}");
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
+        .expect("SSH window rect");
+    let title =
+        egui::Rect::from_min_max(window.min, egui::pos2(window.right(), window.top() + 36.0));
+    assert!(
+        triangles_in(&opened, title).is_empty(),
+        "Servidores SSH must not paint a collapse triangle"
+    );
+    let close = short_segments_in(&opened, title)
+        .into_iter()
+        .find(|segment| segment[0].x > window.center().x && segment[1].x > window.center().x)
+        .expect("close button still paints in the title bar");
+
+    let name = ssh_field_id("name");
+    let host = ssh_field_id("host");
+    let user = ssh_field_id("user");
+    let port = ssh_field_id("port");
+    let key = ssh_field_id("key");
+    let directory = ssh_field_id("directory");
+    let name_rect = headless.response(name).rect;
+    let host_rect = headless.response(host).rect;
+    let user_rect = headless.response(user).rect;
+    let port_rect = headless.response(port).rect;
+    let key_rect = headless.response(key).rect;
+    let directory_rect = headless.response(directory).rect;
+    for rect in [host_rect, user_rect, key_rect, directory_rect] {
+        assert!(
+            (rect.left() - name_rect.left()).abs() < 1.0,
+            "fields must share a left edge: {name_rect:?} vs {rect:?}"
+        );
+    }
+    assert!(
+        (port_rect.right() - name_rect.right()).abs() < 1.0,
+        "Port must align to the form's right edge: {port_rect:?} vs {name_rect:?}"
+    );
+    let pair_gap = host_rect.top() - name_rect.bottom();
+    let later_gap = directory_rect.top() - key_rect.bottom();
+    assert!(
+        pair_gap >= 8.0 && (pair_gap - later_gap).abs() < 2.0,
+        "field pairs must keep one Calm Editor rhythm: {pair_gap} vs {later_gap}"
+    );
+
+    headless.click(name);
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(name),
+        "clicking Display name must focus that field"
+    );
+    for _ in 0..3 {
+        headless.render();
+        assert_eq!(
+            headless.ctx.memory(|memory| memory.focused()),
+            Some(name),
+            "the terminal must not reclaim a focused SSH field"
+        );
+    }
+    let pane = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    headless.ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique(("made-terminal-focus-boost", pane.as_str())),
+            4u8,
+        );
+    });
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(name),
+        "a terminal focus boost must not steal an active SSH field"
+    );
+    headless.click(top_workspace_action_id(id, "explorer"));
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(name),
+        "hiding the explorer must not hand focus back to the terminal"
+    );
+
+    headless.press_key(egui::Key::Tab);
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(host),
+        "Tab must move into the next SSH field and stay there"
+    );
+
+    let close_at = egui::pos2(
+        (close[0].x + close[1].x) * 0.5,
+        (close[0].y + close[1].y) * 0.5,
+    );
+    headless.render_events(vec![egui::Event::PointerMoved(close_at)]);
+    headless.render_events(vec![pointer_button(close_at, true)]);
+    headless.render_events(vec![pointer_button(close_at, false)]);
+    // The close click and the terminal focus handback can settle on different
+    // frames depending on the host. Render one settling frame before checking.
+    headless.render();
+    let closed = headless.render();
+    assert!(
+        !output_text(&closed).contains("Display name"),
+        "the window must still close: {}",
+        output_text(&closed)
+    );
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .terminal()
+            .unwrap()
+            .is_focused(),
+        "closing the window must return focus to the terminal"
+    );
+}
+
+fn triangles_in(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<egui::Rect> {
+    fn visit(shape: &egui::Shape, bounds: egui::Rect, found: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Path(path) if path.points.len() == 3 => {
+                let rect = egui::Rect::from_points(&path.points);
+                if bounds.contains_rect(rect) {
+                    found.push(rect);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, bounds, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, bounds, &mut found);
+    }
+    found
+}
+
+fn short_segments_in(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<[egui::Pos2; 2]> {
+    fn visit(shape: &egui::Shape, bounds: egui::Rect, found: &mut Vec<[egui::Pos2; 2]>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => {
+                let rect = egui::Rect::from_two_pos(points[0], points[1]);
+                let length = (points[1] - points[0]).length();
+                if length < 20.0 && bounds.intersects(rect) {
+                    found.push(*points);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, bounds, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, bounds, &mut found);
+    }
+    found
+}
+
 fn grok_home_dir() -> PathBuf {
     let dir = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join(".grok");
     fs::create_dir_all(&dir).unwrap();
@@ -7878,10 +8457,24 @@ fn header_plus_without_a_detected_tui_shows_no_menu() {
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "no-tui", "main.rs");
     let (mut headless, id) = menu_model(&root, &[]);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
     headless.click(top_action_id("open-folder"));
     assert!(headless.model.is_picker());
     assert_eq!(headless.model.workspace_count(), 1);
     assert!(headless.model.workspace(id).is_some());
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "opening the picker must leave the local terminal running"
+    );
     assert!(headless
         .ctx
         .read_response(new_tab_menu_item_id("terminal"))
@@ -8330,6 +8923,7 @@ fn opencode_row_for_catalog(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_revealed_grok_row(
     output: &egui::FullOutput,
     headless: &Headless,
@@ -8975,6 +9569,7 @@ fn assert_catalog_menu_unchanged(headless: &mut Headless) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_opencode_diagnostics_row(
     headless: &mut Headless,
     id: WorkspaceId,

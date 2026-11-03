@@ -184,6 +184,12 @@ fn workspace_view_directory_is_sanitized_redacted_and_reported() {
         ))),
         view_directory_available: Some(false),
         view_directory_reason: Some(format!("directory unavailable: {}", token.expose_secret())),
+        ssh_authority: None,
+        remote_root: None,
+        ssh_transport: None,
+        ssh_integration: None,
+        remote_version: None,
+        cleanup_unconfirmed: None,
     });
 
     let directory = view.view_directory.as_ref().expect("view directory kept");
@@ -224,6 +230,12 @@ fn tabs_unavailable_diagnostics_report_no_view_directory() {
         view_directory: None,
         view_directory_available: None,
         view_directory_reason: None,
+        ssh_authority: None,
+        remote_root: None,
+        ssh_transport: None,
+        ssh_integration: None,
+        remote_version: None,
+        cleanup_unconfirmed: None,
     });
 
     assert_eq!(view.view_directory, None);
@@ -259,6 +271,12 @@ fn workspace_shell_context_is_inspectable_and_redacted() {
         view_directory: None,
         view_directory_available: None,
         view_directory_reason: None,
+        ssh_authority: None,
+        remote_root: None,
+        ssh_transport: None,
+        ssh_integration: None,
+        remote_version: None,
+        cleanup_unconfirmed: None,
     });
 
     assert_eq!(view.workspace_identity.as_deref(), Some("made-123-7"));

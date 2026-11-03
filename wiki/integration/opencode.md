@@ -126,6 +126,7 @@ The plugin is pinned to this observed surface. Bridge protocol version gates maj
 - Phase 0 gate: 19/19 gate plus 5/5 supporting checks against OpenCode v2.1.4; see the [Phase 0 gate record](../records/20261025-phase-0-gate.md). The harness was removed after the gate.
 - App-level live session switching on the revised terminal-first build is still pending; the current evidence for bridge/config/root precedence is test-level plus historical real-OpenCode runs.
 - Connected view-directory follow is TUI-only; a folder selected in the OpenCode desktop app's own picker is not observable.
-- WSL-hosted OpenCode, remote/SSH OpenCode, ACP, and other agents are out of scope.
+- WSL-hosted OpenCode, ACP, and other agents are out of scope.
+- SSH remote workspaces are an active change, not an out-of-scope exclusion. The contract is [specs/changes/ssh-remote-workspaces/](../../specs/changes/ssh-remote-workspaces/spec.md). Made does not depend on tmux; the native supervisor is the chosen mechanism. Real SSH proof has not been executed.
 
 Related: [Security](../security.md), [Runtime terminal-first](../runtime/terminal-first.md), [Phase 0 record](../records/20261025-phase-0-gate.md).

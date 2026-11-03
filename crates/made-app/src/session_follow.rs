@@ -21,6 +21,7 @@ use made_bridge::state::{SessionSnapshot, SnapshotError, SnapshotTracker};
 use made_explorer::root_switch::{GenerationGate, RootGeneration};
 
 use crate::workspace::{LaunchPlan, WorkspaceError, WorkspaceErrorKind};
+use made_remote::protocol::RemotePath;
 
 /// The active session identity after a snapshot is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,16 @@ pub enum RootSource {
     OpenCode,
     /// The single Grok session open in this terminal.
     Grok,
+}
+
+/// Accept a remote directory report without consulting the host filesystem.
+///
+/// POSIX bytes stay POSIX bytes. A Windows client must not canonicalize them
+/// or open them as a local path. The error is a static sentence so a rejected
+/// report cannot be repaired into a host `PathBuf`.
+pub fn validate_remote_directory(bytes: &[u8]) -> Result<RemotePath, &'static str> {
+    RemotePath::new(bytes.to_vec())
+        .map_err(|_| "the remote directory is not an absolute POSIX path")
 }
 
 impl RootSource {

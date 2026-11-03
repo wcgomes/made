@@ -3034,6 +3034,260 @@ pub fn document_text(document: &PreviewDocument) -> String {
         .join("\n")
 }
 
+/// What the remote explorer asked the owning tab to do. Paths stay remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteExplorerAction {
+    SetMode(crate::remote_workspace::ExplorerMode),
+    Expand(made_remote::protocol::RemotePath),
+    Collapse(made_remote::protocol::RemotePath),
+    Select(made_remote::protocol::RemotePath),
+    OpenPreview(made_remote::protocol::RemotePath),
+    RefreshPreview,
+    ClosePreview,
+    CopyPath(String),
+    UseRoot(made_remote::protocol::RemotePath),
+}
+
+/// Draw a remote explorer from an already-applied projection. This function
+/// does not read the host filesystem and does not start a local watcher.
+pub fn remote_explorer_ui(
+    ui: &mut Ui,
+    root: &made_remote::protocol::RemotePath,
+    projection: &crate::remote_workspace::WorkspaceProjection,
+    connection: crate::remote_workspace::ConnectionState,
+    integration: crate::remote_workspace::IntegrationState,
+    phase_detail: &str,
+    layout: &theme::Layout,
+) -> Vec<RemoteExplorerAction> {
+    use crate::remote_workspace::{ConnectionState, ExplorerMode, Freshness, IntegrationState};
+    let mut actions = Vec::new();
+    ui.spacing_mut().item_spacing.y = 4.0;
+    theme::section_label(
+        ui,
+        if projection.mode == ExplorerMode::Git {
+            "REPOS"
+        } else {
+            "EXPLORER"
+        },
+    );
+    let status = match connection {
+        ConnectionState::Connected => "SSH connected",
+        ConnectionState::Disconnected => "SSH disconnected",
+    };
+    let integration_label = match integration {
+        IntegrationState::Connected => "integration connected",
+        IntegrationState::Unavailable => "integration unavailable",
+        IntegrationState::Unknown => "integration unknown",
+    };
+    ui.label(theme::micro(format!("{status} · {integration_label}")));
+    if !phase_detail.is_empty() {
+        ui.label(theme::body(sanitize_display(phase_detail, 240)));
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(projection.mode == ExplorerMode::Files, "Files")
+            .clicked()
+        {
+            actions.push(RemoteExplorerAction::SetMode(ExplorerMode::Files));
+        }
+        if ui
+            .selectable_label(projection.mode == ExplorerMode::Git, "Source Control")
+            .clicked()
+        {
+            actions.push(RemoteExplorerAction::SetMode(ExplorerMode::Git));
+        }
+    });
+    if projection.mode == ExplorerMode::Git {
+        remote_git_ui(ui, projection, &mut actions);
+    } else {
+        remote_files_ui(ui, root, projection, &mut actions, layout);
+    }
+    if let Some(preview) = &projection.preview {
+        ui.separator();
+        ui.label(theme::micro("Preview"));
+        let path = remote_path_text(&preview.path);
+        ui.label(theme::body(sanitize_display(&path, 180)));
+        ui.horizontal(|ui| {
+            if ui.button("Copy path").clicked() {
+                actions.push(RemoteExplorerAction::CopyPath(path.clone()));
+            }
+            if ui.button("Refresh").clicked() {
+                actions.push(RemoteExplorerAction::RefreshPreview);
+            }
+            if ui.button("Close").clicked() {
+                actions.push(RemoteExplorerAction::ClosePreview);
+            }
+        });
+        match &preview.freshness {
+            Freshness::Stale => {
+                ui.label(theme::micro("Preview is stale"));
+            }
+            Freshness::Loading => {
+                ui.label(theme::micro("Loading preview"));
+            }
+            Freshness::Unavailable(code) => {
+                ui.label(theme::micro(format!("Preview unavailable ({code:?})")));
+            }
+            Freshness::Current => {
+                if preview.data.is_empty() {
+                    ui.label(theme::micro("No preview text"));
+                } else if let Ok(text) = std::str::from_utf8(&preview.data) {
+                    ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        ui.label(theme::mono(
+                            sanitize_display(text, 8000),
+                            theme::SMALL_SIZE,
+                            theme::TEXT_SECONDARY,
+                        ));
+                    });
+                } else {
+                    ui.label(theme::micro("Preview is not valid UTF-8"));
+                }
+            }
+        }
+    }
+    let _ = layout;
+    actions
+}
+
+fn remote_files_ui(
+    ui: &mut Ui,
+    root: &made_remote::protocol::RemotePath,
+    projection: &crate::remote_workspace::WorkspaceProjection,
+    actions: &mut Vec<RemoteExplorerAction>,
+    _layout: &theme::Layout,
+) {
+    use crate::remote_workspace::Freshness;
+    let root = projection.directories.get(root);
+    let Some(root) = root else {
+        ui.label(theme::micro("Remote listing has not arrived"));
+        return;
+    };
+    if root.truncated {
+        ui.label(theme::micro("Listing truncated"));
+    }
+    if matches!(root.freshness, Freshness::Unavailable(_)) {
+        ui.label(theme::micro("Remote directory unavailable"));
+    }
+    ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+        paint_remote_directory(ui, &root.path, projection, actions, 0);
+    });
+}
+
+fn paint_remote_directory(
+    ui: &mut Ui,
+    path: &made_remote::protocol::RemotePath,
+    projection: &crate::remote_workspace::WorkspaceProjection,
+    actions: &mut Vec<RemoteExplorerAction>,
+    depth: usize,
+) {
+    let Some(directory) = projection.directories.get(path) else {
+        return;
+    };
+    for entry in &directory.entries {
+        let name = remote_file_name(&entry.path);
+        let expanded = projection.expanded.contains(&entry.path);
+        let kind = match entry.kind {
+            made_remote::protocol::EntryKind::Directory => {
+                made_explorer::tree::EntryKind::Directory
+            }
+            made_remote::protocol::EntryKind::File => made_explorer::tree::EntryKind::File,
+            made_remote::protocol::EntryKind::Symlink => made_explorer::tree::EntryKind::Symlink,
+            made_remote::protocol::EntryKind::Other => made_explorer::tree::EntryKind::Other,
+        };
+        ui.horizontal(|ui| {
+            if depth > 0 {
+                ui.add_space(depth as f32 * 12.0);
+            }
+            if let Some(icon) = explorer_icons::resolve(&name, kind, expanded) {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                paint_entry_icon(ui, rect.center(), icon);
+            }
+            let label = sanitize_display(&name, 120);
+            if ui.selectable_label(false, label).clicked() {
+                actions.push(RemoteExplorerAction::Select(entry.path.clone()));
+                match entry.kind {
+                    made_remote::protocol::EntryKind::Directory => {
+                        if expanded {
+                            actions.push(RemoteExplorerAction::Collapse(entry.path.clone()));
+                        } else {
+                            actions.push(RemoteExplorerAction::Expand(entry.path.clone()));
+                        }
+                    }
+                    made_remote::protocol::EntryKind::File => {
+                        actions.push(RemoteExplorerAction::OpenPreview(entry.path.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if expanded && depth < 64 {
+            paint_remote_directory(ui, &entry.path, projection, actions, depth + 1);
+        }
+    }
+}
+
+fn remote_git_ui(
+    ui: &mut Ui,
+    projection: &crate::remote_workspace::WorkspaceProjection,
+    actions: &mut Vec<RemoteExplorerAction>,
+) {
+    let Some(git) = &projection.git_view else {
+        ui.label(theme::micro("Remote Git metadata has not arrived"));
+        return;
+    };
+    let head = if git.detached {
+        git.commit.as_deref().unwrap_or("detached")
+    } else {
+        git.branch.as_deref().unwrap_or("unknown")
+    };
+    ui.label(theme::body(sanitize_display(head, 80)));
+    if let Some(subject) = &git.subject {
+        ui.label(theme::micro(sanitize_display(subject, 160)));
+    }
+    if git.linked_worktree {
+        if let Some(name) = &git.worktree_name {
+            ui.label(theme::micro(format!(
+                "linked worktree {}",
+                sanitize_display(name, 80)
+            )));
+        }
+    }
+    if git.groups.is_empty() {
+        ui.label(theme::micro("No changes"));
+        return;
+    }
+    for group in &git.groups {
+        ui.label(theme::micro(format!(
+            "{} ({})",
+            group.title,
+            group.rows.len()
+        )));
+        for row in &group.rows {
+            let name = remote_file_name(&row.path);
+            if ui
+                .selectable_label(false, sanitize_display(&name, 120))
+                .clicked()
+            {
+                actions.push(RemoteExplorerAction::OpenPreview(row.path.clone()));
+            }
+        }
+    }
+}
+
+fn remote_path_text(path: &made_remote::protocol::RemotePath) -> String {
+    path.to_utf8()
+        .map(str::to_owned)
+        .unwrap_or_else(|_| "remote path".to_owned())
+}
+
+fn remote_file_name(path: &made_remote::protocol::RemotePath) -> String {
+    let text = remote_path_text(path);
+    text.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("remote")
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use made_platform::{find_executable_on_path, CompatibleTui};
+use made_remote::protocol::AuthorityId;
 use made_terminal::PtyOptions;
 
 /// Which child process a workspace terminal starts.
@@ -17,6 +18,10 @@ pub enum TerminalTarget {
     Shell,
     /// A detected TUI started directly as the PTY child.
     Tui(CompatibleTui),
+    /// A remote shell on a saved server. Never resolved against the host PATH.
+    RemoteShell { authority: AuthorityId },
+    /// Remote OpenCode on a saved server. Never substituted with a host binary.
+    RemoteOpenCode { authority: AuthorityId },
 }
 
 impl TerminalTarget {
@@ -40,6 +45,21 @@ impl TerminalTarget {
                     CompatibleTui::OpenCode => options,
                 })
             }
+            // Remote launches must not resolve a host executable or host cwd.
+            Self::RemoteShell { .. } | Self::RemoteOpenCode { .. } => None,
+        }
+    }
+
+    /// Whether this target belongs to a saved SSH authority.
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::RemoteShell { .. } | Self::RemoteOpenCode { .. })
+    }
+
+    /// Saved server for a remote target.
+    pub fn authority(self) -> Option<AuthorityId> {
+        match self {
+            Self::RemoteShell { authority } | Self::RemoteOpenCode { authority } => Some(authority),
+            Self::Shell | Self::Tui(_) => None,
         }
     }
 
@@ -48,6 +68,8 @@ impl TerminalTarget {
         match self {
             Self::Shell => "Shell",
             Self::Tui(tui) => tui.label(),
+            Self::RemoteShell { .. } => "Terminal SSH",
+            Self::RemoteOpenCode { .. } => "OpenCode SSH",
         }
     }
 
@@ -56,6 +78,8 @@ impl TerminalTarget {
         match self {
             Self::Shell => "shell",
             Self::Tui(tui) => tui.label(),
+            Self::RemoteShell { .. } => "terminal-ssh",
+            Self::RemoteOpenCode { .. } => "opencode-ssh",
         }
     }
 
@@ -64,6 +88,8 @@ impl TerminalTarget {
         match self {
             Self::Shell => "Restart shell".to_owned(),
             Self::Tui(tui) => format!("Restart {}", tui.label()),
+            Self::RemoteShell { .. } => "Reconnect Terminal SSH".to_owned(),
+            Self::RemoteOpenCode { .. } => "Reconnect OpenCode SSH".to_owned(),
         }
     }
 }
@@ -73,6 +99,22 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+
+    #[test]
+    fn remote_targets_do_not_resolve_a_host_executable_or_cwd() {
+        let authority = AuthorityId([7; 16]);
+        let shell = TerminalTarget::RemoteShell { authority };
+        let opencode = TerminalTarget::RemoteOpenCode { authority };
+        assert!(shell.pty_options("/tmp", OsStr::new("/usr/bin")).is_none());
+        assert!(opencode
+            .pty_options("/tmp", OsStr::new("/usr/bin"))
+            .is_none());
+        assert_eq!(shell.program_label(), "Terminal SSH");
+        assert_eq!(opencode.program_label(), "OpenCode SSH");
+        assert!(shell.is_remote());
+        assert_eq!(opencode.authority(), Some(authority));
+        assert!(!TerminalTarget::Shell.is_remote());
+    }
 
     #[test]
     fn shell_target_keeps_platform_shell_resolution() {

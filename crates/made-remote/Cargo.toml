@@ -1,0 +1,26 @@
+[package]
+name = "made-remote"
+description = "Headless remote workspace protocol and companion for Made"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+# Explicit binary: autobins stays off so only this companion entry point is built.
+autobins = false
+
+[[bin]]
+name = "made-remote"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+getrandom = "0.4"
+made-platform = { path = "../made-platform", default-features = false }
+made-terminal = { path = "../made-terminal" }
+made-explorer = { path = "../made-explorer" }
+made-bridge = { path = "../made-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

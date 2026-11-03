@@ -40,6 +40,8 @@
 pub mod emulation;
 pub mod input;
 pub mod pty;
+pub mod transport;
+pub use transport::{LocalPtyTransport, TerminalTransport, TransportStatus};
 
 pub use emulation::{
     CellAttributes, CellSnapshot, CursorShape, CursorSnapshot, DamageLine, LineSnapshot,
