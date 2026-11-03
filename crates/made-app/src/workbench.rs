@@ -2497,6 +2497,9 @@ impl Workbench {
         match reply.operation {
             made_remote::protocol::Operation::Attached => {}
             made_remote::protocol::Operation::Error { code } => {
+                self.diag
+                    .log_mut()
+                    .record(LogLevel::Error, format!("remote attach error: {code:?}"));
                 remote.phase = RemotePhase::Failed;
                 remote.detail = crate::remote_session::classify_error(code)
                     .detail()

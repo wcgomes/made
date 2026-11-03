@@ -16,8 +16,8 @@ pub const MAX_DIRECTORY_ENTRIES: usize = made_explorer::tree::MAX_DIR_ENTRIES;
 pub const MAX_TREE_ROWS: usize = made_explorer::tree::MAX_TREE_ROWS;
 pub const MAX_TREE_DEPTH: usize = made_explorer::tree::MAX_TREE_DEPTH;
 pub const MAX_GIT_BYTES: u64 = 2 * 1024 * 1024;
-pub const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+pub const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 pub const DETACHED_LEASE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 pub const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 

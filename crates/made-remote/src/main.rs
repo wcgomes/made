@@ -129,7 +129,7 @@ fn frontend() -> io::Result<()> {
         Operation::Attach { .. } => {}
         _ => return Err(fail()),
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let endpoint: Endpoint = loop {
         // A private endpoint can contain only a bounded loopback locator, never
         // command text. Following symlinks is rejected by the platform reader.
