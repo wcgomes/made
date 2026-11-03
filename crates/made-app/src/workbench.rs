@@ -2183,6 +2183,10 @@ impl Workbench {
     }
 
     fn apply_attempt_error(&mut self, error: crate::ssh_servers::AttemptError, retry: OpenRetry) {
+        self.diag.log_mut().record(
+            LogLevel::Error,
+            format!("remote attempt failed: {}", error.detail),
+        );
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
@@ -2283,6 +2287,10 @@ impl Workbench {
             DEFAULT_COLS as u16,
         );
         debug_assert!(crate::remote_session::allow_before_attached(&operation));
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!("remote opening: {:?} epoch {}", launch, remote.client_epoch),
+        );
         match client.request(operation, None) {
             Ok(id) => {
                 remote.client = Some(client);
@@ -2303,7 +2311,7 @@ impl Workbench {
     }
 
     fn pump_remote_client(&mut self) {
-        let (attach_reply, upload_replies, disconnected) = {
+        let (attach_reply, upload_replies, seen, disconnected) = {
             let Some(remote) = self.remote.as_mut() else {
                 return;
             };
@@ -2311,12 +2319,14 @@ impl Workbench {
                 return;
             };
             if !client.is_connected() {
-                (None, Vec::new(), true)
+                (None, Vec::new(), Vec::new(), true)
             } else {
                 let waiting_attach = remote.attach_request;
                 let mut attach_reply = None;
                 let mut upload_replies = Vec::new();
+                let mut seen = Vec::new();
                 while let Some(reply) = client.poll_reply() {
+                    seen.push(operation_name(&reply.operation));
                     if waiting_attach == Some(reply.request_id) {
                         attach_reply = Some(reply);
                         continue;
@@ -2338,9 +2348,21 @@ impl Workbench {
                     }
                     let _ = remote.workspace.accept(reply);
                 }
-                (attach_reply, upload_replies, false)
+                (attach_reply, upload_replies, seen, false)
             }
         };
+        if !seen.is_empty() || attach_reply.is_some() {
+            self.diag.log_mut().record(
+                LogLevel::Info,
+                format!(
+                    "remote replies: {seen:?} attach={}",
+                    attach_reply
+                        .as_ref()
+                        .map(|reply| operation_name(&reply.operation))
+                        .unwrap_or("none")
+                ),
+            );
+        }
         if disconnected {
             self.fail_remote_transport();
             return;
@@ -2387,6 +2409,9 @@ impl Workbench {
     }
 
     fn fail_remote_transport(&mut self) {
+        self.diag
+            .log_mut()
+            .record(LogLevel::Error, "remote transport disconnected");
         if let Some(remote) = self.remote.as_mut() {
             remote.workspace.disconnect();
             remote.phase = RemotePhase::Failed;
@@ -2461,6 +2486,10 @@ impl Workbench {
     }
 
     fn note_attach_reply(&mut self, reply: made_remote::protocol::WireEnvelope) {
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!("remote attach reply: {}", operation_name(&reply.operation)),
+        );
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
@@ -4587,6 +4616,29 @@ pub fn worktree_indicator(metadata: Option<&WorktreeMetadata>, loading: bool) ->
 /// any per-OS UI branch.
 pub fn platform_family_label() -> &'static str {
     PlatformFamily::current().name()
+}
+
+/// Stable operation name for diagnostics. `Operation` Debug is redacted.
+fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str {
+    use made_remote::protocol::Operation;
+    match operation {
+        Operation::Attached => "Attached",
+        Operation::Error { .. } => "Error",
+        Operation::RootResult { .. } => "RootResult",
+        Operation::TerminalOutput { .. } => "TerminalOutput",
+        Operation::TerminalExit { .. } => "TerminalExit",
+        Operation::SessionSnapshot { .. } => "SessionSnapshot",
+        Operation::Changed { .. } => "Changed",
+        Operation::Listed { .. } => "Listed",
+        Operation::PreviewResult { .. } => "PreviewResult",
+        Operation::GitResult { .. } => "GitResult",
+        Operation::Ack => "Ack",
+        Operation::Closed { .. } => "Closed",
+        Operation::FocusResult { .. } => "FocusResult",
+        Operation::UploadResult { .. } => "UploadResult",
+        Operation::CapabilitiesResult { .. } => "CapabilitiesResult",
+        _ => "other",
+    }
 }
 
 #[cfg(test)]
