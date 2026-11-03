@@ -4,8 +4,11 @@ use std::{path::Path, process::Command};
 fn arbitrary_made_git_bin_is_not_a_program_selector() {
     let runner = GitRunner::from_env_value(Some("/tmp/not-git-at-all".into()));
     let program = runner.program().to_string_lossy();
+    let name = Path::new(program.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str());
     assert!(
-        program == "git" || program.ends_with("/git") || program.ends_with("\\git"),
+        matches!(name, Some("git") | Some("git.exe")),
         "honored arbitrary MADE_GIT_BIN value {program}"
     );
 }

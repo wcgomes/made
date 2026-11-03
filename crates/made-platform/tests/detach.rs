@@ -249,7 +249,24 @@ fn detach_survives_parent_hangup_without_invoking_tmux() {
         status.success(),
         "could not hang up the parent process group"
     );
-    let _ = parent.wait();
+    // Some hosted Linux shells start the test binary with SIGHUP ignored, so
+    // the hangup may not reap the parent. Wait a bounded time, then force the
+    // parent down; the detached child must still survive.
+    let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reaped = false;
+    while std::time::Instant::now() < reap_deadline {
+        if parent.try_wait().unwrap().is_some() {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reaped {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", &format!("-{}", parent.id())])
+            .status();
+        let _ = parent.wait();
+    }
     std::thread::sleep(Duration::from_millis(100));
     assert!(
         pid_alive(leader),
