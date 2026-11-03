@@ -26,7 +26,9 @@ case "$target:$machine" in
 esac
 
 libc="$(getconf GNU_LIBC_VERSION)"
-ldd_line="$(ldd --version | head -n 1)"
+# sed reads the whole stream. `head` closes the pipe early, and pipefail
+# turns that SIGPIPE into exit 141 before the glibc check can run.
+ldd_line="$(ldd --version | sed -n '1p')"
 echo "companion build libc: $libc"
 echo "ldd: $ldd_line"
 case "$libc" in
