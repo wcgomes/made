@@ -1721,6 +1721,10 @@ pub fn open_private_log(path: impl AsRef<Path>) -> Result<std::fs::File, Platfor
                     path.display()
                 )));
             }
+            // Windows: a file created before the parent directory was tightened
+            // keeps its old inherited DACL. Give it the owner-only DACL before
+            // the append open needs write access.
+            tighten_private_log_permissions(path)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(PlatformError::io("inspect private log path", error)),

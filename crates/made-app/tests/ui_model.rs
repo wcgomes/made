@@ -429,7 +429,10 @@ impl Headless {
     }
 
     fn pump_until(&mut self, mut predicate: impl FnMut(&AppModel) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(6);
+        // Hosted CI runners, especially macOS arm64, can take longer than the
+        // local machine to spawn the fixture PTY. The predicate still has to
+        // become true; only the observation window grows.
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !predicate(&self.model) && Instant::now() < deadline {
             self.model.logic(&self.ctx);
             std::thread::sleep(Duration::from_millis(5));
