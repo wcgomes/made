@@ -58,7 +58,7 @@ fn packaged_helper_answers_the_broker_prompt() {
     let temp = tempfile::tempdir().unwrap();
     let mut broker = AskpassBroker::new(temp.path(), Duration::from_secs(5)).unwrap();
     let socket = broker.socket_path().to_owned();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_made-askpass"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_made-askpass"))
         .env("MADE_ASKPASS_SOCKET", &socket)
         .arg("vscode@example's password:")
         .stdout(std::process::Stdio::piped())
