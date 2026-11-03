@@ -18,7 +18,7 @@ use made_platform::{
 use made_terminal::{
     InputEncoder, Key as TerminalKey, Modifiers as TerminalModifiers, MouseButton, MouseEvent,
     MouseEventKind, MouseMode, PtyError, PtyOptions, PtyProcess, TerminalCore, TerminalDamage,
-    TerminalSize, TerminalSnapshot,
+    TerminalSize, TerminalSnapshot, TerminalTransport,
 };
 
 use crate::diagnostics::{DiagnosticLog, LogLevel};
@@ -139,6 +139,14 @@ pub struct TerminalUiOutput {
 pub struct TerminalPane {
     core: TerminalCore,
     pty: Option<PtyProcess>,
+    /// Remote attachment. Local panes leave this empty and keep `pty`.
+    remote_transport: Option<Box<dyn TerminalTransport>>,
+    /// Reject input until a remote resnapshot has been applied, or until a new
+    /// Open is attached. Output may still be fed.
+    input_paused: bool,
+    remote_image_paste: bool,
+    pending_image_png: Option<Vec<u8>>,
+    remote_image_hint_shown: bool,
     options: PtyOptions,
     /// Program this pane runs; names the exit overlay and restart copy.
     target: TerminalTarget,
@@ -203,6 +211,11 @@ impl TerminalPane {
         let mut pane = Self {
             core,
             pty: Some(pty),
+            remote_transport: None,
+            input_paused: false,
+            remote_image_paste: false,
+            pending_image_png: None,
+            remote_image_hint_shown: false,
             options,
             target: TerminalTarget::Shell,
             encoder,
@@ -243,6 +256,133 @@ impl TerminalPane {
         Ok(pane)
     }
 
+    /// A remote pane with no host PTY. Input stays paused until the session is
+    /// attached and, for reattach, until the resnapshot is fed.
+    pub fn open_remote(target: TerminalTarget, rows: u16, cols: u16) -> Self {
+        let options = PtyOptions::new(std::path::PathBuf::new()).with_size(PtySize {
+            rows: rows.max(1),
+            cols: cols.max(2),
+        });
+        let size = TerminalSize {
+            rows: usize::from(options.size.rows),
+            cols: usize::from(options.size.cols),
+        };
+        let core = TerminalCore::with_size(size, SCROLLBACK_LINES);
+        let encoder = InputEncoder::new(core.input_modes());
+        let mut pane = Self {
+            core,
+            pty: None,
+            remote_transport: None,
+            input_paused: true,
+            remote_image_paste: true,
+            pending_image_png: None,
+            remote_image_hint_shown: false,
+            options,
+            target,
+            encoder,
+            renderer: GridRenderer::new(CellMetrics::default()),
+            font_size: crate::render::DEFAULT_FONT_SIZE,
+            title: None,
+            cwd: None,
+            exit: None,
+            monitor_error: None,
+            read_error: None,
+            eof: false,
+            focused: false,
+            blink_epoch: Instant::now(),
+            selecting: false,
+            selection: None,
+            selection_anchor: None,
+            mouse_button_down: None,
+            ime: ImeComposition::new(),
+            ime_preedit: String::new(),
+            input_echo: None,
+            recent_typed_text: String::new(),
+            cwd_changed_at: None,
+            pending_input: PendingInput::default(),
+            input_notice: None,
+            native_image_paste_hint_shown: false,
+            focus_on_next_frame: false,
+            wrote_input: false,
+            palette: crate::theme::terminal_palette(),
+            visible: true,
+            focus_id: None,
+            reset_focus: false,
+            grid_paint_count: 0,
+            last_grid_paint_visible: false,
+            output_bytes: 0,
+        };
+        pane.encoder.set_modes(pane.core.input_modes());
+        pane
+    }
+
+    /// Attach the remote transport. Does not replay queued input.
+    pub fn attach_remote_transport(&mut self, transport: Box<dyn TerminalTransport>) {
+        self.pending_input.clear();
+        self.remote_transport = Some(transport);
+        self.remote_image_paste = true;
+    }
+
+    /// Append remote output without resetting the grid. Used after the first
+    /// resnapshot burst. Does not accept input.
+    pub fn feed_remote_output(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.core.feed(bytes);
+        self.output_bytes = self.output_bytes.saturating_add(bytes.len() as u64);
+        self.encoder.set_modes(self.core.input_modes());
+        self.note_cwd_after_feed();
+    }
+
+    /// Reset the grid and feed only the supervisor resnapshot. Input stays
+    /// paused until [`Self::resume_input`].
+    pub fn apply_resnapshot(&mut self, bytes: &[u8]) {
+        let size = self.core.size();
+        self.core = TerminalCore::with_size(size, SCROLLBACK_LINES);
+        if !bytes.is_empty() {
+            self.core.feed(bytes);
+            self.output_bytes = self.output_bytes.saturating_add(bytes.len() as u64);
+        }
+        self.pending_input.clear();
+        self.encoder.set_modes(self.core.input_modes());
+        self.note_cwd_after_feed();
+        self.input_paused = true;
+    }
+
+    pub fn resume_input(&mut self) {
+        self.input_paused = false;
+    }
+
+    pub fn input_paused(&self) -> bool {
+        self.input_paused
+    }
+
+    pub fn take_pending_image(&mut self) -> Option<Vec<u8>> {
+        self.pending_image_png.take()
+    }
+
+    pub fn finish_remote_image_paste(&mut self, path: &str, log: &mut DiagnosticLog) -> bool {
+        if path.is_empty() || path.as_bytes().contains(&0) {
+            self.fail_remote_image_paste();
+            return false;
+        }
+        let wrote = self.write_paste(path, log);
+        if wrote && !self.remote_image_hint_shown {
+            self.remote_image_hint_shown = true;
+            self.input_notice = Some(
+                "Remote paste uses an uploaded PNG path for both chords. The remote process does not read the host clipboard."
+                    .to_owned(),
+            );
+        }
+        wrote
+    }
+
+    pub fn fail_remote_image_paste(&mut self) {
+        self.pending_image_png = None;
+        self.input_notice = Some("Clipboard image was not pasted. Nothing was sent.".to_owned());
+    }
+
     /// Name the program this pane runs in its exit overlay and restart copy.
     pub fn with_target(mut self, target: TerminalTarget) -> Self {
         self.target = target;
@@ -256,6 +396,9 @@ impl TerminalPane {
 
     /// Whether the child is known to be running.
     pub fn is_running(&self) -> bool {
+        if self.remote_transport.is_some() {
+            return !self.eof && self.exit.is_none() && self.monitor_error.is_none();
+        }
         self.pty
             .as_ref()
             .map(|pty| pty.is_running())
@@ -264,7 +407,7 @@ impl TerminalPane {
 
     /// Whether a child exists at all.
     pub fn has_child(&self) -> bool {
-        self.pty.is_some()
+        self.pty.is_some() || self.remote_transport.is_some()
     }
 
     /// Current terminal grid size.
@@ -429,7 +572,7 @@ impl TerminalPane {
         let mut events = 0_usize;
 
         while events < MAX_PTY_EVENTS_PER_FRAME && bytes < MAX_PTY_BYTES_PER_FRAME {
-            let Some(event) = self.pty.as_ref().and_then(PtyProcess::poll) else {
+            let Some(event) = self.poll_io() else {
                 break;
             };
             events += 1;
@@ -469,7 +612,7 @@ impl TerminalPane {
         let palette = self.palette;
         let replies = self.core.take_replies(|query| palette.reply_rgb(query));
         if !replies.is_empty() {
-            self.write(&replies, log);
+            self.write_raw(&replies, log);
         }
         if self.core.take_bell() {
             log.record(LogLevel::Info, "terminal bell");
@@ -512,12 +655,12 @@ impl TerminalPane {
             rows: rows.clamp(1, u16::MAX as usize) as u16,
             cols: cols.clamp(2, u16::MAX as usize) as u16,
         };
-        if let Some(pty) = self.pty.as_mut() {
-            if let Err(error) = pty.resize(requested.rows, requested.cols) {
+        if let Err(error) = self.resize_io(requested.rows, requested.cols) {
+            if self.pty.is_some() || self.remote_transport.is_some() {
                 log.record(LogLevel::Warn, format!("terminal resize failed: {error}"));
             }
-            self.options.size = requested;
         }
+        self.options.size = requested;
         self.core.resize(rows, cols);
     }
 
@@ -588,8 +731,24 @@ impl TerminalPane {
         Some(started.elapsed())
     }
 
-    /// Queue already encoded bytes and retry the PTY without blocking.
+    /// Queue already encoded bytes and retry the attachment without blocking.
     fn write(&mut self, bytes: &[u8], log: &mut DiagnosticLog) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        if self.input_paused {
+            self.pending_input.clear();
+            self.input_notice = Some(
+                "Remote terminal input is paused until the session snapshot is applied."
+                    .to_owned(),
+            );
+            return false;
+        }
+        self.write_raw(bytes, log)
+    }
+
+    /// Protocol replies generated by feeding output. Not user input.
+    fn write_raw(&mut self, bytes: &[u8], log: &mut DiagnosticLog) -> bool {
         if bytes.is_empty() {
             return true;
         }
@@ -603,19 +762,71 @@ impl TerminalPane {
         true
     }
 
+    fn poll_io(&mut self) -> Option<made_terminal::PtyEvent> {
+        if let Some(transport) = self.remote_transport.as_mut() {
+            return transport.poll();
+        }
+        self.pty.as_ref().and_then(PtyProcess::poll)
+    }
+
+    fn write_io(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+        if let Some(transport) = self.remote_transport.as_mut() {
+            return transport.write(bytes);
+        }
+        self.pty.as_mut().ok_or(PtyError::Closed)?.write(bytes)
+    }
+
+    fn resize_io(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
+        if let Some(transport) = self.remote_transport.as_mut() {
+            return transport.resize(rows, cols);
+        }
+        self.pty.as_mut().ok_or(PtyError::Closed)?.resize(rows, cols)
+    }
+
+    /// Drain already-queued remote output. `true` means the cap was hit and more
+    /// may still be queued. Local panes return an empty burst.
+    pub fn drain_remote_burst(&mut self, cap: usize) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        if self.remote_transport.is_none() {
+            return (out, false);
+        }
+        while out.len() < cap {
+            match self.poll_io() {
+                Some(made_terminal::PtyEvent::Data(bytes)) => out.extend(bytes),
+                Some(other) => self.apply_transport_event(other),
+                None => return (out, false),
+            }
+        }
+        (out, true)
+    }
+
+    fn apply_transport_event(&mut self, event: made_terminal::PtyEvent) {
+        match event {
+            made_terminal::PtyEvent::Data(data) => {
+                self.output_bytes = self.output_bytes.saturating_add(data.len() as u64);
+                self.core.feed(&data);
+                self.note_cwd_after_feed();
+            }
+            made_terminal::PtyEvent::Eof => self.eof = true,
+            made_terminal::PtyEvent::ReadError(message) => self.read_error = Some(message),
+            made_terminal::PtyEvent::Exited(status) => self.exit = Some(status),
+            made_terminal::PtyEvent::MonitorError(message) => self.monitor_error = Some(message),
+        }
+    }
+
     fn flush_pending_input(&mut self, log: &mut DiagnosticLog) {
         loop {
             if self.pending_input.is_empty() {
                 return;
             }
             let batch = self.pending_input.front_batch().to_vec();
-            let Some(pty) = self.pty.as_mut() else {
+            if self.pty.is_none() && self.remote_transport.is_none() {
                 self.pending_input.clear();
                 self.input_notice =
                     Some("Shell is no longer running; input was not sent.".to_owned());
                 return;
-            };
-            match pty.write(&batch) {
+            }
+            match self.write_io(&batch) {
                 Ok(()) => {
                     self.pending_input.consume(batch.len());
                     self.wrote_input = true;
@@ -730,6 +941,9 @@ impl TerminalPane {
         };
 
         if let Some(image) = image {
+            if self.remote_image_paste {
+                return self.queue_remote_image(&image);
+            }
             return match mode {
                 PasteMode::Native => self.forward_native_image_paste(platform, log),
                 PasteMode::Path => self.paste_image_path(platform, &image, log),
@@ -764,6 +978,10 @@ impl TerminalPane {
             LogLevel::Warn,
             format!("clipboard image read failed: {image_error}"),
         );
+        if self.remote_image_paste {
+            self.fail_remote_image_paste();
+            return false;
+        }
         match text {
             Ok(text) if !text.is_empty() => return self.write_paste(&text, log),
             Ok(_) => {}
@@ -783,6 +1001,33 @@ impl TerminalPane {
                 Some("Clipboard has no readable text or image; nothing was pasted.".to_owned());
             false
         }
+    }
+
+    fn queue_remote_image(&mut self, image: &ClipboardImage) -> bool {
+        if self.input_paused || self.pending_image_png.is_some() || self.remote_transport.is_none()
+        {
+            self.fail_remote_image_paste();
+            return false;
+        }
+        let png = match image.to_png() {
+            Ok(png)
+                if !png.is_empty()
+                    && u64::try_from(png.len()).unwrap_or(u64::MAX)
+                        <= made_remote::protocol::MAX_UPLOAD_BYTES =>
+            {
+                png
+            }
+            _ => {
+                self.fail_remote_image_paste();
+                return false;
+            }
+        };
+        self.pending_image_png = Some(png);
+        self.input_notice = Some(
+            "Uploading the clipboard image. Nothing is pasted until the remote path is ready."
+                .to_owned(),
+        );
+        true
     }
 
     fn forward_native_image_paste(
@@ -3421,5 +3666,125 @@ mod tests {
             assert!(alternate.size.cols >= primary.size.cols);
             assert_eq!(primary.origin, primary.content.min);
         }
+    }
+
+    struct SharedTransport {
+        writes: Arc<Mutex<Vec<u8>>>,
+        resized: Arc<Mutex<Option<(u16, u16)>>>,
+    }
+
+    impl made_terminal::TerminalTransport for SharedTransport {
+        fn poll(&mut self) -> Option<made_terminal::PtyEvent> {
+            None
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<(), PtyError> {
+            self.writes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
+            *self.resized.lock().unwrap() = Some((rows, cols));
+            Ok(())
+        }
+        fn status(&self) -> made_terminal::TransportStatus {
+            made_terminal::TransportStatus::Connected
+        }
+        fn detach(&mut self) -> Result<(), PtyError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn remote_pane_pauses_input_resizes_transport_and_uploads_both_image_chords() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let resized = Arc::new(Mutex::new(None));
+        let mut pane = TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([7; 16]),
+            },
+            24,
+            80,
+        );
+        let mut log = DiagnosticLog::new();
+        pane.send_key(
+            made_terminal::Key::Char('a'),
+            made_terminal::Modifiers::NONE,
+            &mut log,
+        );
+        assert!(pane.input_paused());
+        pane.attach_remote_transport(Box::new(SharedTransport {
+            writes: writes.clone(),
+            resized: resized.clone(),
+        }));
+        pane.apply_resnapshot(b"\x1b[?1000h\x1b[?1049hready");
+        pane.send_key(
+            made_terminal::Key::Char('b'),
+            made_terminal::Modifiers::NONE,
+            &mut log,
+        );
+        assert!(writes.lock().unwrap().is_empty());
+        pane.resume_input();
+        pane.resize(30, 100, &mut log);
+        assert_eq!(*resized.lock().unwrap(), Some((30, 100)));
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(
+            &temp,
+            TestClipboardState {
+                text: Ok("also text".to_owned()),
+                image: Ok(Some(test_image(1, 1))),
+            },
+        );
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+        let first = pane.take_pending_image().expect("native chord queues a PNG");
+        assert!(first.starts_with(b"\x89PNG"));
+        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Path));
+        let second = pane.take_pending_image().expect("path chord queues a PNG");
+        assert!(second.starts_with(b"\x89PNG"));
+        assert!(!writes.lock().unwrap().contains(&0x16));
+    }
+
+    #[test]
+    fn resnapshot_input_stays_paused_until_the_done_frame() {
+        use crate::remote_session::{SnapshotGate, SnapshotStep};
+        let mut pane = TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([3; 16]),
+            },
+            24,
+            80,
+        );
+        let mut gate = SnapshotGate::default();
+        let (next, step) = gate.observe_empty();
+        gate = next;
+        assert_eq!(step, SnapshotStep::StillWaiting);
+        assert!(pane.input_paused(), "an empty poll must not resume input");
+
+        let (next, step) = gate.observe_frame(false);
+        gate = next;
+        assert_eq!(step, SnapshotStep::Feed { reset: true });
+        pane.apply_resnapshot(b"partial-screen");
+        assert!(pane.input_paused());
+
+        let (next, step) = gate.observe_empty();
+        gate = next;
+        assert_eq!(step, SnapshotStep::StillWaiting);
+        assert!(pane.input_paused(), "a later empty poll is still not done");
+
+        let (next, step) = gate.observe_frame(false);
+        gate = next;
+        assert_eq!(step, SnapshotStep::Feed { reset: false });
+        pane.feed_remote_output(b"-more");
+        assert!(pane.input_paused());
+
+        let (next, step) = gate.observe_frame(true);
+        gate = next;
+        assert_eq!(step, SnapshotStep::Complete { reset: false });
+        pane.feed_remote_output(b"-end");
+        pane.resume_input();
+        assert!(!pane.input_paused());
+
+        let (gate, step) = gate.observe_frame(true);
+        assert_eq!(step, SnapshotStep::Live);
+        assert!(gate.is_complete());
+        assert!(!pane.input_paused(), "a second done must not pause or restart");
     }
 }

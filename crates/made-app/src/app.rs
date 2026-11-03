@@ -16,6 +16,8 @@ use made_platform::native_backdrop::NativeBackdropStatus;
 use made_platform::{CompatibleTui, Platform};
 
 use crate::cli::LaunchArgs;
+use crate::session_follow::validate_remote_directory;
+use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
 use crate::tui::TerminalTarget;
 use crate::ui;
@@ -152,6 +154,39 @@ fn spawn_compatible_tui_detection() -> Option<Receiver<Vec<CompatibleTui>>> {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SshDraft {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: String,
+    pub key_file: String,
+    pub directory: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteLaunchDraft {
+    pub authority: made_remote::protocol::AuthorityId,
+    pub opencode: bool,
+    pub directory: String,
+    pub label: String,
+}
+
+fn load_ssh_registry() -> Result<ServerRegistry<PrivateMetadataStorage>, String> {
+    let storage = PrivateMetadataStorage::from_app_paths()
+        .map_err(|_| "SSH server list is unavailable. Local workspaces still open.".to_owned())?;
+    ServerRegistry::load(storage).map_err(|error| match error {
+        crate::ssh_servers::RegistryError::Corrupt => {
+            "The SSH server list is unreadable. The original file was kept. Local workspaces still open."
+                .to_owned()
+        }
+        crate::ssh_servers::RegistryError::Version(version) => {
+            format!("The SSH server list uses schema {version}, which this version does not rewrite.")
+        }
+        other => format!("SSH server list: {other}"),
+    })
+}
+
 /// The app model for one process.
 pub struct AppModel {
     launch: WorkspaceLaunch,
@@ -174,6 +209,17 @@ pub struct AppModel {
     compatible_tui_receiver: Option<Receiver<Vec<CompatibleTui>>>,
     terminal_target: TerminalTarget,
     smoke: Option<SmokeState>,
+    ssh: Result<ServerRegistry<PrivateMetadataStorage>, String>,
+    show_ssh: bool,
+    ssh_selected: Option<made_remote::protocol::AuthorityId>,
+    ssh_draft: SshDraft,
+    ssh_notice: Option<String>,
+    probe: Option<ProbeAttempt>,
+    ssh_prompt: Option<made_platform::ssh_askpass::PromptRequest>,
+    prompt_draft: String,
+    remote_launch: Option<RemoteLaunchDraft>,
+    remote_closes: Vec<Receiver<crate::remote_session::CloseReport>>,
+    remote_close_notice: Option<String>,
 }
 
 impl std::fmt::Debug for AppModel {
@@ -242,6 +288,17 @@ impl AppModel {
             compatible_tui_receiver,
             terminal_target: TerminalTarget::Shell,
             smoke,
+            ssh: load_ssh_registry(),
+            show_ssh: false,
+            ssh_selected: None,
+            ssh_draft: SshDraft::default(),
+            ssh_notice: None,
+            probe: None,
+            ssh_prompt: None,
+            prompt_draft: String::new(),
+            remote_launch: None,
+            remote_closes: Vec::new(),
+            remote_close_notice: None,
         }
     }
 
@@ -299,6 +356,472 @@ impl AppModel {
     /// PTY child selected for the next workspace preparation.
     pub fn terminal_target(&self) -> TerminalTarget {
         self.terminal_target
+    }
+
+    pub(crate) fn ssh_open(&self) -> bool {
+        self.show_ssh
+    }
+
+    pub(crate) fn toggle_ssh(&mut self) {
+        self.show_ssh = !self.show_ssh;
+    }
+
+    pub(crate) fn set_ssh_open(&mut self, open: bool) {
+        self.show_ssh = open;
+    }
+
+    pub(crate) fn set_ssh_notice(&mut self, notice: impl Into<String>) {
+        self.ssh_notice = Some(notice.into());
+    }
+
+    pub(crate) fn ssh_registry(&self) -> Result<&ServerRegistry<PrivateMetadataStorage>, &str> {
+        self.ssh.as_ref().map_err(String::as_str)
+    }
+
+    pub(crate) fn ssh_draft(&mut self) -> &mut SshDraft {
+        &mut self.ssh_draft
+    }
+
+    pub(crate) fn ssh_notice(&self) -> Option<&str> {
+        self.ssh_notice.as_deref()
+    }
+
+    pub fn remote_close_notice(&self) -> Option<&str> {
+        self.remote_close_notice.as_deref()
+    }
+
+    pub fn approve_remote_provision(&mut self) -> Result<(), String> {
+        let id = self
+            .workbench()
+            .and_then(Workbench::remote_authority)
+            .ok_or_else(|| "No remote workspace is waiting for consent.".to_owned())?;
+        self.ssh
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .set_consent(id, Some(APP_VERSION.to_owned()))
+            .map_err(|error| error.to_string())?;
+        if let Some(workbench) = self.workbench_mut() {
+            workbench.grant_remote_consent();
+        }
+        self.ssh_notice = Some(
+            "Provisioning approved for this server and version. No password was stored.".to_owned(),
+        );
+        Ok(())
+    }
+
+    pub fn deny_remote_provision(&mut self) {
+        if let Some(workbench) = self.workbench_mut() {
+            workbench.deny_remote_consent();
+        }
+    }
+
+    pub fn submit_remote_auth(&mut self, accept: bool) {
+        if let Some(workbench) = self.workbench_mut() {
+            workbench.submit_remote_auth(accept);
+        }
+    }
+
+    pub fn reconnect_remote(&mut self) -> bool {
+        self.workbench_mut()
+            .is_some_and(Workbench::reconnect_remote)
+    }
+
+    fn persist_remote_consent(&mut self) {
+        let pending: Vec<made_remote::protocol::AuthorityId> = self
+            .workspaces
+            .iter_mut()
+            .filter_map(|(_, workbench)| workbench.take_consent_persist())
+            .collect();
+        for id in pending {
+            if let Ok(registry) = self.ssh.as_mut() {
+                let _ = registry.set_consent(id, Some(APP_VERSION.to_owned()));
+            }
+        }
+    }
+
+    fn poll_remote_closes(&mut self) {
+        let mut notices = Vec::new();
+        self.remote_closes.retain(|watch| match watch.try_recv() {
+            Ok(report) => {
+                notices.push(report.label().to_owned());
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                notices.push(crate::remote_session::CloseReport::Unconfirmed.label().to_owned());
+                false
+            }
+        });
+        if let Some(notice) = notices.last() {
+            self.remote_close_notice = Some(notice.clone());
+            self.ssh_notice = Some(notice.clone());
+        }
+    }
+
+    pub(crate) fn ssh_selected(&self) -> Option<made_remote::protocol::AuthorityId> {
+        self.ssh_selected
+    }
+
+    pub(crate) fn select_ssh_server(&mut self, id: made_remote::protocol::AuthorityId) {
+        let Ok(registry) = self.ssh.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = registry.snapshot(id) else {
+            return;
+        };
+        let metadata = snapshot.server().metadata();
+        self.ssh_selected = Some(id);
+        self.ssh_draft = SshDraft {
+            name: metadata.display_name.clone(),
+            host: metadata.host.clone(),
+            user: metadata.user.clone().unwrap_or_default(),
+            port: metadata
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            key_file: metadata.key_file.clone().unwrap_or_default(),
+            directory: metadata
+                .initial_directory
+                .as_ref()
+                .and_then(|path| path.to_utf8().ok())
+                .unwrap_or("")
+                .to_owned(),
+        };
+    }
+
+    pub(crate) fn ssh_prompt(&self) -> Option<&made_platform::ssh_askpass::PromptRequest> {
+        self.ssh_prompt.as_ref()
+    }
+
+    pub(crate) fn prompt_draft(&mut self) -> &mut String {
+        &mut self.prompt_draft
+    }
+
+    pub(crate) fn remote_launch(&self) -> Option<&RemoteLaunchDraft> {
+        self.remote_launch.as_ref()
+    }
+
+    pub(crate) fn remote_launch_directory(&mut self) -> Option<&mut String> {
+        self.remote_launch
+            .as_mut()
+            .map(|draft| &mut draft.directory)
+    }
+
+    /// Save non-secret server metadata. Passwords are not accepted by the type.
+    pub fn add_ssh_metadata(
+        &mut self,
+        metadata: ServerMetadata,
+    ) -> Result<made_remote::protocol::AuthorityId, String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        let id = registry.add(metadata).map_err(|error| error.to_string())?;
+        self.ssh_selected = Some(id);
+        Ok(id)
+    }
+
+    /// Attach a remote model without starting a host shell. A missing live SSH
+    /// process is not reported as a successful connection.
+    pub fn attach_remote_model(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        workspace: crate::remote_workspace::RemoteWorkspace,
+        opencode: bool,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .ssh
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .snapshot(id)
+            .map_err(|error| error.to_string())?;
+        let target = if opencode {
+            TerminalTarget::RemoteOpenCode { authority: id }
+        } else {
+            TerminalTarget::RemoteShell { authority: id }
+        };
+        let workbench =
+            Workbench::bind_remote_model(snapshot, workspace, target, "Remote model attached");
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
+    pub fn begin_remote_choice(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        opencode: bool,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        if opencode && !registry.can_launch_opencode(id) {
+            return Err(
+                "OpenCode SSH stays hidden until this server's own detection succeeds.".to_owned(),
+            );
+        }
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        let directory = snapshot
+            .server()
+            .metadata()
+            .initial_directory
+            .as_ref()
+            .and_then(|path| path.to_utf8().ok())
+            .unwrap_or("/")
+            .to_owned();
+        self.remote_launch = Some(RemoteLaunchDraft {
+            authority: id,
+            opencode,
+            directory,
+            label: snapshot.server().metadata().display_name.clone(),
+        });
+        self.show_ssh = true;
+        self.ssh_notice = None;
+        Ok(())
+    }
+
+    pub fn confirm_remote_launch(&mut self) -> Result<(), String> {
+        let draft = self
+            .remote_launch
+            .clone()
+            .ok_or_else(|| "Choose Terminal SSH or OpenCode SSH first.".to_owned())?;
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        if draft.opencode && !registry.can_launch_opencode(draft.authority) {
+            return Err(
+                "OpenCode is not detected on that server. The launch was not started locally."
+                    .to_owned(),
+            );
+        }
+        let snapshot = registry
+            .snapshot(draft.authority)
+            .map_err(|error| error.to_string())?;
+        let directory = validate_remote_directory(draft.directory.as_bytes())
+            .map_err(|error| error.to_owned())?;
+        let target = if draft.opencode {
+            TerminalTarget::RemoteOpenCode {
+                authority: draft.authority,
+            }
+        } else {
+            TerminalTarget::RemoteShell {
+                authority: draft.authority,
+            }
+        };
+        let workbench = Workbench::start_remote(snapshot, directory, target, Instant::now())?;
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.remote_launch = None;
+        self.show_ssh = false;
+        self.start_pending = false;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_remote_launch(&mut self) {
+        self.remote_launch = None;
+    }
+
+    pub(crate) fn save_ssh_server(&mut self) -> Result<(), String> {
+        let metadata = self.draft_metadata()?;
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        if let Some(id) = self.ssh_selected {
+            registry
+                .edit(id, metadata)
+                .map_err(|error| error.to_string())?;
+            self.ssh_notice = Some("Saved. Open workspaces keep their original server.".to_owned());
+        } else {
+            let id = registry.add(metadata).map_err(|error| error.to_string())?;
+            self.ssh_selected = Some(id);
+            self.ssh_notice = Some("Server saved. No password was stored.".to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_selected_ssh_server(&mut self) -> Result<(), String> {
+        let id = self
+            .ssh_selected
+            .ok_or_else(|| "Select a server to remove.".to_owned())?;
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        registry.remove(id).map_err(|error| error.to_string())?;
+        self.ssh_selected = None;
+        self.ssh_draft = SshDraft::default();
+        self.ssh_notice = Some("Server removed. Open workspaces were not closed.".to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn test_selected_ssh_server(&mut self) -> Result<(), String> {
+        let id = self
+            .ssh_selected
+            .ok_or_else(|| "Save the server before testing it.".to_owned())?;
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        let (request, _) = registry
+            .begin_probe(id)
+            .map_err(|error| error.to_string())?;
+        if let Some(previous) = self.probe.take() {
+            previous.cancel();
+        }
+        self.probe = Some(crate::ssh_servers::spawn_probe(request));
+        self.ssh_notice = Some("Testing the connection. OpenCode will not be started.".to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn cancel_ssh_probe(&mut self) {
+        if let Some(probe) = self.probe.as_ref() {
+            let ticket = probe.ticket();
+            probe.cancel();
+            if let Ok(registry) = self.ssh.as_mut() {
+                registry.cancel_probe(ticket);
+            }
+        }
+        self.probe = None;
+        self.ssh_prompt = None;
+        self.prompt_draft.clear();
+        self.ssh_notice = Some("Connection test cancelled.".to_owned());
+    }
+
+    pub(crate) fn submit_ssh_prompt(&mut self, accept: bool) {
+        let Some(prompt) = self.ssh_prompt.take() else {
+            return;
+        };
+        match crate::remote_session::classify_prompt(&prompt.text) {
+            crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
+                self.prompt_draft.clear();
+                if let Some(probe) = self.probe.as_ref() {
+                    let _ = probe.answer(prompt.id, None);
+                    probe.cancel();
+                }
+                self.probe = None;
+                self.ssh_prompt = None;
+                self.ssh_notice = Some(
+                    crate::remote_session::SshFailureClass::ChangedHostKey
+                        .detail()
+                        .to_owned(),
+                );
+            }
+            crate::remote_session::SshPromptClass::UnknownHost { .. } => {
+                self.prompt_draft.clear();
+                let answer = if accept {
+                    made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok()
+                } else {
+                    None
+                };
+                if let Some(probe) = self.probe.as_ref() {
+                    let _ = probe.answer(prompt.id, answer);
+                    if !accept {
+                        probe.cancel();
+                    }
+                }
+                if !accept {
+                    self.probe = None;
+                    self.ssh_notice = Some(
+                        crate::remote_session::SshFailureClass::Cancelled
+                            .detail()
+                            .to_owned(),
+                    );
+                }
+            }
+            crate::remote_session::SshPromptClass::Secret { .. } => {
+                let answer = if accept {
+                    let text = std::mem::take(&mut self.prompt_draft);
+                    made_platform::ssh_askpass::PromptAnswer::new(text.into_bytes()).ok()
+                } else {
+                    self.prompt_draft.clear();
+                    None
+                };
+                if let Some(probe) = self.probe.as_ref() {
+                    let _ = probe.answer(prompt.id, answer);
+                }
+            }
+        }
+    }
+
+    fn leave_picker_for_remote(&mut self) {
+        if !self.is_picker() {
+            return;
+        }
+        self.launch = crate::workspace::WorkspaceLaunch::TerminalFallback {
+            error: crate::workspace::WorkspaceError::new(
+                crate::workspace::WorkspaceErrorKind::InvalidPath,
+                std::path::PathBuf::new(),
+                "remote workspace",
+            ),
+            cwd: std::path::PathBuf::new(),
+            source: crate::workspace::WorkspaceSource::Picker,
+        };
+    }
+
+    fn draft_metadata(&self) -> Result<ServerMetadata, String> {
+        let port = if self.ssh_draft.port.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.ssh_draft
+                    .port
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "Port must be a number.".to_owned())?,
+            )
+        };
+        let directory = if self.ssh_draft.directory.trim().is_empty() {
+            None
+        } else {
+            Some(
+                validate_remote_directory(self.ssh_draft.directory.trim().as_bytes())
+                    .map_err(|error| error.to_owned())?,
+            )
+        };
+        let metadata = ServerMetadata {
+            display_name: self.ssh_draft.name.trim().to_owned(),
+            host: self.ssh_draft.host.trim().to_owned(),
+            user: {
+                let user = self.ssh_draft.user.trim();
+                (!user.is_empty()).then(|| user.to_owned())
+            },
+            port,
+            key_file: {
+                let key = self.ssh_draft.key_file.trim();
+                (!key.is_empty()).then(|| key.to_owned())
+            },
+            initial_directory: directory,
+        };
+        metadata.validate().map_err(|_| {
+            "Check the name, host, user, port, and key file. Passwords are not stored.".to_owned()
+        })?;
+        Ok(metadata)
+    }
+
+    fn poll_ssh_probe(&mut self) {
+        if let Some(probe) = self.probe.as_ref() {
+            if self.ssh_prompt.is_none() {
+                self.ssh_prompt = probe.poll_prompt();
+                if self.ssh_prompt.is_some() {
+                    self.show_ssh = true;
+                }
+            }
+        }
+        let finished = self.probe.as_ref().and_then(ProbeAttempt::poll);
+        if let Some(result) = finished {
+            let ticket = self.probe.as_ref().map(ProbeAttempt::ticket);
+            self.probe = None;
+            self.ssh_prompt = None;
+            self.prompt_draft.clear();
+            if let (Some(ticket), Ok(registry)) = (ticket, self.ssh.as_mut()) {
+                let stored = match &result {
+                    Ok(capabilities) => Ok(capabilities.clone()),
+                    Err(error) => Err(error.protocol_code()),
+                };
+                let _ = registry.finish_probe(ticket, stored);
+            }
+            self.ssh_notice = Some(match result {
+                Ok(capabilities) if capabilities.opencode => {
+                    "Connection succeeded. OpenCode was detected. The TUI was not started."
+                        .to_owned()
+                }
+                Ok(_) => {
+                    "Connection succeeded. OpenCode was not detected on this server.".to_owned()
+                }
+                Err(error) => match error.fingerprint {
+                    Some(fingerprint) => format!("{}\n{fingerprint}", error.detail),
+                    None => error.detail,
+                },
+            });
+        }
     }
 
     /// Look up a live owner; closed identities never resolve again.
@@ -388,6 +911,18 @@ impl AppModel {
         if self.workspace(id).is_none() {
             return false;
         }
+        if self.workspace(id).is_some_and(Workbench::is_remote) {
+            if let Some(workbench) = self.workbench_mut() {
+                workbench.set_visible(false);
+            }
+            self.active = Some(id);
+            self.reset_ui_focus = true;
+            if let Some(workbench) = self.workbench_mut() {
+                workbench.set_visible(true);
+            }
+            self.start_pending = false;
+            return true;
+        }
         let Some(source) = self.workspace_source(id) else {
             return false;
         };
@@ -426,6 +961,9 @@ impl AppModel {
         };
         let (_, mut workbench) = self.workspaces.remove(index);
         self.workspace_sources.retain(|(key, _)| *key != id);
+        if let Some(watch) = workbench.take_remote_close() {
+            self.remote_closes.push(watch);
+        }
         workbench.shutdown();
         if self.active == Some(id) {
             self.reset_ui_focus = true;
@@ -737,6 +1275,9 @@ impl AppModel {
     /// Poll runtime work and drive the smoke run.
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.poll_compatible_tui_detection(ctx);
+        self.poll_ssh_probe();
+        self.poll_remote_closes();
+        self.persist_remote_consent();
         self.apply_focus_reset(ctx);
         self.poll_pending_start();
         self.begin_pending_start();
@@ -816,6 +1357,7 @@ impl AppModel {
         if ui::workspace_strip(self, ui) {
             self.show_about = !self.show_about;
         }
+        ui::ssh_servers_window(self, ui.ctx());
         if self.is_picker() {
             return;
         }
@@ -859,8 +1401,12 @@ impl AppModel {
         self.shutdown_done = true;
         self.cancel_pending_start();
         for (_, workbench) in &mut self.workspaces {
+            if let Some(watch) = workbench.take_remote_close() {
+                self.remote_closes.push(watch);
+            }
             workbench.shutdown();
         }
+        self.poll_remote_closes();
         let _ = made_platform::host_platform().cleanup();
     }
 

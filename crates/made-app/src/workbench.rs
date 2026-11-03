@@ -191,6 +191,120 @@ pub struct WorktreeState {
     pub loading: bool,
 }
 
+enum RemotePhase {
+    Connecting,
+    NeedsConsent,
+    NeedsHostApproval,
+    Staging,
+    AwaitingAttach,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+enum OpenRetry {
+    Probe,
+    Stage,
+    Companion,
+}
+
+struct PendingUpload {
+    upload_id: u64,
+    bytes: Vec<u8>,
+    offset: u64,
+    begin_id: Option<u64>,
+    begin_acked: bool,
+    inflight_chunk: Option<u64>,
+    commit_id: Option<u64>,
+}
+
+struct RemoteTab {
+    snapshot: crate::ssh_servers::ServerSnapshot,
+    workspace: crate::remote_workspace::RemoteWorkspace,
+    phase: RemotePhase,
+    detail: String,
+    prompt: Option<made_platform::ssh_askpass::PromptRequest>,
+    prompt_draft: String,
+    opencode: bool,
+    probe: Option<crate::ssh_servers::ProbeAttempt>,
+    stage: Option<crate::ssh_servers::StageAttempt>,
+    client_rx: Option<Receiver<Result<crate::ssh_servers::CompanionSession, crate::ssh_servers::AttemptError>>>,
+    failures: crate::ssh_servers::SshFailureSlot,
+    host_fingerprint: Option<String>,
+    approved_fingerprint: Option<String>,
+    host_retry: Option<OpenRetry>,
+    snapshot_gate: crate::remote_session::SnapshotGate,
+    companion_spawn_requested: bool,
+    client: Option<made_remote::client::RemoteClient>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Client request id -> workspace request id. RemoteClient assigns its own ids.
+    id_map: std::collections::HashMap<u64, u64>,
+    cleanup_unconfirmed: bool,
+    /// Set when the user approves provisioning for this launch.
+    consent_granted: bool,
+    consent_persist: bool,
+    session_open: crate::remote_session::SessionOpen,
+    /// Epoch stamped on the next client. The workspace epoch stays put until Attached.
+    client_epoch: u64,
+    attach_request: Option<u64>,
+    attached_once: bool,
+    holding_input: bool,
+    remote_target: Option<String>,
+    upload: Option<PendingUpload>,
+    next_upload: u64,
+}
+
+impl RemoteTab {
+    fn connecting(
+        snapshot: crate::ssh_servers::ServerSnapshot,
+        directory: made_remote::protocol::RemotePath,
+    ) -> Result<Self, String> {
+        let identity = made_remote::protocol::Identity {
+            authority: snapshot.server().id(),
+            tab: made_remote::protocol::TabCapability::random()
+                .map_err(|_| "could not allocate a remote tab capability".to_owned())?,
+            epoch: 1,
+            generation: 1,
+        };
+        let workspace = crate::remote_workspace::RemoteWorkspace::new(identity, directory)
+            .map_err(|_| "remote workspace identity was rejected".to_owned())?;
+        let mut workspace = workspace;
+        workspace.disconnect();
+        Ok(Self {
+            snapshot,
+            workspace,
+            phase: RemotePhase::Connecting,
+            detail: "Connecting. No local shell was started.".to_owned(),
+            prompt: None,
+            prompt_draft: String::new(),
+            opencode: false,
+            probe: None,
+            stage: None,
+            client_rx: None,
+            failures: crate::ssh_servers::SshFailureSlot::default(),
+            host_fingerprint: None,
+            approved_fingerprint: None,
+            host_retry: None,
+            snapshot_gate: crate::remote_session::SnapshotGate::default(),
+            companion_spawn_requested: false,
+            client: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            id_map: std::collections::HashMap::new(),
+            cleanup_unconfirmed: false,
+            consent_granted: false,
+            consent_persist: false,
+            session_open: crate::remote_session::SessionOpen::New,
+            client_epoch: 1,
+            attach_request: None,
+            attached_once: false,
+            holding_input: false,
+            remote_target: None,
+            upload: None,
+            next_upload: 1,
+        })
+    }
+}
+
 /// One workspace owner; siblings share no process, bridge or load receiver.
 pub struct Workbench {
     pub(crate) platform: made_platform::HostPlatform,
@@ -254,6 +368,7 @@ pub struct Workbench {
     benchmark_frames: bool,
     pending_notice: Option<(String, Instant)>,
     last_title: Option<String>,
+    remote: Option<RemoteTab>,
 }
 
 impl std::fmt::Debug for Workbench {
@@ -281,10 +396,109 @@ impl Workbench {
     /// does not prevent the terminal from starting.
     pub fn start(
         plan: Option<LaunchPlan>,
+        workspace_error: Option<WorkspaceError>,
+        terminal_cwd: PathBuf,
+        terminal_target: TerminalTarget,
+        started_at: Instant,
+    ) -> Self {
+        Self::start_with(
+            plan,
+            workspace_error,
+            terminal_cwd,
+            terminal_target,
+            started_at,
+            None,
+        )
+    }
+
+    /// Open a remote tab without starting a host shell, bridge, or explorer.
+    ///
+    /// Connection continues on a worker. Failure stays on this tab.
+    pub fn start_remote(
+        snapshot: crate::ssh_servers::ServerSnapshot,
+        directory: made_remote::protocol::RemotePath,
+        target: TerminalTarget,
+        started_at: Instant,
+    ) -> Result<Self, String> {
+        let mut remote = RemoteTab::connecting(snapshot.clone(), directory)?;
+        remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
+        remote.probe = Some(crate::ssh_servers::spawn_probe(
+            crate::ssh_servers::ProbeRequest {
+                ticket: crate::ssh_servers::ProbeTicket {
+                    authority: snapshot.server().id(),
+                    attempt: 1,
+                },
+                server: snapshot,
+            },
+        ));
+        Ok(Self::start_with(
+            None,
+            None,
+            PathBuf::new(),
+            target,
+            started_at,
+            Some(remote),
+        ))
+    }
+
+    /// Insert an already-built remote model. Used by UI tests and by a caller
+    /// that has a projection but no live SSH process. It does not claim a
+    /// successful connection.
+    pub fn bind_remote_model(
+        snapshot: crate::ssh_servers::ServerSnapshot,
+        workspace: crate::remote_workspace::RemoteWorkspace,
+        target: TerminalTarget,
+        detail: impl Into<String>,
+    ) -> Self {
+        let remote = RemoteTab {
+            snapshot,
+            workspace,
+            phase: RemotePhase::Ready,
+            detail: detail.into(),
+            prompt: None,
+            prompt_draft: String::new(),
+            opencode: false,
+            probe: None,
+            stage: None,
+            client_rx: None,
+            failures: crate::ssh_servers::SshFailureSlot::default(),
+            host_fingerprint: None,
+            approved_fingerprint: None,
+            host_retry: None,
+            snapshot_gate: crate::remote_session::SnapshotGate::default(),
+            companion_spawn_requested: false,
+            client: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            id_map: std::collections::HashMap::new(),
+            cleanup_unconfirmed: false,
+            consent_granted: false,
+            consent_persist: false,
+            session_open: crate::remote_session::SessionOpen::New,
+            client_epoch: 1,
+            attach_request: None,
+            attached_once: false,
+            holding_input: false,
+            remote_target: None,
+            upload: None,
+            next_upload: 1,
+        };
+        Self::start_with(
+            None,
+            None,
+            PathBuf::new(),
+            target,
+            Instant::now(),
+            Some(remote),
+        )
+    }
+
+    fn start_with(
+        plan: Option<LaunchPlan>,
         mut workspace_error: Option<WorkspaceError>,
         terminal_cwd: PathBuf,
         terminal_target: TerminalTarget,
         started_at: Instant,
+        remote: Option<RemoteTab>,
     ) -> Self {
         let platform = host_platform();
         let mut app_paths = None;
@@ -395,6 +609,7 @@ impl Workbench {
             benchmark_frames: false,
             pending_notice: None,
             last_title: None,
+            remote,
         };
 
         if let Some(error) = path_error {
@@ -476,6 +691,16 @@ impl Workbench {
                 .record(level, issue.message.clone());
         }
         workbench.log_launch_context();
+        if workbench.remote.is_some() {
+            workbench.follow = None;
+            workbench.explorer = None;
+            workbench.plan = None;
+            workbench.diag.log_mut().record(
+                LogLevel::Info,
+                "remote workspace opened without a host shell",
+            );
+            return workbench;
+        }
         let composed_content = workbench.start_integration();
         workbench.start_terminal(composed_content);
         workbench.refresh_shell_capability();
@@ -1177,6 +1402,16 @@ impl Workbench {
 
     /// Request focus for a session from the session map.
     pub fn focus_session(&mut self, session_id: &str) {
+        if self.remote.is_some() {
+            let update = self
+                .remote
+                .as_mut()
+                .and_then(|remote| remote.workspace.focus_session(session_id).ok());
+            if update.is_none() {
+                self.set_notice("That session is not in the remote map.");
+            }
+            return;
+        }
         let Some(bridge) = self.bridge.as_ref() else {
             self.set_notice("Focus is unavailable: the integration is not connected.");
             return;
@@ -1247,6 +1482,1148 @@ impl Workbench {
     }
 
     /// Poll PTY, bridge, explorer, focus, and worktree work.
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    pub fn remote_label(&self) -> Option<String> {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.snapshot.server().metadata().display_name.clone())
+    }
+
+    pub fn remote_path_label(&self) -> Option<String> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.workspace.root().to_utf8().ok().map(str::to_owned))
+    }
+
+    pub fn remote_detail(&self) -> Option<&str> {
+        self.remote.as_ref().map(|remote| remote.detail.as_str())
+    }
+
+    pub fn remote_authority(&self) -> Option<made_remote::protocol::AuthorityId> {
+        self.remote.as_ref().map(|remote| remote.snapshot.server().id())
+    }
+
+    pub fn remote_needs_consent(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsConsent))
+    }
+
+    /// Show a sanitized open failure on this tab. Does not start SSH.
+    pub fn present_open_failure(
+        &mut self,
+        class: crate::remote_session::SshFailureClass,
+        detail: impl Into<String>,
+        fingerprint: Option<&str>,
+    ) -> bool {
+        if self.remote.is_none() {
+            return false;
+        }
+        let shown = crate::remote_session::shown_failure(class, detail, fingerprint);
+        self.apply_attempt_error(
+            crate::ssh_servers::AttemptError {
+                class: shown.class,
+                detail: shown.detail,
+                fingerprint: shown.fingerprint,
+            },
+            OpenRetry::Probe,
+        );
+        true
+    }
+
+    pub fn remote_needs_host_approval(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsHostApproval))
+    }
+
+    pub fn remote_host_fingerprint(&self) -> Option<&str> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.host_fingerprint.as_deref())
+    }
+
+    pub fn approve_unknown_host(&mut self) {
+        let retry = {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            if !matches!(remote.phase, RemotePhase::NeedsHostApproval) {
+                return;
+            }
+            remote.approved_fingerprint = remote.host_fingerprint.clone();
+            remote.host_retry.take()
+        };
+        match retry {
+            Some(OpenRetry::Probe) => self.retry_remote_probe(),
+            Some(OpenRetry::Stage) => self.start_remote_stage(),
+            Some(OpenRetry::Companion) => self.spawn_remote_companion(),
+            None => {}
+        }
+    }
+
+    pub fn deny_unknown_host(&mut self) {
+        self.cancel_remote_attempt(
+            "the remote host key is not in the app trust file",
+        );
+    }
+
+    pub fn remote_can_reconnect(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            remote.attached_once && matches!(remote.phase, RemotePhase::Failed)
+        })
+    }
+
+    /// Show an authentication card on an existing remote tab. Does not start SSH.
+    pub fn present_remote_prompt(&mut self, text: impl Into<String>) -> bool {
+        let Some(remote) = self.remote.as_mut() else {
+            return false;
+        };
+        remote.prompt = Some(made_platform::ssh_askpass::PromptRequest {
+            id: 1,
+            text: text.into(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        });
+        true
+    }
+
+    pub fn remote_auth(&self) -> Option<crate::remote_session::SshPromptClass> {
+        self.remote.as_ref().and_then(|remote| {
+            remote
+                .prompt
+                .as_ref()
+                .map(|prompt| crate::remote_session::classify_prompt(&prompt.text))
+        })
+    }
+
+    pub fn remote_prompt_draft(&mut self) -> Option<&mut String> {
+        self.remote.as_mut().and_then(|remote| {
+            remote
+                .prompt
+                .is_some()
+                .then_some(&mut remote.prompt_draft)
+        })
+    }
+
+    /// Persist consent outside this method. This only continues the launch.
+    pub fn grant_remote_consent(&mut self) {
+        let allowed = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsConsent));
+        if !allowed {
+            return;
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            remote.consent_granted = true;
+            remote.consent_persist = true;
+            remote.prompt = None;
+        }
+        self.start_remote_stage();
+    }
+
+    pub fn take_consent_persist(&mut self) -> Option<made_remote::protocol::AuthorityId> {
+        let remote = self.remote.as_mut()?;
+        if !remote.consent_persist {
+            return None;
+        }
+        remote.consent_persist = false;
+        Some(remote.snapshot.server().id())
+    }
+
+    pub fn deny_remote_consent(&mut self) {
+        self.cancel_remote_attempt(
+            "Provisioning was not approved. No remote files were written and no local shell was started.",
+        );
+    }
+
+    pub fn submit_remote_auth(&mut self, accept: bool) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(prompt) = remote.prompt.take() else {
+            return;
+        };
+        let class = crate::remote_session::classify_prompt(&prompt.text);
+        let draft = std::mem::take(&mut remote.prompt_draft);
+        match class {
+            crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
+                self.cancel_remote_attempt("the remote host key changed and was refused");
+            }
+            crate::remote_session::SshPromptClass::UnknownHost { .. } => {
+                if accept {
+                    let answer = made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok();
+                    self.deliver_remote_answer(prompt.id, answer);
+                } else {
+                    self.cancel_remote_attempt(
+                        crate::remote_session::SshFailureClass::Cancelled.detail(),
+                    );
+                }
+            }
+            crate::remote_session::SshPromptClass::Secret { .. } => {
+                if accept {
+                    match made_platform::ssh_askpass::PromptAnswer::new(draft.into_bytes()) {
+                        Ok(answer) => self.deliver_remote_answer(prompt.id, Some(answer)),
+                        Err(_) => {
+                            if let Some(remote) = self.remote.as_mut() {
+                                remote.prompt = Some(prompt);
+                                remote.detail =
+                                    "That answer was rejected locally. Nothing was sent.".to_owned();
+                            }
+                        }
+                    }
+                } else {
+                    self.deliver_remote_answer(prompt.id, None);
+                    self.cancel_remote_attempt(
+                        crate::remote_session::SshFailureClass::Cancelled.detail(),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn reconnect_remote(&mut self) -> bool {
+        let Some(remote) = self.remote.as_mut() else {
+            return false;
+        };
+        if !remote.attached_once || !matches!(remote.phase, RemotePhase::Failed) {
+            return false;
+        }
+        remote.session_open = crate::remote_session::SessionOpen::Reattach;
+        remote.client_epoch = remote.workspace.identity().epoch.saturating_add(1);
+        if remote.client_epoch == remote.workspace.identity().epoch {
+            return false;
+        }
+        remote.phase = RemotePhase::Connecting;
+        remote.detail =
+            "Reconnecting. The previous session is not replaced until attach succeeds.".to_owned();
+        remote.prompt = None;
+        remote.prompt_draft.clear();
+        remote.attach_request = None;
+        remote.workspace.disconnect();
+        let snapshot = remote.snapshot.clone();
+        remote.probe = Some(crate::ssh_servers::spawn_probe(
+            crate::ssh_servers::ProbeRequest {
+                ticket: crate::ssh_servers::ProbeTicket {
+                    authority: snapshot.server().id(),
+                    attempt: remote.client_epoch,
+                },
+                server: snapshot,
+            },
+        ));
+        true
+    }
+
+    /// Hand the live client to a worker that sends Close and waits at most 2s.
+    /// The UI thread does not wait. Call this before [`Self::shutdown`].
+    pub fn take_remote_close(&mut self) -> Option<Receiver<crate::remote_session::CloseReport>> {
+        let remote = self.remote.as_mut()?;
+        remote.cancel.store(true, Ordering::Release);
+        if let Some(probe) = remote.probe.as_ref() {
+            probe.cancel();
+        }
+        if let Some(stage) = remote.stage.as_ref() {
+            stage.cancel();
+        }
+        let (tx, rx) = mpsc::channel();
+        if let Some(client) = remote.client.take() {
+            let _ = thread::Builder::new()
+                .name("made-ssh-close".to_owned())
+                .spawn(move || {
+                    let report = crate::remote_session::await_close(client);
+                    let _ = tx.send(report);
+                });
+            return Some(rx);
+        }
+        if remote.attached_once
+            && remote.workspace.close_state() != crate::remote_workspace::CloseState::Confirmed
+        {
+            let _ = tx.send(crate::remote_session::CloseReport::Unconfirmed);
+            return Some(rx);
+        }
+        None
+    }
+
+    fn deliver_remote_answer(
+        &mut self,
+        id: u64,
+        answer: Option<made_platform::ssh_askpass::PromptAnswer>,
+    ) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        if let Some(probe) = remote.probe.as_ref() {
+            let _ = probe.answer(id, answer);
+            return;
+        }
+        if let Some(stage) = remote.stage.as_ref() {
+            let _ = stage.answer(id, answer);
+            return;
+        }
+        if let Some(client) = remote.client.as_ref() {
+            let _ = client.answer_prompt(id, answer);
+        }
+    }
+
+    fn cancel_remote_attempt(&mut self, detail: &str) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        remote.cancel.store(true, Ordering::Release);
+        if let Some(probe) = remote.probe.as_ref() {
+            probe.cancel();
+        }
+        if let Some(stage) = remote.stage.as_ref() {
+            stage.cancel();
+        }
+        if let Some(client) = remote.client.take() {
+            client.disconnect();
+        }
+        remote.probe = None;
+        remote.stage = None;
+        remote.client_rx = None;
+        remote.prompt = None;
+        remote.prompt_draft.clear();
+        remote.phase = RemotePhase::Failed;
+        remote.detail = detail.to_owned();
+    }
+
+    pub fn remote_connection(&self) -> Option<crate::remote_workspace::ConnectionState> {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.workspace.connection())
+    }
+
+    pub fn remote_integration(&self) -> Option<crate::remote_workspace::IntegrationState> {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.workspace.integration())
+    }
+
+    pub fn remote_projection(&self) -> Option<&crate::remote_workspace::WorkspaceProjection> {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.workspace.projection())
+    }
+
+    pub fn remote_sessions_available(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            remote.workspace.integration() == crate::remote_workspace::IntegrationState::Connected
+                || remote
+                    .workspace
+                    .projection()
+                    .sessions
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.sessions.is_empty())
+        })
+    }
+
+    pub fn remote_workspace_mut(
+        &mut self,
+    ) -> Option<&mut crate::remote_workspace::RemoteWorkspace> {
+        self.remote.as_mut().map(|remote| &mut remote.workspace)
+    }
+
+    pub fn answer_remote_prompt(&mut self, text: Option<String>) {
+        if let Some(text) = text {
+            if let Some(remote) = self.remote.as_mut() {
+                remote.prompt_draft = text;
+            }
+            self.submit_remote_auth(true);
+        } else {
+            self.submit_remote_auth(false);
+        }
+    }
+
+    pub fn apply_remote_actions(
+        &mut self,
+        actions: Vec<crate::explorer_view::RemoteExplorerAction>,
+    ) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        for action in actions {
+            match action {
+                crate::explorer_view::RemoteExplorerAction::SetMode(mode) => {
+                    remote.workspace.set_mode(mode);
+                    if mode == crate::remote_workspace::ExplorerMode::Git {
+                        let _ = remote.workspace.refresh_git();
+                    }
+                }
+                crate::explorer_view::RemoteExplorerAction::Expand(path) => {
+                    let _ = remote.workspace.expand(path);
+                }
+                crate::explorer_view::RemoteExplorerAction::Collapse(path) => {
+                    remote.workspace.collapse(&path);
+                }
+                crate::explorer_view::RemoteExplorerAction::Select(path) => {
+                    let _ = remote.workspace.select(path);
+                }
+                crate::explorer_view::RemoteExplorerAction::OpenPreview(path) => {
+                    let _ = remote.workspace.open_preview(path);
+                }
+                crate::explorer_view::RemoteExplorerAction::RefreshPreview => {
+                    let _ = remote.workspace.refresh_preview();
+                }
+                crate::explorer_view::RemoteExplorerAction::ClosePreview => {
+                    let _ = remote.workspace.close_preview();
+                }
+                crate::explorer_view::RemoteExplorerAction::CopyPath(path) => {
+                    self.pending_notice =
+                        Some((format!("Copied remote path"), Instant::now() + NOTICE_TTL));
+                    let _ = path;
+                }
+                crate::explorer_view::RemoteExplorerAction::UseRoot(path) => {
+                    let _ = remote.workspace.select_root(path);
+                }
+            }
+        }
+    }
+
+    fn tick_remote(&mut self, ctx: &egui::Context) {
+        self.poll_remote_prompt();
+        self.take_observed_failure();
+        let probe_done = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.probe.as_ref())
+            .and_then(|probe| probe.poll());
+        if let Some(result) = probe_done {
+            self.finish_remote_probe(result);
+        }
+        let stage_done = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.stage.as_ref())
+            .and_then(|stage| stage.poll());
+        if let Some(result) = stage_done {
+            self.finish_remote_stage(result);
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            if let Some(rx) = remote.client_rx.as_ref() {
+                if let Ok(client) = rx.try_recv() {
+                    remote.client_rx = None;
+                    match client {
+                        Ok(session) => {
+                            if let Some(remote) = self.remote.as_mut() {
+                                remote.failures = session.failures;
+                            }
+                            self.arm_remote_client(session.client);
+                        }
+                        Err(error) => self.apply_attempt_error(error, OpenRetry::Companion),
+                    }
+                }
+            }
+        }
+        self.pump_remote_client();
+        self.pump_remote_terminal();
+        self.pump_remote_upload();
+        if self.remote.as_ref().is_some_and(|remote| {
+            remote.prompt.is_some()
+                || remote.holding_input
+                || remote.upload.is_some()
+                || matches!(
+                    remote.phase,
+                    RemotePhase::Connecting
+                        | RemotePhase::NeedsConsent
+                        | RemotePhase::NeedsHostApproval
+                        | RemotePhase::Staging
+                        | RemotePhase::AwaitingAttach
+                )
+        }) {
+            ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
+        }
+    }
+
+    fn poll_remote_prompt(&mut self) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        if remote.prompt.is_some() {
+            return;
+        }
+        let approved = remote.approved_fingerprint.clone();
+        let prompt = remote
+            .probe
+            .as_ref()
+            .and_then(|probe| probe.poll_prompt())
+            .or_else(|| remote.stage.as_ref().and_then(|stage| stage.poll_prompt()))
+            .or_else(|| remote.client.as_ref().and_then(|client| client.poll_prompt()));
+        let Some(prompt) = prompt else {
+            return;
+        };
+        let class = crate::remote_session::classify_prompt(&prompt.text);
+        if matches!(class, crate::remote_session::SshPromptClass::ChangedHostKey { .. }) {
+            return self.cancel_remote_attempt("the remote host key changed and was refused");
+        }
+        if crate::remote_session::may_answer_yes(&class, approved.as_deref(), &prompt.text) {
+            let answer = made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok();
+            if let Some(probe) = remote.probe.as_ref() {
+                let _ = probe.answer(prompt.id, answer);
+            } else if let Some(stage) = remote.stage.as_ref() {
+                let _ = stage.answer(prompt.id, answer);
+            } else if let Some(client) = remote.client.as_ref() {
+                let _ = client.answer_prompt(prompt.id, answer);
+            }
+            return;
+        }
+        remote.prompt = Some(prompt);
+    }
+
+    fn take_observed_failure(&mut self) {
+        let failure = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.failures.take());
+        let Some(failure) = failure else {
+            return;
+        };
+        if let Some(client) = self.remote.as_mut().and_then(|remote| remote.client.take()) {
+            client.disconnect();
+        }
+        self.apply_attempt_error(
+            crate::ssh_servers::AttemptError::from_failure(&failure),
+            OpenRetry::Companion,
+        );
+    }
+
+    fn finish_remote_probe(
+        &mut self,
+        result: Result<made_remote::protocol::Capabilities, crate::ssh_servers::AttemptError>,
+    ) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        remote.probe = None;
+        remote.prompt = None;
+        remote.prompt_draft.clear();
+        let capabilities = match result {
+            Ok(capabilities) => capabilities,
+            Err(error) => return self.apply_attempt_error(error, OpenRetry::Probe),
+        };
+        // Presence is recorded; the field itself is not a gate.
+        let _ = capabilities.tmux;
+        if remote.opencode && !capabilities.opencode {
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "OpenCode was not detected on this server. Nothing ran locally.".to_owned();
+            return;
+        }
+        let target = match capabilities.target {
+            made_remote::protocol::RemoteTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
+            made_remote::protocol::RemoteTarget::LinuxArm64 => "aarch64-unknown-linux-gnu",
+            made_remote::protocol::RemoteTarget::MacosX64 => "x86_64-apple-darwin",
+            made_remote::protocol::RemoteTarget::MacosArm64 => "aarch64-apple-darwin",
+        };
+        remote.remote_target = Some(target.to_owned());
+        if crate::ssh_servers::companion_artifact(target).is_none() {
+            remote.phase = RemotePhase::Failed;
+            remote.detail = "The remote companion is not packaged with this build. Made did not start a local shell.".to_owned();
+            return;
+        }
+        let allowed = remote.consent_granted
+            || remote.snapshot.server().allows_provision(APP_VERSION);
+        if !allowed {
+            remote.phase = RemotePhase::NeedsConsent;
+            remote.detail = format!(
+                "Approve installing or reusing the private companion {APP_VERSION} on this server. No files are written until you approve."
+            );
+            return;
+        }
+        self.start_remote_stage();
+    }
+
+    fn start_remote_stage(&mut self) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(target) = remote.remote_target.clone() else {
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "The remote target is unknown. Made did not start a local shell.".to_owned();
+            return;
+        };
+        let metadata = remote.snapshot.server().metadata().clone();
+        remote.stage = Some(crate::ssh_servers::spawn_consented_stage(
+            metadata,
+            APP_VERSION.to_owned(),
+            target,
+        ));
+        remote.phase = RemotePhase::Staging;
+        remote.detail =
+            "Checking the private companion. Existing matching files are reused; nothing runs locally."
+                .to_owned();
+    }
+
+    fn finish_remote_stage(&mut self, result: Result<(), crate::ssh_servers::AttemptError>) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        remote.stage = None;
+        remote.prompt = None;
+        remote.prompt_draft.clear();
+        let Err(error) = result else {
+            return self.spawn_remote_companion();
+        };
+        // A failed stage must not open another SSH session or the companion.
+        self.apply_attempt_error(error, OpenRetry::Stage);
+    }
+
+    fn apply_attempt_error(
+        &mut self,
+        error: crate::ssh_servers::AttemptError,
+        retry: OpenRetry,
+    ) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        remote.prompt = None;
+        remote.prompt_draft.clear();
+        if error.class == crate::remote_session::SshFailureClass::UnknownHost {
+            remote.phase = RemotePhase::NeedsHostApproval;
+            remote.detail = error.detail;
+            remote.host_fingerprint = error.fingerprint;
+            remote.host_retry = Some(retry);
+            return;
+        }
+        remote.host_fingerprint = None;
+        remote.host_retry = None;
+        remote.phase = RemotePhase::Failed;
+        remote.detail = error.detail;
+    }
+
+    fn retry_remote_probe(&mut self) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let snapshot = remote.snapshot.clone();
+        remote.phase = RemotePhase::Connecting;
+        remote.detail = "Retrying after host approval. No local shell was started.".to_owned();
+        remote.prompt = None;
+        remote.probe = Some(crate::ssh_servers::spawn_probe(
+            crate::ssh_servers::ProbeRequest {
+                ticket: crate::ssh_servers::ProbeTicket {
+                    authority: snapshot.server().id(),
+                    attempt: remote.client_epoch.saturating_add(1),
+                },
+                server: snapshot,
+            },
+        ));
+    }
+
+    /// Apply a finished Stage result. Success is the only path that starts the companion.
+    pub fn deliver_stage_result(
+        &mut self,
+        result: Result<(), crate::ssh_servers::AttemptError>,
+    ) {
+        self.finish_remote_stage(result);
+    }
+
+    pub fn companion_spawn_requested(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.companion_spawn_requested)
+    }
+
+    fn spawn_remote_companion(&mut self) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.companion_spawn_requested = true;
+        }
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(target) = remote.remote_target.clone() else {
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "The remote target is unknown. Made did not start a local shell.".to_owned();
+            return;
+        };
+        let metadata = remote.snapshot.server().metadata().clone();
+        let mut identity = remote.workspace.identity().clone();
+        identity.epoch = remote.client_epoch;
+        let root = remote.workspace.launch_directory().clone();
+        let version = APP_VERSION.to_owned();
+        let (tx, rx) = mpsc::channel();
+        remote.client_rx = Some(rx);
+        remote.phase = RemotePhase::Connecting;
+        remote.detail = "Companion staged. Opening the authenticated session.".to_owned();
+        let _ = thread::Builder::new()
+            .name("made-ssh-attach".to_owned())
+            .spawn(move || {
+                let result = crate::ssh_servers::connect_companion(
+                    &metadata, &version, &target, identity, root,
+                );
+                let _ = tx.send(result);
+            });
+    }
+
+    /// The first authenticated frame is Open or Attach. Nothing else is queued.
+    fn arm_remote_client(&mut self, client: made_remote::client::RemoteClient) {
+        let Some(remote) = self.remote.as_mut() else {
+            client.disconnect();
+            return;
+        };
+        let directory = remote.workspace.launch_directory().clone();
+        let launch = if remote.opencode {
+            made_remote::protocol::LaunchTarget::OpenCode
+        } else {
+            made_remote::protocol::LaunchTarget::Shell
+        };
+        let operation = crate::remote_session::first_operation(
+            remote.session_open,
+            directory,
+            launch,
+            DEFAULT_ROWS as u16,
+            DEFAULT_COLS as u16,
+        );
+        debug_assert!(crate::remote_session::allow_before_attached(&operation));
+        match client.request(operation, None) {
+            Ok(id) => {
+                remote.client = Some(client);
+                remote.attach_request = Some(id);
+                remote.phase = RemotePhase::AwaitingAttach;
+                remote.detail =
+                    "Session opening. Root checks wait until the remote session is attached."
+                        .to_owned();
+            }
+            Err(_) => {
+                client.disconnect();
+                remote.phase = RemotePhase::Failed;
+                remote.detail =
+                    "The remote session rejected the opening frame. No local shell was started."
+                        .to_owned();
+            }
+        }
+    }
+
+    fn pump_remote_client(&mut self) {
+        let (attach_reply, upload_replies, disconnected) = {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            let Some(client) = remote.client.clone() else {
+                return;
+            };
+            if !client.is_connected() {
+                (None, Vec::new(), true)
+            } else {
+                let waiting_attach = remote.attach_request;
+                let mut attach_reply = None;
+                let mut upload_replies = Vec::new();
+                while let Some(reply) = client.poll_reply() {
+                    if waiting_attach == Some(reply.request_id) {
+                        attach_reply = Some(reply);
+                        continue;
+                    }
+                    if remote.upload.as_ref().is_some_and(|upload| {
+                        upload.begin_id == Some(reply.request_id)
+                            || upload.inflight_chunk == Some(reply.request_id)
+                            || upload.commit_id == Some(reply.request_id)
+                    }) {
+                        upload_replies.push(reply);
+                        continue;
+                    }
+                    if remote.attach_request.is_some() {
+                        continue;
+                    }
+                    let mut reply = reply;
+                    if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                        reply.request_id = workspace_id;
+                    }
+                    let _ = remote.workspace.accept(reply);
+                }
+                (attach_reply, upload_replies, false)
+            }
+        };
+        if disconnected {
+            self.fail_remote_transport();
+            return;
+        }
+        if attach_reply.is_some() || !upload_replies.is_empty() {
+            self.finish_remote_replies(attach_reply, upload_replies);
+        }
+        let snapshot = {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            if remote.attach_request.is_some() {
+                return;
+            }
+            let Some(client) = remote.client.clone() else {
+                return;
+            };
+            while let Some(command) = remote.workspace.next_command() {
+                if remote.workspace.connection()
+                    != crate::remote_workspace::ConnectionState::Connected
+                    && !crate::remote_session::allow_before_attached(&command.operation)
+                {
+                    continue;
+                }
+                let workspace_id = command.request_id;
+                match client.request(command.operation, None) {
+                    Ok(client_id) => {
+                        remote.id_map.insert(client_id, workspace_id);
+                    }
+                    Err(_) => {
+                        remote.workspace.disconnect();
+                        break;
+                    }
+                }
+            }
+            let snapshot = remote.workspace.projection().sessions.clone();
+            let _ = remote.workspace.expire(Instant::now());
+            let _ = remote.workspace.reconcile();
+            snapshot
+        };
+        if let Some(snapshot) = snapshot {
+            self.session_map.apply_snapshot(&snapshot);
+        }
+    }
+
+    fn fail_remote_transport(&mut self) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.workspace.disconnect();
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "SSH disconnected. Queued input was discarded and will not be replayed."
+                    .to_owned();
+            remote.client = None;
+            remote.attach_request = None;
+            remote.holding_input = false;
+            remote.upload = None;
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.fail_remote_image_paste();
+        }
+    }
+
+    fn finish_remote_replies(
+        &mut self,
+        attach_reply: Option<made_remote::protocol::WireEnvelope>,
+        upload_replies: Vec<made_remote::protocol::WireEnvelope>,
+    ) {
+        if let Some(reply) = attach_reply {
+            self.note_attach_reply(reply);
+        }
+        for reply in upload_replies {
+            self.apply_upload_reply(reply);
+        }
+    }
+
+    fn apply_upload_reply(&mut self, reply: made_remote::protocol::WireEnvelope) {
+        let outcome = {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            let Some(upload) = remote.upload.as_mut() else {
+                return;
+            };
+            use made_remote::protocol::Operation;
+            match &reply.operation {
+                Operation::Ack if upload.begin_id == Some(reply.request_id) => {
+                    upload.begin_acked = true;
+                    upload.begin_id = None;
+                    None
+                }
+                Operation::Ack if upload.inflight_chunk == Some(reply.request_id) => {
+                    upload.inflight_chunk = None;
+                    None
+                }
+                Operation::UploadResult { path, .. } => {
+                    let pasted = path.to_utf8().ok().map(str::to_owned);
+                    remote.upload = None;
+                    Some(pasted)
+                }
+                Operation::Error { .. } => {
+                    remote.upload = None;
+                    Some(None)
+                }
+                _ => None,
+            }
+        };
+        let Some(pasted) = outcome else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        match pasted {
+            Some(path) => {
+                let _ = terminal.finish_remote_image_paste(&path, self.diag.log_mut());
+            }
+            None => terminal.fail_remote_image_paste(),
+        }
+    }
+
+    fn note_attach_reply(&mut self, reply: made_remote::protocol::WireEnvelope) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        remote.attach_request = None;
+        match reply.operation {
+            made_remote::protocol::Operation::Attached => {}
+            made_remote::protocol::Operation::Error { code } => {
+                remote.phase = RemotePhase::Failed;
+                remote.detail = crate::remote_session::classify_error(code)
+                    .detail()
+                    .to_owned();
+                if let Some(client) = remote.client.take() {
+                    client.disconnect();
+                }
+                return;
+            }
+            _ => {
+                remote.phase = RemotePhase::Failed;
+                remote.detail =
+                    "The remote session did not attach. No local shell was started.".to_owned();
+                return;
+            }
+        }
+        let open = remote.session_open;
+        let epoch = remote.client.as_ref().map(|client| client.identity().epoch);
+        let attached = match open {
+            crate::remote_session::SessionOpen::New => remote
+                .workspace
+                .mark_attached()
+                .and_then(|()| remote.workspace.begin_resnapshot()),
+            crate::remote_session::SessionOpen::Reattach => {
+                remote.workspace.reattach(epoch.unwrap_or(0))
+            }
+        };
+        if attached.is_err() {
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "The remote session attached, but this tab could not accept it. Input was not sent."
+                    .to_owned();
+            return;
+        }
+        remote.attached_once = true;
+        remote.phase = RemotePhase::Ready;
+        remote.holding_input = true;
+        remote.detail =
+            "SSH attached. Applying the remote snapshot before accepting input.".to_owned();
+        let Some(client) = remote.client.clone() else {
+            return;
+        };
+        let target = self.terminal_target;
+        let mut pane = TerminalPane::open_remote(target, DEFAULT_ROWS as u16, DEFAULT_COLS as u16);
+        pane.attach_remote_transport(Box::new(client.terminal_transport()));
+        self.terminal = Some(pane);
+        self.terminal_error = None;
+        if let Some(remote) = self.remote.as_mut() {
+            remote.snapshot_gate = crate::remote_session::SnapshotGate::default();
+            remote.holding_input = true;
+        }
+        // An empty queue here is not completion. Input stays paused until done.
+        self.pull_resnapshot();
+    }
+
+    fn pump_remote_terminal(&mut self) {
+        let holding = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.holding_input);
+        if !holding {
+            if let Some(terminal) = self.terminal.as_mut() {
+                let _ = terminal.pump(self.diag.log_mut());
+            }
+            return;
+        }
+        self.pull_resnapshot();
+    }
+
+    /// Apply queued `TerminalOutput` frames. `poll_output` returning `None` does
+    /// not resume input. Only the first `done: true` frame does, after it is fed.
+    fn pull_resnapshot(&mut self) {
+        let Some(client) = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.client.clone())
+        else {
+            return;
+        };
+        if !self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.holding_input)
+        {
+            return;
+        }
+        let mut transport = client.terminal_transport();
+        loop {
+            let frame = transport.poll_output();
+            let gate = self
+                .remote
+                .as_ref()
+                .map(|remote| remote.snapshot_gate)
+                .unwrap_or_default();
+            let (gate, step) = match &frame {
+                None => gate.observe_empty(),
+                Some(frame) => gate.observe_frame(frame.done),
+            };
+            if let Some(remote) = self.remote.as_mut() {
+                remote.snapshot_gate = gate;
+            }
+            let Some(frame) = frame else {
+                break;
+            };
+            self.apply_snapshot_step(step, &frame.bytes);
+            if matches!(step, crate::remote_session::SnapshotStep::Complete { .. }) {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.resume_input();
+                }
+                if let Some(remote) = self.remote.as_mut() {
+                    remote.holding_input = false;
+                    remote.detail = "SSH attached.".to_owned();
+                }
+            }
+        }
+    }
+
+    fn apply_snapshot_step(&mut self, step: crate::remote_session::SnapshotStep, bytes: &[u8]) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        match step {
+            crate::remote_session::SnapshotStep::StillWaiting => {}
+            crate::remote_session::SnapshotStep::Feed { reset: true }
+            | crate::remote_session::SnapshotStep::Complete { reset: true } => {
+                terminal.apply_resnapshot(bytes);
+            }
+            crate::remote_session::SnapshotStep::Feed { reset: false }
+            | crate::remote_session::SnapshotStep::Complete { reset: false }
+            | crate::remote_session::SnapshotStep::Live => {
+                if !bytes.is_empty() {
+                    terminal.feed_remote_output(bytes);
+                }
+            }
+        }
+    }
+
+    fn pump_remote_upload(&mut self) {
+        let pending = self
+            .terminal
+            .as_mut()
+            .and_then(TerminalPane::take_pending_image);
+        if let Some(bytes) = pending {
+            let ready = self.remote.as_ref().is_some_and(|remote| {
+                remote.attach_request.is_none()
+                    && remote.client.is_some()
+                    && !remote.holding_input
+                    && remote.upload.is_none()
+            });
+            if !ready {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.fail_remote_image_paste();
+                }
+            } else if let Some(remote) = self.remote.as_mut() {
+                let upload_id = remote.next_upload;
+                remote.next_upload = remote.next_upload.saturating_add(1);
+                remote.upload = Some(PendingUpload {
+                    upload_id,
+                    bytes,
+                    offset: 0,
+                    begin_id: None,
+                    begin_acked: false,
+                    inflight_chunk: None,
+                    commit_id: None,
+                });
+            }
+        }
+        let mut failed = false;
+        {
+            let Some(remote) = self.remote.as_mut() else {
+                return;
+            };
+            let Some(client) = remote.client.clone() else {
+                return;
+            };
+            let Some(upload) = remote.upload.as_mut() else {
+                return;
+            };
+            if upload.begin_id.is_none() && !upload.begin_acked {
+                match client.request(
+                    made_remote::protocol::Operation::UploadBegin {
+                        upload_id: upload.upload_id,
+                        total: upload.bytes.len() as u64,
+                    },
+                    None,
+                ) {
+                    Ok(id) => upload.begin_id = Some(id),
+                    Err(_) => {
+                        remote.upload = None;
+                        failed = true;
+                    }
+                }
+            } else if upload.begin_acked
+                && upload.inflight_chunk.is_none()
+                && upload.commit_id.is_none()
+            {
+                if upload.offset < upload.bytes.len() as u64 {
+                    let start = upload.offset as usize;
+                    let end =
+                        (start + made_remote::protocol::MAX_CHUNK_BYTES).min(upload.bytes.len());
+                    let chunk = upload.bytes[start..end].to_vec();
+                    let offset = upload.offset;
+                    let upload_id = upload.upload_id;
+                    match made_remote::protocol::Chunk::new(chunk) {
+                        Ok(data) => match client.request(
+                            made_remote::protocol::Operation::UploadChunk {
+                                upload_id,
+                                offset,
+                                data,
+                            },
+                            None,
+                        ) {
+                            Ok(id) => {
+                                if let Some(upload) = remote.upload.as_mut() {
+                                    upload.inflight_chunk = Some(id);
+                                    upload.offset = end as u64;
+                                }
+                            }
+                            Err(_) => {
+                                remote.upload = None;
+                                failed = true;
+                            }
+                        },
+                        Err(_) => {
+                            remote.upload = None;
+                            failed = true;
+                        }
+                    }
+                } else {
+                    let upload_id = upload.upload_id;
+                    match client.request(
+                        made_remote::protocol::Operation::UploadCommit { upload_id },
+                        None,
+                    ) {
+                        Ok(id) => {
+                            if let Some(upload) = remote.upload.as_mut() {
+                                upload.commit_id = Some(id);
+                            }
+                        }
+                        Err(_) => {
+                            remote.upload = None;
+                            failed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if failed {
+            self.fail_remote_paste();
+        }
+    }
+
+    fn fail_remote_paste(&mut self) {
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.fail_remote_image_paste();
+        }
+    }
+
     pub fn tick(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let frame_time = now.saturating_duration_since(self.last_frame);
@@ -1255,6 +2632,10 @@ impl Workbench {
         self.finalize_paint_metrics();
 
         self.tick_count = self.tick_count.saturating_add(1);
+        if self.remote.is_some() {
+            self.tick_remote(ctx);
+            return;
+        }
         let mut active = false;
 
         let terminal_visible = self.visible && self.left_surface == LeftSurface::Terminal;
@@ -2208,6 +3589,26 @@ impl Workbench {
             return;
         }
         self.shutdown_done = true;
+        // Online close is a worker. Dropping the watch does not cancel the Close.
+        let _close = self.take_remote_close();
+        if let Some(remote) = self.remote.as_mut() {
+            remote.cancel.store(true, Ordering::Release);
+            if let Some(probe) = remote.probe.as_ref() {
+                probe.cancel();
+            }
+            if let Some(stage) = remote.stage.as_ref() {
+                stage.cancel();
+            }
+            // A close worker may already own the client. Do not disconnect first:
+            // that drops Operation::Close before it is written.
+            if remote.client.is_some() && remote.attached_once {
+                remote.cleanup_unconfirmed = true;
+                self.diag.log_mut().record(
+                    LogLevel::Warn,
+                    "remote cleanup was not confirmed before local release",
+                );
+            }
+        }
 
         // Preserve the selected workspace's capability/reason before the
         // terminal (the live capability owner) is dropped. The persisted
@@ -2371,6 +3772,38 @@ impl Workbench {
             view_directory,
             view_directory_available,
             view_directory_reason,
+            ssh_authority: self
+                .remote
+                .as_ref()
+                .map(|remote| remote.snapshot.server().metadata().display_name.clone()),
+            remote_root: self.remote_path_label(),
+            ssh_transport: self.remote.as_ref().map(|remote| {
+                match remote.workspace.connection() {
+                    crate::remote_workspace::ConnectionState::Connected => "connected",
+                    crate::remote_workspace::ConnectionState::Disconnected => "disconnected",
+                }
+                .to_owned()
+            }),
+            ssh_integration: self.remote.as_ref().map(|remote| {
+                match remote.workspace.integration() {
+                    crate::remote_workspace::IntegrationState::Connected => "connected",
+                    crate::remote_workspace::IntegrationState::Unavailable => "unavailable",
+                    crate::remote_workspace::IntegrationState::Unknown => "unknown",
+                }
+                .to_owned()
+            }),
+            remote_version: self.remote.as_ref().and_then(|remote| {
+                remote
+                    .workspace
+                    .projection()
+                    .sessions
+                    .as_ref()
+                    .map(|_| APP_VERSION.to_owned())
+            }),
+            cleanup_unconfirmed: self
+                .remote
+                .as_ref()
+                .map(|remote| remote.cleanup_unconfirmed),
         }
     }
 

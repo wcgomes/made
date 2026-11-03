@@ -22,6 +22,7 @@ mod events;
 pub mod config;
 pub mod config_guard;
 pub mod protocol;
+pub mod remote_rpc;
 pub mod security;
 pub mod server;
 pub mod state;

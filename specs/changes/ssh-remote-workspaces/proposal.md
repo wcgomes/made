@@ -1,0 +1,58 @@
+# Proposal: SSH workspaces with local-experience parity
+
+## Intent
+An SSH terminal alone does not satisfy the requested outcome. A remote workspace must provide the existing Made experience against the selected server: explorer, safe preview and live updates, read-only Git, terminal, OpenCode session integration and directory follow, with independent tabs and honest connection failures.
+
+## Scope
+Add SSH server registration, connection testing and remote OpenCode detection through a `Servidores SSH` action beside Hide/Show Explorer; add `Terminal SSH` and, when detected, `OpenCode SSH` to `+`. Extend workspace identity, remote filesystem access, Git observation, terminal lifecycle, optional integration, diagnostics and isolation without regressing local workspaces. The delta affects the domains realized in `specs/opencode-session-follow.md`, `specs/made-ui-ux.md` and `specs/explorer-file-icons.md`.
+
+## Non-goals
+No product implementation, spec migration or archive in this change-preparation step. No remote editor/save, Git writes or worktree management: these are not local Made capabilities. No silent remote installation, wildcard bridge listener, copied SSH private key, disabled host verification, persistent personal configuration edits, general file synchronization or remote Windows support. No remote tab/session recovery across client restart or server reboot; server metadata persists, live session credentials do not. No tmux dependency, probe, configuration, fallback or installation, and no authorization to install tmux or a Rust toolchain on a remote or in a development container.
+
+## Approach
+Keep the existing native UI and per-tab ownership; introduce an explicit execution/filesystem authority rather than interpreting server paths as host paths. Reuse terminal rendering, tree/preview presentation, session precedence and Git presentation behind authority-aware operations. Use host OpenSSH and an explicitly consented, versioned private remote companion/plugin. An app-owned supervisor, detached through made-platform OS process capabilities, owns that tab's PTY, filesystem watchers, bounded VT state and the remote loopback integration bridge. SSH stdio relays bounded events/operations, not an externally exposed bridge. User-installed tmux is irrelevant. See [design.md](design.md) for alternatives and concrete interfaces.
+
+The user answered **“Pode implementar”** to the six explicit recommendations relayed below. This authorizes those outcomes, not a claim that they already work. Clarify is complete, the executable plan is in [tasks.md](tasks.md), and the pre-execution analyze result is recorded there. This preparation step still performs no product implementation; execution is a separate handoff.
+
+## Decision index
+- **Confirmed — full parity:** remote explorer, preview, live updates, Git, terminal, OpenCode, session/cwd follow and independent tabs are in scope; terminal-only delivery is insufficient.
+- **Confirmed — entry points:** `Servidores SSH` beside Explorer; server registration/test/detection; `Terminal SSH` and detected `OpenCode SSH` in `+`.
+- **Technical decision — authority-aware operations:** retain one UI, encode server/workspace/epoch/root identity and resolve paths on the owning machine; avoids local filesystem access from remote reports. See [boundaries](design.md#architectural-boundaries).
+- **Accepted outcome / technical decision — companion over SSH:** private helper/plugin provisioning requires per-server/version consent; host OpenSSH carries authenticated framed stdio to a persistent per-tab supervisor. The supervisor, not tmux, owns the PTY and a bounded VT resnapshot so reattach restores modes, mouse and alternate screen without replaying commands, input or the historical PTY byte stream. tmux is not a prerequisite, fallback or hidden probe. Native SSH/SFTP was compared and does not remove the watch/plugin/survival work. See [alternatives](design.md#significant-decisions).
+- **Technical decision — resnapshot end:** the existing `TerminalOutput` verb carries a required `done` bit. After `Attached`, resnapshot bytes end with `done: true` before any live PTY output; client input stays closed until that frame is applied. Later live output uses the same verb with `done: false` and is not more resnapshot. No new operation and no protocol-major change. See [durable terminal](design.md#durable-terminal-and-cwd-reporting).
+- **Preserved guarantees:** local startup and all local behavior remain; bridges stay loopback-only and authenticated; user configs remain unchanged; Git and preview remain read-only; no credential forwarding is implied.
+- **Remote trust boundary:** client-generated operations remain authority/root/tab-confined and the remote helper must enforce filesystem guards on a trusted server. Hostile responses must not escape client validation, execution or tab isolation; SSH authentication does not prove the filesystem/content claims of a compromised server/helper. No filesystem attestation is promised.
+- **Technical defaults, not additional user quotes:** Linux glibc x64/arm64 and macOS x64/arm64; bash/zsh/fish follow; fixed controlled-network acceptance profile; remote PNG path paste for both explicit image chords (never fake native clipboard access); 24-hour detached-session lease and confirmed online close. These make the approved outcomes testable and are detailed in spec.md/design.md.
+- **Readiness:** analyze was rerun after the resnapshot-delimiter correction and passed for the persisted plan; product verification and first real remote vertical-slice proof remain unrun. The recorded result is in [tasks.md](tasks.md).
+
+## Clarifications
+- **Q:** Is opening an SSH terminal sufficient?
+  **A:** No. The user explicitly requires the remote explorer and the whole existing local experience, including remote files/live preview/Git, terminal/OpenCode, session and cwd follow, independent tabs and disconnection handling (confirmation relayed by the coordinator).
+- **Q:** Where are SSH actions exposed?
+  **A:** `Servidores SSH` beside Hide/Show Explorer manages registration, testing and OpenCode detection; `+` offers `Terminal SSH` and `OpenCode SSH` when remote OpenCode is detected (confirmation relayed by the coordinator).
+
+### Resolved Q1–Q6 (approval relayed by coordinator)
+The user's single response “Pode implementar” approved the explicit package below. The following are the approved recommendations, not six separately invented answers.
+1. **Q1 — approved:** persist server metadata only, without credentials. Technical detail: add/edit/remove app-owned records; removing/editing a record affects future launches, not the authority of an existing tab; do not restore live tabs across restart.
+2. **Q2 — approved:** reuse OpenSSH, keys/agent and password/MFA prompts; unknown hosts require explicit approval. Technical detail: honor existing SSH aliases/ProxyJump, use app-owned trust additions, reject changed keys, never forward agents or persist prompt answers; no separate jump-host editor is added.
+3. **Q3 — approved:** private remote Made helper/plugin with consent, without altering personal configurations or installing OpenCode. Technical detail: packaged verified artifacts, per-version/server consent and explicit failure/cancel path. The earlier tmux-prerequisite sentence is superseded by the correction below; absence of tmux is not a failure and is not an installation prompt.
+4. **Q4 — approved:** Linux/macOS remotes initially; Windows remotes excluded. Technical detail: the exact architecture/prerequisite matrix and bounded controlled-network budgets in spec.md are engineering acceptance defaults, not claims that every Linux/macOS variant already works.
+5. **Q5 — approved:** image upload only through explicit paste, remote temp storage with defined cleanup, no clipboard synchronization. Technical detail: both remote image chords use the approved upload-and-server-path mechanism and disclose that behavior; local default/native versus fallback semantics stay unchanged. A remote path attachment is not represented as native clipboard access.
+6. **Q6 — approved:** preserve terminal/OpenCode during network interruption and reattach without replay of commands/input. Technical detail: app-owned detached supervisor, 24-hour detached lease, exclusive attach/epoch, complete modes/mouse/alternate-screen resnapshot without historical replay, explicit expiry/host-failure limits, local release independent of unreachable remote cleanup and no automatic process replacement. Details are normative in spec.md.
+
+- **Q:** Must Made depend on, probe, or install tmux so a remote terminal can survive and reattach?
+  **A:** No. After the package approval, the user corrected the mechanism: Made must not depend on tmux; if the user wants tmux, they install it themselves. tmux is irrelevant to Made — not a prerequisite, fallback, probe, configuration target or hidden requirement. This correction does not authorize installing tmux or a Rust toolchain on the inspected or any other development container. Q6's survival and no-replay outcome remains; the owner is the native supervisor described above.
+
+- **Q:** How does the client know the resnapshot has ended without a new snapshot verb?
+  **A:** Independent review found that split `TerminalOutput` frames have no end, so an empty poll can reopen input too early or leave an active session closed. The correction stays inside the approved no-replay outcome: the existing verb gains a required `done` bit. That is not a new operation, not a protocol-major change, and not a return to tmux.
+
+No material clarification remains. Implementation must stop and evolve this contract if the selected mechanisms cannot meet these outcomes; it must not silently substitute terminal-only behavior, an auto-restarted OpenCode process, tmux, or an empty poll as the end of a resnapshot.
+
+## Contract review and conflicts
+No active change folder other than this new change was present during inspection; existing changes are archived. No legacy `specs/<domain>/spec.md` source layout was found. Realized flat specs remain unchanged.
+
+The local v1 contract does not require SSH. Local-only absolute-path validation, `SessionFollowCoordinator` filesystem validation, loopback-only integration, host-private clipboard paths and header ordering cannot simply be reused unchanged for remote workspaces. The delta explicitly scopes remote authority and security while retaining local rules. The new SSH action amends the UI requirement's old `Sessions then Explorer` order to `Sessions, Servidores SSH, Explorer`, and `+` gains remote launch choices rather than replacing local choices. Local-only startup does not become dependent on remote detection.
+
+The realized Minimal Workspace Layout paragraph still describes disclosure triangles/bullets whereas its later explorer scenario and `specs/explorer-file-icons.md` require vendored icons. This pre-existing inconsistency is not repaired here: parity follows the dedicated icon contract and current renderer. `wiki/architecture.md` still points its opening product-contract reference to an archived delta; this work uses the realized `specs/opencode-session-follow.md` as authority. Historical wiki notes that mention tmux are not a product prerequisite and are not updated here. Wiki remains read-only.
+
+See the [code-grounded parity inventory](design.md#current-local-parity-inventory) for reviewed capabilities, paths and the remote gap. No live SSH execution, implementation tests, or readiness approval is claimed by these documents.

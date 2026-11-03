@@ -1038,8 +1038,359 @@ struct WorkspaceTabInfo {
     id: WorkspaceId,
     label: String,
     path: std::path::PathBuf,
+    remote_path: Option<String>,
     opencode: bool,
     sessions: Vec<SessionActivity>,
+}
+
+fn authority_key(id: made_remote::protocol::AuthorityId) -> String {
+    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Stable id for the SSH servers window.
+pub fn ssh_servers_window_id() -> egui::Id {
+    egui::Id::unique("made-ssh-servers")
+}
+
+/// Stable id for one field in the SSH servers window.
+pub fn ssh_field_id(field: &str) -> egui::Id {
+    egui::Id::unique(("made-ssh-field", field))
+}
+
+fn ssh_field_hold_id() -> egui::Id {
+    egui::Id::unique("made-ssh-field-hold")
+}
+
+fn ssh_window_rect_id() -> egui::Id {
+    egui::Id::unique("made-ssh-window-rect")
+}
+
+fn ssh_window_was_open_id() -> egui::Id {
+    egui::Id::unique("made-ssh-window-was-open")
+}
+
+fn terminal_hit_rect_id() -> egui::Id {
+    egui::Id::unique("made-terminal-hit-rect")
+}
+
+fn ssh_field_held(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<egui::Id>(ssh_field_hold_id()).is_some())
+}
+
+fn hold_ssh_field(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|data| data.insert_temp(ssh_field_hold_id(), id));
+}
+
+fn clear_ssh_field_hold(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.remove::<egui::Id>(ssh_field_hold_id());
+        data.remove::<egui::Rect>(ssh_window_rect_id());
+    });
+}
+
+/// The terminal paints after this window and treats a click in its rect as its
+/// own, including clicks on the centered window. Restore the field after that.
+struct SshFieldFocusRestore;
+
+impl egui::plugin::Plugin for SshFieldFocusRestore {
+    fn debug_name(&self) -> &'static str {
+        "ssh-field-focus"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut Ui) {
+        restore_ssh_field_focus(ui);
+    }
+}
+
+fn restore_ssh_field_focus(ui: &mut Ui) {
+    let ctx = ui.ctx().clone();
+    let Some(field) = ctx.data(|data| data.get_temp::<egui::Id>(ssh_field_hold_id())) else {
+        return;
+    };
+    let window = ctx.data(|data| data.get_temp::<egui::Rect>(ssh_window_rect_id()));
+    let terminal = ctx.data(|data| data.get_temp::<egui::Rect>(terminal_hit_rect_id()));
+    let returned_to_terminal = ctx.input(|input| {
+        input.pointer.any_pressed()
+            && input.pointer.interact_pos().is_some_and(|pos| {
+                window.is_some_and(|window| !window.contains(pos))
+                    && terminal.is_some_and(|terminal| terminal.contains(pos))
+            })
+    });
+    if returned_to_terminal {
+        clear_ssh_field_hold(&ctx);
+        return;
+    }
+    ui.memory_mut(|memory| memory.request_focus(field));
+}
+
+fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) {
+    let id = ssh_field_id(field);
+    let mut edit = egui::TextEdit::singleline(text)
+        .id(id)
+        .desired_width(f32::INFINITY);
+    if password {
+        edit = edit.password(true);
+    }
+    let response = ui.add(edit);
+    if response.clicked() {
+        response.request_focus();
+    }
+    if response.clicked() || response.has_focus() {
+        hold_ssh_field(ui.ctx(), id);
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab: false,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: false,
+                },
+            );
+        });
+    }
+}
+
+/// Label sits 4px above its field. The window's `layout.gap` separates pairs.
+fn ssh_field(ui: &mut Ui, label: &str, field: &str, text: &mut String) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(theme::micro(label));
+        ssh_text_edit(ui, field, text, false);
+    });
+}
+
+fn ssh_user_port_row(ui: &mut Ui, layout: &Layout, user: &mut String, port: &mut String) {
+    let gap = layout.gap;
+    let port_width = 96.0;
+    let width = ui.available_width();
+    ui.horizontal(|ui| {
+        ui.set_min_width(width);
+        ui.spacing_mut().item_spacing.x = gap;
+        let user_width = (width - gap - port_width).max(80.0);
+        ui.vertical(|ui| {
+            ui.set_width(user_width);
+            ssh_field(ui, "User", "user", user);
+        });
+        ui.vertical(|ui| {
+            ui.set_width(port_width);
+            ssh_field(ui, "Port", "port", port);
+        });
+    });
+}
+
+/// SSH server registration, test, and remote launch confirmation.
+pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
+    ctx.add_plugin(SshFieldFocusRestore);
+    let open_now = model.ssh_open();
+    let was_open = ctx
+        .data(|data| data.get_temp::<bool>(ssh_window_was_open_id()))
+        .unwrap_or(false);
+    if !open_now {
+        if was_open {
+            clear_ssh_field_hold(ctx);
+            ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), false));
+            if let Some(workbench) = model.workbench_mut() {
+                workbench.request_terminal_focus(ctx);
+            }
+        }
+        return;
+    }
+    ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), true));
+    let mut open = true;
+    let layout = Layout::for_window(ctx.content_rect().width(), ctx.content_rect().height());
+    let shown = egui::Window::new("Servidores SSH")
+        .id(ssh_servers_window_id())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .default_width(460.0)
+        .frame(theme::floating_frame())
+        .show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.spacing_mut().item_spacing.y = layout.gap;
+            ui.spacing_mut().item_spacing.x = layout.gap;
+            if let Err(error) = model.ssh_registry() {
+                ui.label(theme::body(sanitize_display(error, 300)));
+            }
+            if let Some(notice) = model.ssh_notice() {
+                ui.label(theme::micro(sanitize_display(notice, 240)));
+            }
+            let listed = model.ssh_registry().ok().map(|registry| {
+                registry
+                    .servers()
+                    .iter()
+                    .map(|server| {
+                        let id = server.id();
+                        let probe = match registry.probe_state(id) {
+                            crate::ssh_servers::ProbeState::Complete(capabilities)
+                                if capabilities.opencode =>
+                            {
+                                "OpenCode detected"
+                            }
+                            crate::ssh_servers::ProbeState::Complete(_) => "OpenCode not detected",
+                            crate::ssh_servers::ProbeState::Failed(_) => "test failed",
+                            crate::ssh_servers::ProbeState::Running(_) => "testing",
+                            crate::ssh_servers::ProbeState::Cancelled => "cancelled",
+                            crate::ssh_servers::ProbeState::Idle => "not tested",
+                        };
+                        (id, server.metadata().display_name.clone(), probe)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if let Some(servers) = listed {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (id, name, probe) in servers {
+                        let selected = model.ssh_selected() == Some(id);
+                        let label = sanitize_display(&name, 48);
+                        if ui
+                            .selectable_label(selected, format!("{label} · {probe}"))
+                            .clicked()
+                        {
+                            model.select_ssh_server(id);
+                        }
+                    }
+                });
+            }
+            {
+                let draft = model.ssh_draft();
+                ssh_field(ui, "Display name", "name", &mut draft.name);
+                ssh_field(ui, "Host or SSH alias", "host", &mut draft.host);
+                ssh_user_port_row(ui, &layout, &mut draft.user, &mut draft.port);
+                ssh_field(ui, "Key file reference", "key", &mut draft.key_file);
+                ssh_field(
+                    ui,
+                    "Initial remote directory",
+                    "directory",
+                    &mut draft.directory,
+                );
+            }
+            ui.label(theme::micro(
+                "Passwords, tokens, and private key bytes are not stored.",
+            ));
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = layout.gap;
+                if theme::primary_action(
+                    ui,
+                    top_action_id("ssh-save"),
+                    "Save",
+                    layout.button_height,
+                    true,
+                    theme::BG_CARD,
+                )
+                .activated
+                {
+                    if let Err(error) = model.save_ssh_server() {
+                        model.set_ssh_notice(error);
+                    }
+                }
+                if theme::ghost_action(
+                    ui,
+                    top_action_id("ssh-test"),
+                    "Test",
+                    false,
+                    layout.button_height,
+                    theme::BG_CARD,
+                )
+                .activated
+                {
+                    if let Err(error) = model.test_selected_ssh_server() {
+                        model.set_ssh_notice(error);
+                    }
+                }
+                if theme::ghost_action(
+                    ui,
+                    top_action_id("ssh-remove"),
+                    "Remove",
+                    false,
+                    layout.button_height,
+                    theme::BG_CARD,
+                )
+                .activated
+                {
+                    if let Err(error) = model.remove_selected_ssh_server() {
+                        model.set_ssh_notice(error);
+                    }
+                }
+            });
+            if model.ssh_prompt().is_some() {
+                ui.separator();
+                let class = model
+                    .ssh_prompt()
+                    .map(|prompt| crate::remote_session::classify_prompt(&prompt.text));
+                let changed = matches!(
+                    class,
+                    Some(crate::remote_session::SshPromptClass::ChangedHostKey { .. })
+                );
+                if let Some(class) = class {
+                    ssh_prompt_card(ui, &class, model.prompt_draft());
+                }
+                ui.horizontal(|ui| {
+                    if !changed && ui.button("Approve").clicked() {
+                        model.submit_ssh_prompt(true);
+                    }
+                    if ui
+                        .button(if changed {
+                            "Refuse key"
+                        } else {
+                            "Cancel prompt"
+                        })
+                        .clicked()
+                    {
+                        model.submit_ssh_prompt(false);
+                        if !changed {
+                            model.cancel_ssh_probe();
+                        }
+                    }
+                });
+            }
+            let launch_title = model.remote_launch().map(|launch| {
+                if launch.opencode {
+                    format!("OpenCode SSH — {}", sanitize_display(&launch.label, 48))
+                } else {
+                    format!("Terminal SSH — {}", sanitize_display(&launch.label, 48))
+                }
+            });
+            if let Some(title) = launch_title {
+                ui.separator();
+                ui.label(theme::body(title));
+                if let Some(directory) = model.remote_launch_directory() {
+                    ssh_field(ui, "Remote directory", "launch-directory", directory);
+                }
+                ui.horizontal(|ui| {
+                    if theme::primary_action(
+                        ui,
+                        top_action_id("ssh-launch"),
+                        "Open remote workspace",
+                        layout.button_height,
+                        true,
+                        theme::BG_CARD,
+                    )
+                    .activated
+                    {
+                        if let Err(error) = model.confirm_remote_launch() {
+                            model.set_ssh_notice(error);
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        model.cancel_remote_launch();
+                    }
+                });
+            }
+        });
+    if let Some(shown) = shown {
+        ctx.data_mut(|data| data.insert_temp(ssh_window_rect_id(), shown.response.rect));
+    }
+    if !open {
+        clear_ssh_field_hold(ctx);
+        ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), false));
+        model.set_ssh_open(false);
+        if let Some(workbench) = model.workbench_mut() {
+            workbench.request_terminal_focus(ctx);
+        }
+    }
 }
 
 /// Global workspace tabs; OpenCode sessions remain a separate optional map.
@@ -1051,6 +1402,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         .filter_map(|id| {
             let workbench = model.workspace(id)?;
             let path = workbench.shell_cwd().to_path_buf();
+            let remote_path = workbench.remote_path_label();
             let opencode = workspace_opencode_active(
                 workbench.terminal_target(),
                 workbench.is_connected(),
@@ -1060,6 +1412,8 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             );
             let label = if opencode {
                 "OpenCode".to_owned()
+            } else if let Some(name) = workbench.remote_label() {
+                name
             } else {
                 workbench
                     .launch_plan()
@@ -1086,6 +1440,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 id,
                 label,
                 path,
+                remote_path,
                 opencode,
                 sessions,
             })
@@ -1099,6 +1454,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         sessions_visible
             || !workbench.session_map().is_empty()
             || workbench.integration().status().is_connected()
+            || workbench.remote_sessions_available()
     });
     if let (Some(active), Some(workbench)) = (active, model.workbench()) {
         let target = top_workspace_action_id(active, "explorer");
@@ -1116,7 +1472,9 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut launch_tui = None;
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
+    let mut toggle_ssh = false;
     let mut about = false;
+    let mut launch_remote: Option<(made_remote::protocol::AuthorityId, bool)> = None;
 
     let panel_height = layout.content_top();
     egui::Panel::top("made-workspaces")
@@ -1150,6 +1508,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     sessions_visible,
                 ));
             }
+            right_specs.push((
+                "ssh-servers",
+                theme::IconGlyph::Servers,
+                "Servidores SSH",
+                model.ssh_open(),
+            ));
             if has_workbench {
                 right_specs.push((
                     "explorer",
@@ -1201,6 +1565,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 match *name {
                     "sessions" if action.activated => toggle_sessions = true,
                     "explorer" if action.activated => toggle_explorer = true,
+                    "ssh-servers" if action.activated => toggle_ssh = true,
                     _ => {}
                 }
             }
@@ -1282,11 +1647,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 layout.tab_height,
                 theme::BG_CLEAR,
             );
-            if compatible_tuis.is_empty() {
-                if open_folder.activated {
-                    create = true;
-                }
-            } else {
+            {
                 egui::Popup::menu(&open_folder.response)
                     .open_memory(
                         open_folder
@@ -1325,6 +1686,41 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                 ui.close();
                             }
                         }
+                        if let Ok(registry) = model.ssh_registry() {
+                            for server in registry.servers() {
+                                let name = sanitize_display(&server.metadata().display_name, 48);
+                                let terminal_label = format!("Terminal SSH — {name}");
+                                if new_tab_menu_item(
+                                    ui,
+                                    new_tab_menu_item_id(&format!(
+                                        "ssh-terminal-{}",
+                                        authority_key(server.id())
+                                    )),
+                                    theme::MenuLeading::Glyph(theme::IconGlyph::Servers),
+                                    &terminal_label,
+                                    layout.button_height,
+                                ) {
+                                    launch_remote = Some((server.id(), false));
+                                    ui.close();
+                                }
+                                if registry.can_launch_opencode(server.id()) {
+                                    let opencode_label = format!("OpenCode SSH — {name}");
+                                    if new_tab_menu_item(
+                                        ui,
+                                        new_tab_menu_item_id(&format!(
+                                            "ssh-opencode-{}",
+                                            authority_key(server.id())
+                                        )),
+                                        theme::MenuLeading::Glyph(theme::IconGlyph::Terminal),
+                                        &opencode_label,
+                                        layout.button_height,
+                                    ) {
+                                        launch_remote = Some((server.id(), true));
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        }
                     });
             }
             if overflow {
@@ -1349,11 +1745,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                             ui.close();
                         }
                         ui.horizontal(|ui| {
+                            let path_text = tab
+                                .remote_path
+                                .clone()
+                                .unwrap_or_else(|| tab.path.display().to_string());
                             ui.label(theme::mono(
-                                truncate_path(
-                                    &sanitize_display(&tab.path.display().to_string(), 900),
-                                    72,
-                                ),
+                                truncate_path(&sanitize_display(&path_text, 900), 72),
                                 10.0,
                                 theme::TEXT_TERTIARY,
                             ));
@@ -1371,6 +1768,15 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     if let Some(tui) = launch_tui {
         model.begin_tui_workspace(tui);
     }
+    if let Some((id, opencode)) = launch_remote {
+        if let Err(error) = model.begin_remote_choice(id, opencode) {
+            model.set_ssh_notice(error);
+            model.set_ssh_open(true);
+        }
+    }
+    if toggle_ssh {
+        model.toggle_ssh();
+    }
     if create {
         model.begin_new_workspace();
     }
@@ -1379,6 +1785,9 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     }
     if let Some(id) = close {
         model.close_workspace(id);
+    }
+    if let Some(notice) = model.remote_close_notice() {
+        ui.label(theme::micro(sanitize_display(notice, 180)));
     }
     if toggle_explorer {
         if let Some(workbench) = model.workbench_mut() {
@@ -1579,6 +1988,8 @@ fn workspace_tab_ui(
     }
     let tooltip = if tab.opencode {
         session_summary.clone()
+    } else if let Some(path) = &tab.remote_path {
+        Some(sanitize_display(path, 900))
     } else {
         Some(sanitize_display(&tab.path.display().to_string(), 900))
     };
@@ -1746,6 +2157,8 @@ impl Workbench {
         show_about: &mut bool,
         native_backdrop_applied: bool,
     ) {
+        ui.ctx()
+            .data_mut(|data| data.remove::<egui::Rect>(terminal_hit_rect_id()));
         self.sync_terminal_visibility(ui.ctx());
         self.main_panels(ui, layout, native_backdrop_applied);
         self.apply_terminal_focus_boost(ui.ctx());
@@ -1767,6 +2180,9 @@ impl Workbench {
     /// first terminal frame after a hidden preview can legitimately allocate a
     /// new auto widget id.
     fn request_terminal_focus(&mut self, ctx: &egui::Context) {
+        if ssh_field_held(ctx) {
+            return;
+        }
         ctx.data_mut(|data| {
             data.insert_temp(
                 egui::Id::unique(("made-terminal-focus-boost", self.pane_id())),
@@ -1776,6 +2192,9 @@ impl Workbench {
     }
 
     fn apply_terminal_focus_boost(&mut self, ctx: &egui::Context) {
+        if ssh_field_held(ctx) {
+            return;
+        }
         let boost_id = egui::Id::unique(("made-terminal-focus-boost", self.pane_id()));
         if self.left_surface() != LeftSurface::Terminal {
             ctx.data_mut(|data| data.remove::<u8>(boost_id));
@@ -1817,7 +2236,7 @@ impl Workbench {
         ui.ctx()
             .data_mut(|data| data.insert_temp(visibility_id, explorer_visible));
         let available = ui.available_width().max(1.0);
-        let has_content = explorer.is_some() || self.workspace_error.is_some();
+        let has_content = explorer.is_some() || self.workspace_error.is_some() || self.is_remote();
         let target_visible = self.explorer_visible() && has_content;
         let animation_id = egui::Id::unique(("made-explorer-animation", self.pane_id()));
         let progress = ui
@@ -1891,6 +2310,40 @@ impl Workbench {
                         if let Some(explorer) = explorer.as_mut() {
                             explorer.set_native_backdrop_applied(native_backdrop_applied);
                             explorer.tree_ui(&mut content_ui, self.diag.log_mut(), layout);
+                        } else if self.is_remote() {
+                            if let (
+                                Some(root),
+                                Some(projection),
+                                Some(connection),
+                                Some(integration),
+                            ) = (
+                                self.remote_path_label().and_then(|path| {
+                                    made_remote::protocol::RemotePath::new(path.into_bytes()).ok()
+                                }),
+                                self.remote_projection().cloned(),
+                                self.remote_connection(),
+                                self.remote_integration(),
+                            ) {
+                                let detail = self.remote_detail().unwrap_or("").to_owned();
+                                let actions = crate::explorer_view::remote_explorer_ui(
+                                    &mut content_ui,
+                                    &root,
+                                    &projection,
+                                    connection,
+                                    integration,
+                                    &detail,
+                                    layout,
+                                );
+                                if let Some(path) = actions.iter().find_map(|action| match action {
+                                    crate::explorer_view::RemoteExplorerAction::CopyPath(path) => {
+                                        Some(path.clone())
+                                    }
+                                    _ => None,
+                                }) {
+                                    content_ui.ctx().copy_text(path);
+                                }
+                                self.apply_remote_actions(actions);
+                            }
                         } else if let Some(error) = self.workspace_error.clone() {
                             unavailable_card(
                                 &mut content_ui,
@@ -2007,6 +2460,8 @@ impl Workbench {
 
     fn terminal_card(&mut self, ui: &mut Ui, layout: &Layout, preview_loaded: bool) -> bool {
         let card_rect = ui.available_rect_before_wrap();
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(terminal_hit_rect_id(), card_rect));
         let alternate_screen = self
             .terminal
             .as_ref()
@@ -2120,7 +2575,13 @@ impl Workbench {
         let terminal_error = self.terminal_error.clone();
         let mut terminal = self.terminal.take();
         let mut output = TerminalUiOutput::default();
-        if let Some(terminal) = terminal.as_mut() {
+        if self.is_remote()
+            && (self.remote_needs_consent()
+                || self.remote_needs_host_approval()
+                || self.remote_auth().is_some())
+        {
+            remote_open_card(&mut body_ui, layout, self);
+        } else if let Some(terminal) = terminal.as_mut() {
             let produced = terminal.ui(
                 &mut body_ui,
                 &self.platform,
@@ -2131,6 +2592,11 @@ impl Workbench {
             output.input_sent = produced.input_sent;
             output.notice = produced.notice;
             output.focus_exit_requested = produced.focus_exit_requested;
+        } else if self.is_remote() {
+            let detail = self.remote_detail().unwrap_or(
+                "Remote terminal input is paused until SSH attaches. No local shell was started.",
+            );
+            terminal_unavailable_card(&mut body_ui, layout, detail);
         } else {
             terminal_unavailable_card(
                 &mut body_ui,
@@ -3409,6 +3875,116 @@ fn unavailable_card(ui: &mut Ui, layout: &Layout, title: &str, message: &str) {
                     .color(theme::ERROR),
             );
             ui.label(theme::body(sanitize_display(message, 600)));
+        });
+}
+
+fn ssh_prompt_card(ui: &mut Ui, class: &crate::remote_session::SshPromptClass, draft: &mut String) {
+    match class {
+        crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
+            ui.label(theme::body("the remote host key changed and was refused"));
+        }
+        crate::remote_session::SshPromptClass::UnknownHost { text } => {
+            ui.label(theme::body(
+                "This host is not trusted yet. Approve only if the fingerprint matches.",
+            ));
+            ui.label(theme::body(sanitize_display(text, 700)));
+            ui.label(theme::micro(
+                "Approve sends yes. Reject cancels the attempt.",
+            ));
+        }
+        crate::remote_session::SshPromptClass::Secret { text } => {
+            ui.label(theme::body(sanitize_display(text, 400)));
+            ssh_text_edit(ui, "prompt", draft, true);
+        }
+    }
+}
+
+fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
+    let available = ui.max_rect();
+    let width = (available.width() - 48.0).clamp(220.0, 560.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(available.left() + 24.0, available.top() + 24.0),
+        egui::vec2(width, 220.0),
+    );
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
+    let needs_consent = workbench.remote_needs_consent();
+    let auth = workbench.remote_auth();
+    let detail = workbench
+        .remote_detail()
+        .unwrap_or("Remote session")
+        .to_owned();
+    egui::Frame::new()
+        .fill(theme::BG_CARD)
+        .stroke(Stroke::new(1.0, theme::BORDER_HEADER))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .show(&mut child, |ui| {
+            ui.label(
+                RichText::new("SSH")
+                    .font(FontId::proportional(13.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(theme::body(sanitize_display(&detail, 500)));
+            if workbench.remote_needs_host_approval() {
+                ui.label(theme::body(
+                    "This host is not in the trust file. Approve only the fingerprint below. Nothing is sent until you do.",
+                ));
+                match workbench.remote_host_fingerprint() {
+                    Some(fingerprint) => {
+                        ui.label(theme::body(sanitize_display(fingerprint, 120)));
+                    }
+                    None => {
+                        ui.label(theme::micro(
+                            "No fingerprint was provided. Approval is still required, and none was assumed.",
+                        ));
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Approve host").clicked() {
+                        workbench.approve_unknown_host();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        workbench.deny_unknown_host();
+                    }
+                });
+            }
+            if needs_consent {
+                ui.label(theme::micro(
+                    "Cancel writes nothing. Approval is stored for this server and version only.",
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Approve companion").clicked() {
+                        workbench.grant_remote_consent();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        workbench.deny_remote_consent();
+                    }
+                });
+            }
+            if let Some(class) = auth {
+                if let Some(draft) = workbench.remote_prompt_draft() {
+                    ssh_prompt_card(ui, &class, draft);
+                }
+                let changed = matches!(
+                    class,
+                    crate::remote_session::SshPromptClass::ChangedHostKey { .. }
+                );
+                ui.horizontal(|ui| {
+                    if !changed && ui.button("Approve").clicked() {
+                        workbench.submit_remote_auth(true);
+                    }
+                    if ui
+                        .button(if changed { "Refuse key" } else { "Cancel" })
+                        .clicked()
+                    {
+                        workbench.submit_remote_auth(false);
+                    }
+                });
+            }
+            if workbench.remote_can_reconnect() && ui.button("Reconnect").clicked() {
+                let _ = workbench.reconnect_remote();
+            }
+            let _ = layout;
         });
 }
 

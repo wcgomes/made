@@ -53,6 +53,7 @@ pub struct ShellLaunchPlan {
     request: PtyRequest,
     capability: ShellCwdCapability,
     directory: Option<PathBuf>,
+    cwd_sink: Option<(PathBuf, PathBuf)>,
 }
 impl std::fmt::Debug for ShellLaunchPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +74,16 @@ impl Drop for ShellLaunchPlan {
 impl ShellLaunchPlan {
     /// Prepare hooks, falling back to the original request on unsafe modes or IO failure.
     pub fn new(request: PtyRequest) -> Self {
+        Self::build(request, None)
+    }
+    /// Launch-local out-of-band reports, independent of the terminal byte stream
+    /// and of any user multiplexer. `reporter` is the installed companion with the fixed
+    /// `cwd-report SOCKET PATH` mode; the supervisor owns the sink for the
+    /// entire detached shell lifetime. No dotfile is modified.
+    pub fn with_cwd_sink(request: PtyRequest, reporter: PathBuf, socket: PathBuf) -> Self {
+        Self::build(request, Some((reporter, socket)))
+    }
+    fn build(request: PtyRequest, cwd_sink: Option<(PathBuf, PathBuf)>) -> Self {
         let mut plan = Self {
             request,
             capability: ShellCwdCapability {
@@ -80,6 +91,7 @@ impl ShellLaunchPlan {
                 reason: "shell has no safe launch-local cwd hook".into(),
             },
             directory: None,
+            cwd_sink,
         };
         let shell = Path::new(&plan.request.program)
             .file_stem()
@@ -97,6 +109,18 @@ impl ShellLaunchPlan {
             }
             _ => return plan,
         };
+        if plan.cwd_sink.is_some()
+            && (!cfg!(unix) || !matches!(shell.as_str(), "bash" | "zsh" | "fish"))
+        {
+            plan.capability.reason = "private cwd sink unsupported for this shell/host".into();
+            return plan;
+        }
+        if plan.cwd_sink.as_ref().is_some_and(|(reporter, socket)| {
+            !reporter.is_absolute() || !reporter.is_file() || !socket.is_absolute()
+        }) {
+            plan.capability.reason = "private cwd reporter unavailable".into();
+            return plan;
+        }
         let program = Path::new(&plan.request.program);
         let available = if program.components().count() > 1 {
             program.is_file()
@@ -137,7 +161,12 @@ impl ShellLaunchPlan {
             Ok(()) => {
                 plan.capability = ShellCwdCapability {
                     supported: true,
-                    reason: "launch-local OSC 7 hook installed; reports remain untrusted".into(),
+                    reason: if plan.cwd_sink.is_some() {
+                        "private launch-local cwd sink installed; reports require remote validation"
+                    } else {
+                        "launch-local OSC 7 hook installed; reports remain untrusted"
+                    }
+                    .into(),
                 }
             }
             Err(_) => {
@@ -186,6 +215,10 @@ impl ShellLaunchPlan {
         self.request.env_remove.push(name.into());
     }
     fn prepare(&mut self, shell: &str) -> std::io::Result<()> {
+        if let Some((reporter, socket)) = self.cwd_sink.clone() {
+            self.set_env("MADE_CWD_REPORTER", reporter.into_os_string());
+            self.set_env("MADE_CWD_SOCKET", socket.into_os_string());
+        }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -211,14 +244,19 @@ impl ShellLaunchPlan {
             "bash" => {
                 let path = directory.join("bashrc");
                 let no_rc = self.request.args.iter().any(|a| a == "--norc");
-                fs::write(
+                write_bootstrap(
                     &path,
                     format!(
-                        "{}\n{BASH}",
+                        "{}\n{BASH}\n{}",
                         if no_rc {
                             ""
                         } else {
                             "[[ -r ~/.bashrc ]] && source ~/.bashrc"
+                        },
+                        if self.cwd_sink.is_some() {
+                            POSIX_CWD_SINK
+                        } else {
+                            ""
                         }
                     ),
                 )?;
@@ -230,9 +268,13 @@ impl ShellLaunchPlan {
             }
             "zsh" => {
                 // zsh reads the system files itself; these wrappers chain only user files.
-                fs::write(directory.join(".zshenv"), ZSH_ZSHENV)?;
+                write_bootstrap(&directory.join(".zshenv"), ZSH_ZSHENV)?;
                 for name in [".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
-                    fs::write(directory.join(name), zsh_chain_script(name))?;
+                    let mut script = zsh_chain_script(name);
+                    if name == ".zshrc" && self.cwd_sink.is_some() {
+                        script.push_str(POSIX_CWD_SINK);
+                    }
+                    write_bootstrap(&directory.join(name), script)?;
                 }
                 // Preserve whether the user's ZDOTDIR was set: an unset value
                 // must stay unset so zsh uses $HOME for later startup files and
@@ -250,7 +292,14 @@ impl ShellLaunchPlan {
             }
             "fish" => {
                 let path = directory.join("init.fish");
-                fs::write(&path, FISH)?;
+                write_bootstrap(
+                    &path,
+                    if self.cwd_sink.is_some() {
+                        FISH_CWD_SINK
+                    } else {
+                        FISH
+                    },
+                )?;
                 self.set_env("MADE_FISH_INIT", path.into_os_string());
                 self.request.args.extend([
                     "--interactive".into(),
@@ -260,7 +309,7 @@ impl ShellLaunchPlan {
             }
             _ => {
                 let path = directory.join("init.ps1");
-                fs::write(&path, POWERSHELL)?;
+                write_bootstrap(&path, POWERSHELL)?;
                 self.request
                     .args
                     .extend(["-NoExit".into(), "-File".into(), path.into_os_string()]);
@@ -268,6 +317,155 @@ impl ShellLaunchPlan {
         }
         Ok(())
     }
+}
+
+// A fresh, fixed helper invocation, not discovery injected into a live shell.
+// Unix datagram send is nonblocking and bounded; a full sink is retried at the
+// next prompt. Quoted argv preserves spaces/newlines/non-UTF8 POSIX path bytes.
+const POSIX_CWD_SINK: &str = r#"
+__made_cwd() {
+    "$MADE_CWD_REPORTER" cwd-report "$MADE_CWD_SOCKET" "$PWD" >/dev/null 2>&1 || :
+}
+"#;
+const FISH_CWD_SINK: &str = r#"
+function __made_cwd --on-event fish_prompt
+    "$MADE_CWD_REPORTER" cwd-report "$MADE_CWD_SOCKET" "$PWD" >/dev/null 2>&1
+end
+"#;
+
+/// Private datagram sink survives SSH detach when owned by the supervisor.
+/// Reports are raw POSIX bytes, not host paths and not filesystem attestation.
+#[cfg(unix)]
+pub struct CwdReportSink {
+    socket: std::os::unix::net::UnixDatagram,
+    directory: PathBuf,
+    path: PathBuf,
+}
+#[cfg(unix)]
+impl CwdReportSink {
+    pub fn new(parent: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let directory = parent.join(format!(
+            "cwd-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let path = directory.join("report.sock");
+        let socket = match std::os::unix::net::UnixDatagram::bind(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = fs::remove_dir(&directory);
+                return Err(e);
+            }
+        };
+        publish_private_socket(socket.as_raw_fd(), &path)?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            directory,
+            path,
+        })
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// Bounded work, returns latest report. The caller must validate the real
+    /// directory on this authority before publishing it as shell cwd.
+    pub fn poll(&self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut latest = None;
+        let mut bytes = [0; 4097];
+        for _ in 0..32 {
+            match self.socket.recv(&mut bytes) {
+                Ok(n) if n <= 4096 && valid_report(&bytes[..n]) => {
+                    latest = Some(bytes[..n].to_vec())
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(latest)
+    }
+}
+#[cfg(unix)]
+impl Drop for CwdReportSink {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+fn write_bootstrap(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(contents.as_ref())?;
+        // umask can only clear bits, but fchmod publishes the exact owner-only
+        // mode even if a later caller inspects the inode before drop.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents)
+    }
+}
+
+#[cfg(unix)]
+fn publish_private_socket(fd: std::os::fd::RawFd, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    // SAFETY: fd is the datagram socket just bound in a 0700 directory.
+    // fchmod removes the umask-dependent group/other bits bind published.
+    // macOS returns EINVAL for fchmod on a datagram socket; fall back to chmod
+    // of the inode after proving the path is a socket and not a symlink.
+    if unsafe { libc::fchmod(fd, 0o600) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+        return Err(error);
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || meta.permissions().mode() & 0o777 != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cwd socket is not owner-only",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_report(bytes: &[u8]) -> bool {
+    bytes.first() == Some(&b'/')
+        && bytes.len() <= 4096
+        && !bytes.contains(&0)
+        && (bytes == b"/"
+            || !bytes[1..]
+                .split(|b| *b == b'/')
+                .any(|part| part.is_empty() || part == b"." || part == b".."))
+}
+/// Companion `cwd-report SOCKET PATH` entry mode. No terminal output or file
+/// writes. Full/unavailable sink fails immediately; normal shell startup lives.
+#[cfg(unix)]
+pub fn emit_cwd_report(socket: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if !valid_report(bytes) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let sender = std::os::unix::net::UnixDatagram::unbound()?;
+    sender.set_nonblocking(true)?;
+    sender.send_to(bytes, socket)?;
+    Ok(())
 }
 
 // This is a fresh, noninteractive preflight process, never a command injected

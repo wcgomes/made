@@ -28,6 +28,71 @@ pub trait FocusSink {
     fn request_state(&self) -> Result<String, String>;
 }
 
+/// Forwards focus and state refresh to a remote command queue.
+///
+/// The sink does not open a local bridge and does not read the host filesystem.
+/// Correlation ids are decimal strings of the remote request id. Cancellation
+/// is the caller's `cancel` of that id; a transport break must drop the queue
+/// rather than replay it.
+pub struct RemoteFocusSink {
+    pending: std::sync::Mutex<Vec<made_remote::protocol::SessionCommand>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl RemoteFocusSink {
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(Vec::new()),
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    /// Take queued commands. Empty after a disconnect so nothing is replayed.
+    pub fn drain(&self) -> Vec<made_remote::protocol::SessionCommand> {
+        self.pending
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    pub fn cancel_all(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+    }
+}
+
+impl Default for RemoteFocusSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FocusSink for RemoteFocusSink {
+    fn send_focus(&self, session_id: &str) -> Result<String, String> {
+        if session_id.is_empty() || session_id.chars().any(char::is_control) {
+            return Err("focus session id is empty or contains controls".to_owned());
+        }
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending
+            .lock()
+            .map_err(|_| "focus sink unavailable".to_owned())?
+            .push(made_remote::protocol::SessionCommand::Focus {
+                session_id: session_id.to_owned(),
+            });
+        Ok(id.to_string())
+    }
+
+    fn request_state(&self) -> Result<String, String> {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending
+            .lock()
+            .map_err(|_| "focus sink unavailable".to_owned())?
+            .push(made_remote::protocol::SessionCommand::State);
+        Ok(id.to_string())
+    }
+}
+
 impl FocusSink for BridgeHandle {
     fn send_focus(&self, session_id: &str) -> Result<String, String> {
         BridgeHandle::focus(self, session_id).map_err(|error| error.to_string())
@@ -412,5 +477,26 @@ impl SessionFocusController {
             state_refresh,
             in_flight: self.pending.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_focus_sink_queues_without_a_local_bridge_and_cancel_drops_it() {
+        let sink = RemoteFocusSink::new();
+        let id = sink.send_focus("session-1").unwrap();
+        assert!(!id.is_empty());
+        assert!(sink.send_focus("bad\nid").is_err());
+        let queued = sink.drain();
+        assert!(matches!(
+            queued.as_slice(),
+            [made_remote::protocol::SessionCommand::Focus { session_id }] if session_id == "session-1"
+        ));
+        sink.request_state().unwrap();
+        sink.cancel_all();
+        assert!(sink.drain().is_empty());
     }
 }

@@ -1631,8 +1631,11 @@ dependencies = [
  "made-bridge",
  "made-explorer",
  "made-platform",
+ "made-remote",
  "made-terminal",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tungstenite",
 ]
@@ -1670,8 +1673,25 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "portable-pty",
  "raw-window-handle",
+ "tempfile",
  "window-vibrancy",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "made-remote"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "made-bridge",
+ "made-explorer",
+ "made-platform",
+ "made-terminal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

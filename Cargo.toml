@@ -5,6 +5,7 @@ members = [
     "crates/made-bridge",
     "crates/made-explorer",
     "crates/made-platform",
+    "crates/made-remote",
     "crates/made-terminal",
 ]
 

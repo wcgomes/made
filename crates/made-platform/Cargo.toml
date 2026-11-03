@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["desktop"]
+desktop = ["dep:arboard", "dep:image", "dep:raw-window-handle", "dep:objc2", "dep:objc2-app-kit", "dep:window-vibrancy"]
+
 [dependencies]
 # Text and RGBA image clipboard. X11 is used when available;
 # wayland-data-control adds the native Wayland clipboard path required by the
@@ -12,23 +16,23 @@ publish.workspace = true
 arboard = { version = "3.7", default-features = false, features = [
     "wayland-data-control",
     "image-data",
-] }
+], optional = true }
 # PNG encoding for clipboard images saved as private files. Kept in the platform
 # crate so the app never depends on the image crate directly.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 # POSIX PTY and Windows ConPTY behind one cross-platform interface.
 portable-pty = "0.9"
 # Unix file modes, process-group signalling, and O_NOFOLLOW for local logs.
 libc = "0.2"
 # Narrow window-handle contract used by the optional native backdrop.
-raw-window-handle = "0.6"
+raw-window-handle = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Optional NSVisualEffectView vibrancy; the in-app glass remains the fallback.
 # The effect view is inserted behind the eframe content view, so this crate
 # talks to AppKit directly instead of using window-vibrancy's subview helper.
-objc2 = "0.6"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, optional = true, features = [
     "std",
     "NSGraphics",
     "NSResponder",
@@ -38,11 +42,22 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Mica only: window-vibrancy documents resize lag for Windows acrylic/blur.
-window-vibrancy = "0.8.1"
+window-vibrancy = { version = "0.8.1", optional = true }
 # Scoped ConPTY descendant cleanup through a kill-on-close Job Object.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+[[bin]]
+name = "made-askpass"
+path = "src/bin/made-askpass.rs"
+
+[dev-dependencies]
+tempfile = "3"

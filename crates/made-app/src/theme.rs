@@ -885,6 +885,8 @@ pub enum IconGlyph {
     Folders,
     /// Forked chevrons: linked-worktree mark in the REPOS header.
     LinkedWorktree,
+    /// Two-bay rack: SSH server management. Not a key.
+    Servers,
 }
 
 /// Linked-worktree mark beside the worktree name. Not the source-control toggle.
@@ -1164,6 +1166,17 @@ fn paint_icon_with(
                 ],
                 stroke,
             );
+        }
+        IconGlyph::Servers => {
+            // Rack face, not a key and not a 14×11 panel. The Explorer and
+            // terminal glyph finders key on that size. Two bays stay readable
+            // inside the 14px menu slot.
+            let body = egui::Rect::from_center_size(center, egui::vec2(12.0, 10.0));
+            painter.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Middle);
+            for y in [-2.15, 2.15] {
+                painter.circle_filled(point(-3.35, y), 0.85, color);
+                line(vec![point(-1.7, y), point(4.0, y)]);
+            }
         }
         IconGlyph::LinkedWorktree => {
             // Worktree-compact: a short stem forks into two right-pointing

@@ -237,6 +237,14 @@ pub enum SnapshotError {
     },
 }
 
+/// Path syntax is explicit at a remote boundary; native validation stays default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathSemantics {
+    #[default]
+    NativeLocal,
+    RemotePosix,
+}
+
 impl SessionSnapshot {
     /// Validate the snapshot against the protocol limits and identity rules.
     ///
@@ -255,6 +263,15 @@ impl SessionSnapshot {
     /// `activeSessionID` must name it; a snapshot with neither is valid (the
     /// transient no-active-tab state).
     pub fn validate(&self) -> Result<(), SnapshotError> {
+        self.validate_with_path_semantics(PathSemantics::NativeLocal)
+    }
+
+    /// Validate remote POSIX syntax without canonicalizing or touching host fs.
+    /// All non-path protocol/identity limits are identical to native validation.
+    pub fn validate_with_path_semantics(
+        &self,
+        semantics: PathSemantics,
+    ) -> Result<(), SnapshotError> {
         if self.revision == 0 {
             return Err(SnapshotError::ZeroRevision);
         }
@@ -265,7 +282,7 @@ impl SessionSnapshot {
             });
         }
         if let Some(view_directory) = &self.view_directory {
-            validate_view_directory(view_directory)?;
+            validate_view_directory(view_directory, semantics)?;
         }
 
         let mut seen = HashSet::with_capacity(self.sessions.len());
@@ -304,10 +321,10 @@ impl SessionSnapshot {
             }
 
             if let Some(directory) = &session.directory {
-                validate_directory(index, directory)?;
+                validate_directory(index, directory, semantics)?;
             }
             if let Some(subpath) = &session.subpath {
-                validate_subpath(index, subpath)?;
+                validate_subpath(index, subpath, semantics)?;
             }
             if let Some(project_id) = &session.project_id {
                 validate_project_id(index, project_id)?;
@@ -354,7 +371,11 @@ impl SessionSnapshot {
     }
 }
 
-fn validate_directory(index: usize, path: &Path) -> Result<(), SnapshotError> {
+fn validate_directory(
+    index: usize,
+    path: &Path,
+    semantics: PathSemantics,
+) -> Result<(), SnapshotError> {
     let raw = path.to_string_lossy();
     let length = raw.chars().count();
     if length > MAX_PATH_CHARS {
@@ -374,14 +395,10 @@ fn validate_directory(index: usize, path: &Path) -> Result<(), SnapshotError> {
             field: "directory",
         });
     }
-    if !path.is_absolute() {
+    if !semantics.is_absolute(path, &raw) {
         return Err(SnapshotError::DirectoryNotAbsolute { index });
     }
-    if has_dot_segment(&raw)
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if semantics.has_traversal(path, &raw) {
         return Err(SnapshotError::PathTraversal {
             index,
             field: "directory",
@@ -390,7 +407,7 @@ fn validate_directory(index: usize, path: &Path) -> Result<(), SnapshotError> {
     Ok(())
 }
 
-fn validate_view_directory(path: &Path) -> Result<(), SnapshotError> {
+fn validate_view_directory(path: &Path, semantics: PathSemantics) -> Result<(), SnapshotError> {
     let raw = path.to_string_lossy();
     let length = raw.chars().count();
     if length > MAX_PATH_CHARS {
@@ -405,20 +422,20 @@ fn validate_view_directory(path: &Path) -> Result<(), SnapshotError> {
     if raw.contains('\0') {
         return Err(SnapshotError::NulInViewDirectory);
     }
-    if !path.is_absolute() {
+    if !semantics.is_absolute(path, &raw) {
         return Err(SnapshotError::ViewDirectoryNotAbsolute);
     }
-    if has_dot_segment(&raw)
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
+    if semantics.has_traversal(path, &raw) {
         return Err(SnapshotError::ViewDirectoryTraversal);
     }
     Ok(())
 }
 
-fn validate_subpath(index: usize, subpath: &str) -> Result<(), SnapshotError> {
+fn validate_subpath(
+    index: usize,
+    subpath: &str,
+    semantics: PathSemantics,
+) -> Result<(), SnapshotError> {
     let length = subpath.chars().count();
     if length > MAX_PATH_CHARS {
         return Err(SnapshotError::PathTooLong {
@@ -436,6 +453,18 @@ fn validate_subpath(index: usize, subpath: &str) -> Result<(), SnapshotError> {
     }
 
     let path = Path::new(subpath);
+    if semantics == PathSemantics::RemotePosix {
+        if subpath.starts_with('/') {
+            return Err(SnapshotError::SubpathNotRelative { index });
+        }
+        if subpath.split('/').any(|s| s == "." || s == "..") {
+            return Err(SnapshotError::PathTraversal {
+                index,
+                field: "subpath",
+            });
+        }
+        return Ok(());
+    }
     if path.is_absolute()
         || path.has_root()
         || path
@@ -480,6 +509,27 @@ fn has_dot_segment(raw: &str) -> bool {
         .any(|segment| segment == "." || segment == "..")
 }
 
+impl PathSemantics {
+    fn is_absolute(self, path: &Path, raw: &str) -> bool {
+        match self {
+            Self::NativeLocal => path.is_absolute(),
+            Self::RemotePosix => raw.starts_with('/'),
+        }
+    }
+
+    fn has_traversal(self, path: &Path, raw: &str) -> bool {
+        match self {
+            Self::NativeLocal => {
+                has_dot_segment(raw)
+                    || path
+                        .components()
+                        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+            }
+            Self::RemotePosix => raw.split('/').any(|s| s == "." || s == ".."),
+        }
+    }
+}
+
 fn has_parent_segment(raw: &str) -> bool {
     raw.split(std::path::is_separator)
         .any(|segment| segment == "..")
@@ -508,7 +558,16 @@ impl SnapshotTracker {
     /// high-water mark. Stale snapshots are rejected with
     /// [`SnapshotError::StaleRevision`] and leave the tracker unchanged.
     pub fn accept(&mut self, snapshot: SessionSnapshot) -> Result<SessionSnapshot, SnapshotError> {
-        snapshot.validate()?;
+        self.accept_with_path_semantics(snapshot, PathSemantics::NativeLocal)
+    }
+
+    /// Explicit remote validation, retaining the same revision/epoch rules.
+    pub fn accept_with_path_semantics(
+        &mut self,
+        snapshot: SessionSnapshot,
+        semantics: PathSemantics,
+    ) -> Result<SessionSnapshot, SnapshotError> {
+        snapshot.validate_with_path_semantics(semantics)?;
         if snapshot.revision <= self.last_revision {
             return Err(SnapshotError::StaleRevision {
                 revision: snapshot.revision,

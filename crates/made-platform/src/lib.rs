@@ -86,7 +86,7 @@
 //!
 //! # Native backdrop
 //!
-//! [`native_backdrop`] optionally applies macOS vibrancy or Windows Mica to the
+//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Mica to the
 //! app window once at startup. Platforms without a portable native backdrop,
 //! disabled configurations, and failed attempts keep Made's current in-app
 //! glass. The module never uses Windows acrylic/blur, whose resize lag is a
@@ -115,10 +115,16 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod private_metadata;
+pub use private_metadata::{
+    read_private_metadata, write_private_metadata_atomic, MAX_PRIVATE_METADATA_BYTES,
+};
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(feature = "desktop")]
 pub mod native_backdrop;
 #[cfg(target_os = "windows")]
 pub mod windows;
@@ -1821,6 +1827,7 @@ impl ClipboardImage {
     }
 
     /// Encode this image as PNG.
+    #[cfg(feature = "desktop")]
     pub fn to_png(&self) -> Result<Vec<u8>, PlatformError> {
         use image::ImageEncoder as _;
 
@@ -1837,6 +1844,14 @@ impl ClipboardImage {
                 PlatformError::message(format!("clipboard image PNG encoding failed: {error}"))
             })?;
         Ok(png)
+    }
+
+    /// PNG encoding requires the desktop feature; companions accept encoded PNGs.
+    #[cfg(not(feature = "desktop"))]
+    pub fn to_png(&self) -> Result<Vec<u8>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "PNG encoding disabled in headless build".into(),
+        ))
     }
 
     fn validate(&self) -> Result<(), PlatformError> {
@@ -2132,6 +2147,7 @@ impl Clipboard for InMemoryClipboard {
 /// Construction fails cleanly when no display server is available, which is
 /// why the platform contract tests use [`InMemoryClipboard`] instead.
 pub struct SystemClipboard {
+    #[cfg(feature = "desktop")]
     inner: arboard::Clipboard,
 }
 
@@ -2142,6 +2158,7 @@ impl fmt::Debug for SystemClipboard {
 }
 
 impl SystemClipboard {
+    #[cfg(feature = "desktop")]
     pub fn new() -> Result<Self, PlatformError> {
         arboard::Clipboard::new()
             .map(|inner| Self { inner })
@@ -2149,8 +2166,16 @@ impl SystemClipboard {
                 PlatformError::Unsupported(format!("system clipboard unavailable: {err}"))
             })
     }
+
+    #[cfg(not(feature = "desktop"))]
+    pub fn new() -> Result<Self, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
 }
 
+#[cfg(feature = "desktop")]
 impl Clipboard for SystemClipboard {
     fn get_text(&mut self) -> Result<String, PlatformError> {
         self.inner
@@ -2186,6 +2211,25 @@ impl Clipboard for SystemClipboard {
                 "clipboard image read failed: {error}"
             ))),
         }
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+impl Clipboard for SystemClipboard {
+    fn get_text(&mut self) -> Result<String, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
+    fn set_text(&mut self, _text: &str) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
+    }
+    fn get_image(&mut self) -> Result<Option<ClipboardImage>, PlatformError> {
+        Err(PlatformError::Unsupported(
+            "system clipboard disabled in headless build".into(),
+        ))
     }
 }
 
@@ -2928,7 +2972,16 @@ fn map_exit_status(status: portable_pty::ExitStatus) -> ExitStatus {
 pub fn in_memory_clipboard() -> InMemoryClipboard {
     InMemoryClipboard::new()
 }
-mod shell_integration;
+mod detach;
+pub mod shell_integration;
+pub mod ssh;
+pub mod ssh_askpass;
+pub use detach::{
+    create_private_directory_new, create_private_file_new, ensure_private_directory,
+    exec_remote_child, lock_private_file, read_private_file, remote_path_bytes,
+    remote_path_from_bytes, remote_program_version_supported, remote_target,
+    spawn_detached_command,
+};
 pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
 
 #[cfg(test)]
