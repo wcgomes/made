@@ -905,11 +905,20 @@ mod unix {
         if !meta.is_file()
             || meta.uid() != current_euid()
             || meta.nlink() != 1
-            || meta.mode() & 0o777 != mode as u32
+            || meta.mode() & 0o777 != mode_bits(mode)
         {
             return Err(denied("private file is not owner-only"));
         }
         Ok(())
+    }
+
+    /// Zero-extend `mode_t` for the permission comparison.
+    ///
+    /// `mode_t` is `u16` on macOS and `u32` on Linux. `as u32` is an unnecessary
+    /// cast on Linux, and `u32::from` is a useless conversion there. `u64::from`
+    /// is a real widening on both widths, so the compared bits stay the same.
+    fn mode_bits(mode: libc::mode_t) -> u32 {
+        u32::try_from(u64::from(mode)).expect("mode_t fits in u32")
     }
 
     fn fchmod(file: &File, mode: libc::mode_t) -> Result<(), PlatformError> {

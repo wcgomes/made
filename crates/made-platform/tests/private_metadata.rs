@@ -4,14 +4,14 @@ use std::path::PathBuf;
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        let name = format!(
-            "made-metadata-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let call = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let name = format!("made-metadata-test-{}-{nanos}-{call}", std::process::id());
         Self(std::env::temp_dir().join(name))
     }
 }

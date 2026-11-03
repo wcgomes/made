@@ -482,15 +482,28 @@ fn valid_report(bytes: &[u8]) -> bool {
 }
 /// Companion `cwd-report SOCKET PATH` entry mode. No terminal output or file
 /// writes. Full/unavailable sink fails immediately; normal shell startup lives.
-#[cfg(unix)]
+///
+/// The signature is the same on every target. Unix sends one datagram. Windows
+/// returns [`std::io::ErrorKind::Unsupported`] and does not send one.
 pub fn emit_cwd_report(socket: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if !valid_report(bytes) {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
-    let sender = std::os::unix::net::UnixDatagram::unbound()?;
-    sender.set_nonblocking(true)?;
-    sender.send_to(bytes, socket)?;
-    Ok(())
+    #[cfg(unix)]
+    {
+        let sender = std::os::unix::net::UnixDatagram::unbound()?;
+        sender.set_nonblocking(true)?;
+        sender.send_to(bytes, socket)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cwd report datagrams are unsupported on this platform",
+        ))
+    }
 }
 
 // This is a fresh, noninteractive preflight process, never a command injected
