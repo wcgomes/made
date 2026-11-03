@@ -1764,6 +1764,11 @@ impl Workbench {
             }
             crate::remote_session::SshPromptClass::Secret { .. } => {
                 if accept {
+                    if crate::credential_cache::is_password_prompt(&prompt.text) {
+                        if let Some(authority) = self.remote_authority() {
+                            crate::credential_cache::remember(authority, &draft);
+                        }
+                    }
                     match made_platform::ssh_askpass::PromptAnswer::new(draft.into_bytes()) {
                         Ok(answer) => self.deliver_remote_answer(prompt.id, Some(answer)),
                         Err(_) => {
@@ -2080,6 +2085,24 @@ impl Workbench {
             }
             return;
         }
+        if matches!(class, crate::remote_session::SshPromptClass::Secret { .. })
+            && crate::credential_cache::is_password_prompt(&prompt.text)
+        {
+            if let Some(answer) = crate::credential_cache::answer(remote.snapshot.server().id()) {
+                if let Some(probe) = remote.probe.as_ref() {
+                    let _ = probe.answer(prompt.id, Some(answer));
+                    return;
+                }
+                if let Some(stage) = remote.stage.as_ref() {
+                    let _ = stage.answer(prompt.id, Some(answer));
+                    return;
+                }
+                if let Some(client) = remote.client.as_ref() {
+                    let _ = client.answer_prompt(prompt.id, Some(answer));
+                    return;
+                }
+            }
+        }
         remote.prompt = Some(prompt);
     }
 
@@ -2187,6 +2210,11 @@ impl Workbench {
             LogLevel::Error,
             format!("remote attempt failed: {}", error.detail),
         );
+        if error.class == crate::remote_session::SshFailureClass::AuthFailed {
+            if let Some(authority) = self.remote_authority() {
+                crate::credential_cache::forget(authority);
+            }
+        }
         let Some(remote) = self.remote.as_mut() else {
             return;
         };

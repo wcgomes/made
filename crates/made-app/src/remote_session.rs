@@ -33,7 +33,7 @@ impl SshFailureClass {
             Self::ChangedHostKey => {
                 "The server key changed. Made refused the connection and will not accept it through first-use approval."
             }
-            Self::AuthFailed => "Authentication failed. No password was stored.",
+            Self::AuthFailed => "Authentication failed. The in-memory password was discarded.",
             Self::Timeout => "The SSH attempt timed out.",
             Self::Cancelled => "The SSH attempt was cancelled. Other workspaces were not touched.",
             Self::MissingCapability => {

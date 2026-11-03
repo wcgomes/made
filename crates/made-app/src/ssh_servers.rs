@@ -1077,7 +1077,9 @@ pub fn probe_failure_detail(code: ErrorCode) -> &'static str {
         ErrorCode::Unavailable => {
             "OpenSSH or the packaged askpass helper is unavailable. Made will not fall back to an insecure login."
         }
-        ErrorCode::Unauthorized => "The server rejected authentication. No password was stored.",
+        ErrorCode::Unauthorized => {
+            "The server rejected authentication. The in-memory password was discarded."
+        }
         ErrorCode::Timeout => "The connection test timed out. Cancel and try again.",
         ErrorCode::Cancelled => "The connection test was cancelled. Other workspaces were not touched.",
         ErrorCode::InvalidRequest => {

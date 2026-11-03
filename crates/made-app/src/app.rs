@@ -626,7 +626,8 @@ impl AppModel {
             workbench.grant_remote_consent();
         }
         self.ssh_notice = Some(
-            "Provisioning approved for this server and version. No password was stored.".to_owned(),
+            "Provisioning approved for this server and version. No password was written to disk."
+                .to_owned(),
         );
         Ok(())
     }
@@ -852,11 +853,16 @@ impl AppModel {
             registry
                 .edit(id, metadata)
                 .map_err(|error| error.to_string())?;
+            // Host, user, or port may have changed; never reuse the old secret.
+            crate::credential_cache::forget(id);
             self.ssh_notice = Some("Saved. Open workspaces keep their original server.".to_owned());
         } else {
             let id = registry.add(metadata).map_err(|error| error.to_string())?;
             self.ssh_selected = Some(id);
-            self.ssh_notice = Some("Server saved. No password was stored.".to_owned());
+            self.ssh_notice = Some(
+                "Server saved. Passwords stay in memory until Made closes; never on disk."
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -867,6 +873,7 @@ impl AppModel {
             .ok_or_else(|| "Select a server to remove.".to_owned())?;
         let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
         registry.remove(id).map_err(|error| error.to_string())?;
+        crate::credential_cache::forget(id);
         self.ssh_selected = None;
         self.ssh_host_key_changed = false;
         self.ssh_draft = SshDraft::default();
@@ -976,11 +983,16 @@ impl AppModel {
                 }
             }
             crate::remote_session::SshPromptClass::Secret { .. } => {
+                let remember = accept && crate::credential_cache::is_password_prompt(&prompt.text);
+                let text = std::mem::take(&mut self.prompt_draft);
+                if remember {
+                    if let Some(authority) = self.ssh_selected {
+                        crate::credential_cache::remember(authority, &text);
+                    }
+                }
                 let answer = if accept {
-                    let text = std::mem::take(&mut self.prompt_draft);
                     made_platform::ssh_askpass::PromptAnswer::new(text.into_bytes()).ok()
                 } else {
-                    self.prompt_draft.clear();
                     None
                 };
                 if let Some(probe) = self.probe.as_ref() {
@@ -1040,18 +1052,17 @@ impl AppModel {
             initial_directory: directory,
         };
         metadata.validate().map_err(|_| {
-            "Check the name, host, user, port, and key file. Passwords are not stored.".to_owned()
+            "Check the name, host, user, port, and key file. Passwords are never written to disk.".to_owned()
         })?;
         Ok(metadata)
     }
 
     fn poll_ssh_probe(&mut self) {
-        if let Some(probe) = self.probe.as_ref() {
-            if self.ssh_prompt.is_none() {
-                self.ssh_prompt = probe.poll_prompt();
-                if self.ssh_prompt.is_some() {
-                    self.show_ssh = true;
-                }
+        if self.probe.is_some() && self.ssh_prompt.is_none() {
+            self.ssh_prompt = self.probe.as_ref().and_then(ProbeAttempt::poll_prompt);
+            if self.ssh_prompt.is_some() {
+                self.show_ssh = true;
+                self.try_cached_ssh_password();
             }
         }
         let finished = self.probe.as_ref().and_then(ProbeAttempt::poll);
@@ -1060,6 +1071,14 @@ impl AppModel {
             self.probe = None;
             self.ssh_prompt = None;
             self.prompt_draft.clear();
+            if matches!(
+                &result,
+                Err(error) if error.class == crate::remote_session::SshFailureClass::AuthFailed
+            ) {
+                if let Some(authority) = self.ssh_selected {
+                    crate::credential_cache::forget(authority);
+                }
+            }
             if let (Some(ticket), Ok(registry)) = (ticket, self.ssh.as_mut()) {
                 let stored = match &result {
                     Ok(capabilities) => Ok(capabilities.clone()),
@@ -1086,6 +1105,33 @@ impl AppModel {
                 },
             });
         }
+    }
+
+    /// Answer a password prompt from the process-lifetime cache. The card is
+    /// suppressed only when a password is already available for this server.
+    fn try_cached_ssh_password(&mut self) {
+        let Some(prompt) = self.ssh_prompt.as_ref() else {
+            return;
+        };
+        if !crate::credential_cache::is_password_prompt(&prompt.text)
+            || !matches!(
+                crate::remote_session::classify_prompt(&prompt.text),
+                crate::remote_session::SshPromptClass::Secret { .. }
+            )
+        {
+            return;
+        }
+        let Some(authority) = self.ssh_selected else {
+            return;
+        };
+        let Some(answer) = crate::credential_cache::answer(authority) else {
+            return;
+        };
+        let Some(probe) = self.probe.as_ref() else {
+            return;
+        };
+        let _ = probe.answer(prompt.id, Some(answer));
+        self.ssh_prompt = None;
     }
 
     /// Look up a live owner; closed identities never resolve again.

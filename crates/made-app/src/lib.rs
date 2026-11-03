@@ -12,6 +12,7 @@
 pub mod app;
 mod cell_glyphs;
 pub mod cli;
+mod credential_cache;
 pub mod diagnostics;
 pub mod explorer_icons;
 pub mod explorer_view;
