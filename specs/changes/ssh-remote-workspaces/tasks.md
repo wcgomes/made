@@ -121,8 +121,8 @@ Native-supervisor delta:
 - [ ] SSH-01 through SSH-09 model/regression tests pass with inherited local suites. Shared desktop files are sequential to avoid conflicting Workbench/UI ownership. No local cwd/session/file validation is weakened to accept remote strings. User action errors stay visible, routine diagnostics stay in About.
 
 ## 5. Native builds, packaging and end-to-end verification — E after integration
-- [ ] 5.1 Add four headless companion target builds (glibc >=2.31 x64/arm64 and macOS >=12 x64/arm64), hash/plugin artifact manifest, target-runtime tests and askpass host binaries; no GUI dependency in companion. (path: .github/workflows/ci-ssh-remote.yml)
-- [ ] 5.2 Assemble every desktop package with all remote target binaries/plugin/manifest plus its native askpass executable; missing/mismatched artifacts fail packaging, not runtime download. (path: .github/workflows/ci-artifacts.yml)
+- [x] 5.1 Add four headless companion target builds (glibc >=2.31 x64/arm64 and macOS >=12 x64/arm64), hash/plugin artifact manifest, target-runtime tests and askpass host binaries; no GUI dependency in companion. (path: .github/workflows/ci-ssh-remote.yml)
+- [x] 5.2 Assemble every desktop package with all remote target binaries/plugin/manifest plus its native askpass executable; missing/mismatched artifacts fail packaging, not runtime download. (path: .github/workflows/ci-artifacts.yml)
 - [ ] 5.3 Execute real native client/server matrix with tmux absent, both window sizes, all auth methods, hooks/config hashes, remote explorer/Git/live preview, both image chords, same-session loss/reattach/expiry/close, loopback scans, compromised-response containment and network profiles; label unavailable combinations unverified and block full release acceptance. Do not install tmux or Rust as part of the run. (path: tests/ssh/parity.py)
 - [ ] 5.4 Run cargo workspace tests, fmt/clippy/target/package checks, existing plugin Node 24 tests/typecheck, and local UI regression under concurrent stalled remote work; attach scenario-level results inline in the review/handoff rather than creating unrelated report files. (path: tests/ssh/harness.py)
 
