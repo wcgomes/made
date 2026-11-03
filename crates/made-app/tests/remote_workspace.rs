@@ -607,3 +607,21 @@ fn bounded_requests_and_outside_root_require_explicit_grant() {
     }
     assert!(workspace.request(Operation::SessionState, None).is_err());
 }
+
+#[test]
+fn root_port_resolution_updates_the_workspace_generation() {
+    let mut workspace = model(3);
+    let id = workspace.select_root(path("/project/src")).unwrap();
+    let command = workspace.next_command().unwrap();
+    assert_eq!(command.request_id, id);
+    let resolution = made_remote::protocol::RootResolution {
+        identity: command.identity.clone(),
+        request_id: id,
+        result: Ok(path("/project/src")),
+        generation: 2,
+    };
+    let result = workspace.accept_root(resolution).unwrap();
+    assert!(matches!(result, Some(RemoteResult::Root(root)) if root == path("/project/src")));
+    assert_eq!(workspace.identity().generation, 2);
+    assert_eq!(workspace.root(), &path("/project/src"));
+}

@@ -2376,6 +2376,31 @@ impl Workbench {
                     }
                     let _ = remote.workspace.accept(reply);
                 }
+                // Root and session results use dedicated client ports. They
+                // still belong to workspace request ids and must be applied
+                // through the same id map as the generic queue.
+                use made_remote::protocol::{RootResolver, SessionCommandSink};
+                let mut resolver = client.root_resolver();
+                while let Some(mut resolution) = resolver.poll() {
+                    if let Some(workspace_id) = remote.id_map.remove(&resolution.request_id) {
+                        resolution.request_id = workspace_id;
+                    } else {
+                        continue;
+                    }
+                    let generation = resolution.generation;
+                    if let Ok(Some(crate::remote_workspace::RemoteResult::Root(path))) =
+                        remote.workspace.accept_root(resolution)
+                    {
+                        let _ = client.set_root(path, generation);
+                    }
+                }
+                let mut sessions = client.session_sink();
+                while let Some(mut reply) = sessions.poll() {
+                    if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                        reply.request_id = workspace_id;
+                    }
+                    let _ = remote.workspace.accept(reply);
+                }
                 (attach_reply, upload_replies, seen, false)
             }
         };
@@ -2416,7 +2441,13 @@ impl Workbench {
                     continue;
                 }
                 let workspace_id = command.request_id;
-                match client.request(command.operation, None) {
+                let operation = command.operation;
+                let grant = match &operation {
+                    made_remote::protocol::Operation::RootSelect { path }
+                    | made_remote::protocol::Operation::RootValidate { path } => Some(path.clone()),
+                    _ => None,
+                };
+                match client.request(operation, grant.as_ref()) {
                     Ok(client_id) => {
                         remote.id_map.insert(client_id, workspace_id);
                     }

@@ -369,6 +369,39 @@ impl RemoteWorkspace {
         self.pending.remove(&request_id).is_some()
     }
 
+    /// Feed a root-port resolution back into the workspace projection. The
+    /// client keeps root and session replies on dedicated ports; the desktop
+    /// pump is responsible for draining them in the same order as the request
+    /// ids it maps.
+    pub fn accept_root(
+        &mut self,
+        resolution: made_remote::protocol::RootResolution,
+    ) -> Result<Option<RemoteResult>, ProtocolError> {
+        let requested = match self
+            .pending
+            .get(&resolution.request_id)
+            .map(|pending| &pending.request.operation)
+        {
+            Some(Operation::RootSelect { path }) | Some(Operation::RootValidate { path }) => {
+                path.clone()
+            }
+            _ => return Err(ProtocolError::Identity),
+        };
+        let operation = match resolution.result {
+            Ok(path) => Operation::RootResult {
+                requested,
+                path,
+                generation: resolution.generation,
+            },
+            Err(code) => Operation::Error { code },
+        };
+        self.accept(WireEnvelope::new(
+            resolution.identity,
+            resolution.request_id,
+            operation,
+        ))
+    }
+
     /// Reject stale, unsolicited, mismatched or malformed replies before applying.
     pub fn accept(&mut self, reply: WireEnvelope) -> Result<Option<RemoteResult>, ProtocolError> {
         if self.connection != ConnectionState::Connected || !reply.identity.matches(&self.identity)
