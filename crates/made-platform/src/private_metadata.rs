@@ -933,10 +933,48 @@ mod backend {
             }
         }
     }
-    /// Give a regular app-owned file the current user as owner and a protected
-    /// full-allow DACL. Used before rotating a log so the rename has DELETE.
+    /// Give an existing regular file a protected full-allow DACL for the
+    /// current user. The owner is left untouched: changing an owner can require
+    /// restore privilege, while WRITE_DAC on an inherited file is enough to let
+    /// a rotation rename delete it.
     pub fn tighten_file(path: &Path) -> io::Result<()> {
-        assign_owner_only_path(&wide(path)?)
+        let wide_path = wide(path)?;
+        let user = current_user_sid()?;
+        let mut acl = AclBuf([0; 256]);
+        // SAFETY: aligned ACL buffer larger than one allow ACE for a maximum
+        // SID; the user SID stays live for the call.
+        if unsafe { InitializeAcl(acl.0.as_mut_ptr().cast(), acl.0.len() as u32, ACL_REVISION) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            AddAccessAllowedAce(
+                acl.0.as_mut_ptr().cast(),
+                ACL_REVISION,
+                FILE_ALL_ACCESS,
+                user.as_psid(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl.0.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
     }
     pub fn replace(_root: &File, directory: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::rename(directory.join(from), directory.join(to))
