@@ -37,11 +37,23 @@ fn paths() -> io::Result<made_platform::AppPaths> {
     )))
 }
 fn find(name: &str) -> io::Result<PathBuf> {
-    let path = Environment::current()
-        .get("PATH")
-        .map(OsStr::to_owned)
-        .ok_or_else(fail)?;
-    made_platform::find_executable_on_path(OsStr::new(name), &path).ok_or_else(fail)
+    let environment = Environment::current();
+    if let Some(path) = environment.get("PATH") {
+        if let Some(found) = made_platform::find_executable_on_path(OsStr::new(name), &path) {
+            return Ok(found);
+        }
+    }
+    // The OpenCode installer commonly uses ~/.opencode/bin, which is not in
+    // every login PATH. Check the fixed user-owned locations before failing.
+    if let Some(home) = environment.get("HOME") {
+        for relative in [".opencode/bin", ".local/bin", ".cargo/bin"] {
+            let candidate = std::path::Path::new(&home).join(relative).join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(fail())
 }
 fn capabilities() -> io::Result<Capabilities> {
     let target = match convert(made_platform::remote_target())?.as_str() {

@@ -76,7 +76,7 @@ impl SshCommand {
 }
 // Shell receives exactly one constant command string. Never concatenate a path,
 // hostname, user, prompt or server response here.
-const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; command -v opencode || :'"#;
+const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"'"#;
 const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --stdio'"#;
 
 // First-install bootstrap does not assume an executable already exists. Exactly
@@ -238,8 +238,11 @@ impl SshOptions {
             "KnownHostsCommand=none",
             "AddKeysToAgent=no",
             "ConnectTimeout=10",
-            "ServerAliveInterval=15",
-            "ServerAliveCountMax=2",
+            // Do not send SSH keepalive requests: some container port
+            // forwards never answer them and the client then drops a healthy
+            // long-lived session. OS-level TCP keepalive still detects dead
+            // peers.
+            "TCPKeepAlive=yes",
         ] {
             args.extend(["-o".into(), option.into()]);
         }
