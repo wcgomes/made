@@ -1694,6 +1694,12 @@ impl Workbench {
         })
     }
 
+    pub fn remote_prompt_id(&self) -> Option<u64> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.prompt.as_ref().map(|prompt| prompt.id))
+    }
+
     pub fn remote_prompt_draft(&mut self) -> Option<&mut String> {
         self.remote
             .as_mut()

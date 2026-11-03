@@ -54,6 +54,30 @@ fn one_use_answers_repeated_mfa_and_cancellation_are_request_bound() {
     assert!(thread.join().unwrap().is_err());
 }
 #[test]
+fn packaged_helper_answers_the_broker_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut broker = AskpassBroker::new(temp.path(), Duration::from_secs(5)).unwrap();
+    let socket = broker.socket_path().to_owned();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_made-askpass"))
+        .env("MADE_ASKPASS_SOCKET", &socket)
+        .arg("vscode@example's password:")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let prompt = prompt(&mut broker);
+    assert_eq!(prompt.text, "vscode@example's password:");
+    broker
+        .respond(
+            prompt.id,
+            Some(PromptAnswer::new(b"plantsuite".to_vec()).unwrap()),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"plantsuite\n");
+}
+
+#[test]
 fn private_directory_and_redacted_answer() {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();

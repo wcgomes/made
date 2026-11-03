@@ -4087,6 +4087,28 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
                 });
             }
             if let Some(class) = auth {
+                // A prompt appears while the terminal still owns focus. Focus the
+                // secret field once so typing does not go to the terminal and
+                // submit an empty password. The flag prevents re-focusing after
+                // the user deliberately clicks away.
+                if matches!(
+                    class,
+                    crate::remote_session::SshPromptClass::Secret { .. }
+                ) {
+                    if let Some(prompt_id) = workbench.remote_prompt_id() {
+                        let key = egui::Id::unique(("made-ssh-prompt-focus", prompt_id));
+                        let first = ui
+                            .ctx()
+                            .data(|data| data.get_temp::<bool>(key).is_none());
+                        if first {
+                            let field = ssh_field_id("prompt");
+                            ui.memory_mut(|memory| memory.request_focus(field));
+                            hold_ssh_field(ui.ctx(), field);
+                            ui.ctx()
+                                .data_mut(|data| data.insert_temp(key, true));
+                        }
+                    }
+                }
                 if let Some(draft) = workbench.remote_prompt_draft() {
                     ssh_prompt_card(ui, &class, draft);
                 }
