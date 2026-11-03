@@ -284,28 +284,7 @@ fn current_euid() -> u32 {
 
 #[cfg(unix)]
 fn publish_socket(fd: std::os::fd::RawFd, path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    // SAFETY: fd is the listener we just bound. fchmod publishes it owner-only
-    // regardless of umask; bind itself creates the inode as 0666 & ~umask.
-    // macOS returns EINVAL for fchmod on a socket, so chmod the path after
-    // proving it is a socket and not a symlink.
-    if unsafe { libc::fchmod(fd, 0o600) } == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
-        return Err(error);
-    }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || meta.permissions().mode() & 0o777 != 0o600 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "askpass socket is not owner-only",
-        ));
-    }
-    Ok(())
+    crate::shell_integration::publish_private_socket(fd, path)
 }
 
 #[cfg(unix)]

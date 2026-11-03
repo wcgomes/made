@@ -446,27 +446,29 @@ fn write_bootstrap(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<(
 }
 
 #[cfg(unix)]
-fn publish_private_socket(fd: std::os::fd::RawFd, path: &Path) -> std::io::Result<()> {
+pub(crate) fn publish_private_socket(fd: std::os::fd::RawFd, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    // SAFETY: fd is the datagram socket just bound in a 0700 directory.
-    // fchmod removes the umask-dependent group/other bits bind published.
-    // macOS returns EINVAL for fchmod on a datagram socket; fall back to chmod
-    // of the inode after proving the path is a socket and not a symlink.
-    if unsafe { libc::fchmod(fd, 0o600) } == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
+    // fchmod removes the umask-dependent group/other bits bind published. Some
+    // Linux filesystems and macOS sockets do not reflect it immediately (macOS
+    // returns EINVAL), so always confirm the inode mode and fall back to chmod.
+    // SAFETY: fd is the socket just bound in a 0700 directory.
+    let _ = unsafe { libc::fchmod(fd, 0o600) };
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
-        return Err(error);
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || meta.permissions().mode() & 0o777 != 0o600 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "cwd socket is not owner-only",
+            "private socket path is not a socket",
         ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() || meta.permissions().mode() & 0o777 != 0o600 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private socket is not owner-only",
+            ));
+        }
     }
     Ok(())
 }
