@@ -2391,7 +2391,9 @@ impl Workbench {
                     if let Ok(Some(crate::remote_workspace::RemoteResult::Root(path))) =
                         remote.workspace.accept_root(resolution)
                     {
-                        let _ = client.set_root(path, generation);
+                        if generation > client.identity().generation {
+                            let _ = client.set_root(path, generation);
+                        }
                     }
                 }
                 let mut sessions = client.session_sink();
