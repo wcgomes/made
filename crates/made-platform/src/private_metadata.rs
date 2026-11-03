@@ -879,10 +879,7 @@ mod backend {
     pub fn create_or_tighten(path: &Path) -> io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                if !directory_owner_is_current(path)? {
-                    return Err(refuse("owner is not the current user"));
-                }
-                assign_owner_only_path(&wide(path)?)
+                tighten_existing(path)
             }
             Ok(_) => Err(refuse("path is not a directory")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -894,51 +891,40 @@ mod backend {
                         std::fs::create_dir_all(parent)?;
                     }
                 }
-                create_directory(path)
+                match create_directory(path) {
+                    // Another thread or process won the create race. Its owner
+                    // assignment may still be in flight, so reuse the retrying
+                    // existing-directory path instead of reporting AlreadyExists.
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        tighten_existing(path)
+                    }
+                    other => other,
+                }
             }
             Err(error) => Err(error),
         }
     }
-    fn directory_owner_is_current(path: &Path) -> io::Result<bool> {
+    /// Tighten a directory that already exists. App-owned directories can be
+    /// created by installers, tests, or a previous elevated process that left
+    /// Administrators as owner, so re-owning a pre-existing path is allowed
+    /// when the process has the privilege to do it. Without that privilege the
+    /// assignment fails and the directory is refused.
+    fn tighten_existing(path: &Path) -> io::Result<()> {
         let wide_path = wide(path)?;
-        // READ_CONTROL is enough to read the owner. OPEN_REPARSE_POINT avoids
-        // following a junction. The handle is closed when `file` drops.
-        let handle = unsafe {
-            CreateFileW(
-                wide_path.as_ptr(),
-                0x0002_0000,
-                3,
-                std::ptr::null(),
-                3,
-                0x0200_0000 | 0x0020_0000,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle as isize == -1 {
-            return Err(io::Error::last_os_error());
+        match assign_owner_only_path(&wide_path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A concurrent creator may still be assigning the owner. Retry
+                // briefly so a race does not surface as a permission failure.
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    if assign_owner_only_path(&wide_path).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(error)
+            }
         }
-        // SAFETY: CreateFileW returned this uniquely owned handle.
-        let file = unsafe { File::from_raw_handle(handle) };
-        let mut owner = std::ptr::null_mut();
-        let mut descriptor = std::ptr::null_mut();
-        // SAFETY: the handle is live. GetSecurityInfo allocates `descriptor`.
-        let status = unsafe {
-            GetSecurityInfo(
-                file.as_raw_handle() as _,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(status as i32));
-        }
-        let _descriptor = Descriptor(descriptor);
-        owner_is_current_user(owner)
     }
     pub fn replace(_root: &File, directory: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::rename(directory.join(from), directory.join(to))
