@@ -169,13 +169,37 @@ fn frontend() -> io::Result<()> {
     let mut stream = connection.into_stream();
     stream.set_read_timeout(None)?;
     write_envelope(&mut stream, &first)?;
-    let mut output = stream.try_clone()?;
-    let reader = thread::spawn(move || io::copy(&mut output, &mut io::stdout().lock()));
+    let output = stream.try_clone()?;
+    let reader = thread::spawn(move || {
+        let stdout = io::stdout();
+        relay(output, stdout.lock())
+    });
     // Raw framing is verified at the authenticated supervisor. No retry/replay.
-    let result = io::copy(&mut stdin, &mut stream);
+    let result = relay(&mut stdin, &mut stream);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = reader.join();
-    result.map(|_| ())
+    result
+}
+
+/// Copy bytes without relying on `io::copy`. Its socket/pipe specialization
+/// uses `splice(2)`; on the container kernels used by remote workspaces a
+/// spliced frame can sit in the stdout pipe without waking the SSH channel
+/// reader, so the client waits forever for a frame that was already consumed.
+/// A buffered read/write loop is portable and always issues a real write.
+fn relay(mut input: impl io::Read, mut output: impl io::Write) -> io::Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = match input.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        output.write_all(&buffer[..read])?;
+        // `Stdout` is line-buffered; every v1 frame is minified JSON with no
+        // newline, so an unflushed frame would wait for unrelated output.
+        output.flush()?;
+    }
 }
 fn daemon() -> io::Result<()> {
     let first = read_envelope(&mut io::stdin().lock())?;
@@ -380,4 +404,37 @@ fn stage() -> io::Result<()> {
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay;
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    struct Recorder {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_forwards_minified_frames_and_flushes_each_chunk() {
+        let frame = b"\0\0\0\x1d{\"operation\":{\"op\":\"Attached\"}}";
+        let mut output = Recorder::default();
+        relay(&frame[..], &mut output).unwrap();
+        assert_eq!(output.bytes, frame);
+        assert_eq!(output.flushes, 1);
+    }
 }

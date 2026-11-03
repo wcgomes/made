@@ -578,14 +578,25 @@ impl Supervisor {
 
     fn install_attachment(&mut self, connection: RpcConnection) -> Result<(), ErrorCode> {
         let epoch = connection.epoch();
-        if epoch < self.identity.epoch || (self.attached_once && epoch <= self.identity.epoch) {
-            return Err(ErrorCode::Stale);
-        }
         let mut stream = connection.into_stream();
         stream
             .set_read_timeout(Some(Duration::from_secs(120)))
             .map_err(io_error)?;
         let first = read_envelope(&mut stream).map_err(io_error)?;
+        // A rejected attach must be distinguishable from a dead transport.
+        // Always answer with the code after the connection authenticated.
+        let reject = |stream: &mut TcpStream, code: ErrorCode| {
+            let frame = WireEnvelope::new(
+                first.identity.clone(),
+                first.request_id,
+                Operation::Error { code },
+            );
+            let _ = write_envelope(stream, &frame);
+            code
+        };
+        if epoch < self.identity.epoch || (self.attached_once && epoch <= self.identity.epoch) {
+            return Err(reject(&mut stream, ErrorCode::Stale));
+        }
         if !transport_matches(
             &first.identity,
             &Identity {
@@ -594,18 +605,20 @@ impl Supervisor {
             },
         ) || first.identity.epoch != epoch
         {
-            return Err(ErrorCode::Unauthorized);
+            return Err(reject(&mut stream, ErrorCode::Unauthorized));
         }
-        let (rows, cols) = match first.operation {
+        let (rows, cols) = match &first.operation {
             Operation::Open { rows, cols, .. }
                 if self.attachment.is_none() && epoch == self.identity.epoch =>
             {
-                (rows, cols)
+                (*rows, *cols)
             }
-            Operation::Attach { rows, cols } => (rows, cols),
-            _ => return Err(ErrorCode::InvalidRequest),
+            Operation::Attach { rows, cols } => (*rows, *cols),
+            _ => return Err(reject(&mut stream, ErrorCode::InvalidRequest)),
         };
-        self.session.resize(rows, cols)?;
+        if let Err(code) = self.session.resize(rows, cols) {
+            return Err(reject(&mut stream, code));
+        }
         let (input_tx, input) = mpsc::sync_channel(MAX_IN_FLIGHT);
         let (data_tx, data_rx) = mpsc::sync_channel(MAX_QUEUED_CHUNKS);
         let (control_tx, control_rx) = mpsc::sync_channel(MAX_IN_FLIGHT);
