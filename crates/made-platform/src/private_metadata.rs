@@ -255,6 +255,13 @@ pub(crate) fn create_or_tighten_private_directory(path: &Path) -> io::Result<()>
     backend::create_or_tighten(path)
 }
 
+/// Give an existing regular file an owner-only DACL before a Windows rename
+/// needs DELETE rights on it.
+#[cfg(windows)]
+pub(crate) fn tighten_private_file(path: &Path) -> io::Result<()> {
+    backend::tighten_file(path)
+}
+
 #[cfg(unix)]
 mod backend {
     use super::*;
@@ -925,6 +932,11 @@ mod backend {
                 Err(error)
             }
         }
+    }
+    /// Give a regular app-owned file the current user as owner and a protected
+    /// full-allow DACL. Used before rotating a log so the rename has DELETE.
+    pub fn tighten_file(path: &Path) -> io::Result<()> {
+        assign_owner_only_path(&wide(path)?)
     }
     pub fn replace(_root: &File, directory: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::rename(directory.join(from), directory.join(to))

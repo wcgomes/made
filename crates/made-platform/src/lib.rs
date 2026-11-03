@@ -1563,6 +1563,14 @@ fn rotate_current_log_with(
     rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), LogIssue> {
     inspect_backup_log(path)?;
+    // On Windows a file created before the directory was tightened keeps its
+    // old inherited DACL. Without an explicit owner-only DACL the rename can
+    // fail with access denied even though the directory is private.
+    tighten_private_log_permissions(path).map_err(|error| {
+        LogIssue::error(format!(
+            "diagnostics log rotation refused ({error}); active and previous logs left untouched"
+        ))
+    })?;
     rename(path, &previous_private_log_path(path)).map_err(|error| {
         LogIssue::error(format!(
             "diagnostics log rotation refused ({error}); active and previous logs left untouched"
@@ -1598,6 +1606,11 @@ pub fn tighten_private_log_permissions(path: impl AsRef<Path>) -> Result<(), Pla
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| PlatformError::io("set private log permissions", error))?;
+    }
+    #[cfg(windows)]
+    {
+        private_metadata::tighten_private_file(path)
             .map_err(|error| PlatformError::io("set private log permissions", error))?;
     }
     Ok(())
