@@ -583,7 +583,7 @@ impl Supervisor {
         }
         let mut stream = connection.into_stream();
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .map_err(io_error)?;
         let first = read_envelope(&mut stream).map_err(io_error)?;
         if !transport_matches(
