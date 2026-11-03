@@ -2027,8 +2027,11 @@ impl Workbench {
             }
         }
         self.pump_remote_client();
-        self.pump_remote_terminal();
+        let terminal_changed = self.pump_remote_terminal();
         self.pump_remote_upload();
+        if terminal_changed {
+            ctx.request_repaint();
+        }
         if self.remote.as_ref().is_some_and(|remote| {
             remote.prompt.is_some()
                 || remote.holding_input
@@ -2651,7 +2654,8 @@ impl Workbench {
         self.pull_resnapshot();
     }
 
-    fn pump_remote_terminal(&mut self) {
+    fn pump_remote_terminal(&mut self) -> bool {
+        let before = self.terminal.as_ref().map(TerminalPane::output_bytes);
         let holding = self
             .remote
             .as_ref()
@@ -2660,9 +2664,10 @@ impl Workbench {
             if let Some(terminal) = self.terminal.as_mut() {
                 let _ = terminal.pump(self.diag.log_mut());
             }
-            return;
+        } else {
+            self.pull_resnapshot();
         }
-        self.pull_resnapshot();
+        before != self.terminal.as_ref().map(TerminalPane::output_bytes)
     }
 
     /// Apply queued `TerminalOutput` frames. `poll_output` returning `None` does

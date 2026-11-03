@@ -62,6 +62,9 @@ impl RpcListener {
         }
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // Frames are small and latency-sensitive; Nagle plus delayed ACK adds
+        // ~40 ms per relay hop on loopback.
+        stream.set_nodelay(true)?;
         Ok(RpcConnection { stream, epoch })
     }
 }
@@ -80,6 +83,7 @@ impl RpcConnection {
             return Err(invalid());
         }
         let mut stream = TcpStream::connect_timeout(&addr, AUTH_DEADLINE)?;
+        stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(AUTH_DEADLINE))?;
         stream.write_all(capability)?;
         stream.write_all(authority)?;
