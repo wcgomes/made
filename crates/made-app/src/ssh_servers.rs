@@ -773,11 +773,63 @@ fn run_stage(
         made_platform::ssh::SshCommand::Stage,
         Some(std::time::Duration::from_secs(180)),
     )?;
-    process
-        .write(payload)
-        .map_err(|_| AttemptError::code(ErrorCode::Io))?;
-    let mut stdout = Vec::new();
+    // SshProcess::write accepts one bounded chunk, not the whole multi-megabyte
+    // Stage payload. Send it in chunks and keep draining prompts so the writer
+    // cannot deadlock on a full queue.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut stdout = Vec::new();
+    let mut offset = 0;
+    while offset < payload.len() {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            process.cancel();
+            return Err(AttemptError::code(ErrorCode::Cancelled));
+        }
+        if std::time::Instant::now() >= deadline {
+            process.cancel();
+            return Err(AttemptError::code(ErrorCode::Timeout));
+        }
+        let end = (offset + made_platform::ssh::SSH_CHUNK_BYTES).min(payload.len());
+        match process.write(&payload[offset..end]) {
+            Ok(()) => offset = end,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                while let Ok(answer) = answers.try_recv() {
+                    if process.answer_prompt(answer.id, answer.answer).is_err() {
+                        process.cancel();
+                        return Err(AttemptError::code(ErrorCode::Io));
+                    }
+                }
+                if let Some(prompt) = process.poll_prompt() {
+                    if prompts.try_send(prompt).is_err() {
+                        process.cancel();
+                        return Err(AttemptError::code(ErrorCode::Limit));
+                    }
+                }
+                match process.poll() {
+                    Some(made_platform::ssh::SshEvent::Data(bytes)) => {
+                        if stdout.len().saturating_add(bytes.len()) > 64 * 1024 {
+                            process.cancel();
+                            return Err(AttemptError::code(ErrorCode::Limit));
+                        }
+                        let mut bytes = bytes;
+                        stdout.append(&mut bytes);
+                    }
+                    Some(made_platform::ssh::SshEvent::TimedOut) => {
+                        return Err(AttemptError::code(ErrorCode::Timeout))
+                    }
+                    Some(made_platform::ssh::SshEvent::Failed(failure)) => {
+                        return Err(AttemptError::from_failure(&failure))
+                    }
+                    Some(made_platform::ssh::SshEvent::Eof)
+                    | Some(made_platform::ssh::SshEvent::Exited(_)) => {
+                        return Err(AttemptError::code(ErrorCode::Io))
+                    }
+                    None => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => return Err(AttemptError::code(ErrorCode::Io)),
+        }
+    }
     loop {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
             process.cancel();
