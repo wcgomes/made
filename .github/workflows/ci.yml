@@ -107,7 +107,18 @@ jobs:
         run: cargo build --workspace --locked --target ${{ matrix.target }}
 
       - name: Test the workspace
-        run: cargo test --workspace --locked --no-fail-fast --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Serial Linux runs keep the real-PTY and detached-process cases
+            # from contending for the same process groups. `timeout` turns a
+            # hung test into a released log instead of a 45-minute job timeout.
+            timeout 1200 cargo test --workspace --locked --no-fail-fast \
+              --target "${{ matrix.target }}" -- --test-threads=1 --nocapture
+          else
+            cargo test --workspace --locked --no-fail-fast --target "${{ matrix.target }}"
+          fi
 
       - name: Stage the development binary
         shell: bash
