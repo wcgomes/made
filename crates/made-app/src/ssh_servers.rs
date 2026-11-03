@@ -699,14 +699,14 @@ fn packaged_askpass() -> Option<std::path::PathBuf> {
 
 /// Where a packaged companion binary would live. Absence is a preflight
 /// failure, not permission to run a host shell instead.
+///
+/// The file is always `made-remote`, including on a Windows client. CI stages
+/// that Unix name and the remote bootstrap executes it. Askpass stays
+/// platform-specific; this binary does not.
 pub fn companion_artifact(target: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let path = dir.join("remote").join(target).join(if cfg!(windows) {
-        "made-remote.exe"
-    } else {
-        "made-remote"
-    });
+    let path = dir.join("remote").join(target).join("made-remote");
     path.is_file().then_some(path)
 }
 

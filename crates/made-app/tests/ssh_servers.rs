@@ -171,3 +171,38 @@ fn rejects_option_targets_controls_and_zero_ports_before_storage() {
     assert!(registry.add(invalid).is_err());
     assert_eq!(storage.0.borrow().writes, 0);
 }
+
+#[test]
+fn companion_artifact_finds_unix_made_remote_not_exe() {
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let parent = std::env::current_exe()
+        .expect("test executable")
+        .parent()
+        .expect("executable directory")
+        .to_path_buf();
+    let dir = parent.join("remote").join("test-companion-unix-name");
+    let _cleanup = Cleanup(dir.clone());
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let unix = dir.join("made-remote");
+    std::fs::write(&unix, b"companion").unwrap();
+    let found = companion_artifact("test-companion-unix-name").expect("unix companion");
+    assert_eq!(found, unix);
+    assert_eq!(
+        found.file_name().and_then(|name| name.to_str()),
+        Some("made-remote")
+    );
+
+    std::fs::remove_file(&unix).unwrap();
+    std::fs::write(dir.join("made-remote.exe"), b"wrong").unwrap();
+    assert!(
+        companion_artifact("test-companion-unix-name").is_none(),
+        "clients must not search remote/<target>/ for made-remote.exe"
+    );
+}
