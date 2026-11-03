@@ -6,6 +6,10 @@
 //! definitions directly. They run on every supported host; only the assertion
 //! that the Linux backend was selected is OS-gated.
 //!
+//! `made-app` is the only graphical application. `made-remote` is the only
+//! extra headless binary the SSH contract requires. Any other `src/main.rs`,
+//! or a GUI dependency outside `made-app`, is a second graphical app.
+//!
 //! Test-only `cfg` is acceptable per `wiki/architecture.md`. Shipped Rust code
 //! outside `crates/made-platform` must not contain OS-specific `cfg` branches.
 
@@ -26,6 +30,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "made-bridge",
     "made-explorer",
     "made-platform",
+    "made-remote",
     "made-terminal",
 ];
 
@@ -134,19 +139,21 @@ fn workspace_has_one_app_crate_and_one_ui_source_tree() {
         );
     }
 
-    let binaries: Vec<_> = crates
+    let mut binaries: Vec<_> = crates
         .iter()
         .filter(|dir| dir.join("src/main.rs").is_file())
+        .map(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
         .collect();
+    binaries.sort();
     assert_eq!(
-        binaries.len(),
-        1,
-        "there must be exactly one application binary target"
-    );
-    assert_eq!(
-        binaries[0].file_name().and_then(|name| name.to_str()),
-        Some("made-app"),
-        "the only application binary must live in made-app"
+        binaries,
+        vec!["made-app".to_owned(), "made-remote".to_owned()],
+        "made-app is the only graphical application and made-remote is the only extra headless binary"
     );
 
     for crate_dir in &crates {
@@ -164,6 +171,13 @@ fn workspace_has_one_app_crate_and_one_ui_source_tree() {
                 .lines()
                 .any(|line| line.trim_start().starts_with("made-app =")),
             "{name} must not depend on the app composition root"
+        );
+        assert!(
+            !manifest.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#') && trimmed.contains("eframe")
+            }),
+            "{name} must not be a second graphical application"
         );
 
         for module in APP_UI_MODULES {
@@ -447,6 +461,22 @@ fn platform_smoke_workflows_do_not_silently_skip_validation() {
             workflow.contains("opencode"),
             "the {name} workflow must attempt or record native OpenCode v2 validation"
         );
+    }
+}
+
+#[test]
+fn platform_exports_process_parent_and_askpass_file_name() {
+    let parent = made_platform::process_parent(std::process::id());
+    assert!(
+        parent.is_some(),
+        "the host must report this process's parent"
+    );
+    assert_ne!(parent, Some(std::process::id()));
+    let name = made_platform::askpass_file_name();
+    if cfg!(windows) {
+        assert_eq!(name, "made-askpass.exe");
+    } else {
+        assert_eq!(name, "made-askpass");
     }
 }
 

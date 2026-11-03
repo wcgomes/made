@@ -668,7 +668,11 @@ impl AppModel {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                notices.push(crate::remote_session::CloseReport::Unconfirmed.label().to_owned());
+                notices.push(
+                    crate::remote_session::CloseReport::Unconfirmed
+                        .label()
+                        .to_owned(),
+                );
                 false
             }
         });

@@ -739,8 +739,7 @@ impl TerminalPane {
         if self.input_paused {
             self.pending_input.clear();
             self.input_notice = Some(
-                "Remote terminal input is paused until the session snapshot is applied."
-                    .to_owned(),
+                "Remote terminal input is paused until the session snapshot is applied.".to_owned(),
             );
             return false;
         }
@@ -780,7 +779,10 @@ impl TerminalPane {
         if let Some(transport) = self.remote_transport.as_mut() {
             return transport.resize(rows, cols);
         }
-        self.pty.as_mut().ok_or(PtyError::Closed)?.resize(rows, cols)
+        self.pty
+            .as_mut()
+            .ok_or(PtyError::Closed)?
+            .resize(rows, cols)
     }
 
     /// Drain already-queued remote output. `true` means the cap was hit and more
@@ -3734,7 +3736,9 @@ mod tests {
             },
         );
         assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        let first = pane.take_pending_image().expect("native chord queues a PNG");
+        let first = pane
+            .take_pending_image()
+            .expect("native chord queues a PNG");
         assert!(first.starts_with(b"\x89PNG"));
         assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Path));
         let second = pane.take_pending_image().expect("path chord queues a PNG");
@@ -3785,6 +3789,9 @@ mod tests {
         let (gate, step) = gate.observe_frame(true);
         assert_eq!(step, SnapshotStep::Live);
         assert!(gate.is_complete());
-        assert!(!pane.input_paused(), "a second done must not pause or restart");
+        assert!(
+            !pane.input_paused(),
+            "a second done must not pause or restart"
+        );
     }
 }

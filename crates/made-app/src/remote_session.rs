@@ -145,7 +145,11 @@ pub fn present_ssh_failure(failure: &made_platform::ssh::SshFailure) -> ShownFai
 
 /// `yes` is only the explicit unknown-host approval of a fingerprint this tab
 /// already showed. A changed key never matches.
-pub fn may_answer_yes(class: &SshPromptClass, approved_fingerprint: Option<&str>, prompt: &str) -> bool {
+pub fn may_answer_yes(
+    class: &SshPromptClass,
+    approved_fingerprint: Option<&str>,
+    prompt: &str,
+) -> bool {
     match class {
         SshPromptClass::ChangedHostKey { .. } | SshPromptClass::Secret { .. } => false,
         SshPromptClass::UnknownHost { .. } => approved_fingerprint
@@ -236,10 +240,7 @@ pub fn first_operation(
 
 /// RootValidate and every other control verb wait until Attached.
 pub fn allow_before_attached(operation: &Operation) -> bool {
-    matches!(
-        operation,
-        Operation::Open { .. } | Operation::Attach { .. }
-    )
+    matches!(operation, Operation::Open { .. } | Operation::Attach { .. })
 }
 
 pub const STAGE_FILES: &[&str] = &[
@@ -354,7 +355,13 @@ mod tests {
     #[test]
     fn new_session_opens_and_reattach_attaches_and_root_validate_waits() {
         let directory = RemotePath::new(b"/project".to_vec()).unwrap();
-        let open = first_operation(SessionOpen::New, directory.clone(), LaunchTarget::Shell, 24, 80);
+        let open = first_operation(
+            SessionOpen::New,
+            directory.clone(),
+            LaunchTarget::Shell,
+            24,
+            80,
+        );
         assert!(matches!(open, Operation::Open { .. }));
         let attach = first_operation(
             SessionOpen::Reattach,
@@ -379,7 +386,9 @@ mod tests {
         let unknown = classify_prompt(
             "The authenticity of host 'server' can't be established.\nECDSA key fingerprint is SHA256:abc.\nAre you sure you want to continue connecting (yes/no)?",
         );
-        assert!(matches!(unknown, SshPromptClass::UnknownHost { text } if text.contains("SHA256:abc")));
+        assert!(
+            matches!(unknown, SshPromptClass::UnknownHost { text } if text.contains("SHA256:abc"))
+        );
         let changed = classify_prompt(
             "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost key verification failed.",
         );
@@ -392,7 +401,14 @@ mod tests {
 
     #[test]
     fn stage_body_requires_consent_and_embeds_hashes() {
-        let files = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec(), b"f".to_vec()];
+        let files = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec(),
+            b"f".to_vec(),
+        ];
         assert!(stage_body(false, "0.1.0", "x86_64-unknown-linux-gnu", &files).is_err());
         let body = stage_body(true, "0.1.0", "x86_64-unknown-linux-gnu", &files).unwrap();
         let text = String::from_utf8_lossy(&body);
@@ -433,11 +449,12 @@ mod tests {
         );
         assert!(changed.refuses_answer());
         assert!(changed.fingerprint.is_none());
-        assert_eq!(changed.detail, "the remote host key changed and was refused");
+        assert_eq!(
+            changed.detail,
+            "the remote host key changed and was refused"
+        );
         assert!(!may_answer_yes(
-            &SshPromptClass::ChangedHostKey {
-                text: "yes".into(),
-            },
+            &SshPromptClass::ChangedHostKey { text: "yes".into() },
             Some("SHA256:abc"),
             "yes",
         ));

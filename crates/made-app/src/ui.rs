@@ -1732,7 +1732,17 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 layout.tab_height,
                 theme::BG_CLEAR,
             );
-            {
+            let has_ssh_servers = model
+                .ssh_registry()
+                .ok()
+                .is_some_and(|registry| !registry.servers().is_empty());
+            // No local TUI and no saved server: open the picker. A menu with
+            // only Terminal is the same choice, and it hid the picker.
+            let show_new_tab_menu = !compatible_tuis.is_empty() || has_ssh_servers;
+            if open_folder.activated && !show_new_tab_menu {
+                create = true;
+            }
+            if show_new_tab_menu {
                 egui::Popup::menu(&open_folder.response)
                     .open_memory(
                         open_folder

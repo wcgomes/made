@@ -3683,17 +3683,27 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         headless.focus(top_action_id("open-folder"));
         headless.press_key(egui::Key::Enter);
         headless.render();
-        assert!(
-            !headless.model.is_picker(),
-            "{width}px: Enter on + opens the menu, including when no local TUI is detected"
-        );
-        headless.press_key(egui::Key::ArrowDown);
-        headless.render();
-        headless.press_key(egui::Key::Enter);
-        headless.render();
+        let menu_open = headless
+            .ctx
+            .read_response(new_tab_menu_item_id("terminal"))
+            .is_some();
+        if menu_open {
+            headless.press_key(egui::Key::ArrowDown);
+            headless.render();
+            headless.press_key(egui::Key::Enter);
+            headless.render();
+        }
         assert!(
             headless.model.is_picker(),
-            "{width}px: Terminal in the + menu must still open the local picker"
+            "{width}px: + must open the picker directly when nothing else is offered, or via Terminal when a menu is open"
+        );
+        assert!(
+            headless
+                .model
+                .workspace(beta_id)
+                .and_then(Workbench::terminal)
+                .is_some_and(made_app::TerminalPane::is_running),
+            "{width}px: opening the picker must leave the local terminal running"
         );
     }
 }
@@ -4029,16 +4039,32 @@ fn header_plus_without_a_detected_tui_opens_the_folder_picker() {
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
     wait_explorer_ready(&mut headless, id);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
 
     headless.click(top_action_id("open-folder"));
     assert!(
-        !headless.model.is_picker(),
-        "without a local TUI the + menu must still open so remote choices stay reachable"
+        headless.model.is_picker(),
+        "without a local TUI and without a saved SSH server the + opens the picker"
     );
-    headless.click(new_tab_menu_item_id("terminal"));
-    assert!(headless.model.is_picker());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("terminal"))
+        .is_none());
     assert_eq!(headless.model.workspace_count(), 1);
     assert!(headless.model.workspace(id).is_some());
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "opening the picker must leave the local terminal running"
+    );
 }
 
 #[test]
@@ -4217,10 +4243,7 @@ fn remote_open_prompt_refuses_changed_key_without_a_secret_field() {
         !text.contains("Approve host"),
         "a changed key must not offer acceptance: {text}"
     );
-    assert!(
-        !text.contains("password"),
-        "no secret field copy: {text}"
-    );
+    assert!(!text.contains("password"), "no secret field copy: {text}");
 }
 
 #[test]
@@ -4277,7 +4300,10 @@ fn remote_open_unknown_host_shows_failure_fingerprint_and_requires_approval() {
         text.contains("SHA256:abcDEF123"),
         "unknown host must show the failure fingerprint: {text}"
     );
-    assert!(text.contains("Approve host"), "approval must be explicit: {text}");
+    assert!(
+        text.contains("Approve host"),
+        "approval must be explicit: {text}"
+    );
     assert!(!text.contains("password"), "no secret field: {text}");
 }
 
@@ -8399,10 +8425,24 @@ fn header_plus_without_a_detected_tui_shows_no_menu() {
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "no-tui", "main.rs");
     let (mut headless, id) = menu_model(&root, &[]);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
     headless.click(top_action_id("open-folder"));
     assert!(headless.model.is_picker());
     assert_eq!(headless.model.workspace_count(), 1);
     assert!(headless.model.workspace(id).is_some());
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "opening the picker must leave the local terminal running"
+    );
     assert!(headless
         .ctx
         .read_response(new_tab_menu_item_id("terminal"))
@@ -8851,6 +8891,7 @@ fn opencode_row_for_catalog(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_revealed_grok_row(
     output: &egui::FullOutput,
     headless: &Headless,
@@ -9496,6 +9537,7 @@ fn assert_catalog_menu_unchanged(headless: &mut Headless) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_opencode_diagnostics_row(
     headless: &mut Headless,
     id: WorkspaceId,

@@ -240,7 +240,9 @@ struct RemoteTab {
     opencode: bool,
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
-    client_rx: Option<Receiver<Result<crate::ssh_servers::CompanionSession, crate::ssh_servers::AttemptError>>>,
+    client_rx: Option<
+        Receiver<Result<crate::ssh_servers::CompanionSession, crate::ssh_servers::AttemptError>>,
+    >,
     failures: crate::ssh_servers::SshFailureSlot,
     host_fingerprint: Option<String>,
     approved_fingerprint: Option<String>,
@@ -1585,7 +1587,9 @@ impl Workbench {
     }
 
     pub fn remote_authority(&self) -> Option<made_remote::protocol::AuthorityId> {
-        self.remote.as_ref().map(|remote| remote.snapshot.server().id())
+        self.remote
+            .as_ref()
+            .map(|remote| remote.snapshot.server().id())
     }
 
     pub fn remote_needs_consent(&self) -> bool {
@@ -1648,9 +1652,7 @@ impl Workbench {
     }
 
     pub fn deny_unknown_host(&mut self) {
-        self.cancel_remote_attempt(
-            "the remote host key is not in the app trust file",
-        );
+        self.cancel_remote_attempt("the remote host key is not in the app trust file");
     }
 
     pub fn remote_can_reconnect(&self) -> bool {
@@ -1682,12 +1684,9 @@ impl Workbench {
     }
 
     pub fn remote_prompt_draft(&mut self) -> Option<&mut String> {
-        self.remote.as_mut().and_then(|remote| {
-            remote
-                .prompt
-                .is_some()
-                .then_some(&mut remote.prompt_draft)
-        })
+        self.remote
+            .as_mut()
+            .and_then(|remote| remote.prompt.is_some().then_some(&mut remote.prompt_draft))
     }
 
     /// Persist consent outside this method. This only continues the launch.
@@ -1737,7 +1736,8 @@ impl Workbench {
             }
             crate::remote_session::SshPromptClass::UnknownHost { .. } => {
                 if accept {
-                    let answer = made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok();
+                    let answer =
+                        made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok();
                     self.deliver_remote_answer(prompt.id, answer);
                 } else {
                     self.cancel_remote_attempt(
@@ -1753,7 +1753,8 @@ impl Workbench {
                             if let Some(remote) = self.remote.as_mut() {
                                 remote.prompt = Some(prompt);
                                 remote.detail =
-                                    "That answer was rejected locally. Nothing was sent.".to_owned();
+                                    "That answer was rejected locally. Nothing was sent."
+                                        .to_owned();
                             }
                         }
                     }
@@ -1954,8 +1955,10 @@ impl Workbench {
                     let _ = remote.workspace.close_preview();
                 }
                 crate::explorer_view::RemoteExplorerAction::CopyPath(path) => {
-                    self.pending_notice =
-                        Some((format!("Copied remote path"), Instant::now() + NOTICE_TTL));
+                    self.pending_notice = Some((
+                        "Copied remote path".to_string(),
+                        Instant::now() + NOTICE_TTL,
+                    ));
                     let _ = path;
                 }
                 crate::explorer_view::RemoteExplorerAction::UseRoot(path) => {
@@ -2033,12 +2036,20 @@ impl Workbench {
             .as_ref()
             .and_then(|probe| probe.poll_prompt())
             .or_else(|| remote.stage.as_ref().and_then(|stage| stage.poll_prompt()))
-            .or_else(|| remote.client.as_ref().and_then(|client| client.poll_prompt()));
+            .or_else(|| {
+                remote
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.poll_prompt())
+            });
         let Some(prompt) = prompt else {
             return;
         };
         let class = crate::remote_session::classify_prompt(&prompt.text);
-        if matches!(class, crate::remote_session::SshPromptClass::ChangedHostKey { .. }) {
+        if matches!(
+            class,
+            crate::remote_session::SshPromptClass::ChangedHostKey { .. }
+        ) {
             return self.cancel_remote_attempt("the remote host key changed and was refused");
         }
         if crate::remote_session::may_answer_yes(&class, approved.as_deref(), &prompt.text) {
@@ -2106,8 +2117,8 @@ impl Workbench {
             remote.detail = "The remote companion is not packaged with this build. Made did not start a local shell.".to_owned();
             return;
         }
-        let allowed = remote.consent_granted
-            || remote.snapshot.server().allows_provision(APP_VERSION);
+        let allowed =
+            remote.consent_granted || remote.snapshot.server().allows_provision(APP_VERSION);
         if !allowed {
             remote.phase = RemotePhase::NeedsConsent;
             remote.detail = format!(
@@ -2154,11 +2165,7 @@ impl Workbench {
         self.apply_attempt_error(error, OpenRetry::Stage);
     }
 
-    fn apply_attempt_error(
-        &mut self,
-        error: crate::ssh_servers::AttemptError,
-        retry: OpenRetry,
-    ) {
+    fn apply_attempt_error(&mut self, error: crate::ssh_servers::AttemptError, retry: OpenRetry) {
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
@@ -2197,10 +2204,7 @@ impl Workbench {
     }
 
     /// Apply a finished Stage result. Success is the only path that starts the companion.
-    pub fn deliver_stage_result(
-        &mut self,
-        result: Result<(), crate::ssh_servers::AttemptError>,
-    ) {
+    pub fn deliver_stage_result(&mut self, result: Result<(), crate::ssh_servers::AttemptError>) {
         self.finish_remote_stage(result);
     }
 
@@ -2370,8 +2374,7 @@ impl Workbench {
             remote.workspace.disconnect();
             remote.phase = RemotePhase::Failed;
             remote.detail =
-                "SSH disconnected. Queued input was discarded and will not be replayed."
-                    .to_owned();
+                "SSH disconnected. Queued input was discarded and will not be replayed.".to_owned();
             remote.client = None;
             remote.attach_request = None;
             remote.holding_input = false;
@@ -3120,7 +3123,7 @@ impl Workbench {
         let open = crate::grok_follow::open_sessions(pid);
         let open_ids: Vec<&str> = open.iter().map(|row| row.session_id.as_str()).collect();
         self.grok_closed
-            .retain(|id| open_ids.iter().any(|open_id| *open_id == id.as_str()));
+            .retain(|id| open_ids.contains(&id.as_str()));
         for row in &open {
             if self.grok_closed.contains(&row.session_id) {
                 continue;
@@ -3147,7 +3150,7 @@ impl Workbench {
         }
         let mut reverted_provisional = false;
         if let Some(id) = self.grok_provisional_id.clone() {
-            let confirmed = open_ids.iter().any(|open_id| *open_id == id.as_str());
+            let confirmed = open_ids.contains(&id.as_str());
             if confirmed {
                 self.clear_provisional_slot();
             } else {

@@ -682,18 +682,14 @@ fn spawn_ssh(
         command,
         timeout,
     };
-    made_platform::ssh::SshProcess::spawn(options).map_err(|failure| AttemptError::from_failure(&failure))
+    made_platform::ssh::SshProcess::spawn(options)
+        .map_err(|failure| AttemptError::from_failure(&failure))
 }
 
 fn packaged_askpass() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let name = if cfg!(windows) {
-        "made-askpass.exe"
-    } else {
-        "made-askpass"
-    };
-    let path = dir.join(name);
+    let path = dir.join(made_platform::askpass_file_name());
     path.is_file().then_some(path)
 }
 
@@ -880,7 +876,9 @@ pub fn spawn_consented_stage(
                 crate::remote_session::stage_body(true, &version, &target, &files)
             });
             let result = match result {
-                Ok(payload) => run_stage(&metadata, &payload, &prompt_tx, &answer_rx, &worker_cancel),
+                Ok(payload) => {
+                    run_stage(&metadata, &payload, &prompt_tx, &answer_rx, &worker_cancel)
+                }
                 Err(detail) => Err(AttemptError {
                     class: crate::remote_session::SshFailureClass::MissingCapability,
                     detail,
@@ -967,11 +965,12 @@ pub fn connect_companion(
             fingerprint: None,
         });
     }
-    let header = made_platform::ssh::companion_header(version, target).map_err(|_| AttemptError {
-        class: crate::remote_session::SshFailureClass::Other,
-        detail: "remote target is not supported".to_owned(),
-        fingerprint: None,
-    })?;
+    let header =
+        made_platform::ssh::companion_header(version, target).map_err(|_| AttemptError {
+            class: crate::remote_session::SshFailureClass::Other,
+            detail: "remote target is not supported".to_owned(),
+            fingerprint: None,
+        })?;
     let mut process = spawn_ssh(metadata, made_platform::ssh::SshCommand::Companion, None)?;
     process.write(&header).map_err(|_| AttemptError {
         class: crate::remote_session::SshFailureClass::Other,

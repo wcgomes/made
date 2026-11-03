@@ -164,10 +164,10 @@ impl Uploads {
             if extension != "png" {
                 continue;
             }
-            if now.duration_since(modified).unwrap_or_default() > RETENTION {
-                if fs::remove_file(&path).is_ok() {
-                    continue;
-                }
+            if now.duration_since(modified).unwrap_or_default() > RETENTION
+                && fs::remove_file(&path).is_ok()
+            {
+                continue;
             }
             images.push((modified, path));
         }

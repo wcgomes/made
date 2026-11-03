@@ -2978,6 +2978,7 @@ pub fn in_memory_clipboard() -> InMemoryClipboard {
     InMemoryClipboard::new()
 }
 mod detach;
+mod process;
 pub mod shell_integration;
 pub mod ssh;
 pub mod ssh_askpass;
@@ -2987,7 +2988,9 @@ pub use detach::{
     remote_path_from_bytes, remote_program_version_supported, remote_target,
     spawn_detached_command,
 };
+pub use process::process_parent;
 pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
+pub use ssh_askpass::askpass_file_name;
 
 #[cfg(test)]
 mod diagnostics_log_tests {

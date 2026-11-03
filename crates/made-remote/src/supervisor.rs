@@ -406,6 +406,8 @@ struct OutputQueue {
 }
 
 impl OutputQueue {
+    // The unsent frame has to travel in `TrySendError` so the caller can keep it.
+    #[allow(clippy::result_large_err)]
     fn try_send(&self, frame: WireEnvelope) -> Result<(), TrySendError<WireEnvelope>> {
         if is_data(&frame.operation) {
             self.data.try_send(frame)

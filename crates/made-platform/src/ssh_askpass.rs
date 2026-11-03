@@ -17,6 +17,17 @@ use std::{
 pub const MAX_PROMPT_BYTES: usize = 8192;
 pub const MAX_ANSWER_BYTES: usize = 8192;
 
+/// File name of the packaged askpass helper beside the application executable.
+///
+/// Windows packages `made-askpass.exe`. Every other host packages `made-askpass`.
+pub const fn askpass_file_name() -> &'static str {
+    if cfg!(windows) {
+        "made-askpass.exe"
+    } else {
+        "made-askpass"
+    }
+}
+
 /// Intentionally neither Clone nor printable. Ownership transfers once.
 pub struct PromptAnswer(Vec<u8>);
 impl PromptAnswer {
@@ -64,8 +75,9 @@ pub struct AskpassBroker {
     replies: SyncSender<Reply>,
     cancelled: Arc<AtomicBool>,
     outstanding: Option<(u64, Instant)>,
+    /// Non-owning interrupt token. The serve thread owns the pipe handle.
     #[cfg(windows)]
-    pipe: std::sync::Mutex<windows_sys::Win32::Foundation::HANDLE>,
+    pipe: windows_pipe::PipeInterrupt,
 }
 impl fmt::Debug for AskpassBroker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -200,15 +212,14 @@ impl AskpassBroker {
         );
         let pipe = windows_pipe::create(&name)?;
         let socket = PathBuf::from(&name);
-        let pipe_slot = std::sync::Mutex::new(pipe);
+        // The spawned thread receives the only owner. This token can interrupt
+        // ConnectNamedPipe; it must not close the handle.
+        let interrupt = windows_pipe::interrupt(&pipe);
         let (request_tx, requests) = mpsc::sync_channel(1);
         let (replies, reply_rx) = mpsc::sync_channel::<Reply>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let stop = cancelled.clone();
-        let handle = pipe;
-        std::thread::spawn(move || {
-            windows_pipe::serve(handle, stop, timeout, request_tx, reply_rx)
-        });
+        std::thread::spawn(move || windows_pipe::serve(pipe, stop, timeout, request_tx, reply_rx));
         Ok(Self {
             directory: PathBuf::new(),
             socket,
@@ -216,7 +227,7 @@ impl AskpassBroker {
             replies,
             cancelled,
             outstanding: None,
-            pipe: pipe_slot,
+            pipe: interrupt,
         })
     }
     pub fn socket_path(&self) -> &Path {
@@ -255,7 +266,7 @@ impl AskpassBroker {
         self.cancelled.store(true, Ordering::Release);
         self.outstanding = None;
         #[cfg(windows)]
-        windows_pipe::cancel(*self.pipe.lock().unwrap_or_else(|error| error.into_inner()));
+        windows_pipe::cancel(&self.pipe);
     }
 }
 impl Drop for AskpassBroker {
@@ -403,6 +414,7 @@ mod windows_pipe {
     use super::{read_blob as decode_blob, write_blob as encode_blob, Reply};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::Path;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -418,17 +430,37 @@ mod windows_pipe {
         EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-        PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
     };
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    pub fn create(name: &str) -> io::Result<HANDLE> {
+    /// Non-owning name of the pipe the serve thread owns.
+    ///
+    /// `CancelIoEx` must use the same handle that issued `ConnectNamedPipe`. A
+    /// duplicated handle would not wake that call, so this token stores the
+    /// raw value without taking ownership or closing it.
+    pub(super) struct PipeInterrupt(RawHandle);
+
+    // SAFETY: the token never closes or frees the handle. `CancelIoEx` on a
+    // live named pipe is safe from any thread, and the broker uses this token
+    // only while the serve thread still owns that pipe.
+    unsafe impl Send for PipeInterrupt {}
+
+    pub(super) fn interrupt(pipe: &OwnedHandle) -> PipeInterrupt {
+        PipeInterrupt(pipe.as_raw_handle())
+    }
+
+    fn as_handle(pipe: &OwnedHandle) -> HANDLE {
+        pipe.as_raw_handle() as HANDLE
+    }
+
+    pub fn create(name: &str) -> io::Result<OwnedHandle> {
         let wide = wide(std::ffi::OsStr::new(name));
         let sddl = wide_literal("D:P(A;;GA;;;CU)");
         let mut descriptor = std::ptr::null_mut();
@@ -470,16 +502,19 @@ mod windows_pipe {
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(handle)
+        // SAFETY: CreateNamedPipeW returned a unique live handle. This is the
+        // only owner. The serve thread receives it and closes it on drop.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 
     pub fn serve(
-        pipe: HANDLE,
+        owner: OwnedHandle,
         stop: std::sync::Arc<AtomicBool>,
         timeout: Duration,
         requests: SyncSender<super::PromptRequest>,
         replies: Receiver<Reply>,
     ) {
+        let pipe = as_handle(&owner);
         use std::sync::atomic::AtomicU64;
         static NEXT_PROMPT: AtomicU64 = AtomicU64::new(1);
         while !stop.load(Ordering::Acquire) {
@@ -547,7 +582,6 @@ mod windows_pipe {
                     }
                     Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        close(pipe);
                         return;
                     }
                 }
@@ -556,17 +590,19 @@ mod windows_pipe {
                 DisconnectNamedPipe(pipe);
             }
         }
-        close(pipe);
+        // `owner` drops here and is the only closer of the server pipe.
     }
 
-    pub fn cancel(pipe: HANDLE) {
-        if pipe.is_null() || pipe == INVALID_HANDLE_VALUE {
+    pub fn cancel(pipe: &PipeInterrupt) {
+        let handle = pipe.0 as HANDLE;
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return;
         }
-        // SAFETY: pipe is the server handle. A null overlapped pointer cancels
-        // the blocked ConnectNamedPipe so cancellation does not wait for a client.
+        // SAFETY: `handle` names the server pipe the serve thread still owns.
+        // A null overlapped pointer cancels the blocked ConnectNamedPipe so
+        // cancellation does not wait for a client. This token does not close it.
         unsafe {
-            windows_sys::Win32::System::IO::CancelIoEx(pipe, std::ptr::null());
+            windows_sys::Win32::System::IO::CancelIoEx(handle, std::ptr::null());
         }
     }
 
