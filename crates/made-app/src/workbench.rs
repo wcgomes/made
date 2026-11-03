@@ -203,6 +203,7 @@ pub struct WorktreeState {
     pub loading: bool,
 }
 
+#[derive(Debug)]
 enum RemotePhase {
     Connecting,
     NeedsConsent,
@@ -2373,9 +2374,23 @@ impl Workbench {
                             reply.operation,
                             made_remote::protocol::Operation::Listed { .. }
                         );
+                        let client_id = reply.request_id;
+                        // A streamed reply (directory, preview, git, watch)
+                        // keeps the same client request id across batches.
+                        // Remove the mapping only when that stream is done.
+                        let terminal = match &reply.operation {
+                            made_remote::protocol::Operation::Listed { done, .. }
+                            | made_remote::protocol::Operation::PreviewResult { done, .. }
+                            | made_remote::protocol::Operation::GitResult { done, .. } => *done,
+                            made_remote::protocol::Operation::Changed { .. } => false,
+                            _ => true,
+                        };
                         let mut reply = reply;
-                        if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                        if let Some(workspace_id) = remote.id_map.get(&client_id).copied() {
                             reply.request_id = workspace_id;
+                            if terminal {
+                                remote.id_map.remove(&client_id);
+                            }
                         }
                         let accepted = remote.workspace.accept(reply);
                         if listed {
@@ -4721,6 +4736,18 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
         Operation::FocusResult { .. } => "FocusResult",
         Operation::UploadResult { .. } => "UploadResult",
         Operation::CapabilitiesResult { .. } => "CapabilitiesResult",
+        Operation::RootValidate { .. } => "RootValidate",
+        Operation::RootSelect { .. } => "RootSelect",
+        Operation::List { .. } => "List",
+        Operation::Preview { .. } => "Preview",
+        Operation::Refresh { .. } => "Refresh",
+        Operation::Watch { .. } => "Watch",
+        Operation::Rescan { .. } => "Rescan",
+        Operation::GitRead { .. } => "GitRead",
+        Operation::SessionState => "SessionState",
+        Operation::Heartbeat => "Heartbeat",
+        Operation::Cancel { .. } => "Cancel",
+        Operation::TerminalResize { .. } => "TerminalResize",
         _ => "other",
     }
 }
@@ -5297,5 +5324,152 @@ mod tests {
         panic!(
             "root/list port replies were not applied: sent_root={sent_root} sent_list={sent_list}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires MADE_E2E_PASSWORD and the local plantsuite fixture"]
+    fn real_workbench_populates_the_remote_explorer() {
+        use made_remote::protocol::{Identity, RemotePath, TabCapability};
+        use std::time::Duration;
+
+        let password = std::env::var("MADE_E2E_PASSWORD").expect("MADE_E2E_PASSWORD");
+        let real_home = std::env::var_os("HOME").expect("HOME");
+        let real_known = std::path::PathBuf::from(&real_home)
+            .join("Library/Application Support/Made/ssh-known-hosts");
+        let directory = std::env::temp_dir().join(format!("made-real-wb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory).unwrap();
+        let home = directory.join("home");
+        let app_support = home.join("Library/Application Support/Made");
+        std::fs::create_dir_all(&app_support).unwrap();
+        if real_known.exists() {
+            std::fs::copy(&real_known, app_support.join("ssh-known-hosts")).unwrap();
+        }
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ];
+        let _env = EnvGuard(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+
+        let mut registry = crate::ssh_servers::ServerRegistry::load(
+            crate::ssh_servers::PrivateMetadataStorage::new(&directory),
+        )
+        .unwrap();
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let authority = registry
+            .add(crate::ssh_servers::ServerMetadata {
+                display_name: "e2e".to_owned(),
+                host: "plantsuite.container".to_owned(),
+                user: Some("vscode".to_owned()),
+                port: Some(2222),
+                key_file: None,
+                initial_directory: Some(root.clone()),
+            })
+            .unwrap();
+        let snapshot = registry.snapshot(authority).unwrap();
+        let identity = Identity {
+            authority,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        };
+        let workspace =
+            crate::remote_workspace::RemoteWorkspace::new(identity.clone(), root.clone()).unwrap();
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot.clone(),
+            workspace,
+            TerminalTarget::RemoteShell { authority },
+            "e2e",
+        );
+        let session = crate::ssh_servers::connect_companion(
+            snapshot.server().metadata(),
+            crate::APP_VERSION,
+            "aarch64-unknown-linux-gnu",
+            identity,
+            root.clone(),
+        )
+        .expect("companion");
+        let client = session.client.clone();
+        {
+            let remote = workbench.remote.as_mut().unwrap();
+            remote.client = Some(client.clone());
+            remote.failures = session.failures;
+        }
+        let open = client
+            .request(
+                crate::remote_session::first_operation(
+                    crate::remote_session::SessionOpen::New,
+                    root.clone(),
+                    made_remote::protocol::LaunchTarget::Shell,
+                    24,
+                    80,
+                ),
+                None,
+            )
+            .unwrap();
+        workbench.remote.as_mut().unwrap().attach_request = Some(open);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut attached = false;
+        let mut listed = false;
+        while Instant::now() < deadline {
+            if let Some(prompt) = client.poll_prompt() {
+                let answer =
+                    made_platform::ssh_askpass::PromptAnswer::new(password.as_bytes().to_vec())
+                        .ok();
+                let _ = client.answer_prompt(prompt.id, answer);
+            }
+            workbench.pump_remote_client();
+            workbench.pump_remote_terminal();
+            let remote = workbench.remote.as_ref().unwrap();
+            attached |= remote.attached_once;
+            if attached {
+                if let Some(directory) = remote.workspace.projection().directories.get(&root) {
+                    if !directory.entries.is_empty() {
+                        listed = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = client.request(made_remote::protocol::Operation::Close, None);
+        std::thread::sleep(Duration::from_millis(100));
+        client.disconnect();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(attached, "workbench never attached");
+        assert!(listed, "workbench never applied the root listing");
     }
 }
