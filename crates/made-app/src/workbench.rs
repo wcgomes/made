@@ -5083,4 +5083,211 @@ mod tests {
             "dropping the confirmed session must leave the hook-only row not running"
         );
     }
+
+    #[test]
+    fn workbench_drains_root_and_listing_ports() {
+        use made_platform::ssh::SshEvent;
+        use made_remote::protocol::{
+            encode, DirectoryEntry, EntryKind, Identity, Operation, RemotePath, TabCapability,
+            WireEnvelope,
+        };
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct FakeStream {
+            events: Arc<Mutex<VecDeque<SshEvent>>>,
+            written: Arc<Mutex<Vec<u8>>>,
+        }
+        impl made_remote::client::ClientStream for FakeStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                self.written.lock().unwrap().extend_from_slice(bytes);
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<SshEvent> {
+                self.events.lock().unwrap().pop_front()
+            }
+            fn detach(&mut self) {}
+        }
+        fn take_frames(buffer: &mut Vec<u8>) -> Vec<WireEnvelope> {
+            let mut frames = Vec::new();
+            loop {
+                if buffer.len() < 4 {
+                    break;
+                }
+                let size = u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize;
+                if buffer.len() < 4 + size {
+                    break;
+                }
+                frames.push(serde_json::from_slice(&buffer[4..4 + size]).unwrap());
+                buffer.drain(..4 + size);
+            }
+            frames
+        }
+
+        let directory = std::env::temp_dir().join(format!("made-wb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory).unwrap();
+        // Workbench::start refuses the real app log path in unit tests. Point
+        // every app path at this temporary directory for the test lifetime.
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let home = directory.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let keys = [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ];
+        let _env = EnvGuard(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        let mut registry = crate::ssh_servers::ServerRegistry::load(
+            crate::ssh_servers::PrivateMetadataStorage::new(&directory),
+        )
+        .unwrap();
+        let authority = registry
+            .add(crate::ssh_servers::ServerMetadata {
+                display_name: "test".to_owned(),
+                host: "example".to_owned(),
+                user: Some("vscode".to_owned()),
+                port: None,
+                key_file: None,
+                initial_directory: None,
+            })
+            .unwrap();
+        let snapshot = registry.snapshot(authority).unwrap();
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let identity = Identity {
+            authority,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        };
+        let workspace =
+            crate::remote_workspace::RemoteWorkspace::new(identity.clone(), root.clone()).unwrap();
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot,
+            workspace,
+            TerminalTarget::RemoteShell { authority },
+            "test",
+        );
+        let fake = FakeStream {
+            events: Arc::new(Mutex::new(VecDeque::new())),
+            written: Arc::new(Mutex::new(Vec::new())),
+        };
+        let client =
+            made_remote::client::RemoteClient::new(fake.clone(), identity.clone(), root.clone())
+                .unwrap();
+        {
+            let remote = workbench.remote.as_mut().unwrap();
+            remote.client = Some(client);
+            remote.attach_request = None;
+            remote.phase = RemotePhase::Ready;
+            remote.workspace.begin_resnapshot().unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut sent_root = false;
+        let mut sent_list = false;
+        while Instant::now() < deadline {
+            workbench.pump_remote_client();
+            let frames = {
+                let mut buffer = fake.written.lock().unwrap();
+                take_frames(&mut buffer)
+            };
+            for frame in frames {
+                match frame.operation {
+                    Operation::RootValidate { path } => {
+                        let reply = WireEnvelope::new(
+                            frame.identity.clone(),
+                            frame.request_id,
+                            Operation::RootResult {
+                                requested: path.clone(),
+                                path,
+                                generation: 1,
+                            },
+                        );
+                        fake.events
+                            .lock()
+                            .unwrap()
+                            .push_back(SshEvent::Data(encode(&reply).unwrap()));
+                        sent_root = true;
+                    }
+                    Operation::List { path } => {
+                        let entry = DirectoryEntry {
+                            path: RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap(),
+                            kind: EntryKind::File,
+                        };
+                        let reply = WireEnvelope::new(
+                            frame.identity.clone(),
+                            frame.request_id,
+                            Operation::Listed {
+                                path,
+                                entries: vec![entry],
+                                truncated: false,
+                                done: true,
+                            },
+                        );
+                        fake.events
+                            .lock()
+                            .unwrap()
+                            .push_back(SshEvent::Data(encode(&reply).unwrap()));
+                        sent_list = true;
+                    }
+                    _ => {}
+                }
+            }
+            if sent_root && sent_list {
+                let remote = workbench.remote.as_ref().unwrap();
+                let listed = remote
+                    .workspace
+                    .projection()
+                    .directories
+                    .get(&root)
+                    .is_some_and(|directory| {
+                        directory.entries.iter().any(|entry| {
+                            entry.path
+                                == RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap()
+                        })
+                    });
+                if listed {
+                    let _ = std::fs::remove_dir_all(&directory);
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        panic!(
+            "root/list port replies were not applied: sent_root={sent_root} sent_list={sent_list}"
+        );
+    }
 }
