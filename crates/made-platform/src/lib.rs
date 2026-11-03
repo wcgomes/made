@@ -117,8 +117,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod private_metadata;
 pub use private_metadata::{
-    private_dacl_is_owner_only, read_private_metadata, write_private_metadata_atomic, PrivateAce,
-    PrivateAceTrustee, PrivateDacl, MAX_PRIVATE_METADATA_BYTES,
+    private_dacl_is_owner_only, private_dacl_refusal, read_private_metadata,
+    write_private_metadata_atomic, PrivateAce, PrivateAceTrustee, PrivateDacl,
+    MAX_PRIVATE_METADATA_BYTES,
 };
 
 #[cfg(target_os = "linux")]

@@ -1,6 +1,6 @@
 use made_platform::{
-    private_dacl_is_owner_only, read_private_metadata, write_private_metadata_atomic, PrivateAce,
-    PrivateAceTrustee, PrivateDacl,
+    private_dacl_is_owner_only, private_dacl_refusal, read_private_metadata,
+    write_private_metadata_atomic, PrivateAce, PrivateAceTrustee, PrivateDacl,
 };
 use std::path::PathBuf;
 
@@ -150,38 +150,63 @@ fn owner_only_dacl_accepts_canonical_forms_and_rejects_weaker_grants() {
         true,
         vec![owner, rights]
     )));
-    assert!(!private_dacl_is_owner_only(&dacl(false, true, vec![owner])));
-    assert!(!private_dacl_is_owner_only(&dacl(true, false, vec![owner])));
-    assert!(!private_dacl_is_owner_only(&dacl(true, true, Vec::new())));
-    assert!(!private_dacl_is_owner_only(&dacl(
-        true,
-        true,
-        vec![ace(PrivateAceTrustee::Owner, true, true, true)]
-    )));
-    assert!(!private_dacl_is_owner_only(&dacl(
-        true,
-        true,
-        vec![ace(PrivateAceTrustee::Other, true, true, false)]
-    )));
-    assert!(!private_dacl_is_owner_only(&dacl(
-        true,
-        true,
-        vec![owner, ace(PrivateAceTrustee::Other, true, false, false)]
-    )));
-    assert!(!private_dacl_is_owner_only(&dacl(
-        true,
-        true,
-        vec![ace(PrivateAceTrustee::Owner, true, false, false)]
-    )));
-    assert!(!private_dacl_is_owner_only(&dacl(
-        true,
-        true,
-        vec![ace(PrivateAceTrustee::Owner, false, true, false)]
-    )));
+    assert_eq!(
+        private_dacl_refusal(&dacl(false, true, vec![owner])),
+        Some("DACL is not protected")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(true, false, vec![owner])),
+        Some("owner is not the current user")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(true, true, Vec::new())),
+        Some("DACL has no ACE")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(
+            true,
+            true,
+            vec![ace(PrivateAceTrustee::Owner, true, true, true)]
+        )),
+        Some("ACE is inherited")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(
+            true,
+            true,
+            vec![ace(PrivateAceTrustee::Other, true, true, false)]
+        )),
+        Some("ACE trustee is not the owner")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(
+            true,
+            true,
+            vec![owner, ace(PrivateAceTrustee::Other, true, false, false)]
+        )),
+        Some("ACE trustee is not the owner")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(
+            true,
+            true,
+            vec![ace(PrivateAceTrustee::Owner, true, false, false)]
+        )),
+        Some("ACE mask is not full access")
+    );
+    assert_eq!(
+        private_dacl_refusal(&dacl(
+            true,
+            true,
+            vec![ace(PrivateAceTrustee::Owner, false, true, false)]
+        )),
+        Some("ACE is not an allow")
+    );
 }
 
-/// Windows CI creates this directory under an isolated APPDATA. The DACL check
-/// must accept the canonical ACL, not the raw SDDL bytes. Not executed here.
+/// Windows CI creates this directory under an isolated APPDATA. Creation must
+/// assign the current user as owner and a protected full-allow DACL, then the
+/// following read must accept that canonical ACL. Not executed here.
 #[cfg(windows)]
 #[test]
 fn metadata_write_accepts_canonical_owner_only_dacl() {

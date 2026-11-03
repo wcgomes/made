@@ -177,27 +177,49 @@ pub struct PrivateDacl {
     pub aces: Vec<PrivateAce>,
 }
 
+/// Why a DACL is not owner-only full access, or `None` when it is.
+///
+/// The string names the failed condition. Windows may canonicalize ACL layout
+/// after the descriptor is written; this does not compare raw ACL bytes.
+pub fn private_dacl_refusal(dacl: &PrivateDacl) -> Option<&'static str> {
+    if !dacl.protected {
+        return Some("DACL is not protected");
+    }
+    if !dacl.owner_is_current {
+        return Some("owner is not the current user");
+    }
+    if dacl.aces.is_empty() {
+        return Some("DACL has no ACE");
+    }
+    for ace in &dacl.aces {
+        if ace.inherited {
+            return Some("ACE is inherited");
+        }
+        if !matches!(
+            ace.trustee,
+            PrivateAceTrustee::Owner | PrivateAceTrustee::OwnerRights
+        ) {
+            return Some("ACE trustee is not the owner");
+        }
+        if !ace.allow {
+            return Some("ACE is not an allow");
+        }
+        if !ace.full_access {
+            return Some("ACE mask is not full access");
+        }
+    }
+    None
+}
+
 /// Owner-only full access.
 ///
 /// Accepts a protected DACL whose owner is the current user and whose every ACE
 /// is an explicit allow of full access for that owner or for owner-rights.
 /// Rejects an unprotected or inherited ACL, a partial mask, a deny/audit ACE,
-/// and any trustee other than the owner. Byte identity with `D:P(A;;FA;;;OW)`
-/// is not required.
+/// and any trustee other than the owner.
 #[must_use]
 pub fn private_dacl_is_owner_only(dacl: &PrivateDacl) -> bool {
-    if !dacl.protected || !dacl.owner_is_current || dacl.aces.is_empty() {
-        return false;
-    }
-    dacl.aces.iter().all(|ace| {
-        !ace.inherited
-            && ace.allow
-            && ace.full_access
-            && matches!(
-                ace.trustee,
-                PrivateAceTrustee::Owner | PrivateAceTrustee::OwnerRights
-            )
-    })
+    private_dacl_refusal(dacl).is_none()
 }
 
 fn ensure_directory(path: &Path) -> io::Result<()> {
@@ -346,12 +368,15 @@ mod backend {
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::Authorization::SetSecurityInfo;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
-        GetSecurityDescriptorControl, GetTokenInformation, IsValidSid, TokenUser,
-        WinCreatorOwnerRightsSid, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-        DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION, PSID,
+        AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid, GetAce,
+        GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
+        InitializeAcl, IsValidSid, TokenUser, WinCreatorOwnerRightsSid, ACCESS_ALLOWED_ACE, ACL,
+        ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERITED_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
         SECURITY_MAX_SID_SIZE, SE_DACL_PRESENT, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT};
@@ -433,14 +458,15 @@ mod backend {
         let metadata = file.metadata()?;
         // Reparse points are not regular files or plain directories, even when
         // the reparse tag would otherwise look like a file or directory.
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || if directory {
-                !metadata.is_dir()
-            } else {
-                !metadata.is_file()
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(refuse("path is a reparse point"));
+        }
+        if directory {
+            if !metadata.is_dir() {
+                return Err(refuse("path is not a directory"));
             }
-        {
-            return Err(invalid());
+        } else if !metadata.is_file() {
+            return Err(refuse("path is not a regular file"));
         }
         let mut owner = std::ptr::null_mut();
         let mut dacl = std::ptr::null_mut();
@@ -471,24 +497,38 @@ mod backend {
         }
         // A null DACL grants everyone. That is not owner-only.
         if dacl.is_null() {
-            return Err(invalid());
+            return Err(refuse("DACL is null"));
         }
         let policy = PrivateDacl {
             protected: control & SE_DACL_PRESENT != 0 && control & SE_DACL_PROTECTED != 0,
             owner_is_current: owner_is_current_user(owner)?,
             aces: read_aces(dacl, owner)?,
         };
-        if private_dacl_is_owner_only(&policy) {
-            Ok(())
-        } else {
-            Err(invalid())
+        match private_dacl_refusal(&policy) {
+            None => Ok(()),
+            Some(reason) => Err(refuse(reason)),
         }
     }
+
+    fn refuse(reason: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, reason)
+    }
+
+    #[repr(C, align(4))]
+    struct SidBuf([u8; SECURITY_MAX_SID_SIZE as usize]);
+
+    #[repr(C, align(4))]
+    struct AclBuf([u8; 256]);
 
     fn owner_is_current_user(owner: PSID) -> io::Result<bool> {
         if owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
             return Ok(false);
         }
+        let user = current_user_sid()?;
+        Ok(unsafe { EqualSid(owner, user.0.as_ptr().cast()) } != 0)
+    }
+
+    fn current_user_sid() -> io::Result<SidBuf> {
         let mut token = std::ptr::null_mut();
         // SAFETY: GetCurrentProcess is a pseudo-handle and must not be closed.
         // OpenProcessToken returns a new owned token.
@@ -501,11 +541,11 @@ mod backend {
             GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
         }
         if needed == 0 || needed > 1024 {
-            return Ok(false);
+            return Err(refuse("current user SID is unusable"));
         }
         let mut bytes = vec![0u8; needed as usize];
-        // SAFETY: `bytes` is writable for `needed` bytes. The returned SID
-        // pointer stays inside that buffer until this function returns.
+        // SAFETY: `bytes` is writable for `needed` bytes. The SID pointer stays
+        // inside that buffer until it is copied below.
         let ok = unsafe {
             GetTokenInformation(
                 token.0,
@@ -521,9 +561,104 @@ mod backend {
         // SAFETY: GetTokenInformation wrote a TOKEN_USER at the start of `bytes`.
         let user = unsafe { &*(bytes.as_ptr() as *const TOKEN_USER) };
         if user.User.Sid.is_null() || unsafe { IsValidSid(user.User.Sid) } == 0 {
-            return Ok(false);
+            return Err(refuse("current user SID is unusable"));
         }
-        Ok(unsafe { EqualSid(owner, user.User.Sid) } != 0)
+        let len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+        if len == 0 || len > SECURITY_MAX_SID_SIZE as usize {
+            return Err(refuse("current user SID is unusable"));
+        }
+        let mut sid = SidBuf([0; SECURITY_MAX_SID_SIZE as usize]);
+        // SAFETY: GetLengthSid reported `len` bytes, the source SID is valid,
+        // and `sid` is aligned and at least that large.
+        unsafe {
+            std::ptr::copy_nonoverlapping(user.User.Sid.cast::<u8>(), sid.0.as_mut_ptr(), len);
+        }
+        Ok(sid)
+    }
+
+    /// Write the current user as owner and a protected DACL that allows only
+    /// that user full access. An elevated token would otherwise leave
+    /// `BUILTIN\Administrators` as owner of a `CreateDirectoryW` result.
+    fn assign_owner_only(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<()> {
+        let user = current_user_sid()?;
+        let mut acl = AclBuf([0; 256]);
+        // SAFETY: the ACL buffer is 256 aligned bytes, larger than one allow
+        // ACE for a maximum SID. The user SID remains live for the call.
+        if unsafe { InitializeAcl(acl.0.as_mut_ptr().cast(), acl.0.len() as u32, ACL_REVISION) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            AddAccessAllowedAce(
+                acl.0.as_mut_ptr().cast(),
+                ACL_REVISION,
+                FILE_ALL_ACCESS,
+                user.0.as_ptr().cast(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                user.0.as_ptr().cast(),
+                std::ptr::null_mut(),
+                acl.0.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
+    fn assign_owner_only_path(wide: &[u16]) -> io::Result<()> {
+        let user = current_user_sid()?;
+        let mut acl = AclBuf([0; 256]);
+        // SAFETY: same owner-only ACL as `assign_owner_only`. The path is
+        // NUL-terminated and the buffers stay live for SetNamedSecurityInfoW.
+        if unsafe { InitializeAcl(acl.0.as_mut_ptr().cast(), acl.0.len() as u32, ACL_REVISION) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            AddAccessAllowedAce(
+                acl.0.as_mut_ptr().cast(),
+                ACL_REVISION,
+                FILE_ALL_ACCESS,
+                user.0.as_ptr().cast(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                user.0.as_ptr().cast(),
+                std::ptr::null_mut(),
+                acl.0.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
     }
 
     fn read_aces(dacl: *mut ACL, owner: PSID) -> io::Result<Vec<PrivateAce>> {
@@ -541,7 +676,7 @@ mod backend {
             return Err(io::Error::last_os_error());
         }
         if info.AceCount > 64 {
-            return Err(invalid());
+            return Err(refuse("DACL has too many ACEs"));
         }
         let owner_rights = owner_rights_sid()?;
         let mut aces = Vec::with_capacity(info.AceCount as usize);
@@ -550,7 +685,7 @@ mod backend {
             // SAFETY: `index` is below the ACL's AceCount, so GetAce returns an
             // ACE inside `dacl` or fails.
             if unsafe { GetAce(dacl, index, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
-                return Err(invalid());
+                return Err(refuse("ACE is unreadable"));
             }
             // SAFETY: every ACE begins with ACE_HEADER. GetAce returns that header.
             let header = unsafe { &*(ace_ptr as *const windows_sys::Win32::Security::ACE_HEADER) };
@@ -571,16 +706,16 @@ mod backend {
             // before IsValidSid/EqualSid read it.
             let bytes = unsafe { std::slice::from_raw_parts(ace_ptr.cast::<u8>(), ace_len) };
             if bytes.len() < 16 {
-                return Err(invalid());
+                return Err(refuse("ACE is unreadable"));
             }
             let sub_count = bytes[9] as usize;
             let sid_len = 8 + sub_count.saturating_mul(4);
             if sub_count > 15 || bytes.len() < 8 + sid_len {
-                return Err(invalid());
+                return Err(refuse("ACE is unreadable"));
             }
             let sid = unsafe { ace_ptr.cast::<u8>().add(8) as PSID };
             if unsafe { IsValidSid(sid) } == 0 {
-                return Err(invalid());
+                return Err(refuse("ACE is unreadable"));
             }
             let trustee = if !owner.is_null() && unsafe { EqualSid(sid, owner) } != 0 {
                 PrivateAceTrustee::Owner
@@ -633,15 +768,17 @@ mod backend {
         }
     }
     fn open(path: &Path, directory: bool, create: bool) -> io::Result<Option<File>> {
-        let path = wide(path)?;
+        let wide_path = wide(path)?;
         let descriptor = Descriptor::private()?;
         let attributes = descriptor.attributes();
         let access = if directory {
             0x20080
         } else if create {
-            0x40020000
+            // GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER. The extra
+            // rights let this handle replace the elevated default owner.
+            0x4002_0000 | 0x0004_0000 | 0x0008_0000
         } else {
-            0x80020000
+            0x8002_0000
         };
         // OPEN_REPARSE_POINT, plus BACKUP_SEMANTICS for directories. Excluding
         // FILE_SHARE_DELETE pins the directory against replacement while held.
@@ -650,7 +787,7 @@ mod backend {
         // is uniquely transferred to File below on successful creation/open.
         let handle = unsafe {
             CreateFileW(
-                path.as_ptr(),
+                wide_path.as_ptr(),
                 access,
                 if directory { 3 } else { 1 },
                 &attributes,
@@ -669,7 +806,20 @@ mod backend {
         }
         // SAFETY: CreateFileW returned this uniquely owned, valid handle.
         let file = unsafe { File::from_raw_handle(handle) };
-        check(&file, directory)?;
+        if create {
+            if let Err(error) = assign_owner_only(file.as_raw_handle() as _) {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
+        }
+        if let Err(error) = check(&file, directory) {
+            if create {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(error);
+        }
         Ok(Some(file))
     }
     pub fn open_directory(path: &Path) -> io::Result<Option<File>> {
@@ -682,15 +832,20 @@ mod backend {
         open(&directory.join(name), false, true)?.ok_or_else(invalid)
     }
     pub fn create_directory(path: &Path) -> io::Result<()> {
-        let path = wide(path)?;
+        let wide_path = wide(path)?;
         let descriptor = Descriptor::private()?;
         let attributes = descriptor.attributes();
         // SAFETY: terminated path and live protected DACL descriptor.
-        if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        // CreateDirectoryW on an elevated token still records Administrators as
+        // owner; assign_owner_only_path replaces that before the check.
+        if unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) } == 0 {
+            return Err(io::Error::last_os_error());
         }
+        if let Err(error) = assign_owner_only_path(&wide_path) {
+            let _ = std::fs::remove_dir(path);
+            return Err(error);
+        }
+        Ok(())
     }
     pub fn replace(_root: &File, directory: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::rename(directory.join(from), directory.join(to))
