@@ -1024,6 +1024,7 @@ impl Supervisor {
     }
 
     fn observe_pty(&mut self) {
+        const MAX_PTY_EVENTS_PER_TICK: usize = 256;
         let snapshot_pending = self
             .attachment
             .as_ref()
@@ -1031,41 +1032,49 @@ impl Supervisor {
         if snapshot_pending {
             return;
         }
-        if let Some(bytes) = self
-            .attachment
-            .as_mut()
-            .and_then(|attachment| attachment.pending_relay.take())
-        {
-            if !self.relay_terminal(bytes.clone()) {
-                if let Some(attachment) = self.attachment.as_mut() {
-                    attachment.pending_relay = Some(bytes);
-                }
-                return;
-            }
-        }
-        let Some(event) = self.session.poll() else {
-            return;
-        };
-        match event {
-            PtyEvent::Data(bytes) => {
-                self.session.observe(&bytes);
-                if self.attachment.is_some() && !self.relay_terminal(bytes.clone()) {
+        // A single event per main-loop tick puts every later keystroke echo
+        // behind the shell's startup output and command output. Drain the
+        // reader queue in one pass; the bounded output queue is the
+        // backpressure point.
+        for _ in 0..MAX_PTY_EVENTS_PER_TICK {
+            if let Some(bytes) = self
+                .attachment
+                .as_mut()
+                .and_then(|attachment| attachment.pending_relay.take())
+            {
+                if !self.relay_terminal(bytes.clone()) {
                     if let Some(attachment) = self.attachment.as_mut() {
                         attachment.pending_relay = Some(bytes);
                     }
+                    return;
                 }
             }
-            PtyEvent::Exited(status) => {
-                if let Some(attachment) = &self.attachment {
-                    let frame = WireEnvelope::new(
-                        attachment.identity.clone(),
-                        attachment.request,
-                        Operation::TerminalExit { code: status.code },
-                    );
-                    self.enqueue(frame);
+            let Some(event) = self.session.poll() else {
+                return;
+            };
+            match event {
+                PtyEvent::Data(bytes) => {
+                    self.session.observe(&bytes);
+                    if self.attachment.is_some() && !self.relay_terminal(bytes.clone()) {
+                        if let Some(attachment) = self.attachment.as_mut() {
+                            attachment.pending_relay = Some(bytes);
+                        }
+                        return;
+                    }
                 }
+                PtyEvent::Exited(status) => {
+                    if let Some(attachment) = &self.attachment {
+                        let frame = WireEnvelope::new(
+                            attachment.identity.clone(),
+                            attachment.request,
+                            Operation::TerminalExit { code: status.code },
+                        );
+                        self.enqueue(frame);
+                    }
+                    return;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
