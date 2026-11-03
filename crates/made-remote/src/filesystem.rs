@@ -175,7 +175,7 @@ impl Filesystem {
             .guard
             .resolve_existing(native(path)?)
             .map_err(|_| ErrorCode::Unauthorized)?;
-        let watcher = FsWatcher::new(canonical, RootGeneration::new(self.generation))
+        let watcher = FsWatcher::new_non_recursive(canonical, RootGeneration::new(self.generation))
             .map_err(|_| ErrorCode::Unavailable)?;
         self.watcher = Some((path.clone(), watcher));
         Ok(())

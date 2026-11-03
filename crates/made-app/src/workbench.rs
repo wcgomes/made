@@ -2339,97 +2339,105 @@ impl Workbench {
     }
 
     fn pump_remote_client(&mut self) {
-        let (attach_reply, upload_replies, seen, disconnected) = {
-            let Some(remote) = self.remote.as_mut() else {
-                return;
-            };
-            let Some(client) = remote.client.clone() else {
-                return;
-            };
-            if !client.is_connected() {
-                (None, Vec::new(), Vec::new(), true)
-            } else {
-                let waiting_attach = remote.attach_request;
-                let mut attach_reply = None;
-                let mut upload_replies = Vec::new();
-                let mut seen = Vec::new();
-                while let Some(reply) = client.poll_reply() {
-                    seen.push(operation_name(&reply.operation));
-                    if waiting_attach == Some(reply.request_id) {
-                        attach_reply = Some(reply);
-                        continue;
-                    }
-                    if remote.upload.as_ref().is_some_and(|upload| {
-                        upload.begin_id == Some(reply.request_id)
-                            || upload.inflight_chunk == Some(reply.request_id)
-                            || upload.commit_id == Some(reply.request_id)
-                    }) {
-                        upload_replies.push(reply);
-                        continue;
-                    }
-                    if remote.attach_request.is_some() {
-                        continue;
-                    }
-                    let mut reply = reply;
-                    if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
-                        reply.request_id = workspace_id;
-                    }
-                    let _ = remote.workspace.accept(reply);
-                }
-                // Root and session results use dedicated client ports. They
-                // still belong to workspace request ids and must be applied
-                // through the same id map as the generic queue.
-                use made_remote::protocol::{RootResolver, SessionCommandSink};
-                let mut resolver = client.root_resolver();
-                while let Some(mut resolution) = resolver.poll() {
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!(
-                            "remote root reply: generation {} ok={}",
-                            resolution.generation,
-                            resolution.result.is_ok()
-                        ),
-                    );
-                    if let Some(workspace_id) = remote.id_map.remove(&resolution.request_id) {
-                        resolution.request_id = workspace_id;
-                    } else {
-                        continue;
-                    }
-                    let generation = resolution.generation;
-                    if let Ok(Some(crate::remote_workspace::RemoteResult::Root(path))) =
-                        remote.workspace.accept_root(resolution)
-                    {
-                        if generation > client.identity().generation {
-                            let _ = client.set_root(path, generation);
+        let (attach_reply, upload_replies, disconnected) =
+            {
+                let Some(remote) = self.remote.as_mut() else {
+                    return;
+                };
+                let Some(client) = remote.client.clone() else {
+                    return;
+                };
+                if !client.is_connected() {
+                    (None, Vec::new(), true)
+                } else {
+                    let waiting_attach = remote.attach_request;
+                    let mut attach_reply = None;
+                    let mut upload_replies = Vec::new();
+                    while let Some(reply) = client.poll_reply() {
+                        if waiting_attach == Some(reply.request_id) {
+                            attach_reply = Some(reply);
+                            continue;
+                        }
+                        if remote.upload.as_ref().is_some_and(|upload| {
+                            upload.begin_id == Some(reply.request_id)
+                                || upload.inflight_chunk == Some(reply.request_id)
+                                || upload.commit_id == Some(reply.request_id)
+                        }) {
+                            upload_replies.push(reply);
+                            continue;
+                        }
+                        if remote.attach_request.is_some() {
+                            continue;
+                        }
+                        let listed = matches!(
+                            reply.operation,
+                            made_remote::protocol::Operation::Listed { .. }
+                        );
+                        let mut reply = reply;
+                        if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                            reply.request_id = workspace_id;
+                        }
+                        let accepted = remote.workspace.accept(reply);
+                        if listed {
+                            let root = remote.workspace.root().clone();
+                            let entries = remote
+                                .workspace
+                                .projection()
+                                .directories
+                                .get(&root)
+                                .map(|directory| directory.entries.len());
+                            self.diag.log_mut().record(
+                                LogLevel::Info,
+                                format!(
+                                "remote listed applied: ok={} root_present={} entries={entries:?}",
+                                accepted.is_ok(),
+                                remote.workspace.projection().directories.contains_key(&root)
+                            ),
+                            );
                         }
                     }
-                }
-                let mut sessions = client.session_sink();
-                while let Some(mut reply) = sessions.poll() {
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!("remote session reply: {}", operation_name(&reply.operation)),
-                    );
-                    if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
-                        reply.request_id = workspace_id;
+                    // Root and session results use dedicated client ports. They
+                    // still belong to workspace request ids and must be applied
+                    // through the same id map as the generic queue.
+                    use made_remote::protocol::{RootResolver, SessionCommandSink};
+                    let mut resolver = client.root_resolver();
+                    while let Some(mut resolution) = resolver.poll() {
+                        self.diag.log_mut().record(
+                            LogLevel::Info,
+                            format!(
+                                "remote root reply: generation {} ok={}",
+                                resolution.generation,
+                                resolution.result.is_ok()
+                            ),
+                        );
+                        if let Some(workspace_id) = remote.id_map.remove(&resolution.request_id) {
+                            resolution.request_id = workspace_id;
+                        } else {
+                            continue;
+                        }
+                        let generation = resolution.generation;
+                        if let Ok(Some(crate::remote_workspace::RemoteResult::Root(path))) =
+                            remote.workspace.accept_root(resolution)
+                        {
+                            if generation > client.identity().generation {
+                                let _ = client.set_root(path, generation);
+                            }
+                        }
                     }
-                    let _ = remote.workspace.accept(reply);
+                    let mut sessions = client.session_sink();
+                    while let Some(mut reply) = sessions.poll() {
+                        self.diag.log_mut().record(
+                            LogLevel::Info,
+                            format!("remote session reply: {}", operation_name(&reply.operation)),
+                        );
+                        if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                            reply.request_id = workspace_id;
+                        }
+                        let _ = remote.workspace.accept(reply);
+                    }
+                    (attach_reply, upload_replies, false)
                 }
-                (attach_reply, upload_replies, seen, false)
-            }
-        };
-        if !seen.is_empty() || attach_reply.is_some() {
-            self.diag.log_mut().record(
-                LogLevel::Info,
-                format!(
-                    "remote replies: {seen:?} attach={}",
-                    attach_reply
-                        .as_ref()
-                        .map(|reply| operation_name(&reply.operation))
-                        .unwrap_or("none")
-                ),
-            );
-        }
+            };
         if disconnected {
             self.fail_remote_transport();
             return;

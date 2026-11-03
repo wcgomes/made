@@ -3157,7 +3157,12 @@ fn remote_files_ui(
     _layout: &theme::Layout,
 ) {
     use crate::remote_workspace::Freshness;
-    let root = projection.directories.get(root);
+    let root = projection.directories.get(root).or_else(|| {
+        projection
+            .requested_root
+            .as_ref()
+            .and_then(|requested| projection.directories.get(requested))
+    });
     let Some(root) = root else {
         ui.label(theme::micro("Remote listing has not arrived"));
         return;

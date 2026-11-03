@@ -261,11 +261,35 @@ impl FsWatcher {
         Self::with_debounce(root, generation, DEFAULT_DEBOUNCE)
     }
 
+    /// Watches only the direct children of `root`. Remote explorer roots such
+    /// as a home directory can contain caches and editor servers whose
+    /// recursive event stream would starve the SSH channel.
+    pub fn new_non_recursive(
+        root: impl AsRef<Path>,
+        generation: RootGeneration,
+    ) -> Result<Self, WatchError> {
+        Self::with_debounce_mode(
+            root,
+            generation,
+            DEFAULT_DEBOUNCE,
+            RecursiveMode::NonRecursive,
+        )
+    }
+
     /// Watches `root` recursively with an explicit debounce window.
     pub fn with_debounce(
         root: impl AsRef<Path>,
         generation: RootGeneration,
         debounce: Duration,
+    ) -> Result<Self, WatchError> {
+        Self::with_debounce_mode(root, generation, debounce, RecursiveMode::Recursive)
+    }
+
+    fn with_debounce_mode(
+        root: impl AsRef<Path>,
+        generation: RootGeneration,
+        debounce: Duration,
+        mode: RecursiveMode,
     ) -> Result<Self, WatchError> {
         let guard = PathGuard::new(root)?;
         let root = guard.root().to_path_buf();
@@ -284,7 +308,7 @@ impl FsWatcher {
         })?;
 
         watcher
-            .watch(&root, RecursiveMode::Recursive)
+            .watch(&root, mode)
             .map_err(|source| WatchError::Notify {
                 path: root.clone(),
                 source,
