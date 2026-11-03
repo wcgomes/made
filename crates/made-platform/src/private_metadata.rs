@@ -223,20 +223,37 @@ pub fn private_dacl_is_owner_only(dacl: &PrivateDacl) -> bool {
 }
 
 fn ensure_directory(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
-        Ok(_) => Err(invalid()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                // Existing parents are trusted app-data ancestry, not modified.
-                if !parent.exists() {
-                    ensure_directory(parent)?;
-                }
-            }
-            backend::create_directory(path)
-        }
-        Err(e) => Err(e),
+    #[cfg(windows)]
+    {
+        // An existing app directory may already carry an inherited ACL. Tighten
+        // it when we own it before the privacy check; do not rewrite another
+        // owner's directory.
+        return backend::create_or_tighten(path);
     }
+    #[cfg(not(windows))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
+            Ok(_) => Err(invalid()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    // Existing parents are trusted app-data ancestry, not modified.
+                    if !parent.exists() {
+                        ensure_directory(parent)?;
+                    }
+                }
+                backend::create_directory(path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Create or tighten an app-owned directory so Windows does not leave an
+/// inherited ACL in place. Unix callers keep `create_private_dir_all`.
+#[cfg(windows)]
+pub(crate) fn create_or_tighten_private_directory(path: &Path) -> io::Result<()> {
+    backend::create_or_tighten(path)
 }
 
 #[cfg(unix)]
@@ -854,6 +871,71 @@ mod backend {
             return Err(error);
         }
         Ok(())
+    }
+    /// Create a missing directory with an owner-only DACL, or replace the DACL
+    /// of an existing directory owned by the current user. Another owner's
+    /// directory is refused and left unchanged.
+    pub fn create_or_tighten(path: &Path) -> io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                if !directory_owner_is_current(path)? {
+                    return Err(refuse("owner is not the current user"));
+                }
+                assign_owner_only_path(&wide(path)?)
+            }
+            Ok(_) => Err(refuse("path is not a directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+                {
+                    create_or_tighten(parent)?;
+                }
+                create_directory(path)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn directory_owner_is_current(path: &Path) -> io::Result<bool> {
+        let wide_path = wide(path)?;
+        // READ_CONTROL is enough to read the owner. OPEN_REPARSE_POINT avoids
+        // following a junction. The handle is closed when `file` drops.
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                0x0002_0000,
+                3,
+                std::ptr::null(),
+                3,
+                0x0200_0000 | 0x0020_0000,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned this uniquely owned handle.
+        let file = unsafe { File::from_raw_handle(handle) };
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: the handle is live. GetSecurityInfo allocates `descriptor`.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle() as _,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = Descriptor(descriptor);
+        owner_is_current_user(owner)
     }
     pub fn replace(_root: &File, directory: &Path, from: &str, to: &str) -> io::Result<()> {
         std::fs::rename(directory.join(from), directory.join(to))

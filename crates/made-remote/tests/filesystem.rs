@@ -1,3 +1,5 @@
+//! Unix path and private-root operations. Windows remotes are unsupported.
+#![cfg(unix)]
 use made_remote::{
     filesystem::{remote, Filesystem},
     protocol::*,

@@ -1756,7 +1756,12 @@ fn open_append_private(path: &Path) -> Result<std::fs::File, PlatformError> {
         .map_err(|error| PlatformError::io("open private log", error))
 }
 
-/// Create a directory tree with owner-only permissions on Unix.
+/// Create a directory tree with owner-only permissions.
+///
+/// Unix uses mode 0700. Windows does not use `create_dir_all`: that leaves an
+/// inherited ACL. A new directory is created with the current user as owner
+/// and a protected full-allow DACL for that user only. An existing directory
+/// is tightened the same way when the current user already owns it.
 fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     #[cfg(unix)]
     {
@@ -1775,7 +1780,7 @@ fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(path)
+        private_metadata::create_or_tighten_private_directory(path)
             .map_err(|error| PlatformError::io("create app directory", error))
     }
 }

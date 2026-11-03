@@ -1,12 +1,26 @@
 use made_platform::ssh::{SshCommand, SshDestination, SshOptions};
 use std::path::PathBuf;
 
+fn host_private(name: &str) -> PathBuf {
+    // Forward slashes stay absolute on Windows and are accepted by argv.
+    // A Unix path is not absolute there and must not be passed to argv.
+    if cfg!(windows) {
+        PathBuf::from(format!("C:/private/{name}"))
+    } else {
+        PathBuf::from(format!("/private/{name}"))
+    }
+}
+
 fn options() -> SshOptions {
     SshOptions {
-        executable: "/usr/bin/ssh".into(),
-        askpass_executable: "/private/made-askpass".into(),
-        private_directory: "/private/made".into(),
-        known_hosts: "/private/Made data/known_hosts".into(),
+        executable: if cfg!(windows) {
+            PathBuf::from("C:/Windows/System32/OpenSSH/ssh.exe")
+        } else {
+            PathBuf::from("/usr/bin/ssh")
+        },
+        askpass_executable: host_private("made-askpass"),
+        private_directory: host_private("made"),
+        known_hosts: host_private("Made data/known_hosts"),
         destination: SshDestination {
             host: "configured-alias".into(),
             user: None,
@@ -39,7 +53,12 @@ fn retains_alias_without_overriding_jump_or_config_and_disables_forwarding() {
         &args[args.len() - 3..args.len() - 1],
         &["--", "configured-alias"]
     );
-    assert!(args.contains(&"UserKnownHostsFile=\"/private/Made data/known_hosts\""));
+    let known = options().known_hosts;
+    let expected = format!(
+        "UserKnownHostsFile=\"{}\"",
+        known.to_str().expect("known_hosts is valid Unicode")
+    );
+    assert!(args.contains(&expected.as_str()), "missing {expected}");
 }
 #[test]
 fn rejects_option_and_command_injection_without_shell_interpolation() {

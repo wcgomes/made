@@ -167,7 +167,15 @@ fn private_directory_and_file_operations_reject_symlinks_and_loose_modes() {
     std::fs::hard_link(&file, created.join("hard")).unwrap();
     assert!(read_private_file(&file, 16).is_err());
 
-    let lock_path = created.join("stage.lock");
+    // A fixed name can collide if two tests share a directory and then wait on
+    // the same flock. The counter makes each call a distinct file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_LOCK: AtomicU64 = AtomicU64::new(1);
+    let lock_path = created.join(format!(
+        "stage-{}-{}.lock",
+        std::process::id(),
+        NEXT_LOCK.fetch_add(1, Ordering::Relaxed)
+    ));
     let first = lock_private_file(&lock_path, Duration::from_secs(1)).unwrap();
     assert!(lock_private_file(&lock_path, Duration::ZERO).is_err());
     drop(first);

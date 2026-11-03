@@ -1,3 +1,6 @@
+//! Unix private-file uploads. Windows remotes are unsupported; these tests are
+//! not a pass on that host.
+#![cfg(unix)]
 use base64::Engine;
 use made_remote::{clipboard::Uploads, protocol::*};
 #[test]

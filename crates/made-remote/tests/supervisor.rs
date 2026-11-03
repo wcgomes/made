@@ -1,18 +1,25 @@
 //! Native supervisor tests. tmux is absent from the owner and from these cases.
+//! The PTY spawn case is Unix-only; Windows remotes are unsupported and that
+//! test is not treated as a pass there.
+#[cfg(unix)]
 use made_platform::PtySize;
+#[cfg(unix)]
+use made_remote::supervisor::NativeSession;
 use made_remote::{
     protocol::*,
     supervisor::{
         generation_exempt, live_terminal_output, next_snapshot_frame, transport_matches, Lease,
-        NativeSession, VtState, SCROLLBACK_LINES,
+        VtState, SCROLLBACK_LINES,
     },
 };
-use made_terminal::{MouseMode, PtyOptions, TerminalCore, TerminalSize};
-use std::{
-    process::Command,
-    thread,
-    time::{Duration, Instant},
-};
+#[cfg(unix)]
+use made_terminal::PtyOptions;
+use made_terminal::{MouseMode, TerminalCore, TerminalSize};
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[test]
 fn resnapshot_ends_with_one_done_before_live_output() {
@@ -157,6 +164,7 @@ fn primary_scrollback_survives_alternate_screen_resnapshot() {
 }
 
 #[test]
+#[cfg(unix)]
 fn same_child_pid_and_session_survive_frontend_drop_without_tmux() {
     let platform = made_platform::host_platform();
     let temp = tempfile::tempdir().unwrap();
@@ -184,6 +192,7 @@ fn same_child_pid_and_session_survive_frontend_drop_without_tmux() {
     );
 }
 
+#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
     Command::new("ps")
         .args(["-p", &pid.to_string()])
@@ -191,6 +200,7 @@ fn process_alive(pid: u32) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+#[cfg(unix)]
 fn process_session(pid: u32) -> Option<String> {
     let output = Command::new("ps")
         .args(["-o", "sess=", "-p", &pid.to_string()])
