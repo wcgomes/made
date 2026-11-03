@@ -7806,6 +7806,9 @@ fn ssh_servers_window_keeps_field_focus_and_has_no_collapse() {
     headless.render_events(vec![egui::Event::PointerMoved(close_at)]);
     headless.render_events(vec![pointer_button(close_at, true)]);
     headless.render_events(vec![pointer_button(close_at, false)]);
+    // The close click and the terminal focus handback can settle on different
+    // frames depending on the host. Render one settling frame before checking.
+    headless.render();
     let closed = headless.render();
     assert!(
         !output_text(&closed).contains("Display name"),
