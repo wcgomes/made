@@ -192,6 +192,10 @@ fn private_directory_and_file_operations_reject_symlinks_and_loose_modes() {
 
 #[test]
 #[cfg(unix)]
+// The spawned parent is deliberately kept alive until the hangup probe and is
+// reaped with wait(); the detached child is intentionally left in its own
+// session so the test can prove it survived. Clippy cannot follow that flow.
+#[allow(clippy::zombie_processes)]
 fn detach_survives_parent_hangup_without_invoking_tmux() {
     if std::env::var_os("MADE_DETACH_ROLE").as_deref() == Some(std::ffi::OsStr::new("parent")) {
         detach_parent_role();
