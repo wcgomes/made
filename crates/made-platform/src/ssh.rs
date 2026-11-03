@@ -4,7 +4,7 @@ use std::{
     ffi::OsString,
     fmt, fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -412,6 +412,75 @@ pub fn classify_ssh_stderr(bytes: &[u8]) -> SshFailure {
 /// Whether this askpass prompt is a changed-key confirmation.
 ///
 /// An unknown-host prompt is not a changed key and may be shown to the user.
+/// Remove one app-owned known_hosts entry after an explicit user "forget".
+///
+/// The next connection is treated as an unknown host and shows the new
+/// fingerprint for explicit approval. Only `known_hosts` is touched; the
+/// user's personal trust file is never opened. `host` is validated so it
+/// cannot be interpreted as an option or a wildcard pattern.
+pub fn forget_known_host(
+    ssh_keygen: &Path,
+    known_hosts: &Path,
+    host: &str,
+    port: u16,
+) -> io::Result<()> {
+    if host.is_empty()
+        || host.len() > 255
+        || host.starts_with('-')
+        || host.chars().any(|value| {
+            value.is_control()
+                || value.is_whitespace()
+                || matches!(value, '*' | '?' | '[' | ']' | '#' | '!' | '"' | '\'' | '\\')
+        })
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid host"));
+    }
+    if !known_hosts.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "known_hosts must be absolute",
+        ));
+    }
+    if !known_hosts.exists() {
+        return Ok(());
+    }
+    let target = if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    let mut child = Command::new(ssh_keygen)
+        .arg("-R")
+        .arg(&target)
+        .arg("-f")
+        .arg(known_hosts)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait()? {
+            Some(status) if status.success() => break,
+            Some(_) => return Err(io::Error::other("ssh-keygen failed")),
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ssh-keygen timed out",
+                ));
+            }
+        }
+    }
+    // ssh-keygen -R keeps `<known_hosts>.old`; this copy is app-owned.
+    let mut backup = known_hosts.as_os_str().to_os_string();
+    backup.push(".old");
+    let _ = fs::remove_file(PathBuf::from(backup));
+    Ok(())
+}
+
 pub fn prompt_is_changed_host_key(prompt: &str) -> bool {
     is_changed_host_key(&prompt.to_ascii_lowercase())
 }

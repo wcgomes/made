@@ -950,6 +950,29 @@ pub struct CompanionSession {
     pub failures: SshFailureSlot,
 }
 
+/// Forget the app-owned host key after the user explicitly accepts the change.
+/// The next probe is an unknown-host approval and shows the new fingerprint.
+pub fn forget_saved_host_key(metadata: &ServerMetadata) -> Result<(), AttemptError> {
+    metadata
+        .validate()
+        .map_err(|_| AttemptError::code(ErrorCode::InvalidRequest))?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let ssh_keygen =
+        made_platform::find_executable_on_path(std::ffi::OsStr::new("ssh-keygen"), &path)
+            .ok_or_else(|| AttemptError::code(ErrorCode::Unavailable))?;
+    let paths = made_platform::host_platform()
+        .app_paths()
+        .map_err(|_| AttemptError::code(ErrorCode::Unavailable))?;
+    let known_hosts = paths.data_dir.join("ssh-known-hosts");
+    made_platform::ssh::forget_known_host(
+        &ssh_keygen,
+        &known_hosts,
+        &metadata.host,
+        metadata.port.unwrap_or(22),
+    )
+    .map_err(|_| AttemptError::code(ErrorCode::Io))
+}
+
 pub fn connect_companion(
     metadata: &ServerMetadata,
     version: &str,

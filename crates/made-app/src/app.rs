@@ -353,6 +353,7 @@ pub struct AppModel {
     ssh_selected: Option<made_remote::protocol::AuthorityId>,
     ssh_draft: SshDraft,
     ssh_notice: Option<String>,
+    ssh_host_key_changed: bool,
     probe: Option<ProbeAttempt>,
     ssh_prompt: Option<made_platform::ssh_askpass::PromptRequest>,
     prompt_draft: String,
@@ -452,6 +453,7 @@ impl AppModel {
             ssh_selected: None,
             ssh_draft: SshDraft::default(),
             ssh_notice: None,
+            ssh_host_key_changed: false,
             probe: None,
             ssh_prompt: None,
             prompt_draft: String::new(),
@@ -695,6 +697,7 @@ impl AppModel {
         };
         let metadata = snapshot.server().metadata();
         self.ssh_selected = Some(id);
+        self.ssh_host_key_changed = false;
         self.ssh_draft = SshDraft {
             name: metadata.display_name.clone(),
             host: metadata.host.clone(),
@@ -739,6 +742,7 @@ impl AppModel {
         let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
         let id = registry.add(metadata).map_err(|error| error.to_string())?;
         self.ssh_selected = Some(id);
+        self.ssh_host_key_changed = false;
         Ok(id)
     }
 
@@ -864,6 +868,7 @@ impl AppModel {
         let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
         registry.remove(id).map_err(|error| error.to_string())?;
         self.ssh_selected = None;
+        self.ssh_host_key_changed = false;
         self.ssh_draft = SshDraft::default();
         self.ssh_notice = Some("Server removed. Open workspaces were not closed.".to_owned());
         Ok(())
@@ -881,7 +886,36 @@ impl AppModel {
             previous.cancel();
         }
         self.probe = Some(crate::ssh_servers::spawn_probe(request));
+        self.ssh_host_key_changed = false;
         self.ssh_notice = Some("Testing the connection. OpenCode will not be started.".to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn ssh_host_key_changed(&self) -> bool {
+        self.ssh_host_key_changed
+    }
+
+    /// Forget the app-owned host key for the selected server. The next Test is
+    /// an unknown-host approval, so the new fingerprint is shown explicitly.
+    pub(crate) fn forget_selected_ssh_host_key(&mut self) -> Result<(), String> {
+        let id = self
+            .ssh_selected
+            .ok_or_else(|| "Select a server first.".to_owned())?;
+        let metadata = self
+            .ssh
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .snapshot(id)
+            .map_err(|error| error.to_string())?
+            .server()
+            .metadata()
+            .clone();
+        crate::ssh_servers::forget_saved_host_key(&metadata).map_err(|error| error.detail)?;
+        self.ssh_host_key_changed = false;
+        self.ssh_notice = Some(
+            "Old host key forgotten. Test again to check and approve the new fingerprint."
+                .to_owned(),
+        );
         Ok(())
     }
 
@@ -912,6 +946,7 @@ impl AppModel {
                 }
                 self.probe = None;
                 self.ssh_prompt = None;
+                self.ssh_host_key_changed = true;
                 self.ssh_notice = Some(
                     crate::remote_session::SshFailureClass::ChangedHostKey
                         .detail()
@@ -1032,6 +1067,11 @@ impl AppModel {
                 };
                 let _ = registry.finish_probe(ticket, stored);
             }
+            self.ssh_host_key_changed = matches!(
+                &result,
+                Err(error)
+                    if error.class == crate::remote_session::SshFailureClass::ChangedHostKey
+            );
             self.ssh_notice = Some(match result {
                 Ok(capabilities) if capabilities.opencode => {
                     "Connection succeeded. OpenCode was detected. The TUI was not started."

@@ -1290,6 +1290,16 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
             if let Some(notice) = model.ssh_notice() {
                 ui.label(theme::micro(sanitize_display(notice, 240)));
             }
+            if model.ssh_host_key_changed() {
+                ui.label(theme::micro(
+                    "The stored key no longer matches this server. Forget it only if the server key change was expected.",
+                ));
+                if ui.button("Forget old host key").clicked() {
+                    if let Err(error) = model.forget_selected_ssh_host_key() {
+                        model.set_ssh_notice(error);
+                    }
+                }
+            }
             let listed = model.ssh_registry().ok().map(|registry| {
                 registry
                     .servers()

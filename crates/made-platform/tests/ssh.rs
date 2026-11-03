@@ -395,6 +395,46 @@ fn changed_host_key_exit_is_not_generic_io_and_does_not_keep_stderr() {
     assert!(!debug.contains("IDENTIFICATION"));
 }
 
+#[test]
+#[cfg(unix)]
+fn forget_known_host_removes_only_the_matching_app_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let key = root.join("key");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(status.success(), "ssh-keygen fixture failed");
+    let public = std::fs::read_to_string(root.join("key.pub")).unwrap();
+    let public = public
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let known_hosts = root.join("known_hosts");
+    std::fs::write(
+        &known_hosts,
+        format!(
+            "server.example {public}\n[server.example]:2222 {public}\nother.example {public}\n"
+        ),
+    )
+    .unwrap();
+    let ssh_keygen = made_platform::find_executable_on_path(
+        std::ffi::OsStr::new("ssh-keygen"),
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+    .expect("ssh-keygen on PATH");
+    made_platform::ssh::forget_known_host(&ssh_keygen, &known_hosts, "server.example", 22).unwrap();
+    let text = std::fs::read_to_string(&known_hosts).unwrap();
+    assert!(!text.lines().any(|line| line.starts_with("server.example ")));
+    assert!(text.contains("[server.example]:2222"));
+    assert!(text.contains("other.example"));
+    assert!(!root.join("known_hosts.old").exists());
+    assert!(made_platform::ssh::forget_known_host(&ssh_keygen, &known_hosts, "*", 22).is_err());
+}
+
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("/bin/ps")
