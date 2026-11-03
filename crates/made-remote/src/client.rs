@@ -607,7 +607,7 @@ fn run(mut stream: impl ClientStream, weak: Weak<Mutex<State>>) {
         }
         drop(state);
         drop(shared);
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1));
     }
     // Discard partially sent frames and all uncertain input. There is no retry
     // or replay path; a new epoch requires a new transport/client instance.

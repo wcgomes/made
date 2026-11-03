@@ -753,7 +753,7 @@ impl Supervisor {
                 }
             }
             self.poll_events();
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(1));
         }
         if let Some(integration) = &self.integration {
             let _ = integration.verify_config();
@@ -1108,7 +1108,7 @@ fn writer_loop(
             Err(TryRecvError::Disconnected) => match data_rx.try_recv() {
                 Ok(frame) => frame,
                 Err(TryRecvError::Empty) => {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(1));
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => break,
@@ -1116,7 +1116,7 @@ fn writer_loop(
             Err(TryRecvError::Empty) => match data_rx.try_recv() {
                 Ok(frame) => frame,
                 Err(TryRecvError::Empty) => {
-                    thread::sleep(Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(1));
                     continue;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -1155,7 +1155,7 @@ fn write_frame_retry(writer: &mut TcpStream, frame: &WireEnvelope) -> io::Result
                 ) =>
             {
                 // Backpressure is not attachment death. A broken pipe still returns.
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(1));
             }
             Err(error) => return Err(error),
         }
