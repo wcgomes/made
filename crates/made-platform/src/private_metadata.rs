@@ -517,6 +517,14 @@ mod backend {
     #[repr(C, align(4))]
     struct SidBuf([u8; SECURITY_MAX_SID_SIZE as usize]);
 
+    impl SidBuf {
+        /// `PSID` is `*mut c_void`. `as_ptr` is `*const u8`; this cast only
+        /// matches that signature. Callers do not write through it.
+        fn as_psid(&self) -> PSID {
+            self.0.as_ptr() as PSID
+        }
+    }
+
     #[repr(C, align(4))]
     struct AclBuf([u8; 256]);
 
@@ -525,7 +533,7 @@ mod backend {
             return Ok(false);
         }
         let user = current_user_sid()?;
-        Ok(unsafe { EqualSid(owner, user.0.as_ptr().cast()) } != 0)
+        Ok(unsafe { EqualSid(owner, user.as_psid()) } != 0)
     }
 
     fn current_user_sid() -> io::Result<SidBuf> {
@@ -594,7 +602,7 @@ mod backend {
                 acl.0.as_mut_ptr().cast(),
                 ACL_REVISION,
                 FILE_ALL_ACCESS,
-                user.0.as_ptr().cast(),
+                user.as_psid(),
             )
         } == 0
         {
@@ -607,7 +615,7 @@ mod backend {
                 OWNER_SECURITY_INFORMATION
                     | DACL_SECURITY_INFORMATION
                     | PROTECTED_DACL_SECURITY_INFORMATION,
-                user.0.as_ptr().cast(),
+                user.as_psid(),
                 std::ptr::null_mut(),
                 acl.0.as_ptr().cast(),
                 std::ptr::null(),
@@ -635,7 +643,7 @@ mod backend {
                 acl.0.as_mut_ptr().cast(),
                 ACL_REVISION,
                 FILE_ALL_ACCESS,
-                user.0.as_ptr().cast(),
+                user.as_psid(),
             )
         } == 0
         {
@@ -648,7 +656,7 @@ mod backend {
                 OWNER_SECURITY_INFORMATION
                     | DACL_SECURITY_INFORMATION
                     | PROTECTED_DACL_SECURITY_INFORMATION,
-                user.0.as_ptr().cast(),
+                user.as_psid(),
                 std::ptr::null_mut(),
                 acl.0.as_ptr().cast(),
                 std::ptr::null(),
