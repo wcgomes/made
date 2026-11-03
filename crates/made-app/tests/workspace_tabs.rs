@@ -854,7 +854,10 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         &format!("cd '{}'", target.display()),
     );
     let ctx = egui::Context::default();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Hosted macOS arm64 runners can take longer to drain the 2000-line shell
+    // command. The assertion still requires every hidden tab to produce the
+    // output; only the observation window grows.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         model.logic(&ctx);
         let mut output = ctx.run_ui(
