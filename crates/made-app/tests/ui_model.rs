@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use made_app::app::{AppModel, AppOptions, WorkspaceId};
+use made_app::app::{AppModel, AppOptions, GrokDiagnosticsHold, GrokRunningHold, WorkspaceId};
 use made_app::cli::LaunchArgs;
 use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
@@ -3968,6 +3968,18 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
 fn background_tui_detection_adopts_the_isolated_opencode() {
     if isolated("background_tui_detection_adopts_the_isolated_opencode") {
         return;
+    }
+    // The isolated PATH still contains the real grok after the fake bin. A
+    // no-op grok there keeps plugin install from running the user's binary.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .next()
+            .expect("isolated bin");
+        let grok = bin.join("grok");
+        std::fs::write(&grok, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
@@ -8075,14 +8087,17 @@ fn detection_does_not_launch_grok_or_block_shell_startup() {
     use std::os::unix::fs::PermissionsExt;
 
     let home = PathBuf::from(std::env::var_os("HOME").expect("isolated home"));
-    let sentinel = home.join("grok-launched");
+    let session = home.join("grok-session");
     let bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
         .next()
         .expect("isolated bin");
     let grok = bin.join("grok");
     std::fs::write(
         &grok,
-        format!("#!/bin/sh\nprintf launched >> '{}'\n", sentinel.display()),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = plugin ]; then exit 0; fi\nprintf launched >> '{}'\n",
+            session.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -8117,6 +8132,1198 @@ fn detection_does_not_launch_grok_or_block_shell_startup() {
     headless.pump_until(|model| {
         model.compatible_tuis() == [CompatibleTui::OpenCode, CompatibleTui::Grok].as_slice()
     });
-    assert!(!sentinel.exists(), "detection must not spawn grok");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        headless.model.logic(&headless.ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !session.exists(),
+        "detection must not launch a grok session"
+    );
     assert_eq!(headless.model.workspace_count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_grok_catalog_does_not_install_the_plugin() {
+    if isolated("explicit_grok_catalog_does_not_install_the_plugin") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = PathBuf::from(std::env::var_os("HOME").expect("isolated home"));
+    let sentinel = home.join("grok-install");
+    let bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .next()
+        .expect("isolated bin");
+    let grok = bin.join("grok");
+    std::fs::write(
+        &grok,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("GROK_HOME", home.join("grok-home"));
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "catalog", "main.rs");
+    let (mut headless, _) = menu_model(&root, &[CompatibleTui::Grok]);
+    headless.click(top_action_id("open-folder"));
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("grok"))
+        .is_some());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        headless.model.logic(&headless.ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !sentinel.exists(),
+        "an explicit Grok catalog must not run grok plugin install"
+    );
+}
+
+const GROK_DIAGNOSTIC_SENTENCES: [&str; 7] = [
+    "Checking for Grok Build.",
+    "Grok Build is not on PATH.",
+    "Installing the Grok Build plugin.",
+    "Grok Build session follow is ready.",
+    "Grok Build is not running.",
+    "Grok Build session-status hooks are unavailable.",
+    "Grok Build plugin was not installed for this launch.",
+];
+
+const OPENCODE_DIAGNOSTIC_SENTENCE: &str = "OpenCode is not running.";
+const OPENCODE_READY_SENTENCE: &str = "OpenCode session follow is ready.";
+const OPENCODE_MISSING_SENTENCE: &str = "OpenCode is not on PATH.";
+const OPENCODE_WITHDRAWN_SENTENCE: &str = "Optional OpenCode integration is inactive.";
+
+struct HitText {
+    rect: egui::Rect,
+    clip: egui::Rect,
+    text: String,
+    color: egui::Color32,
+}
+
+fn hit_texts(output: &egui::FullOutput, needle: &str) -> Vec<HitText> {
+    fn visit(shape: &egui::Shape, clip: egui::Rect, needle: &str, hits: &mut Vec<HitText>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text.contains(needle) => {
+                let color = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|section| {
+                        if section.format.color == egui::Color32::PLACEHOLDER {
+                            text.fallback_color
+                        } else {
+                            section.format.color
+                        }
+                    })
+                    .unwrap_or(text.fallback_color);
+                hits.push(HitText {
+                    rect: egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    clip,
+                    text: text.galley.job.text.clone(),
+                    color,
+                });
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, clip, needle, hits);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, clipped.clip_rect, needle, &mut hits);
+    }
+    hits
+}
+
+fn assert_grok_sentences_absent(text: &str) {
+    for sentence in GROK_DIAGNOSTIC_SENTENCES {
+        assert!(
+            !text.contains(sentence),
+            "Grok diagnostics leaked {sentence:?} in {text}"
+        );
+    }
+    assert!(
+        !text.contains(OPENCODE_DIAGNOSTIC_SENTENCE),
+        "OpenCode diagnostics leaked before Show diagnostics: {text}"
+    );
+    for pill in ["○ inactive", "● ready", "! degraded"] {
+        assert!(
+            !text.contains(pill),
+            "status pill leaked {pill:?} in {text}"
+        );
+    }
+}
+
+fn pill_beside(output: &egui::FullOutput, sentence: egui::Rect, pill_text: &str) -> HitText {
+    let pills: Vec<HitText> = hit_texts(output, pill_text)
+        .into_iter()
+        .filter(|hit| hit.text == pill_text)
+        .filter(|hit| hit.rect.center().x < sentence.left())
+        .filter(|hit| (hit.rect.center().y - sentence.center().y).abs() < 14.0)
+        .collect();
+    assert_eq!(
+        pills.len(),
+        1,
+        "expected one {pill_text:?} beside {sentence:?}"
+    );
+    pills.into_iter().next().expect("pill")
+}
+
+fn assert_pill_tint(output: &egui::FullOutput, center: egui::Pos2, tint: egui::Color32) {
+    let matched = rects_with_fill(output, tint)
+        .into_iter()
+        .any(|rect| rect.contains(center) && (rect.height() - 20.0).abs() < 1.5);
+    assert!(matched, "missing pill fill {tint:?} around {center:?}");
+}
+
+fn copied_diagnostics(output: &egui::FullOutput) -> String {
+    output
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("copy diagnostics command")
+}
+
+/// OpenCode row that belongs to the catalog currently offered.
+///
+/// An explicit list that includes OpenCode keeps the inactive not-running
+/// sentence. A list that omits it is the not-on-PATH row.
+fn opencode_row_for_catalog(
+    headless: &Headless,
+) -> (&'static str, &'static str, egui::Color32, egui::Color32) {
+    if headless
+        .model
+        .compatible_tuis()
+        .contains(&CompatibleTui::OpenCode)
+    {
+        (
+            OPENCODE_DIAGNOSTIC_SENTENCE,
+            "○ inactive",
+            made_app::theme::TEXT_TERTIARY,
+            made_app::theme::BG_ELEVATED,
+        )
+    } else {
+        (
+            OPENCODE_MISSING_SENTENCE,
+            "× unsupported",
+            made_app::theme::ERROR,
+            made_app::theme::ERROR_TINT,
+        )
+    }
+}
+
+fn assert_revealed_grok_row(
+    output: &egui::FullOutput,
+    headless: &Headless,
+    id: WorkspaceId,
+    folder: &str,
+    sentence: &str,
+    pill_text: &str,
+    tone: egui::Color32,
+    tint: egui::Color32,
+) {
+    let text = output_text(output);
+    assert_eq!(
+        text.matches(sentence).count(),
+        1,
+        "expected one {sentence:?} in {text}"
+    );
+    for other in GROK_DIAGNOSTIC_SENTENCES {
+        if other != sentence {
+            assert!(
+                !text.contains(other),
+                "{sentence:?} frame also showed {other:?}: {text}"
+            );
+        }
+    }
+    let (opencode_sentence, opencode_pill, opencode_tone, opencode_tint) =
+        opencode_row_for_catalog(headless);
+    assert_eq!(
+        text.matches(opencode_sentence).count(),
+        1,
+        "OpenCode sentence changed: {text}"
+    );
+
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane_id))))
+        .expect("about window");
+    let mut sentences = hit_texts(output, sentence);
+    sentences.retain(|hit| hit.text == sentence);
+    assert_eq!(sentences.len(), 1, "expected one painted {sentence:?}");
+    let hit = &sentences[0];
+    assert!(
+        window.expand(1.0).contains_rect(hit.rect),
+        "Grok sentence is outside About: {:?} window {window:?}",
+        hit.rect
+    );
+    // About overlays the terminal. The clip must belong to that window so the
+    // header, tabs, explorer, and terminal did not paint the row.
+    assert!(
+        window.expand(1.0).contains_rect(hit.clip),
+        "Grok sentence clip is not About: {:?} window {window:?}",
+        hit.clip
+    );
+
+    let mut sections = hit_texts(output, "WORKSPACE");
+    sections.retain(|hit| hit.text == "WORKSPACE");
+    sections.sort_by(|left, right| left.rect.top().total_cmp(&right.rect.top()));
+    let section = sections.first().expect("WORKSPACE section");
+    assert!(
+        hit.rect.bottom() <= section.rect.top() + 0.5,
+        "Grok row must sit with the OpenCode pill, above the sectioned detail: {:?} vs {:?}",
+        hit.rect,
+        section.rect
+    );
+
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        !hit.rect.intersects(tab),
+        "Grok sentence intersected the workspace tab"
+    );
+    let header_bottom =
+        made_app::theme::Layout::for_window(headless.width, headless.height).content_top();
+    assert!(
+        hit.rect.top() >= header_bottom,
+        "Grok sentence intersected the header: {:?} bottom {header_bottom}",
+        hit.rect
+    );
+    let splitter = headless.response(explorer_splitter_id(pane_id)).rect;
+    assert!(
+        hit.rect.right() < splitter.left(),
+        "Grok sentence intersected the explorer: {:?} splitter {:?}",
+        hit.rect,
+        splitter
+    );
+    assert!(
+        hit_texts(output, folder)
+            .iter()
+            .any(|label| label.text == folder && tab.contains_rect(label.rect)),
+        "the workspace tab label changed"
+    );
+    assert!(
+        hit_texts(output, "Grok Build")
+            .iter()
+            .filter(|label| label.text == "Grok Build")
+            .all(|label| !tab.intersects(label.rect)),
+        "the Grok Build tab label changed"
+    );
+
+    let pill = pill_beside(output, hit.rect, pill_text);
+    assert_eq!(pill.color, tone, "Grok pill {pill_text:?} tone");
+    assert_pill_tint(output, pill.rect.center(), tint);
+    assert!(
+        window.expand(1.0).contains_rect(pill.rect),
+        "Grok pill is outside About"
+    );
+
+    let opencode = hit_texts(output, opencode_sentence);
+    let opencode = opencode
+        .iter()
+        .find(|hit| hit.text == opencode_sentence)
+        .expect("OpenCode sentence");
+    let opencode_pill = pill_beside(output, opencode.rect, opencode_pill);
+    assert_eq!(opencode_pill.color, opencode_tone);
+    assert_pill_tint(output, opencode_pill.rect.center(), opencode_tint);
+    assert!(
+        opencode.rect.bottom() <= section.rect.top() + 0.5,
+        "OpenCode pill moved into the sectioned detail"
+    );
+}
+
+fn expect_revealed_grok_row(
+    headless: &mut Headless,
+    id: WorkspaceId,
+    tab_label: &str,
+    sentence: &str,
+    pill: &str,
+    tone: egui::Color32,
+    tint: egui::Color32,
+) {
+    let output = headless.render();
+    assert_revealed_grok_row(&output, headless, id, tab_label, sentence, pill, tone, tint);
+    assert_copied_diagnostics(headless, id, sentence);
+}
+
+fn assert_copied_diagnostics(headless: &mut Headless, id: WorkspaceId, sentence: &str) {
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    let copied = copied_diagnostics(&headless.click(diagnostics_copy_id(&pane_id)));
+    assert_eq!(
+        copied.matches(sentence).count(),
+        1,
+        "copy missing or duplicated {sentence:?}: {copied}"
+    );
+    let (opencode_sentence, _, _, _) = opencode_row_for_catalog(headless);
+    assert_eq!(
+        copied.matches(opencode_sentence).count(),
+        1,
+        "OpenCode copy changed: {copied}"
+    );
+}
+
+#[test]
+fn grok_build_diagnostics_row_follows_detection_and_install() {
+    if isolated("grok_build_diagnostics_row_follows_detection_and_install") {
+        return;
+    }
+    // A bug that reached the real installer must not write the user's Grok home.
+    std::env::remove_var("GROK_HOME");
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "grok-diag", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some(),
+        "an explicit catalog must not block the shell"
+    );
+    let chrome = output_text(&headless.render());
+    assert_grok_sentences_absent(&chrome);
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        hit_texts(&headless.render(), "grok-diag")
+            .iter()
+            .any(|hit| hit.text == "grok-diag" && tab.contains_rect(hit.rect)),
+        "the shell tab label changed before diagnostics were revealed"
+    );
+
+    headless.click(made_app::theme::wordmark_id());
+    let hidden = output_text(&headless.render());
+    assert!(
+        hidden.contains("Show diagnostics"),
+        "About did not open: {hidden}"
+    );
+    assert_grok_sentences_absent(&hidden);
+
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    headless.click(about_diagnostics_toggle_id(&pane_id));
+    settle_about_animation(&mut headless);
+    let revealed = headless.render();
+    assert_revealed_grok_row(
+        &revealed,
+        &headless,
+        id,
+        "grok-diag",
+        "Grok Build is not on PATH.",
+        "○ inactive",
+        made_app::theme::TEXT_TERTIARY,
+        made_app::theme::BG_ELEVATED,
+    );
+    assert_copied_diagnostics(&mut headless, id, "Grok Build is not on PATH.");
+
+    let inactive = (
+        "○ inactive",
+        made_app::theme::TEXT_TERTIARY,
+        made_app::theme::BG_ELEVATED,
+    );
+    let degraded = (
+        "! degraded",
+        made_app::theme::WARNING,
+        made_app::theme::WARNING_TINT,
+    );
+    let states = [
+        (
+            GrokDiagnosticsHold::Detecting,
+            "Checking for Grok Build.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::NotOnPath,
+            "Grok Build is not on PATH.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::Installing,
+            "Installing the Grok Build plugin.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::Installed,
+            "Grok Build is not running.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::AlreadyCurrent,
+            "Grok Build is not running.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::InstallFailed,
+            "Grok Build session-status hooks are unavailable.",
+            degraded.0,
+            degraded.1,
+            degraded.2,
+        ),
+    ];
+    for (hold, sentence, pill, tone, tint) in states {
+        headless.model.hold_grok_diagnostics(hold);
+        let output = headless.render();
+        assert_revealed_grok_row(
+            &output,
+            &headless,
+            id,
+            "grok-diag",
+            sentence,
+            pill,
+            tone,
+            tint,
+        );
+        assert_copied_diagnostics(&mut headless, id, sentence);
+    }
+
+    let menu_root = fixture_workspace(temp.path(), "grok-menu", "main.rs");
+    let mut menu_model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+    );
+    let menu_id = open_workspace(&mut menu_model, &menu_root);
+    let mut menu = Headless::new(menu_model, 1280.0, 800.0);
+    wait_explorer_ready(&mut menu, menu_id);
+    assert!(
+        menu.model
+            .workspace(menu_id)
+            .and_then(Workbench::terminal)
+            .is_some(),
+        "a Grok catalog must not block the shell or install before the menu opens"
+    );
+    menu.click(top_action_id("open-folder"));
+    let menu_output = menu.render();
+    let grok_row = menu.response(new_tab_menu_item_id("grok")).rect;
+    let menu_labels: Vec<String> = hit_texts(&menu_output, "Grok")
+        .into_iter()
+        .filter(|hit| grok_row.intersects(hit.rect))
+        .map(|hit| hit.text)
+        .collect();
+    assert!(
+        menu_labels.iter().any(|label| label == "Grok Build"),
+        "the Grok Build menu row changed: {menu_labels:?}"
+    );
+    assert!(
+        menu_labels
+            .iter()
+            .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
+        "the menu row shows a diagnostics sentence: {menu_labels:?}"
+    );
+
+    menu.click(made_app::theme::wordmark_id());
+    let menu_pane = menu.model.workspace(menu_id).unwrap().pane_id().to_owned();
+    menu.click(about_diagnostics_toggle_id(&menu_pane));
+    settle_about_animation(&mut menu);
+    for _ in 0..3 {
+        let output = menu.render();
+        assert_revealed_grok_row(
+            &output,
+            &menu,
+            menu_id,
+            "grok-menu",
+            "Grok Build plugin was not installed for this launch.",
+            "○ inactive",
+            made_app::theme::TEXT_TERTIARY,
+            made_app::theme::BG_ELEVATED,
+        );
+    }
+    assert_copied_diagnostics(
+        &mut menu,
+        menu_id,
+        "Grok Build plugin was not installed for this launch.",
+    );
+}
+
+#[test]
+fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_workspace() {
+    if isolated("grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_workspace")
+    {
+        return;
+    }
+    // A bug that reached the real installer must not write the user's Grok home.
+    std::env::remove_var("GROK_HOME");
+
+    let temp = tempfile::tempdir().unwrap();
+    let here = fixture_workspace(temp.path(), "grok-here", "main.rs");
+    let there = fixture_workspace(temp.path(), "grok-there", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let here_id = open_workspace(&mut model, &here);
+    let there_id = open_workspace(&mut model, &there);
+    assert!(model.switch_workspace(here_id));
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, here_id);
+    wait_explorer_ready(&mut headless, there_id);
+    assert!(
+        headless
+            .model
+            .workspace(here_id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.is_running()),
+        "the shell must be alive before a running mark is applied"
+    );
+    assert_grok_sentences_absent(&output_text(&headless.render()));
+
+    open_about_diagnostics(&mut headless, here_id);
+
+    let inactive = (
+        "○ inactive",
+        made_app::theme::TEXT_TERTIARY,
+        made_app::theme::BG_ELEVATED,
+    );
+    let ready = (
+        "● ready",
+        made_app::theme::SUCCESS,
+        made_app::theme::SUCCESS_TINT,
+    );
+    let degraded = (
+        "! degraded",
+        made_app::theme::WARNING,
+        made_app::theme::WARNING_TINT,
+    );
+
+    for hold in [
+        GrokDiagnosticsHold::Installed,
+        GrokDiagnosticsHold::AlreadyCurrent,
+    ] {
+        headless.model.hold_grok_diagnostics(hold);
+        headless
+            .model
+            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
+        headless
+            .model
+            .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+        expect_revealed_grok_row(
+            &mut headless,
+            here_id,
+            "grok-here",
+            "Grok Build is not running.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        );
+
+        headless
+            .model
+            .hold_workspace_grok_running(there_id, GrokRunningHold::NotRunning);
+        headless
+            .model
+            .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
+        expect_revealed_grok_row(
+            &mut headless,
+            here_id,
+            "grok-here",
+            "Grok Build session follow is ready.",
+            ready.0,
+            ready.1,
+            ready.2,
+        );
+
+        headless
+            .model
+            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
+        headless
+            .model
+            .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+        expect_revealed_grok_row(
+            &mut headless,
+            here_id,
+            "grok-here",
+            "Grok Build session follow is ready.",
+            ready.0,
+            ready.1,
+            ready.2,
+        );
+    }
+
+    let unchanged = [
+        (
+            GrokDiagnosticsHold::Detecting,
+            "Checking for Grok Build.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::NotOnPath,
+            "Grok Build is not on PATH.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::Installing,
+            "Installing the Grok Build plugin.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        ),
+        (
+            GrokDiagnosticsHold::InstallFailed,
+            "Grok Build session-status hooks are unavailable.",
+            degraded.0,
+            degraded.1,
+            degraded.2,
+        ),
+    ];
+    for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
+        headless.model.hold_workspace_grok_running(here_id, running);
+        for (hold, sentence, pill, tone, tint) in unchanged {
+            headless.model.hold_grok_diagnostics(hold);
+            expect_revealed_grok_row(
+                &mut headless,
+                here_id,
+                "grok-here",
+                sentence,
+                pill,
+                tone,
+                tint,
+            );
+        }
+    }
+
+    headless
+        .model
+        .hold_grok_diagnostics(GrokDiagnosticsHold::Installed);
+    headless
+        .model
+        .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
+    headless.model.hold_workspace_opencode_label(here_id);
+    expect_revealed_grok_row(
+        &mut headless,
+        here_id,
+        "OpenCode",
+        "Grok Build session follow is ready.",
+        ready.0,
+        ready.1,
+        ready.2,
+    );
+    let labeled = headless.render();
+    let tab = headless.response(workspace_tab_id(here_id)).rect;
+    assert!(
+        hit_texts(&labeled, "grok-here")
+            .iter()
+            .filter(|hit| hit.text == "grok-here")
+            .all(|hit| !tab.intersects(hit.rect)),
+        "OpenCode must own the tab label while Grok is running"
+    );
+
+    headless
+        .model
+        .hold_grok_diagnostics(GrokDiagnosticsHold::AlreadyCurrent);
+    headless
+        .model
+        .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+    expect_revealed_grok_row(
+        &mut headless,
+        here_id,
+        "OpenCode",
+        "Grok Build session follow is ready.",
+        ready.0,
+        ready.1,
+        ready.2,
+    );
+
+    headless
+        .model
+        .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
+    headless
+        .model
+        .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+    expect_revealed_grok_row(
+        &mut headless,
+        here_id,
+        "OpenCode",
+        "Grok Build is not running.",
+        inactive.0,
+        inactive.1,
+        inactive.2,
+    );
+
+    let menu_root = fixture_workspace(temp.path(), "grok-other", "main.rs");
+    let mut menu_model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+    );
+    let menu_id = open_workspace(&mut menu_model, &menu_root);
+    let mut menu = Headless::new(menu_model, 1280.0, 800.0);
+    wait_explorer_ready(&mut menu, menu_id);
+    menu.model
+        .hold_workspace_grok_running(menu_id, GrokRunningHold::LivingTarget);
+    assert!(
+        menu.model
+            .workspace(menu_id)
+            .and_then(Workbench::terminal)
+            .is_some(),
+        "a running mark must not block the shell or install"
+    );
+    menu.click(top_action_id("open-folder"));
+    let menu_output = menu.render();
+    let grok_row = menu.response(new_tab_menu_item_id("grok")).rect;
+    let menu_labels: Vec<String> = hit_texts(&menu_output, "Grok")
+        .into_iter()
+        .filter(|hit| grok_row.intersects(hit.rect))
+        .map(|hit| hit.text)
+        .collect();
+    assert!(
+        menu_labels.iter().any(|label| label == "Grok Build"),
+        "the Grok Build menu row changed: {menu_labels:?}"
+    );
+    assert!(
+        menu_labels
+            .iter()
+            .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
+        "the menu row shows a diagnostics sentence: {menu_labels:?}"
+    );
+
+    open_about_diagnostics(&mut menu, menu_id);
+    for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
+        menu.model.hold_workspace_grok_running(menu_id, running);
+        expect_revealed_grok_row(
+            &mut menu,
+            menu_id,
+            "grok-other",
+            "Grok Build plugin was not installed for this launch.",
+            inactive.0,
+            inactive.1,
+            inactive.2,
+        );
+    }
+}
+
+const GROK_EXPLICIT_CATALOG_SENTENCE: &str = "Grok Build plugin was not installed for this launch.";
+
+fn assert_catalog_menu_unchanged(headless: &mut Headless) {
+    headless.click(top_action_id("open-folder"));
+    let output = headless.render();
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    assert!(
+        terminal.top() < opencode.top() && opencode.top() < grok.top(),
+        "menu order changed"
+    );
+    let opencode_labels: Vec<String> = hit_texts(&output, "OpenCode")
+        .into_iter()
+        .filter(|hit| opencode.intersects(hit.rect))
+        .map(|hit| hit.text)
+        .collect();
+    assert!(
+        opencode_labels.iter().any(|label| label == "OpenCode"),
+        "the OpenCode menu row changed: {opencode_labels:?}"
+    );
+    for sentence in [
+        OPENCODE_DIAGNOSTIC_SENTENCE,
+        OPENCODE_READY_SENTENCE,
+        OPENCODE_MISSING_SENTENCE,
+        OPENCODE_WITHDRAWN_SENTENCE,
+    ] {
+        assert!(
+            opencode_labels.iter().all(|label| label != sentence),
+            "the OpenCode menu row shows {sentence:?}: {opencode_labels:?}"
+        );
+    }
+    let grok_labels: Vec<String> = hit_texts(&output, "Grok")
+        .into_iter()
+        .filter(|hit| grok.intersects(hit.rect))
+        .map(|hit| hit.text)
+        .collect();
+    assert!(
+        grok_labels.iter().any(|label| label == "Grok Build"),
+        "the Grok Build menu row changed: {grok_labels:?}"
+    );
+    assert!(
+        grok_labels
+            .iter()
+            .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
+        "the menu row shows a diagnostics sentence: {grok_labels:?}"
+    );
+}
+
+fn assert_opencode_diagnostics_row(
+    headless: &mut Headless,
+    id: WorkspaceId,
+    sentence: &str,
+    pill_text: &str,
+    tone: egui::Color32,
+    tint: egui::Color32,
+    status_label: &str,
+    reason_code: &str,
+    grok_sentence: &str,
+) {
+    let snapshot = headless.model.workspace(id).unwrap().diagnostics_snapshot();
+    assert_eq!(snapshot.status_label, status_label);
+    assert_eq!(
+        snapshot.status.label(),
+        status_label,
+        "machine status code changed"
+    );
+    assert_eq!(snapshot.reason_code, reason_code);
+    assert_eq!(snapshot.reason, sentence);
+    assert_eq!(snapshot.grok_sentence, grok_sentence);
+
+    let output = headless.render();
+    let text = output_text(&output);
+    assert!(
+        !text.contains(OPENCODE_WITHDRAWN_SENTENCE),
+        "revealed row still shows the withdrawn sentence: {text}"
+    );
+    let pane_id = headless.model.workspace(id).unwrap().pane_id();
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane_id))))
+        .expect("about window");
+    let mut sentences = hit_texts(&output, sentence);
+    sentences.retain(|hit| hit.text == sentence);
+    assert_eq!(
+        sentences.len(),
+        1,
+        "expected one painted {sentence:?} in {text}"
+    );
+    let hit = &sentences[0];
+    assert!(
+        window.expand(1.0).contains_rect(hit.rect),
+        "OpenCode sentence is outside About"
+    );
+    let pill = pill_beside(&output, hit.rect, pill_text);
+    assert_eq!(pill.color, tone, "OpenCode pill {pill_text:?} tone");
+    assert_pill_tint(&output, pill.rect.center(), tint);
+    if status_label == "connected" {
+        assert!(
+            hit_texts(&output, "● connected")
+                .iter()
+                .all(|painted| painted.text != "● connected"),
+            "connected OpenCode pill still says connected"
+        );
+    }
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        hit_texts(&output, "Grok Build")
+            .iter()
+            .filter(|label| label.text == "Grok Build")
+            .all(|label| !tab.intersects(label.rect)),
+        "the Grok Build tab label changed"
+    );
+    for other in GROK_DIAGNOSTIC_SENTENCES {
+        if other != grok_sentence {
+            assert!(
+                !text.contains(other),
+                "Grok sentence changed to {other:?}: {text}"
+            );
+        }
+    }
+
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    let copied = copied_diagnostics(&headless.click(diagnostics_copy_id(&pane_id)));
+    assert!(
+        copied.contains(&format!("reason: {sentence}")),
+        "copy missing {sentence:?}: {copied}"
+    );
+    assert!(
+        copied.contains(&format!("status: {status_label}")),
+        "copy status changed: {copied}"
+    );
+    assert!(
+        copied.contains(&format!("reason code: {reason_code}")),
+        "copy reason code changed: {copied}"
+    );
+    assert!(
+        !copied.contains(OPENCODE_WITHDRAWN_SENTENCE),
+        "copy still has the withdrawn sentence: {copied}"
+    );
+    assert!(
+        copied.contains(&format!("grok: {grok_sentence}")),
+        "copied Grok sentence changed: {copied}"
+    );
+}
+
+/// Reveal About diagnostics without polling PATH detection.
+fn reveal_diagnostics_without_logic(headless: &mut Headless, id: WorkspaceId) -> egui::FullOutput {
+    fn click_ui_only(headless: &mut Headless, id: egui::Id) {
+        headless.render_ui_only(Vec::new());
+        headless.render_ui_only(Vec::new());
+        let position = headless.response(id).rect.center();
+        headless.render_ui_only(vec![egui::Event::PointerMoved(position)]);
+        headless.render_ui_only(vec![pointer_button(position, true)]);
+        headless.render_ui_only(vec![pointer_button(position, false)]);
+    }
+
+    click_ui_only(headless, made_app::theme::wordmark_id());
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    click_ui_only(headless, about_diagnostics_toggle_id(&pane_id));
+    let mut output = headless.render_ui_only(Vec::new());
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(40));
+        output = headless.render_ui_only(Vec::new());
+    }
+    output
+}
+
+#[test]
+fn opencode_diagnostics_row_uses_the_grok_wording() {
+    if isolated("opencode_diagnostics_row_uses_the_grok_wording") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "opencode-wording", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode, CompatibleTui::Grok]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    assert_catalog_menu_unchanged(&mut headless);
+
+    open_about_diagnostics(&mut headless, id);
+    let inactive = (
+        "○ inactive",
+        made_app::theme::TEXT_TERTIARY,
+        made_app::theme::BG_ELEVATED,
+    );
+    let ready = (
+        "● ready",
+        made_app::theme::SUCCESS,
+        made_app::theme::SUCCESS_TINT,
+    );
+    let unsupported = (
+        "× unsupported",
+        made_app::theme::ERROR,
+        made_app::theme::ERROR_TINT,
+    );
+    assert_opencode_diagnostics_row(
+        &mut headless,
+        id,
+        OPENCODE_DIAGNOSTIC_SENTENCE,
+        inactive.0,
+        inactive.1,
+        inactive.2,
+        "inactive",
+        "inactive",
+        GROK_EXPLICIT_CATALOG_SENTENCE,
+    );
+
+    let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
+    let socket = connect(&options);
+    headless.pump_until(|model| {
+        let view = model.workspace(id).unwrap().diagnostics_snapshot();
+        view.status_label == "connected" && view.reason_code == "connected"
+    });
+    assert_opencode_diagnostics_row(
+        &mut headless,
+        id,
+        OPENCODE_READY_SENTENCE,
+        ready.0,
+        ready.1,
+        ready.2,
+        "connected",
+        "connected",
+        GROK_EXPLICIT_CATALOG_SENTENCE,
+    );
+
+    drop(socket);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .unwrap()
+            .diagnostics_snapshot()
+            .reason_code
+            == "bridge_closed"
+    });
+    let dropped = headless.model.workspace(id).unwrap().diagnostics_snapshot();
+    assert!(
+        dropped
+            .reason
+            .starts_with("The integration connection closed; waiting to reconnect while the terminal stays usable."),
+        "bridge sentence changed: {}",
+        dropped.reason
+    );
+
+    let socket = connect(&options);
+    headless.pump_until(|model| {
+        let view = model.workspace(id).unwrap().diagnostics_snapshot();
+        view.status_label == "connected" && view.reason_code == "reconnected"
+    });
+    assert_opencode_diagnostics_row(
+        &mut headless,
+        id,
+        OPENCODE_READY_SENTENCE,
+        ready.0,
+        ready.1,
+        ready.2,
+        "connected",
+        "reconnected",
+        GROK_EXPLICIT_CATALOG_SENTENCE,
+    );
+
+    drop(socket);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .unwrap()
+            .diagnostics_snapshot()
+            .reason_code
+            == "bridge_closed"
+    });
+    // About covers the popup's next frame. Close it before checking the menu.
+    headless.click(made_app::theme::wordmark_id());
+    assert_catalog_menu_unchanged(&mut headless);
+
+    let omitted_root = fixture_workspace(temp.path(), "opencode-omitted", "main.rs");
+    let omitted_later = fixture_workspace(temp.path(), "opencode-omitted-later", "main.rs");
+    let mut omitted_model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+    );
+    let omitted_id = open_workspace(&mut omitted_model, &omitted_root);
+    let mut omitted = Headless::new(omitted_model, 1280.0, 800.0);
+    wait_explorer_ready(&mut omitted, omitted_id);
+    open_about_diagnostics(&mut omitted, omitted_id);
+    assert_opencode_diagnostics_row(
+        &mut omitted,
+        omitted_id,
+        OPENCODE_MISSING_SENTENCE,
+        unsupported.0,
+        unsupported.1,
+        unsupported.2,
+        "unsupported",
+        "opencode_missing",
+        GROK_EXPLICIT_CATALOG_SENTENCE,
+    );
+    let omitted_later_id = open_workspace(&mut omitted.model, &omitted_later);
+    let omitted_still = omitted
+        .model
+        .workspace(omitted_id)
+        .unwrap()
+        .diagnostics_snapshot();
+    assert_eq!(omitted_still.reason, OPENCODE_MISSING_SENTENCE);
+    assert_eq!(omitted_still.status_label, "unsupported");
+    wait_explorer_ready(&mut omitted, omitted_later_id);
+    omitted.click(made_app::theme::wordmark_id());
+    open_about_diagnostics(&mut omitted, omitted_later_id);
+    assert_opencode_diagnostics_row(
+        &mut omitted,
+        omitted_later_id,
+        OPENCODE_MISSING_SENTENCE,
+        unsupported.0,
+        unsupported.1,
+        unsupported.2,
+        "unsupported",
+        "opencode_missing",
+        GROK_EXPLICIT_CATALOG_SENTENCE,
+    );
+
+    let path_only = tempfile::tempdir().unwrap();
+    std::env::set_var("PATH", path_only.path());
+    let detect_root = fixture_workspace(temp.path(), "opencode-detect", "main.rs");
+    let detect_later = fixture_workspace(temp.path(), "opencode-detect-later", "main.rs");
+    let mut detect_model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    assert!(
+        detect_model.compatible_tuis().is_empty(),
+        "detection must not block construction"
+    );
+    let detect_id = open_workspace(&mut detect_model, &detect_root);
+    let pending = detect_model
+        .workspace(detect_id)
+        .unwrap()
+        .diagnostics_snapshot();
+    assert_eq!(pending.reason, OPENCODE_DIAGNOSTIC_SENTENCE);
+    assert_eq!(pending.status_label, "inactive");
+    assert_eq!(pending.grok_sentence, "Checking for Grok Build.");
+    assert!(
+        !pending.reason.contains("not on PATH"),
+        "detection still running must not say OpenCode is not on PATH"
+    );
+    let mut detecting = Headless::new(detect_model, 1280.0, 800.0);
+    let pending_output = reveal_diagnostics_without_logic(&mut detecting, detect_id);
+    let pending_text = output_text(&pending_output);
+    assert!(
+        pending_text.contains(OPENCODE_DIAGNOSTIC_SENTENCE),
+        "in-flight detection painted the wrong OpenCode sentence: {pending_text}"
+    );
+    assert!(
+        !pending_text.contains(OPENCODE_MISSING_SENTENCE),
+        "in-flight detection already says OpenCode is not on PATH: {pending_text}"
+    );
+    assert!(
+        pending_text.contains("Checking for Grok Build."),
+        "in-flight detection adopted a Grok result early: {pending_text}"
+    );
+    detecting.pump_until(|model| {
+        let view = model.workspace(detect_id).unwrap().diagnostics_snapshot();
+        view.reason == OPENCODE_MISSING_SENTENCE
+            && view.grok_sentence == "Grok Build is not on PATH."
+    });
+    wait_explorer_ready(&mut detecting, detect_id);
+    assert_opencode_diagnostics_row(
+        &mut detecting,
+        detect_id,
+        OPENCODE_MISSING_SENTENCE,
+        unsupported.0,
+        unsupported.1,
+        unsupported.2,
+        "unsupported",
+        "opencode_missing",
+        "Grok Build is not on PATH.",
+    );
+    let detect_later_id = open_workspace(&mut detecting.model, &detect_later);
+    let detect_still = detecting
+        .model
+        .workspace(detect_id)
+        .unwrap()
+        .diagnostics_snapshot();
+    assert_eq!(detect_still.reason, OPENCODE_MISSING_SENTENCE);
+    assert_eq!(detect_still.status_label, "unsupported");
+    wait_explorer_ready(&mut detecting, detect_later_id);
+    detecting.click(made_app::theme::wordmark_id());
+    open_about_diagnostics(&mut detecting, detect_later_id);
+    assert_opencode_diagnostics_row(
+        &mut detecting,
+        detect_later_id,
+        OPENCODE_MISSING_SENTENCE,
+        unsupported.0,
+        unsupported.1,
+        unsupported.2,
+        "unsupported",
+        "opencode_missing",
+        "Grok Build is not on PATH.",
+    );
 }

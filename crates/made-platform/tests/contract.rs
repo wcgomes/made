@@ -280,6 +280,60 @@ fn integrated_tui_catalog_is_opencode_then_grok() {
 }
 
 #[test]
+fn path_lookup_does_not_spawn_grok_or_read_its_plugin_version() {
+    let root = unique_temp("tui-no-install");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    #[cfg(windows)]
+    let grok = bin.join("grok.exe");
+    #[cfg(not(windows))]
+    let grok = bin.join("grok");
+    #[cfg(unix)]
+    let sentinel = root.join("spawned");
+    #[cfg(unix)]
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" > '{}'\n",
+        sentinel.display()
+    );
+    #[cfg(not(unix))]
+    let body = "not a real program".to_owned();
+    std::fs::write(&grok, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let manifest = root
+        .join("installed-plugins")
+        .join("grok-made")
+        .join("plugin.json");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(
+        &manifest,
+        "{\n  \"name\": \"grok-made\",\n  \"version\": \"9.9.9\"\n}\n",
+    )
+    .unwrap();
+    let path = std::env::join_paths([&bin]).unwrap();
+    let without = detect_compatible_tuis_in_path(&path);
+    let with_manifest = detect_compatible_tuis_in_path(&path);
+    assert_eq!(without, vec![CompatibleTui::Grok]);
+    assert_eq!(
+        with_manifest, without,
+        "a plugin.json version must not change the metadata-only lookup"
+    );
+    #[cfg(unix)]
+    assert!(
+        !sentinel.exists(),
+        "PATH lookup must not spawn grok, read a version, or install a plugin"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        "{\n  \"name\": \"grok-made\",\n  \"version\": \"9.9.9\"\n}\n"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn home_resolution_prefers_userprofile_on_windows() {
     let home = resolve_user_home(
         PlatformFamily::Windows,

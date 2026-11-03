@@ -157,17 +157,13 @@ impl ReasonCode {
     /// Actionable human-readable message.
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Inactive => {
-                "Optional OpenCode integration is inactive."
-            }
-            Self::Connected => "Connected to the OpenCode v2 integration.",
-            Self::Reconnected => "Reconnected to the OpenCode v2 integration.",
+            Self::Inactive => "OpenCode is not running.",
+            Self::Connected => "OpenCode session follow is ready.",
+            Self::Reconnected => "OpenCode session follow is ready.",
             Self::PluginNotLoaded => {
                 "The OpenCode v2 integration plugin did not load; restart OpenCode in the Made terminal."
             }
-            Self::OpenCodeMissing => {
-                "OpenCode v2 is not installed or not on PATH; install OpenCode v2 and run it in the terminal."
-            }
+            Self::OpenCodeMissing => "OpenCode is not on PATH.",
             Self::OpenCodeTooOld => {
                 "OpenCode v2 or newer is required; upgrade OpenCode and restart it in the terminal."
             }

@@ -7,7 +7,7 @@ use made_app::diagnostics::{
     DiagnosticLog, Diagnostics, LogEntry, LogLevel, WorkspaceDiagnostics, LOG_TRUNCATION_MARKER,
     MAX_LOG_ENTRIES, MAX_LOG_FILE_BYTES, MAX_LOG_MESSAGE_BYTES, MAX_LOG_TEXT_BYTES,
 };
-use made_app::integration_status::IntegrationState;
+use made_app::integration_status::{IntegrationState, IntegrationStatus, ReasonCode};
 use made_app::session_follow::FollowedSession;
 use made_app::worktree::{MetadataStatus, WorktreeMetadata};
 use made_bridge::security::Token;
@@ -110,7 +110,8 @@ fn connected_diagnostics_expose_every_required_field() {
     );
     assert_eq!(view.status_label, "connected");
     assert_eq!(view.reason_code, "connected");
-    assert!(view.reason.contains("Connected"));
+    assert_eq!(view.reason, "OpenCode session follow is ready.");
+    assert_eq!(view.status.label(), "connected");
     assert_eq!(view.active_session_id.as_deref(), Some("ses_active"));
     assert_eq!(
         view.active_session_title.as_deref(),
@@ -610,4 +611,149 @@ fn snapshot_heartbeat_age_uses_the_supplied_instant() {
     let diagnostics = Diagnostics::new("/tmp/log");
     let view = diagnostics.snapshot_at(&integration, None, None, None, earlier);
     assert_eq!(view.last_heartbeat, Some(std::time::Duration::ZERO));
+}
+
+fn opencode_reason_sentence(code: ReasonCode) -> &'static str {
+    match code {
+        ReasonCode::Inactive => "OpenCode is not running.",
+        ReasonCode::Connected | ReasonCode::Reconnected => "OpenCode session follow is ready.",
+        ReasonCode::OpenCodeMissing => "OpenCode is not on PATH.",
+        ReasonCode::PluginNotLoaded => {
+            "The OpenCode v2 integration plugin did not load; restart OpenCode in the Made terminal."
+        }
+        ReasonCode::OpenCodeTooOld => {
+            "OpenCode v2 or newer is required; upgrade OpenCode and restart it in the terminal."
+        }
+        ReasonCode::ExtensionLoadingDisabled => {
+            "OpenCode started with extension loading disabled; enable plugins for this launch."
+        }
+        ReasonCode::ConfigCompositionFailed => {
+            "Made could not compose its per-launch OpenCode configuration; your files were not changed."
+        }
+        ReasonCode::ProtocolMismatch => {
+            "The Made plugin protocol is incompatible with this app; update Made or the plugin."
+        }
+        ReasonCode::AuthenticationRejected => {
+            "The integration connection was rejected; restart OpenCode in the Made terminal."
+        }
+        ReasonCode::BridgeClosed => {
+            "The integration connection closed; waiting to reconnect while the terminal stays usable."
+        }
+        ReasonCode::HeartbeatTimeout => {
+            "The integration stopped responding; waiting to reconnect while the terminal stays usable."
+        }
+        ReasonCode::OpenCodeExited => "OpenCode exited; the shell remains usable.",
+        ReasonCode::TabsUnavailable => {
+            "OpenCode session tabs are disabled; Made requires tabs to follow sessions."
+        }
+        ReasonCode::ActiveDirectoryUnavailable => {
+            "The active session directory is unavailable; showing the last known folder."
+        }
+        ReasonCode::WorktreeMetadataUnavailable => {
+            "Git metadata could not be read; showing the folder without branch information."
+        }
+        ReasonCode::FocusFailed => {
+            "The session could not be focused in OpenCode; the current workspace was kept."
+        }
+        ReasonCode::FocusTimedOut => "Focusing the session timed out; the current workspace was kept.",
+    }
+}
+
+fn assert_copied_opencode_reason(
+    integration: &IntegrationState,
+    sentence: &str,
+    status: &str,
+    reason_code: &str,
+) {
+    let view =
+        Diagnostics::new("/tmp/made-integration.log").snapshot(integration, None, None, None);
+    assert_eq!(view.status_label, status);
+    assert_eq!(view.status.label(), status, "machine status code changed");
+    assert_eq!(view.reason_code, reason_code);
+    assert_eq!(view.reason, sentence);
+    let text = view.to_text();
+    assert!(
+        text.contains(&format!("status: {status}")),
+        "copied status changed: {text}"
+    );
+    assert!(
+        text.contains(&format!("reason code: {reason_code}")),
+        "copied reason code changed: {text}"
+    );
+    assert!(
+        text.contains(&format!("reason: {sentence}")),
+        "copied reason missing {sentence:?}: {text}"
+    );
+    assert!(
+        text.contains("grok: Grok Build is not on PATH."),
+        "Grok sentence changed: {text}"
+    );
+    for stale in [
+        "Optional OpenCode integration is inactive.",
+        "Connected to the OpenCode v2 integration.",
+        "Reconnected to the OpenCode v2 integration.",
+        "OpenCode v2 is not installed or not on PATH; install OpenCode v2 and run it in the terminal.",
+    ] {
+        assert!(!text.contains(stale), "copied stale sentence {stale:?}: {text}");
+    }
+}
+
+#[test]
+fn opencode_reason_sentences_follow_the_grok_wording() {
+    for code in ReasonCode::ALL {
+        assert_eq!(
+            code.message(),
+            opencode_reason_sentence(code),
+            "reason sentence changed for {}",
+            code.code()
+        );
+    }
+    assert_eq!(IntegrationStatus::Connected.label(), "connected");
+    assert_eq!(IntegrationStatus::Inactive.label(), "inactive");
+    assert_eq!(IntegrationStatus::Degraded.label(), "degraded");
+    assert_eq!(IntegrationStatus::Unsupported.label(), "unsupported");
+
+    let workspace = PathBuf::from("/workspace");
+    let mut integration = IntegrationState::new(Some(workspace.clone()), workspace);
+    assert_copied_opencode_reason(
+        &integration,
+        "OpenCode is not running.",
+        "inactive",
+        "inactive",
+    );
+
+    integration.apply_bridge_event(&BridgeEvent::Connected(connection()));
+    integration.apply_bridge_event(&BridgeEvent::State(snapshot()));
+    assert_eq!(integration.status().label(), "connected");
+    assert_copied_opencode_reason(
+        &integration,
+        "OpenCode session follow is ready.",
+        "connected",
+        "connected",
+    );
+
+    integration.apply_bridge_event(&BridgeEvent::Disconnected(DisconnectedInfo {
+        connection_id: 12,
+        authenticated: true,
+        code: Some(1006),
+        reason: "dropped".to_owned(),
+        replaced: false,
+    }));
+    integration.apply_bridge_event(&BridgeEvent::Connected(connection()));
+    assert_eq!(integration.reason().code, ReasonCode::Reconnected);
+    assert_copied_opencode_reason(
+        &integration,
+        "OpenCode session follow is ready.",
+        "connected",
+        "reconnected",
+    );
+
+    integration.note_opencode_missing();
+    assert_eq!(integration.status(), IntegrationStatus::Unsupported);
+    assert_copied_opencode_reason(
+        &integration,
+        "OpenCode is not on PATH.",
+        "unsupported",
+        "opencode_missing",
+    );
 }

@@ -748,21 +748,21 @@ Diagnostics logs MUST be bounded and retained as one active log plus one previou
 
 ### Requirement: V1 Scope Boundary
 
-V1 MUST support only OpenCode v2 and MUST NOT integrate with other agent TUIs or ACP. V1 MUST NOT require remote, SSH, or WSL-hosted OpenCode. V1 MUST NOT provide an AI or chat UI that replaces the OpenCode TUI. Made MUST NOT create, remove, merge, or orchestrate worktrees; worktree lifecycle remains owned by OpenCode. V1 MUST NOT require a separate OpenCode server process.
+Made MUST support OpenCode v2 and the Grok Build session follow defined by `specs/grok-session-follow.md`. The `+` menu MUST be where OpenCode and Grok are offered, each only when it is detected on PATH. Made MUST NOT integrate with any other agent TUI. Made MUST NOT require remote, SSH, or WSL-hosted OpenCode or Grok. Made MUST NOT provide an AI or chat UI that replaces either TUI. Made MUST NOT create, remove, merge, or orchestrate worktrees. Made MUST NOT require a separate OpenCode or Grok server process.
 
 #### Scenario: Unsupported agent not offered
 
-- Given the Made interface
+- Given the `+` menu
 - When the user looks for agent integrations
-- Then only OpenCode v2 is offered and no Claude Code, Codex, Grok, ACP, or other agent integration is presented
+- Then OpenCode and Grok are the only agent rows the menu can offer, and Claude Code, Codex, ACP, and any other agent integration are not presented
 
 #### Scenario: No replacement chat UI
 
 - Given the Made interface
 - When the user looks for an AI or chat surface
-- Then no AI or chat UI replaces the OpenCode TUI
+- Then no AI or chat UI replaces the OpenCode or Grok TUI
 
-#### Scenario: Worktree lifecycle remains in OpenCode
+#### Scenario: Worktree lifecycle remains outside Made
 
 - Given a worktree
 - When the user inspects Made's controls
@@ -770,6 +770,6 @@ V1 MUST support only OpenCode v2 and MUST NOT integrate with other agent TUIs or
 
 #### Scenario: Direct launch
 
-- Given a user wants to use OpenCode with Made
-- When they run the OpenCode command directly in the Made terminal
-- Then integration works without starting a separate server or attach process
+- Given a user wants to use OpenCode or Grok with Made
+- When they run that command directly in the Made terminal
+- Then follow works without Made starting a separate server or attach process, and the `+` menu does not replace that direct launch

@@ -20,7 +20,7 @@ use eframe::egui::{
 };
 
 use crate::app::{AppModel, WorkspaceId};
-use crate::diagnostics::DiagnosticsSnapshot;
+use crate::diagnostics::{DiagnosticsSnapshot, GrokDiagnosticsPill};
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -43,6 +43,18 @@ fn status_tone(status: IntegrationStatus) -> (Color32, Color32, &'static str) {
     }
 }
 
+/// Visible OpenCode pill label. Connected, including after a reconnect, paints
+/// `ready` in the connected success tone. [`IntegrationStatus::label`] stays
+/// the machine code `connected`.
+fn opencode_pill_label(status: IntegrationStatus) -> &'static str {
+    match status {
+        IntegrationStatus::Connected => "ready",
+        IntegrationStatus::Inactive
+        | IntegrationStatus::Degraded
+        | IntegrationStatus::Unsupported => status.label(),
+    }
+}
+
 fn status_pill_ui(
     ui: &mut Ui,
     status: IntegrationStatus,
@@ -50,7 +62,42 @@ fn status_pill_ui(
     layout: &Layout,
 ) -> egui::Response {
     let (tone, tint, symbol) = status_tone(status);
-    let text = format!("{symbol} {}", status.label());
+    paint_status_pill(
+        ui,
+        symbol,
+        opencode_pill_label(status),
+        tone,
+        tint,
+        reason,
+        layout,
+    )
+}
+
+fn grok_status_pill_ui(
+    ui: &mut Ui,
+    pill: GrokDiagnosticsPill,
+    sentence: &str,
+    layout: &Layout,
+) -> egui::Response {
+    let (tone, tint, symbol) = match pill {
+        GrokDiagnosticsPill::Inactive => status_tone(IntegrationStatus::Inactive),
+        GrokDiagnosticsPill::Degraded => status_tone(IntegrationStatus::Degraded),
+        // Ready uses the connected pill's success tone, not its label.
+        GrokDiagnosticsPill::Ready => status_tone(IntegrationStatus::Connected),
+    };
+    paint_status_pill(ui, symbol, pill.label(), tone, tint, sentence, layout)
+}
+
+fn paint_status_pill(
+    ui: &mut Ui,
+    symbol: &str,
+    label: &str,
+    tone: Color32,
+    tint: Color32,
+    reason: &str,
+    layout: &Layout,
+) -> egui::Response {
+    let text = format!("{symbol} {label}");
     theme::pill(ui, &text, tone, tint, layout.status_pill_height)
         .on_hover_text(sanitize_display(reason, 400))
 }
@@ -2393,6 +2440,9 @@ impl Workbench {
             explorer.watcher_loading().hash(&mut hasher);
             explorer.watcher_error().hash(&mut hasher);
         }
+        let grok = self.grok_diagnostics();
+        grok.pill.label().hash(&mut hasher);
+        grok.sentence.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2591,6 +2641,11 @@ impl Workbench {
                             copy_requested = true;
                         }
                     });
+                });
+                ui.horizontal(|ui| {
+                    grok_status_pill_ui(ui, snapshot.grok_pill, snapshot.grok_sentence, layout);
+                    ui.label(theme::micro(snapshot.grok_sentence))
+                        .on_hover_text(snapshot.grok_sentence);
                 });
                 if let Some(failure) = &config_failure {
                     notice_strip(
@@ -4107,7 +4162,7 @@ mod tests {
             status_pill_ui(
                 &mut pill_ui,
                 IntegrationStatus::Inactive,
-                "Optional OpenCode integration is inactive.",
+                "OpenCode is not running.",
                 &layout,
             );
         });

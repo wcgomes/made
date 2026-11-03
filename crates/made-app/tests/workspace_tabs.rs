@@ -740,10 +740,11 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         assert!(!workbench.sessions_visible());
         assert_eq!(
             workbench.integration().status(),
-            made_app::IntegrationStatus::Inactive
+            made_app::IntegrationStatus::Unsupported
         );
         let diagnostics = workbench.diagnostics_snapshot();
-        assert_eq!(diagnostics.status_label, "inactive");
+        assert_eq!(diagnostics.status_label, "unsupported");
+        assert_eq!(diagnostics.reason, "OpenCode is not on PATH.");
         assert_eq!(
             diagnostics.workspace_identity.as_deref(),
             Some(workbench.pane_id()),
@@ -789,8 +790,8 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         assert_eq!(workbench.paint_count(), 0);
         assert_eq!(
             workbench.integration().status(),
-            made_app::IntegrationStatus::Inactive,
-            "no elapsed-time warning may activate absent optional integration"
+            made_app::IntegrationStatus::Unsupported,
+            "elapsed time must not replace the not-on-PATH row"
         );
     }
     assert!(model.close_workspace(ids[1]));
@@ -2729,4 +2730,254 @@ fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
     ));
     assert_eq!(std::fs::canonicalize(opencode_cwd.trim()).unwrap(), home);
     opencode.shutdown();
+}
+
+/// Child with a fake grok that blocks in `plugin install` until released, then
+/// exits non-zero. `GROK_HOME` is the temporary home, never the user's `~/.grok`.
+#[cfg(unix)]
+fn isolated_failed_plugin_install(name: &str) -> bool {
+    if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    let grok_home = home.path().join("grok-home");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&grok_home).unwrap();
+    let grok_bin = bin.join("grok");
+    std::fs::write(
+        &grok_bin,
+        "#!/bin/sh\n\
+if [ \"$1\" = plugin ] && [ \"$2\" = install ]; then\n\
+  printf '%s\\n' \"$0\" > \"$MADE_GROK_INSTALL_ARGV0\"\n\
+  printf '%s\\n' \"$*\" > \"$MADE_GROK_INSTALL_ARGS\"\n\
+  if [ -n \"${OPENCODE_CLI_CONFIG_CONTENT+x}\" ]; then printf set > \"$MADE_GROK_OPENCODE_ENV\"; else printf unset > \"$MADE_GROK_OPENCODE_ENV\"; fi\n\
+  printf start > \"$MADE_GROK_INSTALL_PHASE\"\n\
+  i=0\n\
+  while [ ! -f \"$MADE_GROK_INSTALL_RELEASE\" ] && [ \"$i\" -lt 200 ]; do\n\
+    sleep 0.05\n\
+    i=$((i + 1))\n\
+  done\n\
+  exit 1\n\
+fi\n\
+printf 'args:%s\\n' \"$*\" >> \"$MADE_GROK_LAUNCH_ARGS\"\n\
+sleep 30\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&grok_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env("MADE_WORKSPACE_TEST_CHILD", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("GROK_HOME", &grok_home)
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", "/bin/bash")
+        .env("MADE_GROK_BIN", &grok_bin)
+        .env("MADE_GROK_INSTALL_ARGV0", home.path().join("install-argv0"))
+        .env("MADE_GROK_INSTALL_ARGS", home.path().join("install-args"))
+        .env("MADE_GROK_INSTALL_PHASE", home.path().join("install-phase"))
+        .env(
+            "MADE_GROK_INSTALL_RELEASE",
+            home.path().join("install-release"),
+        )
+        .env("MADE_GROK_OPENCODE_ENV", home.path().join("opencode-env"))
+        .env("MADE_GROK_LAUNCH_ARGS", home.path().join("launch-args"));
+    command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_plugin_install_still_starts_grok_and_records_hooks_unavailable() {
+    if isolated_failed_plugin_install(
+        "failed_plugin_install_still_starts_grok_and_records_hooks_unavailable",
+    ) {
+        return;
+    }
+    std::env::set_var(
+        made_bridge::config::CONFIG_CONTENT_ENV,
+        "leaked-plugin-config",
+    );
+    let release = PathBuf::from(std::env::var_os("MADE_GROK_INSTALL_RELEASE").unwrap());
+    let config = PathBuf::from(std::env::var_os("GROK_HOME").unwrap()).join("config.toml");
+    std::fs::write(&config, "made-must-not-edit = true\n").unwrap();
+    let config_before = std::fs::read(&config).unwrap();
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path()).unwrap();
+    model.open_plan(LaunchPlan::open(root.path(), WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let shell_id = model.active_workspace_id().unwrap();
+    assert!(
+        model
+            .workspace(shell_id)
+            .and_then(made_app::Workbench::terminal)
+            .is_some(),
+        "the shell must start before plugin install is polled"
+    );
+    let ctx = egui::Context::default();
+    let install_started = Instant::now();
+    while !std::fs::read_to_string(std::env::var_os("MADE_GROK_INSTALL_PHASE").unwrap())
+        .ok()
+        .is_some_and(|text| text.trim() == "start")
+    {
+        assert!(
+            install_started.elapsed() < Duration::from_secs(3),
+            "detected grok did not run plugin install, or startup waited for it"
+        );
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        install_started.elapsed() < Duration::from_secs(3) && !release.exists(),
+        "the shell must be up before plugin install finishes"
+    );
+    assert!(model
+        .workspace(shell_id)
+        .and_then(made_app::Workbench::terminal)
+        .is_some());
+    model.begin_tui_workspace(made_app::CompatibleTui::Grok);
+    let grok_deadline = Instant::now() + Duration::from_secs(6);
+    let grok_id = loop {
+        model.logic(&ctx);
+        if let Some(id) = model.workspace_ids().find(|id| *id != shell_id) {
+            if model
+                .workspace(id)
+                .and_then(made_app::Workbench::terminal)
+                .is_some_and(|terminal| terminal.is_running())
+            {
+                break id;
+            }
+        }
+        assert!(
+            Instant::now() < grok_deadline && !release.exists(),
+            "menu-launched Grok waited on the failed plugin install"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let terminal = model
+        .workspace(grok_id)
+        .unwrap()
+        .terminal()
+        .expect("grok child");
+    assert_eq!(
+        terminal.options().args,
+        vec![std::ffi::OsString::from("dashboard")],
+        "a menu-launched Grok child is the absolute path plus dashboard"
+    );
+    assert!(
+        terminal
+            .options()
+            .env
+            .iter()
+            .all(|(key, _)| key != made_bridge::config::CONFIG_CONTENT_ENV),
+        "Grok must not receive OpenCode's plugin environment"
+    );
+    assert!(
+        terminal
+            .options()
+            .shell
+            .as_ref()
+            .is_some_and(|program| PathBuf::from(program).is_absolute()),
+        "menu-launched Grok must be the absolute detected path"
+    );
+    assert!(
+        !hooks_unavailable(&model),
+        "hooks stay available until the install command fails"
+    );
+    type_command(model.workspace_mut(shell_id).unwrap(), "grok");
+    let launch_deadline = Instant::now() + Duration::from_secs(5);
+    let launch_path = PathBuf::from(std::env::var_os("MADE_GROK_LAUNCH_ARGS").unwrap());
+    loop {
+        model.logic(&ctx);
+        let text = std::fs::read_to_string(&launch_path).unwrap_or_default();
+        if text.lines().any(|line| line == "args:") {
+            break;
+        }
+        assert!(
+            Instant::now() < launch_deadline,
+            "a shell-typed grok did not start: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let launches = std::fs::read_to_string(&launch_path).unwrap();
+    assert!(
+        launches.lines().any(|line| line == "args:dashboard"),
+        "menu grok must receive dashboard: {launches}"
+    );
+    assert!(
+        launches.lines().any(|line| line == "args:"),
+        "a shell-typed grok must not be given dashboard: {launches}"
+    );
+    std::fs::write(&release, b"release").unwrap();
+    let failed = Instant::now() + Duration::from_secs(6);
+    while !hooks_unavailable(&model) {
+        assert!(
+            Instant::now() < failed,
+            "a failed plugin install must record that session-status hooks are unavailable"
+        );
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(std::env::var_os("MADE_GROK_OPENCODE_ENV").unwrap())
+            .expect("opencode env capture")
+            .trim(),
+        "unset"
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        config_before,
+        "Made must not hand-edit config.toml"
+    );
+    model.shutdown();
+}
+
+#[cfg(unix)]
+fn hooks_unavailable(model: &AppModel) -> bool {
+    model.workspace_ids().any(|id| {
+        model
+            .workspace(id)
+            .unwrap()
+            .diagnostics()
+            .log()
+            .entries()
+            .any(|entry| {
+                entry
+                    .message
+                    .contains("session-status hooks are unavailable")
+            })
+    })
 }

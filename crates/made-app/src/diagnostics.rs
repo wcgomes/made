@@ -529,6 +529,8 @@ impl Diagnostics {
                 .token_fingerprint
                 .clone()
                 .map(|value| sanitize_display(&value, 128)),
+            grok_pill: GrokDiagnosticsRow::NOT_ON_PATH.pill,
+            grok_sentence: GrokDiagnosticsRow::NOT_ON_PATH.sentence,
             entries: self
                 .log
                 .entries()
@@ -577,6 +579,66 @@ pub struct WorkspaceDiagnostics {
     pub view_directory_available: Option<bool>,
     /// Why the reported view directory cannot be used.
     pub view_directory_reason: Option<String>,
+}
+
+/// Pill on the revealed Grok Build diagnostics row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GrokDiagnosticsPill {
+    /// PATH lookup or install has not produced a usable plugin.
+    Inactive,
+    /// The shipped plugin is installed or already current.
+    Ready,
+    /// The shipped-plugin install failed.
+    Degraded,
+}
+
+impl GrokDiagnosticsPill {
+    /// Lowercase pill label. Ready is not the OpenCode "connected" label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Inactive => "inactive",
+            Self::Ready => "ready",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// Current Grok Build pill and the one sentence shown beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GrokDiagnosticsRow {
+    pub(crate) pill: GrokDiagnosticsPill,
+    pub(crate) sentence: &'static str,
+}
+
+impl GrokDiagnosticsRow {
+    pub(crate) const CHECKING: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: "Checking for Grok Build.",
+    };
+    pub(crate) const NOT_ON_PATH: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: "Grok Build is not on PATH.",
+    };
+    pub(crate) const INSTALLING: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: "Installing the Grok Build plugin.",
+    };
+    pub(crate) const READY: Self = Self {
+        pill: GrokDiagnosticsPill::Ready,
+        sentence: "Grok Build session follow is ready.",
+    };
+    pub(crate) const NOT_RUNNING: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: "Grok Build is not running.",
+    };
+    pub(crate) const HOOKS_UNAVAILABLE: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: "Grok Build session-status hooks are unavailable.",
+    };
+    pub(crate) const NOT_INSTALLED: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: "Grok Build plugin was not installed for this launch.",
+    };
 }
 
 /// Immutable diagnostics data consumed by the panel.
@@ -652,6 +714,10 @@ pub struct DiagnosticsSnapshot {
     pub previous_log_exists: bool,
     /// Safe bridge token fingerprint.
     pub token_fingerprint: Option<String>,
+    /// Grok Build pill label (`inactive`, `ready`, or `degraded`).
+    pub grok_pill: GrokDiagnosticsPill,
+    /// The one Grok Build sentence shown beside that pill.
+    pub grok_sentence: &'static str,
     /// Recent log entries, oldest to newest.
     pub entries: Vec<LogEntry>,
 }
@@ -695,6 +761,12 @@ impl DiagnosticsSnapshot {
             .map(|reason| sanitize_log_text(&redact_hex_secrets(&reason)));
     }
 
+    /// Record the Grok Build row. The sentence is a fixed product string.
+    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
+        self.grok_pill = row.pill;
+        self.grok_sentence = row.sentence;
+    }
+
     /// Human-readable report suitable for copying into a bug report.
     pub fn to_text(&self) -> String {
         let mut text = String::new();
@@ -702,6 +774,8 @@ impl DiagnosticsSnapshot {
         push_line(&mut text, "status", &self.status_label);
         push_line(&mut text, "reason code", self.reason_code);
         push_line(&mut text, "reason", &self.reason);
+        push_line(&mut text, "grok status", self.grok_pill.label());
+        push_line(&mut text, "grok", self.grok_sentence);
         if let Some(identity) = &self.workspace_identity {
             push_line(&mut text, "workspace identity", identity);
         }

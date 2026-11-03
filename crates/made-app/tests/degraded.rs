@@ -62,7 +62,7 @@ fn app_start_is_healthy_with_optional_integration_inactive() {
     let state = state();
     assert_eq!(state.status(), IntegrationStatus::Inactive);
     assert_eq!(state.reason().code, ReasonCode::Inactive);
-    assert!(state.reason().human().contains("inactive"));
+    assert_eq!(state.reason().human(), "OpenCode is not running.");
     assert_eq!(state.fallback_root(), Some(root().as_path()));
 }
 

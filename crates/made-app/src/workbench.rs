@@ -27,8 +27,8 @@ use made_platform::{
 };
 
 use crate::diagnostics::{
-    Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
-    MAX_LOG_FILE_BYTES,
+    Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
+    DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
 };
 use crate::explorer_view::{ExplorerGitChrome, ExplorerPane, GitHeader};
 use crate::integration_status::{IntegrationState, IntegrationStatus};
@@ -263,6 +263,8 @@ pub struct Workbench {
     pub(crate) about_diagnostics_visible: bool,
     /// Increments when About opens so its reveal animation starts hidden.
     pub(crate) about_open_generation: u64,
+    /// Grok Build pill and sentence attached to the diagnostics snapshot.
+    grok_diagnostics: GrokDiagnosticsRow,
     tick_count: u64,
     paint_count: u64,
     last_osc7_cwd: Option<PathBuf>,
@@ -415,6 +417,7 @@ impl Workbench {
             sessions_visible: false,
             about_diagnostics_visible: false,
             about_open_generation: 0,
+            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
             tick_count: 0,
             paint_count: 0,
             last_osc7_cwd: None,
@@ -808,6 +811,11 @@ impl Workbench {
         &self.integration
     }
 
+    /// Record that OpenCode is not installed or not on PATH.
+    pub fn note_opencode_missing(&mut self) {
+        self.integration.note_opencode_missing();
+    }
+
     /// Session map.
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
@@ -826,6 +834,32 @@ impl Workbench {
     /// Diagnostics.
     pub fn diagnostics(&self) -> &Diagnostics {
         &self.diag
+    }
+
+    /// Keep the Grok Build diagnostics row for the next snapshot.
+    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
+        self.grok_diagnostics = row;
+    }
+
+    /// Grok Build pill and sentence currently shown in About.
+    pub(crate) fn grok_diagnostics(&self) -> GrokDiagnosticsRow {
+        self.grok_diagnostics
+    }
+
+    /// Record that Grok session follow has no status hooks.
+    ///
+    /// Called when the shipped plugin could not be installed. Repeated calls
+    /// keep a single warning.
+    pub(crate) fn note_grok_session_hooks_unavailable(&mut self) {
+        const MESSAGE: &str = "Grok session follow: session-status hooks are unavailable";
+        if self.diag.log().entries().any(|entry| {
+            entry
+                .message
+                .contains("session-status hooks are unavailable")
+        }) {
+            return;
+        }
+        self.diag.log_mut().record(LogLevel::Warn, MESSAGE);
     }
 
     /// Terminal pane, when the shell started.
@@ -1533,6 +1567,25 @@ impl Workbench {
                 self.last_activity = now;
             }
         }
+    }
+
+    /// Whether Grok is running in this workspace.
+    ///
+    /// Running means the terminal target is Grok and that process is still
+    /// alive, or the inventory has confirmed at least one open Grok session
+    /// for this terminal. A hook row starts with an empty `opened_at` and does
+    /// not count until that confirmation. The tab label is not part of the
+    /// check: OpenCode can own the label while Grok runs.
+    pub(crate) fn grok_follow_running(&self) -> bool {
+        let living_target = matches!(
+            self.terminal_target,
+            TerminalTarget::Tui(CompatibleTui::Grok)
+        ) && self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+        let confirmed = self
+            .grok_sessions
+            .iter()
+            .any(|session| !session.opened_at.is_empty());
+        living_target || confirmed
     }
 
     /// Status dots for Grok sessions open in this terminal.
@@ -2651,6 +2704,7 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
+        snapshot.set_grok_diagnostics(self.grok_diagnostics);
         snapshot
     }
 
@@ -3247,5 +3301,199 @@ mod tests {
         std::fs::write(&path, b"{}").unwrap();
         assert!(bounded_user_config(&path).is_ok());
         assert!(bounded_user_config(&temp.path().join("missing.json")).is_ok());
+    }
+
+    /// Terminates the stand-in child and skips the diagnostics-log write.
+    struct GrokRunningProbe {
+        workbench: Workbench,
+    }
+
+    impl Drop for GrokRunningProbe {
+        fn drop(&mut self) {
+            if let Some(mut terminal) = self.workbench.terminal.take() {
+                terminal.terminate(self.workbench.diag.log_mut());
+            }
+            self.workbench.shutdown_done = true;
+        }
+    }
+
+    impl GrokRunningProbe {
+        /// Shell child, not grok. The running check only reads the target and
+        /// whether that child is alive.
+        fn with_living_shell() -> Self {
+            let cwd = std::env::temp_dir();
+            let platform = host_platform();
+            let terminal = TerminalPane::spawn(&platform, made_terminal::PtyOptions::new(&cwd))
+                .expect("stand-in shell");
+            Self {
+                workbench: idle_workbench(TerminalTarget::Shell, Some(terminal)),
+            }
+        }
+    }
+
+    impl std::ops::Deref for GrokRunningProbe {
+        type Target = Workbench;
+
+        fn deref(&self) -> &Workbench {
+            &self.workbench
+        }
+    }
+
+    impl std::ops::DerefMut for GrokRunningProbe {
+        fn deref_mut(&mut self) -> &mut Workbench {
+            &mut self.workbench
+        }
+    }
+
+    fn idle_workbench(target: TerminalTarget, terminal: Option<TerminalPane>) -> Workbench {
+        let cwd = std::env::temp_dir();
+        let now = Instant::now();
+        Workbench {
+            platform: host_platform(),
+            plan: None,
+            workspace_error: None,
+            terminal_cwd: cwd.clone(),
+            terminal_target: target,
+            paths: None,
+            token: None,
+            bridge: None,
+            config_guard: None,
+            config_failure: None,
+            diag: Diagnostics::unavailable("grok running probe"),
+            metrics: Metrics::new(),
+            integration: IntegrationState::new(None, cwd),
+            follow: None,
+            session_map: SessionMap::new(),
+            focus: SessionFocusController::new(),
+            terminal,
+            terminal_error: None,
+            shell_cwd_error: None,
+            explorer: None,
+            worktree: WorktreeState::default(),
+            worktree_worker: WorktreeWorker::start(),
+            pending_worktree: PendingWorktreeRequest::default(),
+            git_status_worker: GitStatusWorker::start(),
+            pending_git_status: PendingGitStatusRequest::default(),
+            git_status: GitStatusRuntime::default(),
+            shell_capability: None,
+            shell_root_worker: ShellRootWorker::start(),
+            shell_root_unavailable: None,
+            shell_root_check_in_flight: false,
+            shell_root_checked_at: now,
+            shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
+            grok_checked_at: now,
+            grok_log_offset: 0,
+            grok_sessions: Vec::new(),
+            grok_closed: HashSet::new(),
+            grok_provisional_id: None,
+            grok_provisional_cwd: None,
+            grok_restore_root: None,
+            grok_file_newest_id: None,
+            instrumentation: RuntimeInstrumentation::new(),
+            pane_id: "grok-running-probe".to_owned(),
+            visible: false,
+            left_surface: LeftSurface::Terminal,
+            explorer_visible: false,
+            explorer_width: 0.0,
+            sessions_visible: false,
+            about_diagnostics_visible: false,
+            about_open_generation: 0,
+            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
+            tick_count: 0,
+            paint_count: 0,
+            last_osc7_cwd: None,
+            log_path: None,
+            log_write_issue: None,
+            started_at: now,
+            startup_recorded: false,
+            shutdown_done: false,
+            frame_ctx: None,
+            last_activity: now,
+            last_frame: now,
+            last_tick_active: false,
+            benchmark_frames: false,
+            pending_notice: None,
+            last_title: None,
+        }
+    }
+
+    fn hook_or_inventory_session(id: &str, opened_at: &str) -> GrokLiveSession {
+        GrokLiveSession {
+            id: id.to_owned(),
+            cwd: PathBuf::from("/tmp/made-grok-other-workspace"),
+            opened_at: opened_at.to_owned(),
+            activity: SessionActivity::Idle,
+            touched: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn unconfirmed_hook_session_does_not_make_grok_follow_running() {
+        // The signal is the living Grok target or an inventory-confirmed
+        // session. It does not read the tab label or `workspace_grok_branded`.
+        let mut probe = GrokRunningProbe::with_living_shell();
+        assert!(
+            probe
+                .terminal
+                .as_ref()
+                .is_some_and(TerminalPane::is_running),
+            "the stand-in child must be alive"
+        );
+        assert!(
+            !probe.grok_follow_running(),
+            "a shell with no Grok session is not running Grok"
+        );
+
+        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.last_title = Some("OpenCode".to_owned());
+        assert!(
+            probe.grok_follow_running(),
+            "a living Grok target counts even when another label owns the title"
+        );
+
+        probe.terminal_target = TerminalTarget::Shell;
+        probe
+            .grok_sessions
+            .push(hook_or_inventory_session("other-workspace", ""));
+        assert!(
+            !probe.grok_follow_running(),
+            "a hook-only session with an empty opened_at is not confirmed for this terminal"
+        );
+
+        probe.grok_sessions.clear();
+        if let Some(mut terminal) = probe.terminal.take() {
+            terminal.terminate(probe.diag.log_mut());
+        }
+        assert!(probe
+            .terminal
+            .as_ref()
+            .and_then(TerminalPane::pid)
+            .is_none());
+        probe
+            .grok_sessions
+            .push(hook_or_inventory_session("recorded-without-pid", ""));
+        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        assert!(
+            !probe.grok_follow_running(),
+            "a hook row recorded while this terminal has no pid must not count as running"
+        );
+
+        probe.grok_sessions.push(hook_or_inventory_session(
+            "this-terminal",
+            "2024-01-01T00:00:01Z",
+        ));
+        assert!(
+            probe.grok_follow_running(),
+            "inventory confirmation is a non-empty opened_at on this terminal's session"
+        );
+
+        probe
+            .grok_sessions
+            .retain(|session| session.opened_at.is_empty());
+        probe.terminal_target = TerminalTarget::Shell;
+        assert!(
+            !probe.grok_follow_running(),
+            "dropping the confirmed session must leave the hook-only row not running"
+        );
     }
 }
