@@ -3680,13 +3680,28 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: the hovered Explorer fill must end at the card right edge: {hover_fill:?}"
         );
 
+        headless.pump_until(|model| {
+            model
+                .workspace(beta_id)
+                .and_then(Workbench::terminal)
+                .is_some_and(made_app::TerminalPane::is_running)
+        });
+        let terminal_pid = headless
+            .model
+            .workspace(beta_id)
+            .and_then(Workbench::terminal)
+            .and_then(made_app::TerminalPane::pid);
         headless.focus(top_action_id("open-folder"));
         headless.press_key(egui::Key::Enter);
         headless.render();
-        let menu_open = headless
-            .ctx
-            .read_response(new_tab_menu_item_id("terminal"))
-            .is_some();
+        // Enter already opened the picker when nothing else is offered. Do not
+        // send the menu chord into that picker: ArrowDown/Enter would navigate
+        // the folder list, not a terminal row that was never shown.
+        let menu_open = !headless.model.is_picker()
+            && headless
+                .ctx
+                .read_response(new_tab_menu_item_id("terminal"))
+                .is_some();
         if menu_open {
             headless.press_key(egui::Key::ArrowDown);
             headless.render();
@@ -3697,13 +3712,16 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             headless.model.is_picker(),
             "{width}px: + must open the picker directly when nothing else is offered, or via Terminal when a menu is open"
         );
+        let terminal = headless
+            .model
+            .workspace(beta_id)
+            .and_then(Workbench::terminal);
         assert!(
-            headless
-                .model
-                .workspace(beta_id)
-                .and_then(Workbench::terminal)
-                .is_some_and(made_app::TerminalPane::is_running),
-            "{width}px: opening the picker must leave the local terminal running"
+            terminal.is_some_and(made_app::TerminalPane::is_running),
+            "{width}px: opening the picker must leave the local terminal running (pid {terminal_pid:?}, status {})",
+            terminal
+                .map(made_app::TerminalPane::shell_status_label)
+                .unwrap_or_else(|| "absent".to_owned())
         );
     }
 }

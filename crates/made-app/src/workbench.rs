@@ -923,12 +923,18 @@ impl Workbench {
             self.terminal_error = Some(detail);
             return;
         };
+        // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
+        // An interactive terminal must not inherit that, or the first failed
+        // prompt hook exits the shell while the workspace is still open.
         let mut options = options
             .with_size(PtySize {
                 rows: DEFAULT_ROWS as u16,
                 cols: DEFAULT_COLS as u16,
             })
-            .with_channel_capacity(256);
+            .with_channel_capacity(256)
+            .without_env("SHELLOPTS")
+            .without_env("BASH_ENV")
+            .without_env("ENV");
 
         if let Some(content) = &composed_content {
             options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
@@ -964,7 +970,12 @@ impl Workbench {
                 let fallback = fallback_terminal_cwd();
                 if fallback != self.terminal_cwd {
                     if let Some(retry) = self.terminal_target.pty_options(fallback.clone(), &path) {
-                        let mut retry = retry.with_size(options.size).with_channel_capacity(256);
+                        let mut retry = retry
+                            .with_size(options.size)
+                            .with_channel_capacity(256)
+                            .without_env("SHELLOPTS")
+                            .without_env("BASH_ENV")
+                            .without_env("ENV");
                         if let Some(content) = &composed_content {
                             retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }

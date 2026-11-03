@@ -264,17 +264,21 @@ mod tests {
             .expect("sleep child");
         let child_pid = child.id();
         let outside = made_platform::process_parent(terminal_pid).unwrap_or(1);
+        // `json_string` honors JSON escapes. A raw Windows `display()` path
+        // (`\\?\C:\...`) would be decoded as `\?C:...` and fail the real-cwd
+        // comparison. Encode the fixture the same way a writer would.
+        let older_cwd = serde_json::to_string(&older.display().to_string())
+            .expect("older cwd encodes as a JSON string");
+        let newest_cwd = serde_json::to_string(&newest.display().to_string())
+            .expect("newest cwd encodes as a JSON string");
         let body = format!(
             r#"[
-            {{"pid":{outside},"session_id":"outside","cwd":"{outside_cwd}","opened_at":"2024-01-01T00:00:03Z"}},
-            {{"pid":{terminal_pid},"session_id":"","cwd":"{older_cwd}","opened_at":"2024-01-01T00:00:04Z"}},
-            {{"pid":{terminal_pid},"pid":{outside},"session_id":"ambiguous","cwd":"{older_cwd}","cwd":"{newest_cwd}","opened_at":"2024-01-01T00:00:05Z"}},
-            {{"pid":{terminal_pid},"session_id":"self","cwd":"{older_cwd}","opened_at":"2024-01-01T00:00:01Z"}},
-            {{"pid":{child_pid},"session_id":"child","cwd":"{newest_cwd}","opened_at":"2024-01-01T00:00:02Z"}}
-            ]"#,
-            outside_cwd = older.display(),
-            older_cwd = older.display(),
-            newest_cwd = newest.display(),
+            {{"pid":{outside},"session_id":"outside","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:03Z"}},
+            {{"pid":{terminal_pid},"session_id":"","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:04Z"}},
+            {{"pid":{terminal_pid},"pid":{outside},"session_id":"ambiguous","cwd":{older_cwd},"cwd":{newest_cwd},"opened_at":"2024-01-01T00:00:05Z"}},
+            {{"pid":{terminal_pid},"session_id":"self","cwd":{older_cwd},"opened_at":"2024-01-01T00:00:01Z"}},
+            {{"pid":{child_pid},"session_id":"child","cwd":{newest_cwd},"opened_at":"2024-01-01T00:00:02Z"}}
+            ]"#
         );
         write(&sessions, &body);
 
@@ -306,6 +310,25 @@ mod tests {
             open_sessions_at(unreadable, terminal_pid).is_empty(),
             "a malformed inventory path must not invent a session"
         );
+    }
+
+    #[test]
+    fn windows_fixture_cwd_keeps_real_backslashes() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("active_sessions.json");
+        let cwd = r"\\?\C:\Users\runneradmin\AppData\Local\Temp\.tmpzeFZ5P\older";
+        let encoded = serde_json::to_string(cwd).expect("windows cwd encodes");
+        let body = format!(
+            r#"[{{"pid":1,"session_id":"self","cwd":{encoded},"opened_at":"2024-01-01T00:00:01Z"}}]"#
+        );
+        write(&sessions, &body);
+        let open = open_sessions_matching(&sessions, 1, |_| None);
+        assert_eq!(
+            open.len(),
+            1,
+            "the encoded fixture must stay one row: {body}"
+        );
+        assert_eq!(open[0].cwd, cwd);
     }
 
     #[test]
