@@ -62,7 +62,7 @@ fn app_start_is_healthy_with_optional_integration_inactive() {
     let state = state();
     assert_eq!(state.status(), IntegrationStatus::Inactive);
     assert_eq!(state.reason().code, ReasonCode::Inactive);
-    assert!(state.reason().human().contains("inactive"));
+    assert_eq!(state.reason().human(), "OpenCode is not running.");
     assert_eq!(state.fallback_root(), Some(root().as_path()));
 }
 
@@ -500,7 +500,14 @@ fn reason_codes_and_scope_are_enumerated() {
         assert!(!code.code().is_empty());
         assert!(!code.message().is_empty());
     }
-    assert_eq!(V1_SCOPE.agent_integrations.len(), 1);
+    assert_eq!(
+        V1_SCOPE
+            .agent_integrations
+            .iter()
+            .map(|integration| integration.id())
+            .collect::<Vec<_>>(),
+        ["opencode-v2", "grok-build"]
+    );
     const { assert!(!V1_SCOPE.chat_ui) };
     const { assert!(!V1_SCOPE.worktree_management) };
     const { assert!(!V1_SCOPE.separate_opencode_server) };

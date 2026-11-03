@@ -1,5 +1,5 @@
-//! V1 scope-boundary tests: OpenCode v2 only, no chat UI, no worktree
-//! management, and no separate OpenCode server requirement.
+//! V1 scope-boundary tests: OpenCode v2 and Grok Build only, no chat UI, no
+//! worktree management, and no separate server requirement.
 
 use made_app::integration_status::{AgentIntegration, V1_SCOPE};
 use made_app::worktree::{
@@ -21,11 +21,14 @@ const CORE_SOURCES: &[&str] = &[
 ];
 
 #[test]
-fn only_opencode_v2_is_offered() {
-    assert_eq!(V1_SCOPE.agent_integrations.len(), 1);
+fn only_opencode_v2_and_grok_build_are_offered() {
+    assert_eq!(V1_SCOPE.agent_integrations.len(), 2);
     assert_eq!(V1_SCOPE.agent_integrations[0], AgentIntegration::OpenCodeV2);
     assert_eq!(V1_SCOPE.agent_integrations[0].id(), "opencode-v2");
     assert_eq!(V1_SCOPE.agent_integrations[0].name(), "OpenCode v2");
+    assert_eq!(V1_SCOPE.agent_integrations[1], AgentIntegration::GrokBuild);
+    assert_eq!(V1_SCOPE.agent_integrations[1].id(), "grok-build");
+    assert_eq!(V1_SCOPE.agent_integrations[1].name(), "Grok Build");
 }
 
 #[test]
@@ -33,12 +36,23 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
     const { assert!(!V1_SCOPE.chat_ui) };
     for source in CORE_SOURCES {
         let lower = source.to_ascii_lowercase();
-        for forbidden in ["claude", "codex", "grok", "acp", "chat ui"] {
+        for forbidden in ["claude", "codex", "acp", "chat ui"] {
             assert!(
                 !lower.contains(forbidden),
                 "core source mentions forbidden agent/chat surface {forbidden:?}"
             );
         }
+    }
+    let integration = include_str!("../src/integration_status.rs").to_ascii_lowercase();
+    assert!(
+        integration.contains("grok build"),
+        "Grok Build is an offered integration, not a forbidden mention"
+    );
+    for forbidden in ["claude", "codex", "acp", "chat ui"] {
+        assert!(
+            !integration.contains(forbidden),
+            "integration status mentions forbidden surface {forbidden:?}"
+        );
     }
 }
 

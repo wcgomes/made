@@ -612,6 +612,97 @@ fn no_active_session_returns_to_latest_shell_root() {
 }
 
 #[test]
+fn opencode_keeps_the_explorer_when_grok_reports_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let opencode = fixture_dir(&temp, "opencode-dir");
+    let grok = fixture_dir(&temp, "grok-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    let connected = follow.apply_snapshot(snapshot(
+        Some("session"),
+        vec![session("session", "Open", &opencode, None)],
+        1,
+    ));
+    assert!(connected.root_switched);
+    assert_eq!(connected.root, opencode);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+
+    let blocked = follow.follow_grok_directory(Some(&grok));
+    assert!(!blocked.root_switched);
+    assert_eq!(follow.current_root(), opencode);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert!(follow.is_agent_owned());
+}
+
+#[test]
+fn a_connected_view_keeps_the_explorer_when_grok_reports_a_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let view = fixture_dir(&temp, "view-dir");
+    let grok = fixture_dir(&temp, "grok-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    let connected = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
+    assert_eq!(connected.root, view);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+
+    let blocked = follow.follow_grok_directory(Some(&grok));
+    assert!(!blocked.root_switched);
+    assert_eq!(follow.current_root(), view);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+}
+
+#[test]
+fn grok_exit_restores_the_shell_and_shell_reports_do_not_steal() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let elsewhere = fixture_dir(&temp, "elsewhere");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    let moved = follow.follow_grok_directory(Some(&grok));
+    assert!(moved.root_switched);
+    assert_eq!(follow.current_root(), grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+
+    let closed = follow.follow_grok_directory(None);
+    assert!(closed.root_switched);
+    assert_eq!(closed.root, terminal);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+
+    assert!(follow.follow_grok_directory(Some(&grok)).root_switched);
+    let shell = follow.follow_shell_cwd(&elsewhere).unwrap();
+    assert!(
+        !shell.root_switched,
+        "a shell report must not steal from Grok"
+    );
+    assert_eq!(follow.current_root(), grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+
+    let restored = follow.follow_grok_directory(None);
+    assert!(restored.root_switched);
+    assert_eq!(restored.root, elsewhere);
+    assert_eq!(follow.current_root(), elsewhere);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+}
+
+#[test]
+fn a_prompted_grok_directory_stays_until_a_new_directory_is_applied() {
+    let temp = tempfile::tempdir().unwrap();
+    let older = fixture_dir(&temp, "older");
+    let newer = fixture_dir(&temp, "newer");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    assert!(follow.follow_grok_directory(Some(&newer)).root_switched);
+    let prompted = follow.follow_grok_directory(Some(&older));
+    assert!(prompted.root_switched);
+    assert_eq!(follow.current_root(), older);
+
+    let repeated = follow.follow_grok_directory(Some(&older));
+    assert!(!repeated.root_switched);
+    assert_eq!(follow.current_root(), older);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+}
+
+#[test]
 fn usable_view_directory_is_followed_without_an_active_session() {
     let temp = tempfile::tempdir().unwrap();
     let view = fixture_dir(&temp, "view");

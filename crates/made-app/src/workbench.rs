@@ -6,6 +6,7 @@
 //! performs synchronous config/PTY setup (including shell policy preflight);
 //! callers must not mistake that remaining launch cost for background work.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -21,12 +22,13 @@ use made_bridge::server::{self, BridgeEvent, BridgeHandle, BridgeOptions};
 use made_bridge::state::SessionSnapshot;
 use made_explorer::root_switch::RootGeneration;
 use made_platform::{
-    host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
+    host_platform, AppPaths, CompatibleTui, LogIssue, LogIssueSeverity, Platform, PlatformFamily,
+    PtySize,
 };
 
 use crate::diagnostics::{
-    Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
-    MAX_LOG_FILE_BYTES,
+    Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
+    DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
 };
 use crate::explorer_view::{ExplorerGitChrome, ExplorerPane, GitHeader};
 use crate::integration_status::{IntegrationState, IntegrationStatus};
@@ -34,7 +36,7 @@ use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFocusController};
 use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
-use crate::session_map::SessionMap;
+use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
 use crate::tui::TerminalTarget;
@@ -64,6 +66,16 @@ const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
+
+/// One Grok session open in this terminal, with the latest hook status.
+#[derive(Debug, Clone)]
+struct GrokLiveSession {
+    id: String,
+    cwd: PathBuf,
+    opened_at: String,
+    activity: SessionActivity,
+    touched: Instant,
+}
 
 /// Which transition created an explorer root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,6 +351,21 @@ pub struct Workbench {
     shell_root_check_in_flight: bool,
     shell_root_checked_at: Instant,
     shell_root_check_interval: Duration,
+    grok_checked_at: Instant,
+    grok_log_offset: u64,
+    grok_sessions: Vec<GrokLiveSession>,
+    /// Session ids removed by a session-end hook. Inventory must not put the
+    /// dot back while Grok's file still lists that row.
+    grok_closed: HashSet<String>,
+    /// Hook session moved before the inventory could prove it belongs here.
+    grok_provisional_id: Option<String>,
+    /// Explorer root after that provisional move. A later release restores the
+    /// saved directory only while the explorer is still here.
+    grok_provisional_cwd: Option<PathBuf>,
+    /// Grok directory to restore if that provisional session is not ours.
+    /// `None` while a provisional move is active means the shell owned the root.
+    grok_restore_root: Option<PathBuf>,
+    grok_file_newest_id: Option<String>,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -350,6 +377,8 @@ pub struct Workbench {
     pub(crate) about_diagnostics_visible: bool,
     /// Increments when About opens so its reveal animation starts hidden.
     pub(crate) about_open_generation: u64,
+    /// Grok Build pill and sentence attached to the diagnostics snapshot.
+    grok_diagnostics: GrokDiagnosticsRow,
     tick_count: u64,
     paint_count: u64,
     last_osc7_cwd: Option<PathBuf>,
@@ -580,6 +609,14 @@ impl Workbench {
             shell_root_unavailable: None,
             shell_root_check_in_flight: false,
             shell_root_checked_at: Instant::now(),
+            grok_checked_at: Instant::now(),
+            grok_log_offset: u64::MAX,
+            grok_sessions: Vec::new(),
+            grok_closed: HashSet::new(),
+            grok_provisional_id: None,
+            grok_provisional_cwd: None,
+            grok_restore_root: None,
+            grok_file_newest_id: None,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -594,6 +631,7 @@ impl Workbench {
             sessions_visible: false,
             about_diagnostics_visible: false,
             about_open_generation: 0,
+            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
             tick_count: 0,
             paint_count: 0,
             last_osc7_cwd: None,
@@ -857,6 +895,19 @@ impl Workbench {
     }
 
     fn start_terminal(&mut self, composed_content: Option<String>) {
+        // Grok is started as-is. OpenCode and the shell keep the composed
+        // plugin environment; Grok must not receive it or a written config.
+        let composed_content = match self.terminal_target {
+            TerminalTarget::Tui(CompatibleTui::Grok) => None,
+            TerminalTarget::Shell | TerminalTarget::Tui(CompatibleTui::OpenCode) => {
+                composed_content
+            }
+            // Remote tabs already return before this function. If it is reached,
+            // do not start a host PTY or inject the local OpenCode plugin.
+            TerminalTarget::RemoteShell { .. } | TerminalTarget::RemoteOpenCode { .. } => {
+                return;
+            }
+        };
         // One PATH snapshot serves the primary spawn and the fallback retry, so
         // a TUI resolves to the same executable for both.
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -990,6 +1041,11 @@ impl Workbench {
         &self.integration
     }
 
+    /// Record that OpenCode is not installed or not on PATH.
+    pub fn note_opencode_missing(&mut self) {
+        self.integration.note_opencode_missing();
+    }
+
     /// Session map.
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
@@ -1008,6 +1064,32 @@ impl Workbench {
     /// Diagnostics.
     pub fn diagnostics(&self) -> &Diagnostics {
         &self.diag
+    }
+
+    /// Keep the Grok Build diagnostics row for the next snapshot.
+    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
+        self.grok_diagnostics = row;
+    }
+
+    /// Grok Build pill and sentence currently shown in About.
+    pub(crate) fn grok_diagnostics(&self) -> GrokDiagnosticsRow {
+        self.grok_diagnostics
+    }
+
+    /// Record that Grok session follow has no status hooks.
+    ///
+    /// Called when the shipped plugin could not be installed. Repeated calls
+    /// keep a single warning.
+    pub(crate) fn note_grok_session_hooks_unavailable(&mut self) {
+        const MESSAGE: &str = "Grok session follow: session-status hooks are unavailable";
+        if self.diag.log().entries().any(|entry| {
+            entry
+                .message
+                .contains("session-status hooks are unavailable")
+        }) {
+            return;
+        }
+        self.diag.log_mut().record(LogLevel::Warn, MESSAGE);
     }
 
     /// Terminal pane, when the shell started.
@@ -2744,6 +2826,8 @@ impl Workbench {
 
         self.poll_shell_root_revalidation(now);
         self.maybe_schedule_shell_root_revalidation(now);
+        self.poll_grok_hooks(now);
+        self.poll_grok_directory(now);
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -2868,6 +2952,248 @@ impl Workbench {
                 }
                 self.last_activity = now;
             }
+        }
+    }
+
+    /// Whether Grok is running in this workspace.
+    ///
+    /// Running means the terminal target is Grok and that process is still
+    /// alive, or the inventory has confirmed at least one open Grok session
+    /// for this terminal. A hook row starts with an empty `opened_at` and does
+    /// not count until that confirmation. The tab label is not part of the
+    /// check: OpenCode can own the label while Grok runs.
+    pub(crate) fn grok_follow_running(&self) -> bool {
+        let living_target = matches!(
+            self.terminal_target,
+            TerminalTarget::Tui(CompatibleTui::Grok)
+        ) && self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+        let confirmed = self
+            .grok_sessions
+            .iter()
+            .any(|session| !session.opened_at.is_empty());
+        living_target || confirmed
+    }
+
+    /// Status dots for Grok sessions open in this terminal.
+    pub(crate) fn grok_tab_activities(&self) -> Vec<SessionActivity> {
+        let mut sessions = self.grok_sessions.clone();
+        sessions.sort_by(|left, right| left.opened_at.cmp(&right.opened_at));
+        sessions
+            .into_iter()
+            .map(|session| session.activity)
+            .collect()
+    }
+
+    /// Apply hook lines as soon as they are appended.
+    fn poll_grok_hooks(&mut self, now: Instant) {
+        let (offset, events) = crate::grok_follow::read_hook_events(self.grok_log_offset);
+        self.grok_log_offset = offset;
+        for event in events {
+            let moves_explorer = matches!(
+                event.event.to_ascii_lowercase().as_str(),
+                "session_start" | "sessionstart" | "user_prompt_submit" | "userpromptsubmit"
+            );
+            if event.event.eq_ignore_ascii_case("session_end")
+                || event.event.eq_ignore_ascii_case("sessionend")
+            {
+                let ended = event.session_id.clone();
+                let was_provisional = self.grok_provisional_id.as_deref() == Some(ended.as_str());
+                self.grok_closed.insert(ended.clone());
+                self.grok_sessions.retain(|session| session.id != ended);
+                if was_provisional {
+                    self.release_provisional_move();
+                } else if self.grok_sessions.is_empty() {
+                    self.grok_file_newest_id = None;
+                    self.follow_grok_path(None);
+                }
+                continue;
+            }
+            // The log is global. Re-read inventory before moving so a session
+            // this tab owns is not delayed, and a foreign pid is not followed.
+            let ownership = self.hook_session_ownership(&event.session_id);
+            if ownership == crate::grok_follow::SessionOwnership::Foreign {
+                let id = event.session_id.clone();
+                let was_provisional = self.grok_provisional_id.as_deref() == Some(id.as_str());
+                self.grok_sessions.retain(|session| session.id != id);
+                if was_provisional {
+                    self.release_provisional_move();
+                }
+                continue;
+            }
+            self.grok_closed.remove(&event.session_id);
+            let activity = match event.status.as_str() {
+                "working" => SessionActivity::Busy,
+                "attention" | "error" => SessionActivity::Attention,
+                _ => SessionActivity::Idle,
+            };
+            let cwd = PathBuf::from(&event.cwd);
+            if let Some(session) = self
+                .grok_sessions
+                .iter_mut()
+                .find(|session| session.id == event.session_id)
+            {
+                session.activity = activity;
+                session.touched = now;
+                if cwd.is_absolute() {
+                    session.cwd = cwd.clone();
+                }
+            } else if !event.session_id.is_empty() {
+                self.grok_sessions.push(GrokLiveSession {
+                    id: event.session_id.clone(),
+                    cwd: cwd.clone(),
+                    opened_at: String::new(),
+                    activity,
+                    touched: now,
+                });
+            }
+            if moves_explorer && cwd.is_absolute() {
+                if ownership == crate::grok_follow::SessionOwnership::Owned {
+                    // A prompt in a session this tab owns replaces any earlier
+                    // provisional move, including one for a different session.
+                    self.clear_provisional_slot();
+                    self.follow_grok_path(Some(cwd.as_path()));
+                } else {
+                    self.begin_provisional_move(&event.session_id, cwd.as_path());
+                }
+            }
+            self.last_activity = now;
+        }
+    }
+
+    fn hook_session_ownership(&self, session_id: &str) -> crate::grok_follow::SessionOwnership {
+        let Some(pid) = self.terminal.as_ref().and_then(TerminalPane::pid) else {
+            return crate::grok_follow::SessionOwnership::Unknown;
+        };
+        crate::grok_follow::session_ownership(pid, session_id)
+    }
+
+    /// Remember the directory this tab was following, then follow `cwd` until
+    /// inventory confirms the session.
+    fn begin_provisional_move(&mut self, session_id: &str, cwd: &Path) {
+        if self.grok_provisional_id.is_none() {
+            self.grok_restore_root = self.follow.as_ref().and_then(|follow| {
+                (follow.effective_root_source() == crate::session_follow::RootSource::Grok)
+                    .then(|| follow.current_root().to_path_buf())
+            });
+        }
+        self.grok_provisional_id = Some(session_id.to_owned());
+        self.follow_grok_path(Some(cwd));
+        self.grok_provisional_cwd = self.explorer_root().map(Path::to_path_buf);
+    }
+
+    fn clear_provisional_slot(&mut self) {
+        self.grok_provisional_id = None;
+        self.grok_provisional_cwd = None;
+        self.grok_restore_root = None;
+    }
+
+    fn release_provisional_move(&mut self) {
+        if self.grok_provisional_id.is_none() {
+            return;
+        }
+        let restore = self.grok_restore_root.take();
+        let provisional_cwd = self.grok_provisional_cwd.take();
+        self.grok_provisional_id = None;
+        // An owned prompt after this move already left the provisional
+        // directory. Restoring would undo that prompt.
+        let still_there = provisional_cwd
+            .as_ref()
+            .is_some_and(|cwd| self.explorer_root() == Some(cwd.as_path()));
+        if !still_there {
+            return;
+        }
+        match restore {
+            Some(path) => self.follow_grok_path(Some(&path)),
+            None => self.follow_grok_path(None),
+        }
+    }
+
+    /// Refresh the open-session inventory and follow a newly attached session.
+    fn poll_grok_directory(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.grok_checked_at) < Duration::from_secs(1) {
+            return;
+        }
+        self.grok_checked_at = now;
+        let Some(pid) = self.terminal.as_ref().and_then(TerminalPane::pid) else {
+            return;
+        };
+        let open = crate::grok_follow::open_sessions(pid);
+        let open_ids: Vec<&str> = open.iter().map(|row| row.session_id.as_str()).collect();
+        self.grok_closed
+            .retain(|id| open_ids.iter().any(|open_id| *open_id == id.as_str()));
+        for row in &open {
+            if self.grok_closed.contains(&row.session_id) {
+                continue;
+            }
+            let cwd = PathBuf::from(&row.cwd);
+            if let Some(session) = self
+                .grok_sessions
+                .iter_mut()
+                .find(|session| session.id == row.session_id)
+            {
+                session.opened_at = row.opened_at.clone();
+                if cwd.is_absolute() {
+                    session.cwd = cwd;
+                }
+            } else {
+                self.grok_sessions.push(GrokLiveSession {
+                    id: row.session_id.clone(),
+                    cwd,
+                    opened_at: row.opened_at.clone(),
+                    activity: SessionActivity::Idle,
+                    touched: now,
+                });
+            }
+        }
+        let mut reverted_provisional = false;
+        if let Some(id) = self.grok_provisional_id.clone() {
+            let confirmed = open_ids.iter().any(|open_id| *open_id == id.as_str());
+            if confirmed {
+                self.clear_provisional_slot();
+            } else {
+                // Pid is missing, or the row belongs to another process and was
+                // filtered out. Drop the dot and undo only that session's move.
+                self.grok_sessions.retain(|session| session.id != id);
+                self.release_provisional_move();
+                reverted_provisional = true;
+            }
+        }
+        self.grok_sessions.retain(|session| {
+            !self.grok_closed.contains(&session.id) && open_ids.contains(&session.id.as_str())
+        });
+        if reverted_provisional {
+            return;
+        }
+        let newest = open
+            .iter()
+            .rev()
+            .find(|row| !self.grok_closed.contains(&row.session_id));
+        match newest {
+            Some(row) if self.grok_file_newest_id.as_deref() != Some(row.session_id.as_str()) => {
+                self.grok_file_newest_id = Some(row.session_id.clone());
+                let path = PathBuf::from(&row.cwd);
+                if path.is_absolute() {
+                    self.follow_grok_path(Some(path.as_path()));
+                }
+            }
+            None if open.is_empty() && self.grok_file_newest_id.is_some() => {
+                self.grok_file_newest_id = None;
+                self.follow_grok_path(None);
+            }
+            _ => {}
+        }
+    }
+
+    fn follow_grok_path(&mut self, directory: Option<&Path>) {
+        let Some(outcome) = self
+            .follow
+            .as_mut()
+            .map(|follow| follow.follow_grok_directory(directory))
+        else {
+            return;
+        };
+        if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+            self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
         }
     }
 
@@ -3816,6 +4142,7 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
+        snapshot.set_grok_diagnostics(self.grok_diagnostics);
         snapshot
     }
 
@@ -4412,5 +4739,200 @@ mod tests {
         std::fs::write(&path, b"{}").unwrap();
         assert!(bounded_user_config(&path).is_ok());
         assert!(bounded_user_config(&temp.path().join("missing.json")).is_ok());
+    }
+
+    /// Terminates the stand-in child and skips the diagnostics-log write.
+    struct GrokRunningProbe {
+        workbench: Workbench,
+    }
+
+    impl Drop for GrokRunningProbe {
+        fn drop(&mut self) {
+            if let Some(mut terminal) = self.workbench.terminal.take() {
+                terminal.terminate(self.workbench.diag.log_mut());
+            }
+            self.workbench.shutdown_done = true;
+        }
+    }
+
+    impl GrokRunningProbe {
+        /// Shell child, not grok. The running check only reads the target and
+        /// whether that child is alive.
+        fn with_living_shell() -> Self {
+            let cwd = std::env::temp_dir();
+            let platform = host_platform();
+            let terminal = TerminalPane::spawn(&platform, made_terminal::PtyOptions::new(&cwd))
+                .expect("stand-in shell");
+            Self {
+                workbench: idle_workbench(TerminalTarget::Shell, Some(terminal)),
+            }
+        }
+    }
+
+    impl std::ops::Deref for GrokRunningProbe {
+        type Target = Workbench;
+
+        fn deref(&self) -> &Workbench {
+            &self.workbench
+        }
+    }
+
+    impl std::ops::DerefMut for GrokRunningProbe {
+        fn deref_mut(&mut self) -> &mut Workbench {
+            &mut self.workbench
+        }
+    }
+
+    fn idle_workbench(target: TerminalTarget, terminal: Option<TerminalPane>) -> Workbench {
+        let cwd = std::env::temp_dir();
+        let now = Instant::now();
+        Workbench {
+            platform: host_platform(),
+            plan: None,
+            workspace_error: None,
+            terminal_cwd: cwd.clone(),
+            terminal_target: target,
+            paths: None,
+            token: None,
+            bridge: None,
+            config_guard: None,
+            config_failure: None,
+            diag: Diagnostics::unavailable("grok running probe"),
+            metrics: Metrics::new(),
+            integration: IntegrationState::new(None, cwd),
+            follow: None,
+            session_map: SessionMap::new(),
+            focus: SessionFocusController::new(),
+            terminal,
+            terminal_error: None,
+            shell_cwd_error: None,
+            explorer: None,
+            worktree: WorktreeState::default(),
+            worktree_worker: WorktreeWorker::start(),
+            pending_worktree: PendingWorktreeRequest::default(),
+            git_status_worker: GitStatusWorker::start(),
+            pending_git_status: PendingGitStatusRequest::default(),
+            git_status: GitStatusRuntime::default(),
+            shell_capability: None,
+            shell_root_worker: ShellRootWorker::start(),
+            shell_root_unavailable: None,
+            shell_root_check_in_flight: false,
+            shell_root_checked_at: now,
+            shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
+            grok_checked_at: now,
+            grok_log_offset: 0,
+            grok_sessions: Vec::new(),
+            grok_closed: HashSet::new(),
+            grok_provisional_id: None,
+            grok_provisional_cwd: None,
+            grok_restore_root: None,
+            grok_file_newest_id: None,
+            instrumentation: RuntimeInstrumentation::new(),
+            pane_id: "grok-running-probe".to_owned(),
+            visible: false,
+            left_surface: LeftSurface::Terminal,
+            explorer_visible: false,
+            explorer_width: 0.0,
+            sessions_visible: false,
+            about_diagnostics_visible: false,
+            about_open_generation: 0,
+            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
+            tick_count: 0,
+            paint_count: 0,
+            last_osc7_cwd: None,
+            log_path: None,
+            log_write_issue: None,
+            started_at: now,
+            startup_recorded: false,
+            shutdown_done: false,
+            frame_ctx: None,
+            last_activity: now,
+            last_frame: now,
+            last_tick_active: false,
+            benchmark_frames: false,
+            pending_notice: None,
+            last_title: None,
+            remote: None,
+        }
+    }
+
+    fn hook_or_inventory_session(id: &str, opened_at: &str) -> GrokLiveSession {
+        GrokLiveSession {
+            id: id.to_owned(),
+            cwd: PathBuf::from("/tmp/made-grok-other-workspace"),
+            opened_at: opened_at.to_owned(),
+            activity: SessionActivity::Idle,
+            touched: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn unconfirmed_hook_session_does_not_make_grok_follow_running() {
+        // The signal is the living Grok target or an inventory-confirmed
+        // session. It does not read the tab label or `workspace_grok_branded`.
+        let mut probe = GrokRunningProbe::with_living_shell();
+        assert!(
+            probe
+                .terminal
+                .as_ref()
+                .is_some_and(TerminalPane::is_running),
+            "the stand-in child must be alive"
+        );
+        assert!(
+            !probe.grok_follow_running(),
+            "a shell with no Grok session is not running Grok"
+        );
+
+        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.last_title = Some("OpenCode".to_owned());
+        assert!(
+            probe.grok_follow_running(),
+            "a living Grok target counts even when another label owns the title"
+        );
+
+        probe.terminal_target = TerminalTarget::Shell;
+        probe
+            .grok_sessions
+            .push(hook_or_inventory_session("other-workspace", ""));
+        assert!(
+            !probe.grok_follow_running(),
+            "a hook-only session with an empty opened_at is not confirmed for this terminal"
+        );
+
+        probe.grok_sessions.clear();
+        if let Some(mut terminal) = probe.terminal.take() {
+            terminal.terminate(probe.diag.log_mut());
+        }
+        assert!(probe
+            .terminal
+            .as_ref()
+            .and_then(TerminalPane::pid)
+            .is_none());
+        probe
+            .grok_sessions
+            .push(hook_or_inventory_session("recorded-without-pid", ""));
+        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        assert!(
+            !probe.grok_follow_running(),
+            "a hook row recorded while this terminal has no pid must not count as running"
+        );
+
+        probe.grok_sessions.push(hook_or_inventory_session(
+            "this-terminal",
+            "2024-01-01T00:00:01Z",
+        ));
+        assert!(
+            probe.grok_follow_running(),
+            "inventory confirmation is a non-empty opened_at on this terminal's session"
+        );
+
+        probe
+            .grok_sessions
+            .retain(|session| session.opened_at.is_empty());
+        probe.terminal_target = TerminalTarget::Shell;
+        assert!(
+            !probe.grok_follow_running(),
+            "dropping the confirmed session must leave the hook-only row not running"
+        );
     }
 }

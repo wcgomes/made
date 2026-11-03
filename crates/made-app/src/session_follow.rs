@@ -76,6 +76,8 @@ pub enum RootSource {
     Shell,
     /// A connected OpenCode active session or view directory.
     OpenCode,
+    /// The single Grok session open in this terminal.
+    Grok,
 }
 
 /// Accept a remote directory report without consulting the host filesystem.
@@ -94,6 +96,7 @@ impl RootSource {
         match self {
             Self::Shell => "shell",
             Self::OpenCode => "opencode",
+            Self::Grok => "grok",
         }
     }
 }
@@ -241,6 +244,8 @@ pub struct SessionFollowCoordinator {
     directory_cache_ttl: Duration,
     directory_validation_count: u64,
     fallback_cache: Option<(PathBuf, Instant)>,
+    /// Directory of the single Grok session in this terminal, when one is open.
+    grok_root: Option<PathBuf>,
 }
 
 impl SessionFollowCoordinator {
@@ -305,6 +310,7 @@ impl SessionFollowCoordinator {
             directory_cache_ttl: DEFAULT_DIRECTORY_CACHE_TTL,
             directory_validation_count: 0,
             fallback_cache: None,
+            grok_root: None,
         })
     }
 
@@ -338,6 +344,8 @@ impl SessionFollowCoordinator {
     pub fn effective_root_source(&self) -> RootSource {
         if self.active_session.is_some() || self.view_is_effective() {
             RootSource::OpenCode
+        } else if self.grok_root.is_some() {
+            RootSource::Grok
         } else {
             RootSource::Shell
         }
@@ -515,7 +523,35 @@ impl SessionFollowCoordinator {
         if self.view_is_effective() {
             return Ok(self.outcome(SessionFollowUpdate::ViewDirectory, false));
         }
+        if self.grok_root.is_some() {
+            return Ok(self.outcome(SessionFollowUpdate::NoActiveSession, false));
+        }
         Ok(self.release_to_fallback(SessionFollowUpdate::NoActiveSession))
+    }
+
+    /// Follow the directory of the single Grok session in this terminal.
+    ///
+    /// `None` releases that follow. A connected OpenCode session keeps the root.
+    pub fn follow_grok_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
+        if self.active_session.is_some() || self.view_is_effective() {
+            return self.outcome(SessionFollowUpdate::ActiveSession, false);
+        }
+        let Some(directory) = directory else {
+            if self.grok_root.take().is_none() {
+                return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+            }
+            return self.release_to_fallback(SessionFollowUpdate::NoActiveSession);
+        };
+        let Ok(canonical) = usable_directory(directory) else {
+            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+        };
+        self.grok_root = Some(canonical.clone());
+        let switched = canonical != self.current_root;
+        if switched {
+            self.generation.advance();
+            self.current_root = canonical;
+        }
+        self.outcome(SessionFollowUpdate::NoActiveSession, switched)
     }
 
     /// Release agent precedence on no-active, tabs-disabled or disconnection.
@@ -532,6 +568,18 @@ impl SessionFollowCoordinator {
         self.unavailable = None;
         self.directory_check = None;
         let now = Instant::now();
+        if let Some(grok) = self
+            .grok_root
+            .clone()
+            .filter(|path| is_usable_directory(path))
+        {
+            let switched = grok != self.current_root;
+            if switched {
+                self.generation.advance();
+                self.current_root = grok;
+            }
+            return self.outcome(update, switched);
+        }
         let root = match &self.fallback_cache {
             Some((root, checked))
                 if now.saturating_duration_since(*checked) < self.directory_cache_ttl =>

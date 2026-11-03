@@ -30,15 +30,20 @@ impl TerminalTarget {
     /// [`TerminalTarget::Shell`] leaves shell resolution to the platform.
     /// [`TerminalTarget::Tui`] resolves the program against `path` with the
     /// same lookup as detection, then spawns that absolute path with no shell
-    /// arguments. It returns `None` when the program is not found there, so
-    /// nothing is spawned.
+    /// in between. Grok's only argument is `dashboard`. OpenCode gets none.
+    /// It returns `None` when the program is not found there, so nothing is
+    /// spawned.
     pub fn pty_options(self, cwd: impl Into<PathBuf>, path: &OsStr) -> Option<PtyOptions> {
         let options = PtyOptions::new(cwd);
         match self {
             Self::Shell => Some(options),
             Self::Tui(tui) => {
                 let program = find_executable_on_path(OsStr::new(tui.program()), path)?;
-                Some(options.with_shell(program.into_os_string()))
+                let options = options.with_shell(program.into_os_string());
+                Some(match tui {
+                    CompatibleTui::Grok => options.with_args(["dashboard"]),
+                    CompatibleTui::OpenCode => options,
+                })
             }
             // Remote launches must not resolve a host executable or host cwd.
             Self::RemoteShell { .. } | Self::RemoteOpenCode { .. } => None,
@@ -146,16 +151,31 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
-        let executable = root.path().join("opencode");
-        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["opencode", "grok"] {
+            let executable = root.path().join(name);
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let path = std::env::join_paths([root.path()]).unwrap();
 
-        let options = TerminalTarget::Tui(CompatibleTui::OpenCode)
+        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode)
             .pty_options("/tmp", &path)
             .expect("the detected executable must resolve");
-        assert_eq!(options.shell.as_deref(), Some(executable.as_os_str()));
-        assert!(options.args.is_empty());
+        assert_eq!(
+            opencode.shell.as_deref(),
+            Some(root.path().join("opencode").as_os_str())
+        );
+        assert!(opencode.args.is_empty());
+
+        let grok = TerminalTarget::Tui(CompatibleTui::Grok)
+            .pty_options("/tmp", &path)
+            .expect("the detected executable must resolve");
+        assert_eq!(
+            grok.shell.as_deref(),
+            Some(root.path().join("grok").as_os_str())
+        );
+        // Restart clones these options, so the same argument is the relaunch.
+        assert_eq!(grok.args, vec![std::ffi::OsString::from("dashboard")]);
     }
 
     #[cfg(unix)]

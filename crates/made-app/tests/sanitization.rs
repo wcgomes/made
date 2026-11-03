@@ -81,6 +81,8 @@ fn diagnostics_snapshot_and_copy_path_are_sanitized() {
         previous_log_location: Some("/tmp/log.1".to_owned()),
         previous_log_exists: false,
         token_fingerprint: Some("sha256:0123456789abcdef".to_owned()),
+        grok_pill: made_app::diagnostics::GrokDiagnosticsPill::Inactive,
+        grok_sentence: "Grok Build is not on PATH.",
         entries: vec![LogEntry::new(
             LogLevel::Warn,
             sanitize_log_text(&format!("closed: {HOSTILE}")),

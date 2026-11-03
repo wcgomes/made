@@ -16,6 +16,8 @@ use made_platform::native_backdrop::NativeBackdropStatus;
 use made_platform::{CompatibleTui, Platform};
 
 use crate::cli::LaunchArgs;
+use crate::diagnostics::GrokDiagnosticsRow;
+use crate::grok_plugin::{self, EnsureOutcome};
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
@@ -95,7 +97,9 @@ impl AppOptions {
 
     /// Detect compatible TUIs on a background thread started at launch.
     ///
-    /// This clears any explicit list; the last builder call wins.
+    /// This clears any explicit list; the last builder call wins. The lookup
+    /// stays metadata-only. When it reports grok, a separate worker may install
+    /// the shipped plugin. An explicit catalog never does.
     pub fn with_compatible_tui_detection(mut self) -> Self {
         self.compatible_tuis.clear();
         self.detect_compatible_tuis = true;
@@ -106,6 +110,126 @@ impl AppOptions {
 impl Default for AppOptions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Grok Build row while PATH detection and the shipped-plugin install run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokDiagnosticsPhase {
+    /// Background PATH detection has not finished.
+    Detecting,
+    /// Detection finished without grok, or the catalog omits Grok.
+    NotOnPath,
+    /// grok was detected and the install worker has not finished.
+    Installing,
+    /// Install succeeded, or the installed version was already current.
+    Ready,
+    /// The install failed.
+    Unavailable,
+    /// An explicit catalog includes Grok and detection did not run.
+    NotInstalledForLaunch,
+}
+
+impl GrokDiagnosticsPhase {
+    const fn row(self) -> GrokDiagnosticsRow {
+        match self {
+            Self::Detecting => GrokDiagnosticsRow::CHECKING,
+            Self::NotOnPath => GrokDiagnosticsRow::NOT_ON_PATH,
+            Self::Installing => GrokDiagnosticsRow::INSTALLING,
+            // Callers with a workspace use [`grok_row_for`]. This arm is only
+            // the success sentence; a quiet workspace uses `NOT_RUNNING`.
+            Self::Ready => GrokDiagnosticsRow::READY,
+            Self::Unavailable => GrokDiagnosticsRow::HOOKS_UNAVAILABLE,
+            Self::NotInstalledForLaunch => GrokDiagnosticsRow::NOT_INSTALLED,
+        }
+    }
+}
+
+/// Test-only hold for the Grok Build diagnostics row.
+///
+/// Applying a hold does not spawn grok, look up `PATH`, or install the plugin.
+/// Product startup leaves it unset and keeps background detection and install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokDiagnosticsHold {
+    /// PATH detection is still running.
+    Detecting,
+    /// Detection finished and grok is not on PATH.
+    NotOnPath,
+    /// grok was detected and the shipped-plugin install is still running.
+    Installing,
+    /// The install command succeeded.
+    Installed,
+    /// The installed version is already current.
+    AlreadyCurrent,
+    /// The install failed.
+    InstallFailed,
+}
+
+impl GrokDiagnosticsHold {
+    const fn phase(self) -> GrokDiagnosticsPhase {
+        match self {
+            Self::Detecting => GrokDiagnosticsPhase::Detecting,
+            Self::NotOnPath => GrokDiagnosticsPhase::NotOnPath,
+            Self::Installing => GrokDiagnosticsPhase::Installing,
+            Self::Installed | Self::AlreadyCurrent => GrokDiagnosticsPhase::Ready,
+            Self::InstallFailed => GrokDiagnosticsPhase::Unavailable,
+        }
+    }
+}
+
+/// Test-only running mark for one workspace's Grok Build row.
+///
+/// Applying a mark does not spawn grok, look up `PATH`, or install the plugin.
+/// Product startup leaves every workspace unmarked and reads that workspace's
+/// terminal target and open Grok sessions. The tab label is not a mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokRunningHold {
+    /// This workspace's terminal target is Grok and that process is still alive.
+    LivingTarget,
+    /// This workspace's shell has at least one open Grok session.
+    ///
+    /// The target is not a living Grok process.
+    OpenSession,
+    /// Neither a living Grok target nor an open Grok session.
+    NotRunning,
+}
+
+/// Row for one workspace. Install success is ready only while Grok is running there.
+fn grok_row_for(
+    phase: GrokDiagnosticsPhase,
+    mark: Option<GrokRunningHold>,
+    workbench: &Workbench,
+) -> GrokDiagnosticsRow {
+    if phase != GrokDiagnosticsPhase::Ready {
+        return phase.row();
+    }
+    let running = match mark {
+        Some(GrokRunningHold::LivingTarget | GrokRunningHold::OpenSession) => true,
+        Some(GrokRunningHold::NotRunning) => false,
+        None => workbench.grok_follow_running(),
+    };
+    if running {
+        GrokDiagnosticsRow::READY
+    } else {
+        GrokDiagnosticsRow::NOT_RUNNING
+    }
+}
+
+fn initial_grok_phase(
+    detecting: bool,
+    detection_started: bool,
+    catalog_has_grok: bool,
+) -> GrokDiagnosticsPhase {
+    if detecting {
+        if detection_started {
+            GrokDiagnosticsPhase::Detecting
+        } else {
+            GrokDiagnosticsPhase::NotOnPath
+        }
+    } else if catalog_has_grok {
+        GrokDiagnosticsPhase::NotInstalledForLaunch
+    } else {
+        GrokDiagnosticsPhase::NotOnPath
     }
 }
 
@@ -207,6 +331,21 @@ pub struct AppModel {
     native_backdrop: NativeBackdropStatus,
     compatible_tuis: Vec<CompatibleTui>,
     compatible_tui_receiver: Option<Receiver<Vec<CompatibleTui>>>,
+    /// One-shot shipped grok-made install, started only after PATH detection
+    /// reports grok. `None` once that worker has finished or was never started.
+    grok_plugin_receiver: Option<Receiver<EnsureOutcome>>,
+    /// Install failed, so Grok session follow has no status hooks.
+    grok_hooks_unavailable: bool,
+    /// Row derived from detection and install, unless a test hold is set.
+    grok_phase: GrokDiagnosticsPhase,
+    /// Set only by [`AppModel::hold_grok_diagnostics`].
+    grok_hold: Option<GrokDiagnosticsHold>,
+    /// Per-workspace running marks set only by [`AppModel::hold_workspace_grok_running`].
+    grok_running_hold: Vec<(WorkspaceId, GrokRunningHold)>,
+    /// OpenCode was omitted by an explicit catalog, or PATH detection finished
+    /// without it. Stays false while detection is still running, so the row
+    /// keeps the inactive not-running sentence.
+    opencode_missing: bool,
     terminal_target: TerminalTarget,
     smoke: Option<SmokeState>,
     ssh: Result<ServerRegistry<PrivateMetadataStorage>, String>,
@@ -262,10 +401,24 @@ impl AppModel {
             reported: false,
         });
         let start_pending = launch.surfaces().has_terminal();
+        let catalog_has_grok = options.compatible_tuis.contains(&CompatibleTui::Grok);
+        let catalog_has_opencode = options.compatible_tuis.contains(&CompatibleTui::OpenCode);
         let compatible_tui_receiver = if options.detect_compatible_tuis {
             spawn_compatible_tui_detection()
         } else {
             None
+        };
+        let grok_phase = initial_grok_phase(
+            options.detect_compatible_tuis,
+            compatible_tui_receiver.is_some(),
+            catalog_has_grok,
+        );
+        // A live worker has not answered yet. A thread that never started is
+        // the same as detection finishing without OpenCode.
+        let opencode_missing = if options.detect_compatible_tuis {
+            compatible_tui_receiver.is_none()
+        } else {
+            !catalog_has_opencode
         };
         Self {
             launch,
@@ -286,6 +439,12 @@ impl AppModel {
             native_backdrop: NativeBackdropStatus::default(),
             compatible_tuis: options.compatible_tuis,
             compatible_tui_receiver,
+            grok_plugin_receiver: None,
+            grok_hooks_unavailable: false,
+            grok_phase,
+            grok_hold: None,
+            grok_running_hold: Vec::new(),
+            opencode_missing,
             terminal_target: TerminalTarget::Shell,
             smoke,
             ssh: load_ssh_registry(),
@@ -351,6 +510,67 @@ impl AppModel {
     /// Compatible TUIs offered by the `+` new-tab menu.
     pub fn compatible_tuis(&self) -> &[CompatibleTui] {
         &self.compatible_tuis
+    }
+
+    /// Hold the Grok Build diagnostics row without a grok process.
+    ///
+    /// The hold replaces detection and install until the model is dropped. It
+    /// does not spawn grok, wait on `PATH`, or start the shipped-plugin install.
+    /// Background detection and install still run when no hold is set.
+    /// [`GrokDiagnosticsHold::Installed`] and [`GrokDiagnosticsHold::AlreadyCurrent`]
+    /// are ready only while that workspace's Grok is running.
+    pub fn hold_grok_diagnostics(&mut self, hold: GrokDiagnosticsHold) {
+        self.grok_hold = Some(hold);
+        self.grok_phase = hold.phase();
+        self.grok_hooks_unavailable = matches!(hold, GrokDiagnosticsHold::InstallFailed);
+        self.push_grok_diagnostics();
+    }
+
+    /// Mark whether Grok is running in one workspace, without a grok process.
+    ///
+    /// The mark stays until replaced. It does not spawn grok, look up `PATH`,
+    /// or install the plugin, and it does not change the tab label. Checking,
+    /// not on PATH, installing, hooks unavailable, and the explicit-catalog
+    /// sentence ignore it.
+    pub fn hold_workspace_grok_running(&mut self, id: WorkspaceId, running: GrokRunningHold) {
+        if let Some((_, slot)) = self
+            .grok_running_hold
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            *slot = running;
+        } else {
+            self.grok_running_hold.push((id, running));
+        }
+        self.push_grok_diagnostics();
+    }
+
+    /// Give this workspace the OpenCode tab label without a bridge.
+    ///
+    /// The existing terminal process stays the child. This does not spawn
+    /// OpenCode or grok, and the label is not the Grok running signal.
+    pub fn hold_workspace_opencode_label(&mut self, id: WorkspaceId) {
+        if let Some(workbench) = self.workspace_mut(id) {
+            workbench.terminal_target = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        }
+        self.push_grok_diagnostics();
+    }
+
+    fn push_grok_diagnostics(&mut self) {
+        let phase = self
+            .grok_hold
+            .map(GrokDiagnosticsHold::phase)
+            .unwrap_or(self.grok_phase);
+        // Taken so each workspace can be updated while its mark is read.
+        let running = std::mem::take(&mut self.grok_running_hold);
+        for (id, workbench) in &mut self.workspaces {
+            let mark = running
+                .iter()
+                .find(|(key, _)| key == id)
+                .map(|(_, hold)| *hold);
+            workbench.set_grok_diagnostics(grok_row_for(phase, mark, workbench));
+        }
+        self.grok_running_hold = running;
     }
 
     /// PTY child selected for the next workspace preparation.
@@ -964,6 +1184,7 @@ impl AppModel {
         if let Some(watch) = workbench.take_remote_close() {
             self.remote_closes.push(watch);
         }
+        self.grok_running_hold.retain(|(key, _)| *key != id);
         workbench.shutdown();
         if self.active == Some(id) {
             self.reset_ui_focus = true;
@@ -989,6 +1210,22 @@ impl AppModel {
             .next_workspace
             .checked_add(1)
             .expect("workspace identity exhausted");
+        let phase = self
+            .grok_hold
+            .map(GrokDiagnosticsHold::phase)
+            .unwrap_or(self.grok_phase);
+        let mark = self
+            .grok_running_hold
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, hold)| *hold);
+        workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
+        if self.grok_hooks_unavailable {
+            workbench.note_grok_session_hooks_unavailable();
+        }
+        if self.opencode_missing {
+            workbench.note_opencode_missing();
+        }
         workbench.set_benchmark_frames(self.smoke.is_some());
         workbench.set_visible(false);
         workbench.set_visible(true);
@@ -1252,29 +1489,108 @@ impl AppModel {
     /// Adopt the background TUI detection result once it is ready.
     ///
     /// While the worker is pending, schedule another frame so an otherwise idle
-    /// window still updates its `+` menu. A disconnected worker leaves the
-    /// current (empty) list in place.
+    /// window still updates its `+` menu. OpenCode stays on the inactive
+    /// not-running sentence until that result arrives. A disconnected worker
+    /// leaves the current (empty) list in place and records both TUIs as not
+    /// on PATH.
     fn poll_compatible_tui_detection(&mut self, ctx: &egui::Context) {
+        if self.grok_hold.is_some() {
+            return;
+        }
         let Some(receiver) = self.compatible_tui_receiver.as_ref() else {
             return;
         };
         match receiver.try_recv() {
             Ok(tuis) => {
+                let detected_opencode = tuis.contains(&CompatibleTui::OpenCode);
+                let detected_grok = tuis.contains(&CompatibleTui::Grok);
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
+                if !detected_opencode {
+                    self.remember_opencode_missing();
+                }
+                if detected_grok {
+                    self.grok_plugin_receiver = grok_plugin::spawn_ensure();
+                    // `None` means this process already owns the worker. This
+                    // launch must not claim an install is running or ready.
+                    self.grok_phase = if self.grok_plugin_receiver.is_some() {
+                        GrokDiagnosticsPhase::Installing
+                    } else {
+                        GrokDiagnosticsPhase::NotInstalledForLaunch
+                    };
+                } else {
+                    self.grok_phase = GrokDiagnosticsPhase::NotOnPath;
+                }
+                self.push_grok_diagnostics();
             }
             Err(TryRecvError::Empty) => {
                 ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
             }
             Err(TryRecvError::Disconnected) => {
                 self.compatible_tui_receiver = None;
+                if self.grok_phase == GrokDiagnosticsPhase::Detecting {
+                    self.grok_phase = GrokDiagnosticsPhase::NotOnPath;
+                    self.push_grok_diagnostics();
+                }
+                self.remember_opencode_missing();
             }
+        }
+    }
+
+    /// Record that OpenCode is not on PATH for every current workspace.
+    ///
+    /// A workspace opened after this still receives the reason from
+    /// [`Self::insert_workbench`].
+    fn remember_opencode_missing(&mut self) {
+        if self.opencode_missing {
+            return;
+        }
+        self.opencode_missing = true;
+        for (_, workbench) in &mut self.workspaces {
+            workbench.note_opencode_missing();
+        }
+    }
+
+    /// Record a failed shipped-plugin install on every live workspace.
+    fn note_grok_hooks_unavailable(&mut self) {
+        for (_, workbench) in &mut self.workspaces {
+            workbench.note_grok_session_hooks_unavailable();
+        }
+    }
+
+    /// Poll the shipped grok-made install without waiting for it.
+    fn poll_grok_plugin_ensure(&mut self, ctx: &egui::Context) {
+        if self.grok_hold.is_some() {
+            return;
+        }
+        let received = self
+            .grok_plugin_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match received {
+            Some(Ok(EnsureOutcome::Unavailable) | Err(TryRecvError::Disconnected)) => {
+                self.grok_plugin_receiver = None;
+                self.grok_hooks_unavailable = true;
+                self.grok_phase = GrokDiagnosticsPhase::Unavailable;
+                self.note_grok_hooks_unavailable();
+                self.push_grok_diagnostics();
+            }
+            Some(Ok(EnsureOutcome::Installed | EnsureOutcome::Skipped)) => {
+                self.grok_plugin_receiver = None;
+                self.grok_phase = GrokDiagnosticsPhase::Ready;
+                self.push_grok_diagnostics();
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
+            }
+            None => {}
         }
     }
 
     /// Poll runtime work and drive the smoke run.
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.poll_compatible_tui_detection(ctx);
+        self.poll_grok_plugin_ensure(ctx);
         self.poll_ssh_probe();
         self.poll_remote_closes();
         self.persist_remote_consent();
@@ -1284,6 +1600,7 @@ impl AppModel {
         for (_, workbench) in &mut self.workspaces {
             workbench.tick(ctx);
         }
+        self.push_grok_diagnostics();
         if ctx.input(|input| input.viewport().close_requested()) {
             self.shutdown();
         }

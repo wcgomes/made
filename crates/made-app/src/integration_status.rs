@@ -157,17 +157,13 @@ impl ReasonCode {
     /// Actionable human-readable message.
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Inactive => {
-                "Optional OpenCode integration is inactive."
-            }
-            Self::Connected => "Connected to the OpenCode v2 integration.",
-            Self::Reconnected => "Reconnected to the OpenCode v2 integration.",
+            Self::Inactive => "OpenCode is not running.",
+            Self::Connected => "OpenCode session follow is ready.",
+            Self::Reconnected => "OpenCode session follow is ready.",
             Self::PluginNotLoaded => {
                 "The OpenCode v2 integration plugin did not load; restart OpenCode in the Made terminal."
             }
-            Self::OpenCodeMissing => {
-                "OpenCode v2 is not installed or not on PATH; install OpenCode v2 and run it in the terminal."
-            }
+            Self::OpenCodeMissing => "OpenCode is not on PATH.",
             Self::OpenCodeTooOld => {
                 "OpenCode v2 or newer is required; upgrade OpenCode and restart it in the terminal."
             }
@@ -871,11 +867,13 @@ pub fn is_supported_opencode_version(version: &str) -> bool {
     opencode_major(version).is_some_and(|major| major >= SUPPORTED_OPENCODE_MAJOR)
 }
 
-/// The only agent integration Made v1 offers.
+/// Agent integrations Made offers from the `+` menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentIntegration {
     /// OpenCode v2 through its TUI plugin.
     OpenCodeV2,
+    /// Grok Build session follow, offered when `grok` is on `PATH`.
+    GrokBuild,
 }
 
 impl AgentIntegration {
@@ -883,6 +881,7 @@ impl AgentIntegration {
     pub const fn id(self) -> &'static str {
         match self {
             Self::OpenCodeV2 => "opencode-v2",
+            Self::GrokBuild => "grok-build",
         }
     }
 
@@ -890,6 +889,7 @@ impl AgentIntegration {
     pub const fn name(self) -> &'static str {
         match self {
             Self::OpenCodeV2 => "OpenCode v2",
+            Self::GrokBuild => "Grok Build",
         }
     }
 }
@@ -909,7 +909,7 @@ pub struct ScopeBoundary {
 
 /// The v1 scope boundary.
 pub const V1_SCOPE: ScopeBoundary = ScopeBoundary {
-    agent_integrations: &[AgentIntegration::OpenCodeV2],
+    agent_integrations: &[AgentIntegration::OpenCodeV2, AgentIntegration::GrokBuild],
     chat_ui: false,
     worktree_management: false,
     separate_opencode_server: false,

@@ -100,6 +100,100 @@ fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize
     true
 }
 
+/// Child process with fake `opencode` and `grok` binaries first on `PATH`.
+#[cfg(unix)]
+fn isolated_menu_launch(name: &str) -> bool {
+    if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let opencode_sentinel = home.path().join("opencode-launch");
+    let opencode_config = home.path().join("opencode-config");
+    let opencode_cwd = home.path().join("opencode-cwd");
+    let grok_sentinel = home.path().join("grok-launch");
+    let grok_argv0 = home.path().join("grok-argv0");
+    let grok_config = home.path().join("grok-config");
+    let grok_cwd = home.path().join("grok-cwd");
+    let grok_bin = bin.join("grok");
+    let opencode_bin = bin.join("opencode");
+    std::fs::write(
+        &opencode_bin,
+        "#!/bin/sh\nprintf 'invoked\\n' >> \"$MADE_OPENCODE_SENTINEL\"\nprintf '%s' \"$OPENCODE_CLI_CONFIG_CONTENT\" > \"$MADE_OPENCODE_CONFIG_CAPTURE\"\npwd > \"$MADE_OPENCODE_CWD_CAPTURE\"\nprintf '1.9.0\\n'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &grok_bin,
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" > \"$MADE_GROK_ARGV0\"\nif [ -n \"${OPENCODE_CLI_CONFIG_CONTENT+x}\" ]; then printf '%s' \"$OPENCODE_CLI_CONFIG_CONTENT\" > \"$MADE_GROK_CONFIG\"; else printf unset > \"$MADE_GROK_CONFIG\"; fi\npwd > \"$MADE_GROK_CWD\"\nprintf 'invoked\\n' >> \"$MADE_GROK_SENTINEL\"\nsleep 30\n",
+    )
+    .unwrap();
+    for executable in [&opencode_bin, &grok_bin] {
+        assert!(std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(executable)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env("MADE_WORKSPACE_TEST_CHILD", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", "/bin/bash")
+        .env("MADE_OPENCODE_SENTINEL", &opencode_sentinel)
+        .env("MADE_OPENCODE_CONFIG_CAPTURE", &opencode_config)
+        .env("MADE_OPENCODE_CWD_CAPTURE", &opencode_cwd)
+        .env("MADE_GROK_SENTINEL", &grok_sentinel)
+        .env("MADE_GROK_ARGV0", &grok_argv0)
+        .env("MADE_GROK_CONFIG", &grok_config)
+        .env("MADE_GROK_CWD", &grok_cwd)
+        .env("MADE_GROK_BIN", &grok_bin);
+    command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let grok_launches = std::fs::read_to_string(&grok_sentinel)
+        .map(|content| content.lines().filter(|line| *line == "invoked").count())
+        .unwrap_or(0);
+    let opencode_launches = std::fs::read_to_string(&opencode_sentinel)
+        .map(|content| content.lines().filter(|line| *line == "invoked").count())
+        .unwrap_or(0);
+    assert_eq!(grok_launches, 1, "the menu test must launch grok once");
+    assert_eq!(
+        opencode_launches, 1,
+        "the menu test must still launch OpenCode once"
+    );
+    true
+}
+
 #[cfg(unix)]
 fn wait_for_capture(path: &std::path::Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -646,10 +740,11 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         assert!(!workbench.sessions_visible());
         assert_eq!(
             workbench.integration().status(),
-            made_app::IntegrationStatus::Inactive
+            made_app::IntegrationStatus::Unsupported
         );
         let diagnostics = workbench.diagnostics_snapshot();
-        assert_eq!(diagnostics.status_label, "inactive");
+        assert_eq!(diagnostics.status_label, "unsupported");
+        assert_eq!(diagnostics.reason, "OpenCode is not on PATH.");
         assert_eq!(
             diagnostics.workspace_identity.as_deref(),
             Some(workbench.pane_id()),
@@ -695,8 +790,8 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         assert_eq!(workbench.paint_count(), 0);
         assert_eq!(
             workbench.integration().status(),
-            made_app::IntegrationStatus::Inactive,
-            "no elapsed-time warning may activate absent optional integration"
+            made_app::IntegrationStatus::Unsupported,
+            "elapsed time must not replace the not-on-PATH row"
         );
     }
     assert!(model.close_workspace(ids[1]));
@@ -2082,4 +2177,807 @@ fn tui_terminal_target_spawns_opencode_with_composed_config_in_the_isolated_home
     );
 
     workbench.shutdown();
+}
+
+#[cfg(unix)]
+fn grok_state_dir() -> PathBuf {
+    let dir = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join(".grok");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn write_grok_inventory(rows: &[Value]) {
+    std::fs::write(
+        grok_state_dir().join("active_sessions.json"),
+        serde_json::to_string(rows).unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn append_grok_hook(line: &Value) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(grok_state_dir().join("made-grok-status.jsonl"))
+        .unwrap();
+    writeln!(file, "{}", serde_json::to_string(line).unwrap()).unwrap();
+}
+
+#[cfg(unix)]
+fn tick_until_root(
+    workbench: &mut made_app::Workbench,
+    ctx: &egui::Context,
+    expected: &std::path::Path,
+    timeout: Duration,
+) -> PathBuf {
+    let deadline = Instant::now() + timeout;
+    loop {
+        workbench.tick(ctx);
+        let root = workbench
+            .explorer_root()
+            .expect("explorer root")
+            .to_path_buf();
+        if root == expected || Instant::now() >= deadline {
+            return root;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Inventory, hook history, prompt priority, focus, and shell restore.
+///
+/// The refresh decision lives in the workbench, not `session_follow`: a prompt
+/// moves immediately, and a later inventory pass does not call follow again
+/// while the newest attachment id is unchanged.
+#[cfg(unix)]
+#[test]
+fn grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back() {
+    if isolated("grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back") {
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let path = workspace.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path.canonicalize().unwrap()
+    };
+    let root = mk("root");
+    let stale = mk("stale");
+    let older = mk("older");
+    let newer = mk("newer");
+    let attached = mk("attached");
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let mut workbench = made_app::Workbench::start(
+        Some(plan),
+        None,
+        root.clone(),
+        TerminalTarget::Shell,
+        Instant::now(),
+    );
+    let pid = workbench
+        .terminal()
+        .and_then(made_app::TerminalPane::pid)
+        .expect("shell pid");
+    let ctx = egui::Context::default();
+
+    append_grok_hook(&json!({
+        "sessionId": "stale",
+        "cwd": stale,
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    workbench.tick(&ctx);
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(stale.as_path()),
+        "a hook line already in the log when Made starts must not move the explorer"
+    );
+
+    let row = |id: &str, cwd: &std::path::Path, opened_at: &str| {
+        json!({
+            "pid": pid,
+            "session_id": id,
+            "cwd": cwd,
+            "opened_at": opened_at
+        })
+    };
+    write_grok_inventory(&[
+        row("older", &older, "2024-01-01T00:00:01Z"),
+        row("newer", &newer, "2024-01-01T00:00:02Z"),
+    ]);
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &newer, Duration::from_secs(3)),
+        newer,
+        "the newest attachment moves the explorer"
+    );
+
+    write_grok_inventory(&[
+        row("older", &older, "2024-01-01T00:00:01Z"),
+        row("newer", &newer, "2024-01-01T00:00:02Z"),
+        row("attached", &attached, "2024-01-01T00:00:03Z"),
+    ]);
+    for _ in 0..5 {
+        workbench.tick(&ctx);
+    }
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(newer.as_path()),
+        "inventory refresh is about once a second and must not run again immediately"
+    );
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &attached, Duration::from_secs(2)),
+        attached,
+        "a newly attached session moves the explorer on the next refresh"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "older",
+        "cwd": older,
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &older, Duration::from_secs(2)),
+        older,
+        "a prompt moves the explorer without waiting for inventory"
+    );
+
+    // Same attachment times, file order reversed: focus does not change
+    // opened_at, so the refresh must not yank the explorer back to `attached`.
+    write_grok_inventory(&[
+        row("attached", &attached, "2024-01-01T00:00:03Z"),
+        row("newer", &newer, "2024-01-01T00:00:02Z"),
+        row("older", &older, "2024-01-01T00:00:01Z"),
+    ]);
+    std::thread::sleep(Duration::from_millis(1100));
+    for _ in 0..8 {
+        workbench.tick(&ctx);
+    }
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(older.as_path()),
+        "inventory must not steal the explorer back from the prompted session"
+    );
+
+    write_grok_inventory(&[]);
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &root, Duration::from_secs(2)),
+        root,
+        "no remaining Grok session returns the explorer to the shell"
+    );
+    workbench.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_session_start_moves_the_explorer_immediately() {
+    if isolated("grok_session_start_moves_the_explorer_immediately") {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().join("root");
+    let stale = workspace.path().join("stale");
+    let started = workspace.path().join("started");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::create_dir_all(&started).unwrap();
+    let root = root.canonicalize().unwrap();
+    let stale = stale.canonicalize().unwrap();
+    let started = started.canonicalize().unwrap();
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let mut workbench = made_app::Workbench::start(
+        Some(plan),
+        None,
+        root.clone(),
+        TerminalTarget::Shell,
+        Instant::now(),
+    );
+    let ctx = egui::Context::default();
+    append_grok_hook(&json!({
+        "sessionId": "history",
+        "cwd": stale,
+        "event": "SessionStart",
+        "status": "idle"
+    }));
+    workbench.tick(&ctx);
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(stale.as_path()),
+        "a session-start line already on disk must not move the explorer"
+    );
+    append_grok_hook(&json!({
+        "sessionId": "live",
+        "cwd": started,
+        "event": "SessionStart",
+        "status": "idle"
+    }));
+    let began = Instant::now();
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &started, Duration::from_secs(1)),
+        started,
+        "session start moves the explorer immediately and shows idle"
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(900),
+        "session start must not wait for the one-second inventory refresh"
+    );
+    workbench.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_later_owned_prompt_survives_release_of_an_earlier_provisional_move() {
+    if isolated("a_later_owned_prompt_survives_release_of_an_earlier_provisional_move") {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let path = workspace.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path.canonicalize().unwrap()
+    };
+    let root = mk("root");
+    let older = mk("older");
+    let newest = mk("newest");
+    let foreign = mk("foreign");
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let mut workbench = made_app::Workbench::start(
+        Some(plan),
+        None,
+        root.clone(),
+        TerminalTarget::Shell,
+        Instant::now(),
+    );
+    let pid = workbench
+        .terminal()
+        .and_then(made_app::TerminalPane::pid)
+        .expect("shell pid");
+    let ctx = egui::Context::default();
+    std::fs::create_dir_all(grok_state_dir()).unwrap();
+    std::fs::write(grok_state_dir().join("made-grok-status.jsonl"), "").unwrap();
+    workbench.tick(&ctx);
+
+    let row = |id: &str, cwd: &std::path::Path, opened_at: &str| {
+        json!({
+            "pid": pid,
+            "session_id": id,
+            "cwd": cwd,
+            "opened_at": opened_at
+        })
+    };
+    write_grok_inventory(&[
+        row("older", &older, "2024-01-01T00:00:01Z"),
+        row("newest", &newest, "2024-01-01T00:00:02Z"),
+    ]);
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &newest, Duration::from_secs(3)),
+        newest,
+        "the newest owned attachment is where the provisional slot will be filled"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "foreign-new",
+        "cwd": foreign,
+        "event": "SessionStart",
+        "status": "idle"
+    }));
+    for _ in 0..5 {
+        workbench.tick(&ctx);
+    }
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(foreign.as_path()),
+        "a session not yet in the inventory moves the explorer provisionally"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "older",
+        "cwd": older,
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    let began = Instant::now();
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &older, Duration::from_millis(800)),
+        older,
+        "a prompt in the older owned session moves the explorer there immediately"
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(800),
+        "the owned prompt must not wait for inventory"
+    );
+
+    std::thread::sleep(Duration::from_millis(1100));
+    for _ in 0..8 {
+        workbench.tick(&ctx);
+    }
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(newest.as_path()),
+        "inventory must not restore the directory saved when the provisional slot was filled"
+    );
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(foreign.as_path()),
+        "the foreign session must not keep the explorer"
+    );
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(older.as_path()),
+        "the explorer stays on the prompted session"
+    );
+    workbench.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_foreign_hook_does_not_keep_or_yank_this_tabs_explorer() {
+    if isolated("a_foreign_hook_does_not_keep_or_yank_this_tabs_explorer") {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let path = workspace.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path.canonicalize().unwrap()
+    };
+    let root = mk("root");
+    let own = mk("own");
+    let other = mk("other");
+    let foreign = mk("foreign");
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let mut workbench = made_app::Workbench::start(
+        Some(plan),
+        None,
+        root.clone(),
+        TerminalTarget::Shell,
+        Instant::now(),
+    );
+    let pid = workbench
+        .terminal()
+        .and_then(made_app::TerminalPane::pid)
+        .expect("shell pid");
+    let ctx = egui::Context::default();
+    // An empty log is the first observation, so later lines are live.
+    std::fs::create_dir_all(grok_state_dir()).unwrap();
+    std::fs::write(grok_state_dir().join("made-grok-status.jsonl"), "").unwrap();
+    workbench.tick(&ctx);
+
+    let row = |id: &str, cwd: &std::path::Path, opened_at: &str, pid: u32| {
+        json!({
+            "pid": pid,
+            "session_id": id,
+            "cwd": cwd,
+            "opened_at": opened_at
+        })
+    };
+    write_grok_inventory(&[
+        row("own", &own, "2024-01-01T00:00:01Z", pid),
+        row("other", &other, "2024-01-01T00:00:02Z", pid),
+        row("foreign-known", &foreign, "2024-01-01T00:00:03Z", 1),
+    ]);
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &other, Duration::from_secs(3)),
+        other,
+        "the owned newest attachment still moves the explorer"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "own",
+        "cwd": own,
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    let began = Instant::now();
+    assert_eq!(
+        tick_until_root(&mut workbench, &ctx, &own, Duration::from_secs(1)),
+        own,
+        "a prompt for a session this terminal owns moves immediately"
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(900),
+        "an owned prompt must not wait for the one-second inventory poll"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "foreign-known",
+        "cwd": foreign,
+        "event": "UserPromptSubmit",
+        "status": "working"
+    }));
+    for _ in 0..5 {
+        workbench.tick(&ctx);
+    }
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(own.as_path()),
+        "a hook for another process must not yank the explorer off this tab's prompted session"
+    );
+
+    append_grok_hook(&json!({
+        "sessionId": "foreign-new",
+        "cwd": foreign,
+        "event": "SessionStart",
+        "status": "idle"
+    }));
+    std::thread::sleep(Duration::from_millis(1100));
+    for _ in 0..8 {
+        workbench.tick(&ctx);
+    }
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(foreign.as_path()),
+        "a session this terminal does not own must not leave the explorer on its directory"
+    );
+    assert_ne!(
+        workbench.explorer_root(),
+        Some(other.as_path()),
+        "dropping that session must not jump to a different open session"
+    );
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(own.as_path()),
+        "the explorer returns to the directory this tab was following"
+    );
+    workbench.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
+    if isolated_menu_launch("menu_launched_grok_gets_no_plugin_config_and_opencode_still_does") {
+        return;
+    }
+    use made_platform::Platform;
+
+    let home = made_platform::host_platform()
+        .home_dir()
+        .expect("test home")
+        .canonicalize()
+        .expect("canonical test home");
+    let grok_config_dir = home.join(".grok");
+    let before = grok_config_dir.exists();
+
+    let mut grok = made_app::Workbench::start(
+        None,
+        None,
+        home.clone(),
+        TerminalTarget::Tui(made_app::CompatibleTui::Grok),
+        Instant::now(),
+    );
+    {
+        let grok_terminal = grok.terminal().expect("grok child");
+        assert!(
+            grok_terminal
+                .options()
+                .env
+                .iter()
+                .all(|(key, _)| key != made_bridge::config::CONFIG_CONTENT_ENV),
+            "a Grok child must not receive OpenCode plugin configuration"
+        );
+        assert_eq!(
+            grok_terminal.options().args,
+            vec![std::ffi::OsString::from("dashboard")],
+            "a menu-launched Grok child is the absolute path plus dashboard"
+        );
+    }
+    let argv0 = wait_for_capture(&PathBuf::from(
+        std::env::var_os("MADE_GROK_ARGV0").expect("argv capture"),
+    ));
+    let config = wait_for_capture(&PathBuf::from(
+        std::env::var_os("MADE_GROK_CONFIG").expect("config capture"),
+    ));
+    let cwd = wait_for_capture(&PathBuf::from(
+        std::env::var_os("MADE_GROK_CWD").expect("cwd capture"),
+    ));
+    assert_eq!(
+        argv0.trim(),
+        std::env::var("MADE_GROK_BIN").unwrap(),
+        "grok must be the absolute path, with no shell first"
+    );
+    assert_eq!(config.trim(), "unset");
+    assert_eq!(
+        std::fs::canonicalize(cwd.trim()).unwrap(),
+        home,
+        "grok must start in the home directory"
+    );
+    assert_eq!(
+        grok_config_dir.exists(),
+        before,
+        "Made must not write the user's Grok config"
+    );
+    grok.shutdown();
+
+    let mut opencode = made_app::Workbench::start(
+        None,
+        None,
+        home.clone(),
+        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        Instant::now(),
+    );
+    assert!(
+        opencode
+            .terminal()
+            .expect("opencode child")
+            .options()
+            .args
+            .is_empty(),
+        "a menu-launched OpenCode child keeps an empty argument list"
+    );
+    let captured = wait_for_capture(&PathBuf::from(
+        std::env::var_os("MADE_OPENCODE_CONFIG_CAPTURE").expect("opencode config"),
+    ));
+    let captured: Value = serde_json::from_str(&captured).expect("composed config");
+    assert!(
+        captured["plugins"]
+            .as_array()
+            .expect("plugins")
+            .iter()
+            .any(|entry| entry
+                .get("options")
+                .and_then(|options| options.get("made"))
+                .is_some()),
+        "OpenCode must still receive its composed plugin configuration"
+    );
+    let opencode_cwd = wait_for_capture(&PathBuf::from(
+        std::env::var_os("MADE_OPENCODE_CWD_CAPTURE").expect("opencode cwd"),
+    ));
+    assert_eq!(std::fs::canonicalize(opencode_cwd.trim()).unwrap(), home);
+    opencode.shutdown();
+}
+
+/// Child with a fake grok that blocks in `plugin install` until released, then
+/// exits non-zero. `GROK_HOME` is the temporary home, never the user's `~/.grok`.
+#[cfg(unix)]
+fn isolated_failed_plugin_install(name: &str) -> bool {
+    if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    let grok_home = home.path().join("grok-home");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&grok_home).unwrap();
+    let grok_bin = bin.join("grok");
+    std::fs::write(
+        &grok_bin,
+        "#!/bin/sh\n\
+if [ \"$1\" = plugin ] && [ \"$2\" = install ]; then\n\
+  printf '%s\\n' \"$0\" > \"$MADE_GROK_INSTALL_ARGV0\"\n\
+  printf '%s\\n' \"$*\" > \"$MADE_GROK_INSTALL_ARGS\"\n\
+  if [ -n \"${OPENCODE_CLI_CONFIG_CONTENT+x}\" ]; then printf set > \"$MADE_GROK_OPENCODE_ENV\"; else printf unset > \"$MADE_GROK_OPENCODE_ENV\"; fi\n\
+  printf start > \"$MADE_GROK_INSTALL_PHASE\"\n\
+  i=0\n\
+  while [ ! -f \"$MADE_GROK_INSTALL_RELEASE\" ] && [ \"$i\" -lt 200 ]; do\n\
+    sleep 0.05\n\
+    i=$((i + 1))\n\
+  done\n\
+  exit 1\n\
+fi\n\
+printf 'args:%s\\n' \"$*\" >> \"$MADE_GROK_LAUNCH_ARGS\"\n\
+sleep 30\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&grok_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", name, "--nocapture"])
+        .env("MADE_WORKSPACE_TEST_CHILD", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("GROK_HOME", &grok_home)
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", "/bin/bash")
+        .env("MADE_GROK_BIN", &grok_bin)
+        .env("MADE_GROK_INSTALL_ARGV0", home.path().join("install-argv0"))
+        .env("MADE_GROK_INSTALL_ARGS", home.path().join("install-args"))
+        .env("MADE_GROK_INSTALL_PHASE", home.path().join("install-phase"))
+        .env(
+            "MADE_GROK_INSTALL_RELEASE",
+            home.path().join("install-release"),
+        )
+        .env("MADE_GROK_OPENCODE_ENV", home.path().join("opencode-env"))
+        .env("MADE_GROK_LAUNCH_ARGS", home.path().join("launch-args"));
+    command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_plugin_install_still_starts_grok_and_records_hooks_unavailable() {
+    if isolated_failed_plugin_install(
+        "failed_plugin_install_still_starts_grok_and_records_hooks_unavailable",
+    ) {
+        return;
+    }
+    std::env::set_var(
+        made_bridge::config::CONFIG_CONTENT_ENV,
+        "leaked-plugin-config",
+    );
+    let release = PathBuf::from(std::env::var_os("MADE_GROK_INSTALL_RELEASE").unwrap());
+    let config = PathBuf::from(std::env::var_os("GROK_HOME").unwrap()).join("config.toml");
+    std::fs::write(&config, "made-must-not-edit = true\n").unwrap();
+    let config_before = std::fs::read(&config).unwrap();
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path()).unwrap();
+    model.open_plan(LaunchPlan::open(root.path(), WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let shell_id = model.active_workspace_id().unwrap();
+    assert!(
+        model
+            .workspace(shell_id)
+            .and_then(made_app::Workbench::terminal)
+            .is_some(),
+        "the shell must start before plugin install is polled"
+    );
+    let ctx = egui::Context::default();
+    let install_started = Instant::now();
+    while !std::fs::read_to_string(std::env::var_os("MADE_GROK_INSTALL_PHASE").unwrap())
+        .ok()
+        .is_some_and(|text| text.trim() == "start")
+    {
+        assert!(
+            install_started.elapsed() < Duration::from_secs(3),
+            "detected grok did not run plugin install, or startup waited for it"
+        );
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        install_started.elapsed() < Duration::from_secs(3) && !release.exists(),
+        "the shell must be up before plugin install finishes"
+    );
+    assert!(model
+        .workspace(shell_id)
+        .and_then(made_app::Workbench::terminal)
+        .is_some());
+    model.begin_tui_workspace(made_app::CompatibleTui::Grok);
+    let grok_deadline = Instant::now() + Duration::from_secs(6);
+    let grok_id = loop {
+        model.logic(&ctx);
+        if let Some(id) = model.workspace_ids().find(|id| *id != shell_id) {
+            if model
+                .workspace(id)
+                .and_then(made_app::Workbench::terminal)
+                .is_some_and(|terminal| terminal.is_running())
+            {
+                break id;
+            }
+        }
+        assert!(
+            Instant::now() < grok_deadline && !release.exists(),
+            "menu-launched Grok waited on the failed plugin install"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let terminal = model
+        .workspace(grok_id)
+        .unwrap()
+        .terminal()
+        .expect("grok child");
+    assert_eq!(
+        terminal.options().args,
+        vec![std::ffi::OsString::from("dashboard")],
+        "a menu-launched Grok child is the absolute path plus dashboard"
+    );
+    assert!(
+        terminal
+            .options()
+            .env
+            .iter()
+            .all(|(key, _)| key != made_bridge::config::CONFIG_CONTENT_ENV),
+        "Grok must not receive OpenCode's plugin environment"
+    );
+    assert!(
+        terminal
+            .options()
+            .shell
+            .as_ref()
+            .is_some_and(|program| PathBuf::from(program).is_absolute()),
+        "menu-launched Grok must be the absolute detected path"
+    );
+    assert!(
+        !hooks_unavailable(&model),
+        "hooks stay available until the install command fails"
+    );
+    type_command(model.workspace_mut(shell_id).unwrap(), "grok");
+    let launch_deadline = Instant::now() + Duration::from_secs(5);
+    let launch_path = PathBuf::from(std::env::var_os("MADE_GROK_LAUNCH_ARGS").unwrap());
+    loop {
+        model.logic(&ctx);
+        let text = std::fs::read_to_string(&launch_path).unwrap_or_default();
+        if text.lines().any(|line| line == "args:") {
+            break;
+        }
+        assert!(
+            Instant::now() < launch_deadline,
+            "a shell-typed grok did not start: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let launches = std::fs::read_to_string(&launch_path).unwrap();
+    assert!(
+        launches.lines().any(|line| line == "args:dashboard"),
+        "menu grok must receive dashboard: {launches}"
+    );
+    assert!(
+        launches.lines().any(|line| line == "args:"),
+        "a shell-typed grok must not be given dashboard: {launches}"
+    );
+    std::fs::write(&release, b"release").unwrap();
+    let failed = Instant::now() + Duration::from_secs(6);
+    while !hooks_unavailable(&model) {
+        assert!(
+            Instant::now() < failed,
+            "a failed plugin install must record that session-status hooks are unavailable"
+        );
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(std::env::var_os("MADE_GROK_OPENCODE_ENV").unwrap())
+            .expect("opencode env capture")
+            .trim(),
+        "unset"
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        config_before,
+        "Made must not hand-edit config.toml"
+    );
+    model.shutdown();
+}
+
+#[cfg(unix)]
+fn hooks_unavailable(model: &AppModel) -> bool {
+    model.workspace_ids().any(|id| {
+        model
+            .workspace(id)
+            .unwrap()
+            .diagnostics()
+            .log()
+            .entries()
+            .any(|entry| {
+                entry
+                    .message
+                    .contains("session-status hooks are unavailable")
+            })
+    })
 }
