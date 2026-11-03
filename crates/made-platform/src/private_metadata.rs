@@ -1,10 +1,12 @@
 //! Atomic app-owned metadata, not a workspace file API. The caller supplies a
 //! trusted app-data directory; its parent ancestry must be trusted. The final
 //! private directory and files are pinned/checked, symlinks/reparse points and
-//! nonregular files are refused. Unix uses dirfd-relative no-follow operations;
-//! Windows uses protected owner-only DACLs and a non-delete-shared directory
-//! handle. Metadata is intentionally opaque: schema/version/corruption policy
-//! belongs to the caller, never this capability.
+//! nonregular files are refused. Unix uses dirfd-relative no-follow operations
+//! and modes 0700/0600. Windows uses a protected owner-only DACL and a
+//! non-delete-shared directory handle. The Windows check is semantic: it does
+//! not compare canonicalized ACL bytes with the SDDL form. Metadata is
+//! intentionally opaque: schema/version/corruption policy belongs to the
+//! caller, never this capability.
 use crate::PlatformError;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -138,6 +140,64 @@ pub fn write_private_metadata_atomic(
         backend::remove(&root, directory, &stage);
     }
     result.map_err(|e| PlatformError::io("commit private metadata", e))
+}
+
+/// Who an ACE grants or denies, relative to the object owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateAceTrustee {
+    /// The object's owner SID.
+    Owner,
+    /// Well-known owner-rights SID. Windows may keep this after canonicalizing `OW`.
+    OwnerRights,
+    /// Any other trustee.
+    Other,
+}
+
+/// One discretionary ACE, already classified. Layout and padding are not part of the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivateAce {
+    /// The ACE was inherited from a parent.
+    pub inherited: bool,
+    /// `ACCESS_ALLOWED` rather than deny, audit, or an object ACE.
+    pub allow: bool,
+    /// The mask includes full file access, or is `GENERIC_ALL`.
+    pub full_access: bool,
+    /// Trustee relative to the object owner.
+    pub trustee: PrivateAceTrustee,
+}
+
+/// Semantic DACL view. Windows may canonicalize the bytes of an equivalent ACL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateDacl {
+    /// `SE_DACL_PRESENT` and `SE_DACL_PROTECTED` are both set.
+    pub protected: bool,
+    /// The object owner is the current user.
+    pub owner_is_current: bool,
+    /// Explicit ACEs. A null DACL is not represented here; the caller rejects it.
+    pub aces: Vec<PrivateAce>,
+}
+
+/// Owner-only full access.
+///
+/// Accepts a protected DACL whose owner is the current user and whose every ACE
+/// is an explicit allow of full access for that owner or for owner-rights.
+/// Rejects an unprotected or inherited ACL, a partial mask, a deny/audit ACE,
+/// and any trustee other than the owner. Byte identity with `D:P(A;;FA;;;OW)`
+/// is not required.
+#[must_use]
+pub fn private_dacl_is_owner_only(dacl: &PrivateDacl) -> bool {
+    if !dacl.protected || !dacl.owner_is_current || dacl.aces.is_empty() {
+        return false;
+    }
+    dacl.aces.iter().all(|ace| {
+        !ace.inherited
+            && ace.allow
+            && ace.full_access
+            && matches!(
+                ace.trustee,
+                PrivateAceTrustee::Owner | PrivateAceTrustee::OwnerRights
+            )
+    })
 }
 
 fn ensure_directory(path: &Path) -> io::Result<()> {
@@ -285,20 +345,23 @@ mod backend {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::MetadataExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, GetTokenInformation, IsValidSid, TokenUser,
+        WinCreatorOwnerRightsSid, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_MAX_SID_SIZE, SE_DACL_PRESENT, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     type Pointer = *mut c_void;
     #[repr(C)]
     struct Attributes {
         length: u32,
         descriptor: Pointer,
         inherit: i32,
-    }
-    #[repr(C)]
-    struct Acl {
-        _revision: u8,
-        _reserved: u8,
-        size: u16,
-        _count: u16,
-        _reserved2: u16,
     }
     #[link(name = "advapi32")]
     extern "system" {
@@ -308,27 +371,6 @@ mod backend {
             descriptor: *mut Pointer,
             size: *mut u32,
         ) -> i32;
-        fn GetSecurityDescriptorDacl(
-            descriptor: Pointer,
-            present: *mut i32,
-            acl: *mut *mut Acl,
-            defaulted: *mut i32,
-        ) -> i32;
-        fn GetSecurityDescriptorControl(
-            descriptor: Pointer,
-            control: *mut u16,
-            revision: *mut u32,
-        ) -> i32;
-        fn GetSecurityInfo(
-            handle: Pointer,
-            kind: u32,
-            information: u32,
-            owner: *mut Pointer,
-            group: *mut Pointer,
-            dacl: *mut *mut Acl,
-            sacl: *mut Pointer,
-            descriptor: *mut Pointer,
-        ) -> u32;
     }
     #[link(name = "kernel32")]
     extern "system" {
@@ -388,63 +430,207 @@ mod backend {
         Ok(value)
     }
     fn check(file: &File, directory: bool) -> io::Result<()> {
-        let m = file.metadata()?;
-        if m.file_attributes() & 0x400 != 0 || if directory { !m.is_dir() } else { !m.is_file() } {
+        let metadata = file.metadata()?;
+        // Reparse points are not regular files or plain directories, even when
+        // the reparse tag would otherwise look like a file or directory.
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || if directory {
+                !metadata.is_dir()
+            } else {
+                !metadata.is_file()
+            }
+        {
             return Err(invalid());
         }
-        let mut actual = std::ptr::null_mut();
-        let mut actual_acl = std::ptr::null_mut();
-        // SAFETY: live handle; request DACL plus its owning security descriptor.
-        let result = unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: the handle is live. GetSecurityInfo allocates `descriptor`;
+        // the owner and DACL pointers alias that allocation until LocalFree.
+        let status = unsafe {
             GetSecurityInfo(
-                file.as_raw_handle(),
-                1,
-                4,
+                file.as_raw_handle() as _,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
                 std::ptr::null_mut(),
+                &mut dacl,
                 std::ptr::null_mut(),
-                &mut actual_acl,
-                std::ptr::null_mut(),
-                &mut actual,
+                &mut descriptor,
             )
         };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result as i32));
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
         }
-        let actual = Descriptor(actual);
-        let expected = Descriptor::private()?;
-        let mut expected_acl = std::ptr::null_mut();
-        let mut present = 0;
-        let mut defaulted = 0;
-        let mut control = 0;
-        let mut revision = 0;
-        // SAFETY: descriptors come from successful system calls and remain live;
-        // ACL pointers returned here stay valid until their descriptors drop.
+        let _descriptor = Descriptor(descriptor);
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: `descriptor` is the allocation just returned above.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A null DACL grants everyone. That is not owner-only.
+        if dacl.is_null() {
+            return Err(invalid());
+        }
+        let policy = PrivateDacl {
+            protected: control & SE_DACL_PRESENT != 0 && control & SE_DACL_PROTECTED != 0,
+            owner_is_current: owner_is_current_user(owner)?,
+            aces: read_aces(dacl, owner)?,
+        };
+        if private_dacl_is_owner_only(&policy) {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
+    }
+
+    fn owner_is_current_user(owner: PSID) -> io::Result<bool> {
+        if owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+            return Ok(false);
+        }
+        let mut token = std::ptr::null_mut();
+        // SAFETY: GetCurrentProcess is a pseudo-handle and must not be closed.
+        // OpenProcessToken returns a new owned token.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = Token(token);
+        let mut needed = 0u32;
         unsafe {
-            if GetSecurityDescriptorControl(actual.0, &mut control, &mut revision) == 0
-                || control & 0x1000 == 0
-                || GetSecurityDescriptorDacl(
-                    expected.0,
-                    &mut present,
-                    &mut expected_acl,
-                    &mut defaulted,
-                ) == 0
-                || present == 0
-                || actual_acl.is_null()
-                || expected_acl.is_null()
-            {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 || needed > 1024 {
+            return Ok(false);
+        }
+        let mut bytes = vec![0u8; needed as usize];
+        // SAFETY: `bytes` is writable for `needed` bytes. The returned SID
+        // pointer stays inside that buffer until this function returns.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                bytes.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetTokenInformation wrote a TOKEN_USER at the start of `bytes`.
+        let user = unsafe { &*(bytes.as_ptr() as *const TOKEN_USER) };
+        if user.User.Sid.is_null() || unsafe { IsValidSid(user.User.Sid) } == 0 {
+            return Ok(false);
+        }
+        Ok(unsafe { EqualSid(owner, user.User.Sid) } != 0)
+    }
+
+    fn read_aces(dacl: *mut ACL, owner: PSID) -> io::Result<Vec<PrivateAce>> {
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` is the non-null DACL from the live security descriptor.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if info.AceCount > 64 {
+            return Err(invalid());
+        }
+        let owner_rights = owner_rights_sid()?;
+        let mut aces = Vec::with_capacity(info.AceCount as usize);
+        for index in 0..info.AceCount {
+            let mut ace_ptr = std::ptr::null_mut();
+            // SAFETY: `index` is below the ACL's AceCount, so GetAce returns an
+            // ACE inside `dacl` or fails.
+            if unsafe { GetAce(dacl, index, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
                 return Err(invalid());
             }
-            let actual_bytes =
-                std::slice::from_raw_parts(actual_acl.cast::<u8>(), (*actual_acl).size as usize);
-            let expected_bytes = std::slice::from_raw_parts(
-                expected_acl.cast::<u8>(),
-                (*expected_acl).size as usize,
-            );
-            if actual_bytes != expected_bytes {
+            // SAFETY: every ACE begins with ACE_HEADER. GetAce returns that header.
+            let header = unsafe { &*(ace_ptr as *const windows_sys::Win32::Security::ACE_HEADER) };
+            let inherited = u32::from(header.AceFlags) & INHERITED_ACE != 0;
+            if header.AceType != 0 || header.AceSize < 8 {
+                aces.push(PrivateAce {
+                    inherited,
+                    allow: false,
+                    full_access: false,
+                    trustee: PrivateAceTrustee::Other,
+                });
+                continue;
+            }
+            let ace_len = header.AceSize as usize;
+            // SAFETY: AceSize is the ACE length GetAce returned. The SID starts
+            // at byte 8. SubAuthorityCount is the second SID byte; 15 is the
+            // SID maximum, so the computed length cannot overflow the ACE
+            // before IsValidSid/EqualSid read it.
+            let bytes = unsafe { std::slice::from_raw_parts(ace_ptr.cast::<u8>(), ace_len) };
+            if bytes.len() < 16 {
                 return Err(invalid());
+            }
+            let sub_count = bytes[9] as usize;
+            let sid_len = 8 + sub_count.saturating_mul(4);
+            if sub_count > 15 || bytes.len() < 8 + sid_len {
+                return Err(invalid());
+            }
+            let sid = unsafe { ace_ptr.cast::<u8>().add(8) as PSID };
+            if unsafe { IsValidSid(sid) } == 0 {
+                return Err(invalid());
+            }
+            let trustee = if !owner.is_null() && unsafe { EqualSid(sid, owner) } != 0 {
+                PrivateAceTrustee::Owner
+            } else if unsafe { EqualSid(sid, owner_rights.as_ptr() as PSID) } != 0 {
+                PrivateAceTrustee::OwnerRights
+            } else {
+                PrivateAceTrustee::Other
+            };
+            // SAFETY: AceSize is at least 16, so the ACCESS_ALLOWED_ACE header
+            // and mask are inside the ACE. The SID was bounded above.
+            let mask = unsafe { (*(ace_ptr as *const ACCESS_ALLOWED_ACE)).Mask };
+            let full_access = mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS || mask == 0x1000_0000;
+            aces.push(PrivateAce {
+                inherited,
+                allow: true,
+                full_access,
+                trustee,
+            });
+        }
+        Ok(aces)
+    }
+
+    fn owner_rights_sid() -> io::Result<[u8; SECURITY_MAX_SID_SIZE as usize]> {
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: the buffer is SECURITY_MAX_SID_SIZE. A null domain is the
+        // documented input for WinCreatorOwnerRightsSid.
+        if unsafe {
+            CreateWellKnownSid(
+                WinCreatorOwnerRightsSid,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut len,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sid)
+    }
+
+    struct Token(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: the handle was returned by OpenProcessToken and is not
+            // the process pseudo-handle.
+            unsafe {
+                CloseHandle(self.0);
             }
         }
-        Ok(())
     }
     fn open(path: &Path, directory: bool, create: bool) -> io::Result<Option<File>> {
         let path = wide(path)?;

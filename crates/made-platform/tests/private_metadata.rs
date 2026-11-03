@@ -1,4 +1,7 @@
-use made_platform::{read_private_metadata, write_private_metadata_atomic};
+use made_platform::{
+    private_dacl_is_owner_only, read_private_metadata, write_private_metadata_atomic, PrivateAce,
+    PrivateAceTrustee, PrivateDacl,
+};
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
@@ -117,4 +120,78 @@ fn metadata_refuses_fifo_without_blocking() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     assert!(read_private_metadata(&root.0, "fifo", 32).is_err());
     assert!(write_private_metadata_atomic(&root.0, "fifo", b"bad", 32).is_err());
+}
+
+fn ace(trustee: PrivateAceTrustee, allow: bool, full_access: bool, inherited: bool) -> PrivateAce {
+    PrivateAce {
+        inherited,
+        allow,
+        full_access,
+        trustee,
+    }
+}
+
+fn dacl(protected: bool, owner_is_current: bool, aces: Vec<PrivateAce>) -> PrivateDacl {
+    PrivateDacl {
+        protected,
+        owner_is_current,
+        aces,
+    }
+}
+
+#[test]
+fn owner_only_dacl_accepts_canonical_forms_and_rejects_weaker_grants() {
+    let owner = ace(PrivateAceTrustee::Owner, true, true, false);
+    let rights = ace(PrivateAceTrustee::OwnerRights, true, true, false);
+    assert!(private_dacl_is_owner_only(&dacl(true, true, vec![owner])));
+    assert!(private_dacl_is_owner_only(&dacl(true, true, vec![rights])));
+    assert!(private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![owner, rights]
+    )));
+    assert!(!private_dacl_is_owner_only(&dacl(false, true, vec![owner])));
+    assert!(!private_dacl_is_owner_only(&dacl(true, false, vec![owner])));
+    assert!(!private_dacl_is_owner_only(&dacl(true, true, Vec::new())));
+    assert!(!private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![ace(PrivateAceTrustee::Owner, true, true, true)]
+    )));
+    assert!(!private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![ace(PrivateAceTrustee::Other, true, true, false)]
+    )));
+    assert!(!private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![owner, ace(PrivateAceTrustee::Other, true, false, false)]
+    )));
+    assert!(!private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![ace(PrivateAceTrustee::Owner, true, false, false)]
+    )));
+    assert!(!private_dacl_is_owner_only(&dacl(
+        true,
+        true,
+        vec![ace(PrivateAceTrustee::Owner, false, true, false)]
+    )));
+}
+
+/// Windows CI creates this directory under an isolated APPDATA. The DACL check
+/// must accept the canonical ACL, not the raw SDDL bytes. Not executed here.
+#[cfg(windows)]
+#[test]
+fn metadata_write_accepts_canonical_owner_only_dacl() {
+    let root = Scratch::new();
+    write_private_metadata_atomic(&root.0, "servers.json", b"registry", 32)
+        .expect("canonicalized owner-only DACL must still be private");
+    assert_eq!(
+        read_private_metadata(&root.0, "servers.json", 32)
+            .unwrap()
+            .unwrap(),
+        b"registry"
+    );
 }
