@@ -225,9 +225,8 @@ pub fn private_dacl_is_owner_only(dacl: &PrivateDacl) -> bool {
 fn ensure_directory(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        // An existing app directory may already carry an inherited ACL. Tighten
-        // it when we own it before the privacy check; do not rewrite another
-        // owner's directory.
+        // Tighten only this directory when we own it. Missing parents are created
+        // normally; an existing parent owned by someone else is left unchanged.
         return backend::create_or_tighten(path);
     }
     #[cfg(not(windows))]
@@ -249,8 +248,8 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Create or tighten an app-owned directory so Windows does not leave an
-/// inherited ACL in place. Unix callers keep `create_private_dir_all`.
+/// Create the leaf privately. Missing parents are ordinary directories and are
+/// not rewritten. Unix callers keep `create_private_dir_all`.
 #[cfg(windows)]
 pub(crate) fn create_or_tighten_private_directory(path: &Path) -> io::Result<()> {
     backend::create_or_tighten(path)
@@ -872,9 +871,11 @@ mod backend {
         }
         Ok(())
     }
-    /// Create a missing directory with an owner-only DACL, or replace the DACL
-    /// of an existing directory owned by the current user. Another owner's
-    /// directory is refused and left unchanged.
+    /// Create the leaf with an owner-only DACL, or replace that DACL when the
+    /// current user already owns the leaf. Missing parents use ordinary
+    /// creation and are not security-checked. An existing parent owned by
+    /// someone else, such as Temp or AppData, is not rewritten and does not
+    /// fail this call. An existing leaf owned by someone else is refused.
     pub fn create_or_tighten(path: &Path) -> io::Result<()> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -887,9 +888,11 @@ mod backend {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if let Some(parent) = path
                     .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+                    .filter(|parent| !parent.as_os_str().is_empty())
                 {
-                    create_or_tighten(parent)?;
+                    if !parent.exists() {
+                        std::fs::create_dir_all(parent)?;
+                    }
                 }
                 create_directory(path)
             }

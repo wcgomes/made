@@ -1756,12 +1756,13 @@ fn open_append_private(path: &Path) -> Result<std::fs::File, PlatformError> {
         .map_err(|error| PlatformError::io("open private log", error))
 }
 
-/// Create a directory tree with owner-only permissions.
+/// Create a directory tree with owner-only permissions on the leaf.
 ///
-/// Unix uses mode 0700. Windows does not use `create_dir_all`: that leaves an
-/// inherited ACL. A new directory is created with the current user as owner
-/// and a protected full-allow DACL for that user only. An existing directory
-/// is tightened the same way when the current user already owns it.
+/// Unix uses mode 0700. On Windows, missing parents are created normally and
+/// are not rewritten: an existing parent such as Temp or AppData may be owned
+/// by Administrators. Only the leaf Made creates receives the current user as
+/// owner and a protected full-allow DACL for that user. An existing leaf owned
+/// by someone else is refused.
 fn create_private_dir_all(path: &Path) -> Result<(), PlatformError> {
     #[cfg(unix)]
     {
