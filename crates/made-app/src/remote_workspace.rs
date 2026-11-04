@@ -687,6 +687,16 @@ impl RemoteWorkspace {
         Ok(())
     }
 
+    /// Drop every old-root request without emitting one Cancel per request.
+    /// A transition owns the next generation; the client is reset separately
+    /// before the RootSelect is sent, so old-root Cance frames would only fill
+    /// its bounded in-flight queue and starve the transition itself.
+    fn abandon_all_pending(&mut self) {
+        self.pending.clear();
+        self.outbox.clear();
+        self.follow_request = None;
+    }
+
     /// Ten-second RPC deadlines are driven by the UI's nonblocking timer.
     pub fn expire(&mut self, now: Instant) -> Result<Vec<u64>, ProtocolError> {
         let ids: Vec<_> = self
@@ -1041,8 +1051,7 @@ impl RemoteWorkspace {
                 }
             }
             Err(_) => {
-                self.cancel_where(|_| true)?;
-                self.follow_request = None;
+                self.abandon_all_pending();
                 self.clear_root_projection();
                 self.projection.root_state = Freshness::Unavailable(ErrorCode::Unavailable);
                 self.projection.source = RootSource::Session;
@@ -1051,9 +1060,10 @@ impl RemoteWorkspace {
         Ok(())
     }
     fn transition(&mut self, path: RemotePath, source: RootSource) -> Result<u64, ProtocolError> {
-        // A single root transition owns the next generation. Cancel all work
-        // immediately, not just when its delayed root reply eventually arrives.
-        self.cancel_where(|_| true)?;
+        // A single root transition owns the next generation. Drop old work
+        // silently: the client is reset before RootSelect, and per-request
+        // Cance frames would exhaust its bounded in-flight queue.
+        self.abandon_all_pending();
         self.clear_root_projection();
         self.projection.source = source;
         self.projection.requested_root = Some(path.clone());
@@ -1081,7 +1091,7 @@ impl RemoteWorkspace {
         self.projection.focus = None;
     }
     pub fn begin_resnapshot(&mut self) -> Result<(), ProtocolError> {
-        self.cancel_where(|_| true)?;
+        self.abandon_all_pending();
         self.clear_root_projection();
         self.projection.sessions = None;
         self.projection.session_state = Freshness::Stale;

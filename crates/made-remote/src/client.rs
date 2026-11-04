@@ -65,6 +65,8 @@ struct State {
     connected: bool,
     external_id: u64,
     internal_id: u64,
+    discard_through: u64,
+    discard_internal_through: u64,
     control: VecDeque<WireEnvelope>,
     data: VecDeque<WireEnvelope>,
     pending: HashMap<u64, Pending>,
@@ -238,6 +240,19 @@ impl State {
                     .push_back(QueuedTerminal::Other(PtyEvent::Exited(status)));
                 return Ok(());
             }
+            _ => {}
+        }
+        // A reset or accepted root transition deliberately abandons old-root
+        // work. Late replies for those request ids are drained, not treated as
+        // forged replies that would disconnect the new root.
+        if !self.pending.contains_key(&frame.request_id)
+            && ((frame.request_id != 0 && frame.request_id <= self.discard_through)
+                || (frame.request_id >= (1u64 << 63)
+                    && frame.request_id <= self.discard_internal_through))
+        {
+            return Ok(());
+        }
+        match &frame.operation {
             Operation::ShellCwd { .. } => return self.deliver(frame),
             Operation::Changed { path } if !self.pending.contains_key(&frame.request_id) => {
                 if !generation_current || !path.is_within(&self.root) {
@@ -340,6 +355,8 @@ impl RemoteClient {
             connected: true,
             external_id: 0,
             internal_id: 1u64 << 63,
+            discard_through: 0,
+            discard_internal_through: 0,
             control: VecDeque::new(),
             data: VecDeque::new(),
             pending: HashMap::new(),
@@ -378,6 +395,24 @@ impl RemoteClient {
         state.submit(frame, grant, Instant::now())?;
         Ok(id)
     }
+    /// Discard every queued and pending old-root request without sending
+    /// Cancel frames. A root transition resets here before RootSelect so the
+    /// old root's full in-flight queue cannot starve the transition.
+    pub fn reset_pending(&self) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().map_err(|_| ProtocolError::Identity)?;
+        state.discard_through = state.external_id;
+        state.discard_internal_through = state.internal_id;
+        state.control.clear();
+        state.data.clear();
+        state.pending.clear();
+        state.terminal_pending.clear();
+        state.replies.clear();
+        state.roots.clear();
+        state.sessions.clear();
+        state.resnapshot_done = false;
+        Ok(())
+    }
+
     /// Applying an accepted RootSelect is explicit and discards all old-root
     /// work. The caller must first validate/consume its RootResolution.
     pub fn set_root(&self, root: RemotePath, generation: u64) -> Result<(), ProtocolError> {
@@ -385,6 +420,8 @@ impl RemoteClient {
         if generation <= state.identity.generation {
             return Err(ProtocolError::Identity);
         }
+        state.discard_through = state.external_id;
+        state.discard_internal_through = state.internal_id;
         state.control.clear();
         state.data.clear();
         state.pending.clear();
@@ -736,5 +773,90 @@ impl TerminalTransport for RemoteTerminalTransport {
     fn detach(&mut self) -> Result<(), PtyError> {
         self.0.disconnect();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use made_platform::ssh::SshEvent;
+    use std::io;
+
+    struct NullStream;
+
+    impl ClientStream for NullStream {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Option<SshEvent> {
+            None
+        }
+        fn detach(&mut self) {}
+    }
+
+    fn identity() -> Identity {
+        Identity {
+            authority: AuthorityId([7; 16]),
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn reset_pending_frees_the_in_flight_queue_for_root_select() {
+        let root = RemotePath::new(b"/project".to_vec()).unwrap();
+        let client = RemoteClient::new(NullStream, identity(), root).unwrap();
+        for _ in 0..MAX_IN_FLIGHT {
+            client
+                .request(
+                    Operation::GitRead {
+                        command: GitRead::Status,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            client.request(
+                Operation::GitRead {
+                    command: GitRead::Status,
+                },
+                None,
+            ),
+            Err(ProtocolError::Limit)
+        ));
+        client.reset_pending().unwrap();
+        let next = RemotePath::new(b"/next".to_vec()).unwrap();
+        client
+            .request(Operation::RootSelect { path: next.clone() }, Some(&next))
+            .unwrap();
+    }
+
+    #[test]
+    fn reset_pending_discards_late_old_replies() {
+        let root = RemotePath::new(b"/project".to_vec()).unwrap();
+        let client = RemoteClient::new(NullStream, identity(), root).unwrap();
+        let old_id = client
+            .request(
+                Operation::GitRead {
+                    command: GitRead::Status,
+                },
+                None,
+            )
+            .unwrap();
+        client.reset_pending().unwrap();
+        let mut state = client.state.lock().unwrap();
+        let late = WireEnvelope::new(state.identity.clone(), old_id, Operation::Ack);
+        assert!(
+            state.receive(late).is_ok(),
+            "late old-root replies must be drained, not disconnect the new root"
+        );
+        let late_internal =
+            WireEnvelope::new(state.identity.clone(), state.internal_id, Operation::Ack);
+        assert!(
+            state.receive(late_internal).is_ok(),
+            "late heartbeat/cancel replies must also be drained"
+        );
     }
 }

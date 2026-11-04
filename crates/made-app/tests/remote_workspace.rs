@@ -794,3 +794,26 @@ fn root_listing_error_closes_the_open_preview() {
         Freshness::Unavailable(ErrorCode::Unavailable)
     );
 }
+
+#[test]
+fn full_pending_queue_transition_drops_old_work_without_cancel_frames() {
+    let mut workspace = model(1);
+    workspace.refresh_git().unwrap();
+    let id = workspace.select_root(path("/project/next")).unwrap();
+    let mut commands = Vec::new();
+    while let Some(command) = workspace.next_command() {
+        commands.push(command);
+    }
+    assert_eq!(commands.len(), 1, "old work must be dropped silently");
+    assert_eq!(commands[0].request_id, id);
+    assert!(matches!(
+        commands[0].operation,
+        Operation::RootSelect { path: ref selected } if selected == &path("/project/next")
+    ));
+    assert!(
+        !commands
+            .iter()
+            .any(|command| matches!(command.operation, Operation::Cancel { .. })),
+        "transition must not enqueue one Cancel per old pending request"
+    );
+}

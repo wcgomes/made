@@ -2818,11 +2818,26 @@ impl Workbench {
                 }
                 let workspace_id = command.request_id;
                 let operation = command.operation;
+                let root_select = matches!(
+                    &operation,
+                    made_remote::protocol::Operation::RootSelect { .. }
+                );
                 let grant = match &operation {
                     made_remote::protocol::Operation::RootSelect { path }
                     | made_remote::protocol::Operation::RootValidate { path } => Some(path.clone()),
                     _ => None,
                 };
+                if root_select {
+                    // The transition already dropped the workspace's old-root
+                    // work silently. Reset the client's bounded queues and id
+                    // map too, so old pending requests cannot consume the
+                    // in-flight slots the RootSelect needs.
+                    remote.id_map.clear();
+                    if client.reset_pending().is_err() {
+                        remote.workspace.disconnect();
+                        break;
+                    }
+                }
                 match client.request(operation, grant.as_ref()) {
                     Ok(client_id) => {
                         remote.id_map.insert(client_id, workspace_id);
