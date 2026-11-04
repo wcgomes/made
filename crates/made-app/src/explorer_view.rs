@@ -10,6 +10,7 @@
 //! [`PREVIEW_ACTIONS`] contains only read-only actions. Preview shortcuts are
 //! scoped to preview focus; the terminal keeps Ctrl+S as XOFF.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -35,7 +36,7 @@ use crate::diagnostics::{DiagnosticLog, LogLevel};
 use crate::explorer_icons;
 use crate::sanitize::sanitize_display;
 use crate::theme;
-use crate::worktree::{ChangeKind, FolderMark, GitStatusRow, GitStatusSnapshot};
+use crate::worktree::{ChangeKind, FolderMark, GitStatusSnapshot};
 
 /// Edge of the square icon slot that file and folder rows reserve, in points.
 const ENTRY_ICON_SIZE: f32 = 16.0;
@@ -165,42 +166,7 @@ impl PreviewDocument {
                 content,
                 size: content_size,
                 ..
-            } => {
-                let highlighted = highlighter.highlight(&path, &content);
-                let lines = highlighted
-                    .lines
-                    .into_iter()
-                    .map(|line| PreviewLine {
-                        spans: line
-                            .spans
-                            .into_iter()
-                            .map(|span| PreviewSpan {
-                                text: span.text,
-                                color: ensure_preview_contrast(
-                                    [
-                                        span.style.foreground.r,
-                                        span.style.foreground.g,
-                                        span.style.foreground.b,
-                                    ],
-                                    [theme::BG_CARD.r(), theme::BG_CARD.g(), theme::BG_CARD.b()],
-                                ),
-                                bold: span.style.bold,
-                                italic: span.style.italic,
-                                underline: span.style.underline,
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                Self {
-                    path,
-                    kind,
-                    size: Some(content_size),
-                    message: None,
-                    syntax: highlighted.syntax,
-                    plain_text: highlighted.plain_text,
-                    lines,
-                }
-            }
+            } => Self::from_text(path, &content, content_size, highlighter),
             other => {
                 let message = other
                     .message()
@@ -216,6 +182,98 @@ impl PreviewDocument {
                     lines: Vec::new(),
                 }
             }
+        }
+    }
+
+    /// Build a display document from a completed remote preview read.
+    ///
+    /// The path is used only for display and syntax selection; no host file is
+    /// read. Text size comes from the received byte length because the remote
+    /// preview reply carries content, not metadata.
+    pub fn from_remote(
+        path: &made_remote::protocol::RemotePath,
+        kind: made_remote::protocol::PreviewKind,
+        data: &[u8],
+        highlighter: &Highlighter,
+    ) -> Self {
+        let display = path
+            .to_utf8()
+            .map(str::to_owned)
+            .unwrap_or_else(|_| String::from_utf8_lossy(path.as_bytes()).into_owned());
+        let path = PathBuf::from(display);
+        if kind == made_remote::protocol::PreviewKind::Text {
+            if let Ok(content) = std::str::from_utf8(data) {
+                return Self::from_text(path, content, data.len() as u64, highlighter);
+            }
+        }
+        let (kind, message) = match kind {
+            made_remote::protocol::PreviewKind::Text
+            | made_remote::protocol::PreviewKind::InvalidUtf8 => (
+                PreviewKind::InvalidUtf8,
+                "The file is not valid UTF-8; raw bytes are not shown.",
+            ),
+            made_remote::protocol::PreviewKind::Binary => (
+                PreviewKind::Binary,
+                "Binary file. Preview shows no raw bytes.",
+            ),
+            made_remote::protocol::PreviewKind::TooLarge => {
+                (PreviewKind::TooLarge, "File is too large to preview.")
+            }
+            made_remote::protocol::PreviewKind::Missing => {
+                (PreviewKind::Missing, "The file no longer exists.")
+            }
+            made_remote::protocol::PreviewKind::Unreadable => {
+                (PreviewKind::Unreadable, "The file could not be read.")
+            }
+            made_remote::protocol::PreviewKind::NotRegular => {
+                (PreviewKind::Unreadable, "The path is not a regular file.")
+            }
+        };
+        Self {
+            path,
+            kind,
+            size: None,
+            message: Some(message.to_owned()),
+            syntax: None,
+            plain_text: true,
+            lines: Vec::new(),
+        }
+    }
+
+    fn from_text(path: PathBuf, content: &str, size: u64, highlighter: &Highlighter) -> Self {
+        let highlighted = highlighter.highlight(&path, content);
+        let lines = highlighted
+            .lines
+            .into_iter()
+            .map(|line| PreviewLine {
+                spans: line
+                    .spans
+                    .into_iter()
+                    .map(|span| PreviewSpan {
+                        text: span.text,
+                        color: ensure_preview_contrast(
+                            [
+                                span.style.foreground.r,
+                                span.style.foreground.g,
+                                span.style.foreground.b,
+                            ],
+                            [theme::BG_CARD.r(), theme::BG_CARD.g(), theme::BG_CARD.b()],
+                        ),
+                        bold: span.style.bold,
+                        italic: span.style.italic,
+                        underline: span.style.underline,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self {
+            path,
+            kind: PreviewKind::Text,
+            size: Some(size),
+            message: None,
+            syntax: highlighted.syntax,
+            plain_text: highlighted.plain_text,
+            lines,
         }
     }
 
@@ -280,14 +338,6 @@ fn relative_luminance(color: [u8; 3]) -> f32 {
         }
     };
     0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
-}
-
-/// A tree row action chosen by one UI click or keyboard command.
-#[derive(Debug, Clone)]
-enum TreeAction {
-    Select(TreeRow),
-    Toggle(PathBuf),
-    OpenFile(PathBuf),
 }
 
 /// Search the visible rows for a path.
@@ -440,6 +490,14 @@ impl WatcherInstaller {
     fn try_recv(&self) -> Option<WatcherResult> {
         self.results.try_recv().ok()
     }
+
+    #[cfg(test)]
+    fn blocked() -> Self {
+        let (jobs, job_rx) = mpsc::sync_channel::<WatcherJob>(1);
+        drop(job_rx);
+        let (_result_tx, results) = mpsc::sync_channel::<WatcherResult>(1);
+        Self { jobs, results }
+    }
 }
 
 struct PreviewJob {
@@ -547,6 +605,167 @@ pub enum PreviewUiAction {
     Close,
     /// Keep the loaded preview and return to the live terminal.
     ShowTerminal,
+}
+
+/// Display state for the shared full-left preview card.
+pub(crate) struct PreviewCardState<'a> {
+    pub(crate) path_name: Option<&'a str>,
+    pub(crate) path_full: Option<&'a str>,
+    pub(crate) document: Option<&'a PreviewDocument>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<&'a str>,
+    pub(crate) refreshed_at: Option<Instant>,
+    pub(crate) focus_pending: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PreviewCardResult {
+    pub(crate) surface: PreviewUiAction,
+    pub(crate) refresh: bool,
+    pub(crate) copy_path: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreviewCardIds {
+    pub(crate) focus: egui::Id,
+    pub(crate) close: egui::Id,
+    pub(crate) terminal: egui::Id,
+    pub(crate) refresh: egui::Id,
+    pub(crate) copy: egui::Id,
+}
+
+/// Which explorer body the shared card is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorerViewKind {
+    Files,
+    Git,
+}
+
+/// One interaction chosen from the shared explorer card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorerRowAction {
+    /// Pointer activation: select and then activate the row.
+    Click(usize),
+    /// Keyboard movement: select without opening or toggling.
+    Select(usize),
+    /// Keyboard expand/collapse: select and toggle a directory.
+    Toggle(usize),
+    /// Enter/Space: activate the already selected row.
+    Activate(usize),
+}
+
+#[derive(Debug, Default)]
+struct ExplorerCardResult {
+    switch: Option<ExplorerViewKind>,
+    row: Option<ExplorerRowAction>,
+    git_row: Option<(usize, usize)>,
+    retry: bool,
+}
+
+/// A tooltip source for a tree row. Local rows keep their path borrowed; remote
+/// rows carry an already-rendered POSIX path.
+enum RowTooltip<'a> {
+    Path(&'a Path),
+    Text(&'a str),
+}
+
+impl RowTooltip<'_> {
+    fn text(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::Text(text) => (*text).to_owned(),
+        }
+    }
+}
+
+/// A change mark shown at the right edge of a tree row.
+enum RowMark<'a> {
+    Local(&'a FolderMark),
+    Remote(&'a [ChangeKind]),
+}
+
+impl RowMark<'_> {
+    fn color(&self) -> Color32 {
+        match self {
+            Self::Local(mark) => folder_mark_color(mark),
+            Self::Remote(kinds) => change_kinds_color(kinds),
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        match self {
+            Self::Local(mark) => mark.tooltip(),
+            Self::Remote(kinds) => kinds
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
+/// One visible tree row, independent of whether it came from the host
+/// filesystem or a remote projection.
+struct ExplorerRowView<'a> {
+    name: Cow<'a, str>,
+    depth: usize,
+    kind: EntryKind,
+    expanded: bool,
+    selected: bool,
+    error: Option<&'a str>,
+    tooltip: RowTooltip<'a>,
+    mark: Option<RowMark<'a>>,
+    icon: Option<explorer_icons::IconId>,
+}
+
+/// Lazily supplies visible rows so the shared renderer can stay virtualized.
+trait ExplorerRowSource {
+    fn row_count(&self) -> usize;
+    fn row(&self, index: usize) -> ExplorerRowView<'_>;
+    fn selected_index(&self) -> Option<usize> {
+        (0..self.row_count()).find(|&index| self.row(index).selected)
+    }
+}
+
+struct GitRowView {
+    name: String,
+    kind: ChangeKind,
+    selected: bool,
+    icon: Option<explorer_icons::IconId>,
+    tooltip: String,
+    original: Option<String>,
+}
+
+struct GitGroupView {
+    title: &'static str,
+    rows: Vec<GitRowView>,
+}
+
+struct GitBodyView {
+    has_status: bool,
+    failed: bool,
+    groups: Vec<GitGroupView>,
+}
+
+enum ExplorerTreeBody<'a> {
+    Rows(&'a dyn ExplorerRowSource),
+    Loading,
+    Empty,
+    Error(String),
+}
+
+/// Everything the shared explorer card needs to paint one frame.
+struct ExplorerCardView<'a> {
+    git_open: bool,
+    show_icon: bool,
+    root_name: Option<(String, String)>,
+    git_header: Option<&'a GitHeader>,
+    source_control_tooltip: String,
+    source_control_rings: theme::SourceControlRings,
+    root_unavailable: Option<String>,
+    tree: ExplorerTreeBody<'a>,
+    git: Option<GitBodyView>,
+    scroll_to_selection: bool,
 }
 
 /// Branch and worktree facts the explorer header needs. Made never invents a branch.
@@ -1334,97 +1553,6 @@ impl ExplorerPane {
         self.apply_selection_path(&path);
     }
 
-    fn move_selection_to(&mut self, index: usize) {
-        self.ensure_rows();
-        if self.rows.is_empty() {
-            return;
-        }
-        let index = index.min(self.rows.len() - 1);
-        let path = self.rows[index].path.clone();
-        self.apply_selection_path(&path);
-    }
-
-    fn selected_row(&mut self) -> Option<TreeRow> {
-        self.ensure_rows();
-        let path = self.selected_path()?.to_path_buf();
-        self.rows.iter().find(|row| row.path == path).cloned()
-    }
-
-    fn handle_tree_keys(&mut self, ui: &Ui, tree_id: egui::Id) {
-        if !ui.memory(|memory| memory.has_focus(tree_id)) {
-            return;
-        }
-        let events = ui.ctx().input(|input| input.events.clone());
-        for event in events {
-            let egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } = event
-            else {
-                continue;
-            };
-            if key == egui::Key::S && (modifiers.command || modifiers.ctrl) {
-                continue;
-            }
-            match key {
-                egui::Key::ArrowDown => self.move_selection(1),
-                egui::Key::ArrowUp => self.move_selection(-1),
-                egui::Key::Home => self.move_selection_to(0),
-                egui::Key::End => {
-                    self.ensure_rows();
-                    self.move_selection_to(self.rows.len().saturating_sub(1));
-                }
-                egui::Key::PageUp => self.move_selection(-10),
-                egui::Key::PageDown => self.move_selection(10),
-                egui::Key::ArrowRight => {
-                    if let Some(row) = self.selected_row() {
-                        if row.kind == EntryKind::Directory {
-                            self.apply_selection_path(&row.path);
-                            self.toggle_dir(row.path);
-                            self.rows_dirty = true;
-                        }
-                    }
-                }
-                egui::Key::ArrowLeft => {
-                    let Some(path) = self.selected_path().map(Path::to_path_buf) else {
-                        continue;
-                    };
-                    let expanded = self
-                        .tree
-                        .as_ref()
-                        .is_some_and(|tree| tree.is_expanded(&path));
-                    if expanded {
-                        if let Some(tree) = self.tree.as_mut() {
-                            tree.collapse(&path);
-                        }
-                        self.rows_dirty = true;
-                    } else if let Some(parent) = path.parent().map(Path::to_path_buf) {
-                        self.ensure_rows();
-                        if let Some(index) = row_index(&self.rows, &parent) {
-                            let path = self.rows[index].path.clone();
-                            self.apply_selection_path(&path);
-                        }
-                    }
-                }
-                egui::Key::Enter | egui::Key::Space => {
-                    if let Some(row) = self.selected_row() {
-                        self.activate_row(&row);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Draw the Explorer card only. The preview lives on the left surface.
-    pub fn ui(&mut self, ui: &mut Ui, log: &mut DiagnosticLog, layout: &theme::Layout) {
-        self.ensure_rows();
-        self.explorer_card(ui, log, layout);
-    }
-
-    /// Full-height tree surface, with no embedded preview.
     pub fn tree_ui(&mut self, ui: &mut Ui, log: &mut DiagnosticLog, layout: &theme::Layout) {
         self.ensure_rows();
         self.explorer_card(ui, log, layout);
@@ -1476,587 +1604,129 @@ impl ExplorerPane {
         self.preview_card(ui, log, layout)
     }
 
-    fn explorer_card(&mut self, ui: &mut Ui, log: &mut DiagnosticLog, layout: &theme::Layout) {
-        // Allocate the whole card so the resizable split panel does not
-        // shrink-wrap to the tree content on the second frame.
-        let (card_rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
-        theme::paint_glass_card(
-            ui.painter(),
-            card_rect,
-            layout,
-            self.native_backdrop_applied,
-        );
-        let header_rect = egui::Rect::from_min_size(
-            card_rect.min,
-            egui::vec2(card_rect.width(), layout.card_header_height),
-        );
-        theme::paint_glass_card_header(ui, header_rect, layout, self.native_backdrop_applied);
-        let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
-        let show_icon = self.git_header.show_icon;
-        let spacing = ui.spacing().item_spacing.x;
-        let icon_extent = theme::icon_action_extent(24.0);
-        // The name stops before the gap and both 24×24 icons. A character
-        // estimate cannot do that: wide glyphs would paint into the icons.
-        let icon_reserve = header_icon_reserve(icon_extent, spacing, show_icon);
-        let left_rect = egui::Rect::from_min_max(
-            content.min,
-            egui::pos2(
-                (content.right() - icon_reserve).max(content.left()),
-                content.bottom(),
-            ),
-        );
-        let mut left = ui.new_child(
-            UiBuilder::new()
-                .max_rect(left_rect)
-                .layout(egui::Layout::left_to_right(Align::Center)),
-        );
+    fn explorer_card(&mut self, ui: &mut Ui, _log: &mut DiagnosticLog, layout: &theme::Layout) {
         let git_open = self.source_control_open();
-        // Owned before the label is painted: the aside width is measured from
-        // the section label's right edge, and the git view must not fall back
-        // to the root name when the head line is empty.
-        let aside = if git_open {
-            let raw_head = source_control_head_label(
-                self.git_header.branch.as_deref(),
-                self.git_header.detached,
-                self.git_header.commit_abbrev.as_deref(),
-            );
-            let (head, shown_name) = repos_aside_texts(
-                &raw_head,
-                self.git_header.is_linked_worktree,
-                self.git_header.directory_name.as_deref(),
-            );
-            if head.is_empty() && shown_name.is_none() {
-                None
-            } else {
-                let hover = source_control_head_hover(
-                    &raw_head,
-                    self.git_header.detached,
-                    self.git_header.commit_abbrev.as_deref(),
-                    self.git_header.commit_subject.as_deref(),
-                );
-                Some((head, hover, shown_name))
-            }
-        } else if let Some(root) = &self.root {
-            let full = root.display().to_string();
-            let name = root
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| full.clone());
-            Some((name, full, None))
-        } else {
+        let show_icon = self.git_header.show_icon;
+        let root_name = if git_open {
             None
+        } else {
+            self.root.as_ref().map(|root| {
+                let full = root.display().to_string();
+                let name = root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| full.clone());
+                (name, full)
+            })
         };
-        theme::section_label(&mut left, if git_open { "REPOS" } else { "EXPLORER" });
-        if let Some((text, hover, shown_name)) = aside {
-            let name_width = root_name_width(
-                left.min_rect().right(),
-                content.right(),
-                spacing,
-                icon_extent,
-                show_icon,
-            );
-            if name_width >= 1.0 {
-                let name_left = left.min_rect().right() + spacing;
-                let name_rect = egui::Rect::from_min_size(
-                    egui::pos2(name_left, left_rect.top()),
-                    egui::vec2(name_width, left_rect.height()),
-                );
-                if git_open {
-                    self.paint_repos_aside(ui, name_rect, &text, &hover, shown_name.as_deref());
+        let tooltip = source_control_tooltip(self.git_status.as_ref());
+        let rings = source_control_rings(self.git_status.as_ref());
+        let scroll_to_selection = std::mem::take(&mut self.scroll_to_selection);
+        let files = self.git_status.as_ref().map(file_status_marks);
+        let result = {
+            let tree = if let Some(error) = self.root_error.as_ref() {
+                ExplorerTreeBody::Error(error.clone())
+            } else if self.rows.is_empty() {
+                if self
+                    .tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.loading_dirs().next().is_some())
+                {
+                    ExplorerTreeBody::Loading
                 } else {
-                    paint_clipped_label(
-                        ui,
-                        name_rect,
-                        name_left,
-                        &text,
-                        name_width,
-                        self.ui_scope.with("explorer-root-name"),
-                        Some(&hover),
-                    );
+                    ExplorerTreeBody::Empty
                 }
-            }
-        }
-        if show_icon {
-            self.header_view_icons(ui, content);
-        }
-        theme::paint_card_border(ui, card_rect, layout);
-
-        let body_rect = egui::Rect::from_min_max(
-            egui::pos2(card_rect.left(), header_rect.bottom()),
-            card_rect.max,
-        );
-        let content_rect = body_rect.shrink2(egui::vec2(8.0, 4.0));
-        let mut body = ui.new_child(UiBuilder::new().max_rect(content_rect));
-        if let Some(unavailable) = self.root_unavailable.clone() {
-            tone_strip(
-                &mut body,
-                layout,
-                26.0,
-                theme::WARNING_TINT,
-                theme::WARNING,
-                "Active root unavailable — showing the last folder.",
-                sanitize_display(&unavailable, 600),
-            );
-            body.add_space(4.0);
-        }
-        if self.source_control_open() {
-            self.git_view_ui(&mut body);
-        } else {
-            self.tree_rows_ui(&mut body, log, layout);
-        }
-    }
-
-    fn paint_repos_aside(
-        &self,
-        ui: &mut Ui,
-        clip: egui::Rect,
-        head: &str,
-        head_hover: &str,
-        shown_name: Option<&str>,
-    ) {
-        let head = sanitize_display(head, 160);
-        let shown = shown_name
-            .map(|name| sanitize_display(name, 160))
-            .filter(|name| !name.is_empty());
-        let Some(name) = shown else {
-            if !head.is_empty() {
-                paint_clipped_label(
-                    ui,
-                    clip,
-                    clip.left(),
-                    &head,
-                    clip.width(),
-                    self.ui_scope.with("source-control-head"),
-                    Some(head_hover),
-                );
-            }
-            return;
-        };
-        let gap = 4.0;
-        let icon = theme::LINKED_WORKTREE_ICON;
-        let mut head_w = if head.is_empty() {
-            0.0
-        } else {
-            mono_width(ui, &head)
-        };
-        let mut name_w = mono_width(ui, &name);
-        let leading = if head_w > 0.0 { gap } else { 0.0 };
-        let block = leading + icon + gap;
-        let overflow = (head_w + block + name_w - clip.width()).max(0.0);
-        if overflow > 0.0 {
-            let name_cut = overflow.min((name_w - 1.0).max(0.0));
-            name_w -= name_cut;
-            head_w = (head_w - (overflow - name_cut)).max(0.0);
-        }
-        let mut x = clip.left();
-        if head_w >= 1.0 && !head.is_empty() {
-            paint_clipped_label(
-                ui,
-                clip,
-                x,
-                &head,
-                head_w,
-                self.ui_scope.with("source-control-head"),
-                Some(head_hover),
-            );
-            x += head_w + gap;
-        }
-        if x + icon > clip.right() {
-            return;
-        }
-        let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(x + icon * 0.5, clip.center().y),
-            egui::vec2(icon, icon),
-        );
-        theme::paint_icon(
-            &ui.painter().with_clip_rect(clip),
-            icon_rect,
-            theme::IconGlyph::LinkedWorktree,
-            theme::TEXT_TERTIARY,
-        );
-        x += icon + gap;
-        name_w = name_w.min((clip.right() - x).max(0.0));
-        let hover = linked_worktree_hover(&name);
-        if name_w < 1.0 {
-            ui.interact(
-                icon_rect,
-                self.ui_scope.with("linked-worktree"),
-                Sense::hover(),
-            )
-            .on_hover_text(sanitize_display(&hover, 600));
-            return;
-        }
-        let text_rect = paint_clipped_label(ui, clip, x, &name, name_w, self.ui_scope, None);
-        ui.interact(
-            icon_rect.union(text_rect),
-            self.ui_scope.with("linked-worktree"),
-            Sense::hover(),
-        )
-        .on_hover_text(sanitize_display(&hover, 600));
-    }
-
-    fn header_view_icons(&mut self, ui: &mut Ui, content: egui::Rect) {
-        let extent = 24.0;
-        let gap = theme::explorer_header_glass(self.native_backdrop_applied);
-        let open = self.source_control_open;
-        let folders_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                content.right() - extent * 2.0 - HEADER_ICON_GAP,
-                content.top(),
-            ),
-            egui::vec2(extent, content.height()),
-        );
-        let git_rect = egui::Rect::from_min_size(
-            egui::pos2(content.right() - extent, content.top()),
-            egui::vec2(extent, content.height()),
-        );
-        let mut folders_ui = ui.new_child(
-            UiBuilder::new()
-                .max_rect(folders_rect)
-                .layout(egui::Layout::right_to_left(Align::Center)),
-        );
-        let folders = theme::icon_action(
-            &mut folders_ui,
-            self.ui_scope.with("explorer-view"),
-            theme::IconGlyph::Folders,
-            "Explorer",
-            !open,
-            extent,
-            gap,
-        );
-        let mut git_ui = ui.new_child(
-            UiBuilder::new()
-                .max_rect(git_rect)
-                .layout(egui::Layout::right_to_left(Align::Center)),
-        );
-        let git = theme::source_control_action(
-            &mut git_ui,
-            self.ui_scope.with("source-control"),
-            &source_control_tooltip(self.git_status.as_ref()),
-            open,
-            extent,
-            gap,
-            source_control_rings(self.git_status.as_ref()),
-        );
-        // The tooltip may include a count. The accessible name does not.
-        git.response
-            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Source Control"));
-        // The active icon does not switch. The other icon switches only the body.
-        if folders.activated && open {
-            self.source_control_open = false;
-        }
-        if git.activated && !open {
-            self.source_control_open = true;
-            self.source_control_opened = true;
-        }
-    }
-
-    fn git_view_ui(&mut self, ui: &mut Ui) {
-        if self.git_status.is_none() {
-            let message = if self.git_status_failed {
-                "Git status unavailable"
             } else {
-                "Reading changes…"
+                ExplorerTreeBody::Rows(&LocalRows {
+                    rows: &self.rows,
+                    icons: &self.row_icons,
+                    folders: self.git_status.as_ref().map(|status| &status.folders),
+                    files: files.as_ref(),
+                })
             };
-            ui.label(quiet_line(message));
-            return;
-        }
-        let Some(status) = self.git_status.clone() else {
-            return;
+            let git = git_open.then(|| {
+                local_git_body(
+                    self.git_status.as_ref(),
+                    self.git_selected.as_deref(),
+                    self.git_status_failed,
+                )
+            });
+            let view = ExplorerCardView {
+                git_open,
+                show_icon,
+                root_name,
+                git_header: git_open.then_some(&self.git_header),
+                source_control_tooltip: tooltip,
+                source_control_rings: rings,
+                root_unavailable: self.root_unavailable.clone(),
+                tree,
+                git,
+                scroll_to_selection,
+            };
+            explorer_card_ui(
+                ui,
+                &view,
+                self.ui_scope,
+                self.native_backdrop_applied,
+                layout,
+            )
         };
-        if open_change_count(Some(&status)) == 0 {
-            ui.label(quiet_line("No changes"));
-            return;
-        }
-        let mut action = None;
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for group in &status.groups {
-                    if group.rows.is_empty() {
-                        continue;
-                    }
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!("{} ({})", group.title, group.rows.len()))
-                            .font(FontId::proportional(10.5))
-                            .color(theme::TEXT_TERTIARY),
-                    );
-                    for (index, row) in group.rows.iter().enumerate() {
-                        if let Some(clicked) = git_status_row_ui(
-                            ui,
-                            self.ui_scope.with((group.title, index)),
-                            row,
-                            self.git_selected.as_deref() == Some(row.path.as_path()),
-                        ) {
-                            action = Some(clicked);
-                        }
-                    }
-                }
-            });
-        if let Some(row) = action {
-            self.git_selected = Some(row.path.clone());
-            if row.opens_preview() {
-                self.open_preview(row.path);
-            }
-        }
+        self.apply_explorer_card_result(result);
     }
 
-    fn tree_rows_ui(&mut self, ui: &mut Ui, _log: &mut DiagnosticLog, layout: &theme::Layout) {
-        if let Some(error) = self.root_error.clone() {
-            self.root_error_ui(ui, &error, layout);
-            return;
-        }
-
-        if self.rows.is_empty() {
-            if self
-                .tree
-                .as_ref()
-                .is_some_and(|tree| tree.loading_dirs().next().is_some())
-            {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                    ui.label(theme::body("Loading folder…"));
-                });
-            } else {
-                ui.add_space(6.0);
-                ui.label(theme::body("This folder is empty."));
-            }
-            return;
-        }
-
-        let tree_id = self.tree_focus_id();
-        let ui_scope = self.ui_scope;
-        let scroll_to_selection = self.scroll_to_selection;
-        let mut action = None;
-        let mut clicked_tree = false;
-        let tree_rect = ui.available_rect_before_wrap();
-        ui.memory_mut(|memory| {
-            memory.set_focus_lock_filter(
-                tree_id,
-                egui::EventFilter {
-                    tab: false,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: false,
-                },
-            );
-        });
-        let container = ui.interact(tree_rect, tree_id, Sense::click());
-        if container.clicked() {
-            container.request_focus();
-        }
-        // Keyboard/programmatic entry into the tree must have a visible cue.
-        // Select the first visible row without activating it (no preview).
-        if container.has_focus()
-            && self.tree.as_ref().and_then(TreeModel::selection).is_none()
-            && !self.rows.is_empty()
-        {
-            let first = self.rows[0].path.clone();
-            self.apply_selection_path(&first);
-        }
-        let rows = &self.rows;
-        let row_icons = &self.row_icons;
-        let folders = self
-            .git_status
-            .as_ref()
-            .map(|status| status.folders.clone())
-            .unwrap_or_default();
-        let files = self
-            .git_status
-            .as_ref()
-            .map(file_status_marks)
-            .unwrap_or_default();
-
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_rows(ui, 24.0, rows.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for index in range {
-                    let Some(row) = rows.get(index) else {
-                        continue;
-                    };
-                    let icon = row_icons.get(index).copied().flatten();
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 24.0),
-                        Sense::hover(),
-                    );
-                    let response =
-                        ui.interact(rect, ui_scope.with(("tree-row", index)), Sense::CLICK);
-                    let fill = if row.selected {
-                        theme::BG_SELECTED
-                    } else if response.hovered() {
-                        theme::BG_HOVER
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
-                    if fill != Color32::TRANSPARENT {
-                        ui.painter()
-                            .rect_filled(row_rect, CornerRadius::same(6), fill);
-                    }
-
-                    let icon_slot_left = 8.0 + row.depth as f32 * 14.0;
-                    let expanded = row.kind == EntryKind::Directory && row.expanded;
-                    let color = if row.kind == EntryKind::Error {
-                        theme::ERROR
-                    } else if row.selected || expanded {
-                        theme::TEXT_PRIMARY
-                    } else {
-                        theme::TEXT_SECONDARY
-                    };
-                    let icon_color = if row.kind == EntryKind::Error {
-                        theme::ERROR
-                    } else if row.selected || expanded {
-                        theme::TEXT_PRIMARY
-                    } else {
-                        theme::TEXT_TERTIARY
-                    };
-                    let name = sanitize_display(&row.name, 200);
-                    let text_left = rect.left() + 28.0 + row.depth as f32 * 14.0;
-                    // Folders use ancestor marks. Files use only their own kinds,
-                    // and only when that path is already a tree row.
-                    let status_mark = match row.kind {
-                        EntryKind::Directory => folders.get(&row.path),
-                        EntryKind::File => files.get(&row.path),
-                        _ => None,
-                    };
-                    // A 6px dot sits 8px in from the row's right edge. Text stops
-                    // before it so the label never covers the mark.
-                    let dot_center =
-                        status_mark.map(|_| egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y));
-                    let text_right = dot_center
-                        .map(|center| center.x - 3.0 - 6.0)
-                        .unwrap_or(rect.right() - 6.0);
-                    let width = (text_right - text_left).max(1.0);
-                    theme::paint_ellipsized_centered(
-                        ui.painter(),
-                        text_left,
-                        rect.center().y,
-                        name,
-                        FontId::proportional(12.5),
-                        color,
-                        width,
-                    );
-                    // The label helper centers its galley on the row center, so
-                    // the markers use that same optical center.
-                    let marker_center =
-                        egui::pos2(rect.left() + icon_slot_left + 8.0, rect.center().y);
-                    match row.kind {
-                        EntryKind::Directory | EntryKind::File => {
-                            if let Some(icon) = icon {
-                                paint_entry_icon(ui, marker_center, icon);
-                            }
-                        }
-                        EntryKind::Symlink => {
-                            ui.painter().text(
-                                marker_center,
-                                Align2::CENTER_CENTER,
-                                "@",
-                                FontId::monospace(10.0),
-                                icon_color,
-                            );
-                        }
-                        EntryKind::Other => {
-                            ui.painter().text(
-                                marker_center,
-                                Align2::CENTER_CENTER,
-                                "?",
-                                FontId::monospace(10.0),
-                                icon_color,
-                            );
-                        }
-                        EntryKind::Error => {
-                            ui.painter().text(
-                                marker_center,
-                                Align2::CENTER_CENTER,
-                                "!",
-                                FontId::monospace(10.0),
-                                icon_color,
-                            );
-                        }
-                    }
-
-                    let pointer_on_dot =
-                        if let (Some(mark), Some(center)) = (status_mark, dot_center) {
-                            paint_status_dot(
-                                ui,
-                                ui_scope.with(("tree-dot", index)),
-                                rect,
-                                center,
-                                folder_mark_color(mark),
-                                &mark.tooltip(),
-                            )
-                        } else {
-                            false
-                        };
-                    let path_tooltip = if let Some(error) = &row.error {
-                        sanitize_display(error, 600)
-                    } else {
-                        sanitize_display(&row.path.display().to_string(), 600)
-                    };
-                    // The kind strip owns the tooltip while the pointer is in it.
-                    let response = if pointer_on_dot {
-                        response
-                    } else {
-                        response.on_hover_text(path_tooltip)
-                    };
-                    if scroll_to_selection && row.selected {
-                        response.scroll_to_me(Some(Align::Center));
-                    }
-                    if response.clicked() {
-                        clicked_tree = true;
-                        action = Some(match row.kind {
-                            EntryKind::Directory => TreeAction::Toggle(row.path.clone()),
-                            EntryKind::File => TreeAction::OpenFile(row.path.clone()),
-                            _ => TreeAction::Select(row.clone()),
-                        });
-                    }
+    fn apply_explorer_card_result(&mut self, result: ExplorerCardResult) {
+        if let Some(switch) = result.switch {
+            match switch {
+                ExplorerViewKind::Files => self.source_control_open = false,
+                ExplorerViewKind::Git => {
+                    self.source_control_open = true;
+                    self.source_control_opened = true;
                 }
-            });
-        self.scroll_to_selection = false;
-        if clicked_tree {
-            ui.memory_mut(|memory| memory.request_focus(tree_id));
+            }
         }
-        if let Some(action) = action {
+        if result.retry {
+            self.retry();
+        }
+        if let Some(action) = result.row {
             match action {
-                TreeAction::Select(row) => self.select_row_click(&row),
-                TreeAction::Toggle(path) => {
-                    self.toggle_dir(path.clone());
-                    if let Some(tree) = self.tree.as_mut() {
-                        tree.select(&path).ok();
+                ExplorerRowAction::Click(index) => {
+                    if let Some(row) = self.rows.get(index).cloned() {
+                        self.select_row_click(&row);
                     }
-                    self.rows_dirty = true;
                 }
-                TreeAction::OpenFile(path) => {
-                    self.apply_selection_path(&path);
-                    self.open_preview(path);
+                ExplorerRowAction::Select(index) => {
+                    if let Some(path) = self.rows.get(index).map(|row| row.path.clone()) {
+                        self.apply_selection_path(&path);
+                    }
+                }
+                ExplorerRowAction::Toggle(index) => {
+                    if let Some(row) = self.rows.get(index).cloned() {
+                        self.apply_selection_path(&row.path);
+                        self.toggle_dir(row.path.clone());
+                        self.rows_dirty = true;
+                    }
+                }
+                ExplorerRowAction::Activate(index) => {
+                    if let Some(row) = self.rows.get(index).cloned() {
+                        self.activate_row(&row);
+                    }
                 }
             }
         }
-        self.handle_tree_keys(ui, tree_id);
-    }
-
-    fn root_error_ui(&mut self, ui: &mut Ui, error: &str, layout: &theme::Layout) {
-        egui::Frame::new()
-            .fill(theme::ERROR_TINT)
-            .stroke(Stroke::new(1.0, theme::ERROR))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("Explorer unavailable")
-                        .font(FontId::proportional(13.0))
-                        .color(theme::ERROR),
-                );
-                ui.label(theme::body(sanitize_display(error, 700)));
-                if theme::secondary_button(ui, "Retry", layout.button_height).clicked() {
-                    self.retry();
+        if let Some((group_index, row_index)) = result.git_row {
+            if let Some(row) = self
+                .git_status
+                .as_ref()
+                .and_then(|status| status.groups.get(group_index))
+                .and_then(|group| group.rows.get(row_index))
+                .cloned()
+            {
+                self.git_selected = Some(row.path.clone());
+                if row.opens_preview() {
+                    self.open_preview(row.path);
                 }
-            });
+            }
+        }
     }
 
     fn preview_card(
@@ -2070,267 +1740,1079 @@ impl ExplorerPane {
             // until the user opens a real file.
             return PreviewUiAction::None;
         }
-        let card_rect = ui.available_rect_before_wrap();
-        theme::paint_card(ui.painter(), card_rect, layout, theme::BG_CARD);
-
-        let focus_id = self.preview_focus_id();
-        let focus_response = ui.interact(card_rect, focus_id, Sense::click());
-        let pressed_here = ui.ctx().input(|input| {
-            input.pointer.any_pressed()
-                && input
-                    .pointer
-                    .interact_pos()
-                    .is_some_and(|pos| card_rect.contains(pos))
-        });
-        if self.preview_focus_pending || pressed_here {
-            self.preview_focus_pending = false;
-            focus_response.request_focus();
+        let path = self.preview.path.as_ref().expect("preview path checked");
+        let full = path.display().to_string();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| full.clone());
+        let focus_pending = self.preview_focus_pending;
+        let result = preview_card_ui(
+            ui,
+            PreviewCardState {
+                path_name: Some(&name),
+                path_full: Some(&full),
+                document: self.preview.document.as_ref(),
+                loading: self.preview.loading,
+                error: self.preview.error.as_deref(),
+                refreshed_at: self.preview.refreshed_at,
+                focus_pending,
+            },
+            PreviewCardIds {
+                focus: self.preview_focus_id(),
+                close: self.preview_action_id(PreviewAction::Close),
+                terminal: self.preview_terminal_id(),
+                refresh: self.preview_action_id(PreviewAction::Refresh),
+                copy: self.preview_action_id(PreviewAction::CopyPath),
+            },
+            layout,
+        );
+        self.preview_focus_pending = false;
+        if result.copy_path {
+            ui.ctx().copy_text(sanitize_display(&full, 4096));
+            log.record(LogLevel::Info, "preview path copied");
         }
-        if ui.memory(|memory| memory.has_focus(focus_id)) {
-            if let Some(action) = preview_shortcut_action_from_input(ui.ctx()) {
-                if let Some(outcome) = self.apply_preview_action(action, ui, log) {
-                    return outcome;
+        if result.refresh {
+            self.refresh_preview();
+        }
+        if result.surface == PreviewUiAction::Close {
+            self.clear_preview();
+        }
+        result.surface
+    }
+}
+
+struct LocalRows<'a> {
+    rows: &'a [TreeRow],
+    icons: &'a [Option<explorer_icons::IconId>],
+    folders: Option<&'a BTreeMap<PathBuf, FolderMark>>,
+    files: Option<&'a BTreeMap<PathBuf, FolderMark>>,
+}
+
+impl ExplorerRowSource for LocalRows<'_> {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, index: usize) -> ExplorerRowView<'_> {
+        let row = &self.rows[index];
+        let mark = match row.kind {
+            EntryKind::Directory => self
+                .folders
+                .and_then(|folders| folders.get(&row.path))
+                .map(RowMark::Local),
+            EntryKind::File => self
+                .files
+                .and_then(|files| files.get(&row.path))
+                .map(RowMark::Local),
+            _ => None,
+        };
+        ExplorerRowView {
+            name: Cow::Borrowed(&row.name),
+            depth: row.depth,
+            kind: row.kind,
+            expanded: row.expanded,
+            selected: row.selected,
+            error: row.error.as_deref(),
+            tooltip: RowTooltip::Path(&row.path),
+            mark,
+            icon: self.icons.get(index).copied().flatten(),
+        }
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.rows.iter().position(|row| row.selected)
+    }
+}
+
+fn local_git_body(
+    status: Option<&GitStatusSnapshot>,
+    selected: Option<&Path>,
+    failed: bool,
+) -> GitBodyView {
+    let mut groups = Vec::new();
+    if let Some(status) = status {
+        for group in &status.groups {
+            if group.rows.is_empty() {
+                continue;
+            }
+            let rows = group
+                .rows
+                .iter()
+                .map(|row| {
+                    let entry_kind = if row.is_directory {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    };
+                    let icon_name = row
+                        .relative
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    GitRowView {
+                        name: row.relative.display().to_string(),
+                        kind: row.kind,
+                        selected: selected == Some(row.path.as_path()),
+                        icon: explorer_icons::resolve(icon_name, entry_kind, false),
+                        tooltip: row.path.display().to_string(),
+                        original: row
+                            .original_relative
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
+                    }
+                })
+                .collect();
+            groups.push(GitGroupView {
+                title: group.title,
+                rows,
+            });
+        }
+    }
+    GitBodyView {
+        has_status: status.is_some(),
+        failed,
+        groups,
+    }
+}
+
+fn explorer_card_ui(
+    ui: &mut Ui,
+    view: &ExplorerCardView<'_>,
+    scope: egui::Id,
+    native_backdrop: bool,
+    layout: &theme::Layout,
+) -> ExplorerCardResult {
+    let mut result = ExplorerCardResult::default();
+    // Allocate the whole card so the resizable split panel does not
+    // shrink-wrap to the tree content on the second frame.
+    let (card_rect, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+    theme::paint_glass_card(ui.painter(), card_rect, layout, native_backdrop);
+    let header_rect = egui::Rect::from_min_size(
+        card_rect.min,
+        egui::vec2(card_rect.width(), layout.card_header_height),
+    );
+    theme::paint_glass_card_header(ui, header_rect, layout, native_backdrop);
+    let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
+    let show_icon = view.show_icon;
+    let spacing = ui.spacing().item_spacing.x;
+    let icon_extent = theme::icon_action_extent(24.0);
+    // The name stops before the gap and both 24×24 icons. A character
+    // estimate cannot do that: wide glyphs would paint into the icons.
+    let icon_reserve = header_icon_reserve(icon_extent, spacing, show_icon);
+    let left_rect = egui::Rect::from_min_max(
+        content.min,
+        egui::pos2(
+            (content.right() - icon_reserve).max(content.left()),
+            content.bottom(),
+        ),
+    );
+    let mut left = ui.new_child(
+        UiBuilder::new()
+            .max_rect(left_rect)
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    let git_open = view.git_open;
+    // Owned before the label is painted: the aside width is measured from
+    // the section label's right edge, and the git view must not fall back
+    // to the root name when the head line is empty.
+    let aside = if git_open {
+        view.git_header.and_then(|header| {
+            let raw_head = source_control_head_label(
+                header.branch.as_deref(),
+                header.detached,
+                header.commit_abbrev.as_deref(),
+            );
+            let (head, shown_name) = repos_aside_texts(
+                &raw_head,
+                header.is_linked_worktree,
+                header.directory_name.as_deref(),
+            );
+            if head.is_empty() && shown_name.is_none() {
+                None
+            } else {
+                let hover = source_control_head_hover(
+                    &raw_head,
+                    header.detached,
+                    header.commit_abbrev.as_deref(),
+                    header.commit_subject.as_deref(),
+                );
+                Some((head, hover, shown_name))
+            }
+        })
+    } else {
+        view.root_name
+            .as_ref()
+            .map(|(name, full)| (name.clone(), full.clone(), None))
+    };
+    theme::section_label(&mut left, if git_open { "REPOS" } else { "EXPLORER" });
+    if let Some((text, hover, shown_name)) = aside {
+        let name_width = root_name_width(
+            left.min_rect().right(),
+            content.right(),
+            spacing,
+            icon_extent,
+            show_icon,
+        );
+        if name_width >= 1.0 {
+            let name_left = left.min_rect().right() + spacing;
+            let name_rect = egui::Rect::from_min_size(
+                egui::pos2(name_left, left_rect.top()),
+                egui::vec2(name_width, left_rect.height()),
+            );
+            if git_open {
+                paint_repos_aside_ui(ui, name_rect, &text, &hover, shown_name.as_deref(), scope);
+            } else {
+                paint_clipped_label(
+                    ui,
+                    name_rect,
+                    name_left,
+                    &text,
+                    name_width,
+                    scope.with("explorer-root-name"),
+                    Some(&hover),
+                );
+            }
+        }
+    }
+    if show_icon {
+        if let Some(switch) = explorer_header_icons_ui(
+            ui,
+            content,
+            git_open,
+            scope,
+            native_backdrop,
+            &view.source_control_tooltip,
+            view.source_control_rings,
+        ) {
+            result.switch = Some(switch);
+        }
+    }
+    theme::paint_card_border(ui, card_rect, layout);
+
+    let body_rect = egui::Rect::from_min_max(
+        egui::pos2(card_rect.left(), header_rect.bottom()),
+        card_rect.max,
+    );
+    let content_rect = body_rect.shrink2(egui::vec2(8.0, 4.0));
+    let mut body = ui.new_child(UiBuilder::new().max_rect(content_rect));
+    if let Some(unavailable) = &view.root_unavailable {
+        tone_strip(
+            &mut body,
+            layout,
+            26.0,
+            theme::WARNING_TINT,
+            theme::WARNING,
+            "Active root unavailable — showing the last folder.",
+            sanitize_display(unavailable, 600),
+        );
+        body.add_space(4.0);
+    }
+    if git_open {
+        if let Some(git) = &view.git {
+            git_body_ui(&mut body, git, scope, &mut result);
+        }
+    } else {
+        explorer_tree_body_ui(
+            &mut body,
+            &view.tree,
+            scope,
+            layout,
+            view.scroll_to_selection,
+            &mut result,
+        );
+    }
+    result
+}
+
+fn explorer_tree_body_ui(
+    ui: &mut Ui,
+    body: &ExplorerTreeBody<'_>,
+    scope: egui::Id,
+    layout: &theme::Layout,
+    scroll_to_selection: bool,
+    result: &mut ExplorerCardResult,
+) {
+    match body {
+        ExplorerTreeBody::Error(message) => {
+            egui::Frame::new()
+                .fill(theme::ERROR_TINT)
+                .stroke(Stroke::new(1.0, theme::ERROR))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Explorer unavailable")
+                            .font(FontId::proportional(13.0))
+                            .color(theme::ERROR),
+                    );
+                    ui.label(theme::body(sanitize_display(message, 700)));
+                    if theme::secondary_button(ui, "Retry", layout.button_height).clicked() {
+                        result.retry = true;
+                    }
+                });
+        }
+        ExplorerTreeBody::Loading => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                ui.label(theme::body("Loading folder…"));
+            });
+        }
+        ExplorerTreeBody::Empty => {
+            ui.add_space(6.0);
+            ui.label(theme::body("This folder is empty."));
+        }
+        ExplorerTreeBody::Rows(source) => {
+            explorer_tree_rows_ui(ui, *source, scope, scroll_to_selection, result);
+        }
+    }
+}
+
+fn explorer_tree_rows_ui(
+    ui: &mut Ui,
+    source: &dyn ExplorerRowSource,
+    scope: egui::Id,
+    scroll_to_selection: bool,
+    result: &mut ExplorerCardResult,
+) {
+    let total = source.row_count();
+    if total == 0 {
+        ui.add_space(6.0);
+        ui.label(theme::body("This folder is empty."));
+        return;
+    }
+    let tree_id = scope.with("tree-focus");
+    let mut action = None;
+    let mut effective_first = None;
+    let selected_index = source.selected_index();
+    let tree_rect = ui.available_rect_before_wrap();
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            tree_id,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: false,
+            },
+        );
+    });
+    let container = ui.interact(tree_rect, tree_id, Sense::click());
+    if container.clicked() {
+        container.request_focus();
+    }
+    // Keyboard/programmatic entry into the tree must have a visible cue.
+    // Select the first visible row without activating it (no preview).
+    if container.has_focus() && selected_index.is_none() {
+        effective_first = Some(0);
+        action = Some(ExplorerRowAction::Select(0));
+    }
+
+    let mut scroll_to = if scroll_to_selection {
+        selected_index
+    } else {
+        None
+    };
+    if container.has_focus() {
+        let events = ui.ctx().input(|input| input.events.clone());
+        let mut cursor = selected_index;
+        for event in events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if key == egui::Key::S && (modifiers.command || modifiers.ctrl) {
+                continue;
+            }
+            match key {
+                egui::Key::ArrowDown => {
+                    let next = cursor.map_or(0, |index| (index + 1).min(total - 1));
+                    cursor = Some(next);
+                    action = Some(ExplorerRowAction::Select(next));
+                    scroll_to = Some(next);
+                }
+                egui::Key::ArrowUp => {
+                    let next = cursor.map_or(total - 1, |index| index.saturating_sub(1));
+                    cursor = Some(next);
+                    action = Some(ExplorerRowAction::Select(next));
+                    scroll_to = Some(next);
+                }
+                egui::Key::Home => {
+                    cursor = Some(0);
+                    action = Some(ExplorerRowAction::Select(0));
+                    scroll_to = Some(0);
+                }
+                egui::Key::End => {
+                    let last = total - 1;
+                    cursor = Some(last);
+                    action = Some(ExplorerRowAction::Select(last));
+                    scroll_to = Some(last);
+                }
+                egui::Key::PageUp => {
+                    let next = cursor.map_or(total - 1, |index| index.saturating_sub(10));
+                    cursor = Some(next);
+                    action = Some(ExplorerRowAction::Select(next));
+                    scroll_to = Some(next);
+                }
+                egui::Key::PageDown => {
+                    let next = cursor.map_or(0, |index| (index + 10).min(total - 1));
+                    cursor = Some(next);
+                    action = Some(ExplorerRowAction::Select(next));
+                    scroll_to = Some(next);
+                }
+                egui::Key::ArrowRight => {
+                    if let Some(index) = cursor {
+                        let row = source.row(index);
+                        if row.kind == EntryKind::Directory {
+                            action = Some(ExplorerRowAction::Toggle(index));
+                        }
+                    }
+                }
+                egui::Key::ArrowLeft => {
+                    if let Some(index) = cursor {
+                        let row = source.row(index);
+                        if row.kind == EntryKind::Directory && row.expanded {
+                            action = Some(ExplorerRowAction::Toggle(index));
+                        } else if row.depth > 0 {
+                            let parent = (0..index)
+                                .rev()
+                                .find(|&candidate| source.row(candidate).depth + 1 == row.depth);
+                            if let Some(parent) = parent {
+                                cursor = Some(parent);
+                                action = Some(ExplorerRowAction::Select(parent));
+                                scroll_to = Some(parent);
+                            }
+                        }
+                    }
+                }
+                egui::Key::Enter | egui::Key::Space => {
+                    if let Some(index) = cursor {
+                        action = Some(ExplorerRowAction::Activate(index));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut clicked = None;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, 24.0, total, |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for index in range {
+                let row = source.row(index);
+                let selected = row.selected || effective_first == Some(index);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+                let response = ui.interact(rect, scope.with(("tree-row", index)), Sense::CLICK);
+                let fill = if selected {
+                    theme::BG_SELECTED
+                } else if response.hovered() {
+                    theme::BG_HOVER
+                } else {
+                    Color32::TRANSPARENT
+                };
+                let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
+                if fill != Color32::TRANSPARENT {
+                    ui.painter()
+                        .rect_filled(row_rect, CornerRadius::same(6), fill);
+                }
+
+                let icon_slot_left = 8.0 + row.depth as f32 * 14.0;
+                let expanded = row.kind == EntryKind::Directory && row.expanded;
+                let color = if row.kind == EntryKind::Error {
+                    theme::ERROR
+                } else if selected || expanded {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SECONDARY
+                };
+                let icon_color = if row.kind == EntryKind::Error {
+                    theme::ERROR
+                } else if selected || expanded {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_TERTIARY
+                };
+                let name = sanitize_display(&row.name, 200);
+                let text_left = rect.left() + 28.0 + row.depth as f32 * 14.0;
+                // A 6px dot sits 8px in from the row's right edge. Text stops
+                // before it so the label never covers the mark.
+                let dot_center = row
+                    .mark
+                    .as_ref()
+                    .map(|_| egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y));
+                let text_right = dot_center
+                    .map(|center| center.x - 3.0 - 6.0)
+                    .unwrap_or(rect.right() - 6.0);
+                let width = (text_right - text_left).max(1.0);
+                theme::paint_ellipsized_centered(
+                    ui.painter(),
+                    text_left,
+                    rect.center().y,
+                    name,
+                    FontId::proportional(12.5),
+                    color,
+                    width,
+                );
+                // The label helper centers its galley on the row center, so
+                // the markers use that same optical center.
+                let marker_center = egui::pos2(rect.left() + icon_slot_left + 8.0, rect.center().y);
+                match row.kind {
+                    EntryKind::Directory | EntryKind::File => {
+                        if let Some(icon) = row.icon {
+                            paint_entry_icon(ui, marker_center, icon);
+                        }
+                    }
+                    EntryKind::Symlink => {
+                        ui.painter().text(
+                            marker_center,
+                            Align2::CENTER_CENTER,
+                            "@",
+                            FontId::monospace(10.0),
+                            icon_color,
+                        );
+                    }
+                    EntryKind::Other => {
+                        ui.painter().text(
+                            marker_center,
+                            Align2::CENTER_CENTER,
+                            "?",
+                            FontId::monospace(10.0),
+                            icon_color,
+                        );
+                    }
+                    EntryKind::Error => {
+                        ui.painter().text(
+                            marker_center,
+                            Align2::CENTER_CENTER,
+                            "!",
+                            FontId::monospace(10.0),
+                            icon_color,
+                        );
+                    }
+                }
+
+                let pointer_on_dot = if let (Some(mark), Some(center)) = (&row.mark, dot_center) {
+                    paint_status_dot(
+                        ui,
+                        scope.with(("tree-dot", index)),
+                        rect,
+                        center,
+                        mark.color(),
+                        &mark.tooltip(),
+                    )
+                } else {
+                    false
+                };
+                let path_tooltip = if let Some(error) = row.error {
+                    sanitize_display(error, 600)
+                } else {
+                    sanitize_display(&row.tooltip.text(), 600)
+                };
+                // The kind strip owns the tooltip while the pointer is in it.
+                let response = if pointer_on_dot {
+                    response
+                } else {
+                    response.on_hover_text(path_tooltip)
+                };
+                if scroll_to == Some(index) {
+                    response.scroll_to_me(Some(Align::Center));
+                }
+                if response.clicked() {
+                    clicked = Some(ExplorerRowAction::Click(index));
+                }
+            }
+        });
+    if let Some(clicked) = clicked {
+        ui.memory_mut(|memory| memory.request_focus(tree_id));
+        result.row = Some(clicked);
+    } else if let Some(action) = action {
+        result.row = Some(action);
+    }
+}
+
+fn paint_repos_aside_ui(
+    ui: &mut Ui,
+    clip: egui::Rect,
+    head: &str,
+    head_hover: &str,
+    shown_name: Option<&str>,
+    scope: egui::Id,
+) {
+    let head = sanitize_display(head, 160);
+    let shown = shown_name
+        .map(|name| sanitize_display(name, 160))
+        .filter(|name| !name.is_empty());
+    let Some(name) = shown else {
+        if !head.is_empty() {
+            paint_clipped_label(
+                ui,
+                clip,
+                clip.left(),
+                &head,
+                clip.width(),
+                scope.with("source-control-head"),
+                Some(head_hover),
+            );
+        }
+        return;
+    };
+    let gap = 4.0;
+    let icon = theme::LINKED_WORKTREE_ICON;
+    let mut head_w = if head.is_empty() {
+        0.0
+    } else {
+        mono_width(ui, &head)
+    };
+    let mut name_w = mono_width(ui, &name);
+    let leading = if head_w > 0.0 { gap } else { 0.0 };
+    let block = leading + icon + gap;
+    let overflow = (head_w + block + name_w - clip.width()).max(0.0);
+    if overflow > 0.0 {
+        let name_cut = overflow.min((name_w - 1.0).max(0.0));
+        name_w -= name_cut;
+        head_w = (head_w - (overflow - name_cut)).max(0.0);
+    }
+    let mut x = clip.left();
+    if head_w >= 1.0 && !head.is_empty() {
+        paint_clipped_label(
+            ui,
+            clip,
+            x,
+            &head,
+            head_w,
+            scope.with("source-control-head"),
+            Some(head_hover),
+        );
+        x += head_w + gap;
+    }
+    if x + icon > clip.right() {
+        return;
+    }
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(x + icon * 0.5, clip.center().y),
+        egui::vec2(icon, icon),
+    );
+    theme::paint_icon(
+        &ui.painter().with_clip_rect(clip),
+        icon_rect,
+        theme::IconGlyph::LinkedWorktree,
+        theme::TEXT_TERTIARY,
+    );
+    x += icon + gap;
+    name_w = name_w.min((clip.right() - x).max(0.0));
+    let hover = linked_worktree_hover(&name);
+    if name_w < 1.0 {
+        ui.interact(icon_rect, scope.with("linked-worktree"), Sense::hover())
+            .on_hover_text(sanitize_display(&hover, 600));
+        return;
+    }
+    let text_rect = paint_clipped_label(ui, clip, x, &name, name_w, scope, None);
+    ui.interact(
+        icon_rect.union(text_rect),
+        scope.with("linked-worktree"),
+        Sense::hover(),
+    )
+    .on_hover_text(sanitize_display(&hover, 600));
+}
+
+fn explorer_header_icons_ui(
+    ui: &mut Ui,
+    content: egui::Rect,
+    git_open: bool,
+    scope: egui::Id,
+    native_backdrop: bool,
+    source_control_tooltip: &str,
+    rings: theme::SourceControlRings,
+) -> Option<ExplorerViewKind> {
+    let extent = 24.0;
+    let gap = theme::explorer_header_glass(native_backdrop);
+    let folders_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            content.right() - extent * 2.0 - HEADER_ICON_GAP,
+            content.top(),
+        ),
+        egui::vec2(extent, content.height()),
+    );
+    let git_rect = egui::Rect::from_min_size(
+        egui::pos2(content.right() - extent, content.top()),
+        egui::vec2(extent, content.height()),
+    );
+    let mut folders_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(folders_rect)
+            .layout(egui::Layout::right_to_left(Align::Center)),
+    );
+    let folders = theme::icon_action(
+        &mut folders_ui,
+        scope.with("explorer-view"),
+        theme::IconGlyph::Folders,
+        "Explorer",
+        !git_open,
+        extent,
+        gap,
+    );
+    let mut git_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(git_rect)
+            .layout(egui::Layout::right_to_left(Align::Center)),
+    );
+    let git = theme::source_control_action(
+        &mut git_ui,
+        scope.with("source-control"),
+        source_control_tooltip,
+        git_open,
+        extent,
+        gap,
+        rings,
+    );
+    // The tooltip may include a count. The accessible name does not.
+    git.response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Source Control"));
+    // The active icon does not switch. The other icon switches only the body.
+    if folders.activated && git_open {
+        return Some(ExplorerViewKind::Files);
+    }
+    if git.activated && !git_open {
+        return Some(ExplorerViewKind::Git);
+    }
+    None
+}
+
+fn git_body_ui(ui: &mut Ui, body: &GitBodyView, scope: egui::Id, result: &mut ExplorerCardResult) {
+    if !body.has_status {
+        let message = if body.failed {
+            "Git status unavailable"
+        } else {
+            "Reading changes…"
+        };
+        ui.label(quiet_line(message));
+        return;
+    }
+    if body.groups.is_empty() {
+        ui.label(quiet_line("No changes"));
+        return;
+    }
+    let mut clicked = None;
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (group_index, group) in body.groups.iter().enumerate() {
+                if group.rows.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("{} ({})", group.title, group.rows.len()))
+                        .font(FontId::proportional(10.5))
+                        .color(theme::TEXT_TERTIARY),
+                );
+                for (row_index, row) in group.rows.iter().enumerate() {
+                    if git_row_ui(ui, scope.with((group.title, row_index)), row) {
+                        clicked = Some((group_index, row_index));
+                    }
+                }
+            }
+        });
+    if let Some(clicked) = clicked {
+        result.git_row = Some(clicked);
+    }
+}
+
+fn git_row_ui(ui: &mut Ui, id: egui::Id, row: &GitRowView) -> bool {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+    let response = ui.interact(rect, id, Sense::CLICK);
+    let fill = if row.selected {
+        theme::BG_SELECTED
+    } else if response.hovered() {
+        theme::BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
+    if fill != Color32::TRANSPARENT {
+        ui.painter()
+            .rect_filled(row_rect, CornerRadius::same(6), fill);
+    }
+    if let Some(icon) = row.icon {
+        paint_entry_icon(ui, egui::pos2(rect.left() + 16.0, rect.center().y), icon);
+    }
+    let dot_center = egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y);
+    let relative = sanitize_display(&row.name, 240);
+    let text_left = rect.left() + 28.0;
+    let text_right = dot_center.x - 3.0 - 6.0;
+    let width = (text_right - text_left).max(1.0);
+    let name_color = if row.selected {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    theme::paint_ellipsized_centered(
+        ui.painter(),
+        text_left,
+        rect.center().y,
+        relative,
+        FontId::proportional(12.5),
+        name_color,
+        width,
+    );
+    let pointer_on_dot = paint_status_dot(
+        ui,
+        id.with("status-dot"),
+        rect,
+        dot_center,
+        change_kind_color(row.kind),
+        row.kind.label(),
+    );
+    let mut tooltip = sanitize_display(&row.tooltip, 600);
+    if let Some(original) = &row.original {
+        tooltip = format!(
+            "{tooltip}\nrenamed from {}",
+            sanitize_display(original, 400)
+        );
+    }
+    let clicked = response.clicked();
+    if !pointer_on_dot {
+        response.on_hover_text(tooltip);
+    }
+    clicked
+}
+
+pub(crate) fn preview_card_ui(
+    ui: &mut Ui,
+    state: PreviewCardState<'_>,
+    ids: PreviewCardIds,
+    layout: &theme::Layout,
+) -> PreviewCardResult {
+    let mut result = PreviewCardResult::default();
+    let card_rect = ui.available_rect_before_wrap();
+    theme::paint_card(ui.painter(), card_rect, layout, theme::BG_CARD);
+
+    let focus_response = ui.interact(card_rect, ids.focus, Sense::click());
+    let pressed_here = ui.ctx().input(|input| {
+        input.pointer.any_pressed()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|pos| card_rect.contains(pos))
+    });
+    if state.focus_pending || pressed_here {
+        focus_response.request_focus();
+    }
+    if ui.memory(|memory| memory.has_focus(ids.focus)) {
+        if let Some(action) = preview_shortcut_action_from_input(ui.ctx()) {
+            match action {
+                PreviewAction::Refresh => result.refresh = true,
+                PreviewAction::CopyPath => result.copy_path = true,
+                PreviewAction::Close => {
+                    result.surface = PreviewUiAction::Close;
+                    return result;
                 }
             }
         }
+    }
 
-        let header_rect = egui::Rect::from_min_size(
-            card_rect.min,
-            egui::vec2(card_rect.width(), layout.card_header_height),
-        );
-        paint_card_header(ui, header_rect, layout, theme::BG_HEADER);
-        let has_path = self.preview.path.is_some();
-        let filename_chars = if card_rect.width() < 480.0 { 10 } else { 20 };
-        let mut copy_path = false;
-        let mut refresh = false;
-        let mut close = false;
-        let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
-        let mut right = ui.new_child(
-            UiBuilder::new()
-                .max_rect(content)
-                .layout(egui::Layout::right_to_left(Align::Center)),
-        );
-        let close_action = theme::ghost_action_with(
+    let header_rect = egui::Rect::from_min_size(
+        card_rect.min,
+        egui::vec2(card_rect.width(), layout.card_header_height),
+    );
+    paint_card_header(ui, header_rect, layout, theme::BG_HEADER);
+    let has_path = state.path_name.is_some();
+    let filename_chars = if card_rect.width() < 480.0 { 10 } else { 20 };
+    let content = header_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0));
+    let mut right = ui.new_child(
+        UiBuilder::new()
+            .max_rect(content)
+            .layout(egui::Layout::right_to_left(Align::Center)),
+    );
+    let close_action = theme::ghost_action_with(
+        &mut right,
+        ids.close,
+        PreviewAction::Close.label(),
+        false,
+        layout.button_height,
+        theme::BG_HEADER,
+        has_path,
+    );
+    close_action
+        .response
+        .on_hover_text("Close the preview and return to the live terminal");
+    if close_action.activated {
+        result.surface = PreviewUiAction::Close;
+    }
+    let terminal_action = theme::ghost_action(
+        &mut right,
+        ids.terminal,
+        "Terminal",
+        false,
+        layout.button_height,
+        theme::BG_HEADER,
+    );
+    terminal_action
+        .response
+        .on_hover_text("Return to the live terminal; the preview stays loaded");
+    if terminal_action.activated {
+        result.surface = PreviewUiAction::ShowTerminal;
+    }
+    if layout.compact {
+        let more = theme::ghost_action(
             &mut right,
-            self.preview_action_id(PreviewAction::Close),
-            PreviewAction::Close.label(),
+            ids.refresh.with("menu"),
+            "…",
+            false,
+            layout.button_height,
+            theme::BG_HEADER,
+        );
+        let more_response = more.response;
+        egui::Popup::menu(&more_response).show(|ui| {
+            if ui.button(PreviewAction::Refresh.label()).clicked() {
+                result.refresh = true;
+                ui.close();
+            }
+            if ui.button(PreviewAction::CopyPath.label()).clicked() {
+                result.copy_path = true;
+                ui.close();
+            }
+        });
+        more_response.on_hover_text("Preview actions");
+    } else {
+        let refresh_action = theme::ghost_action_with(
+            &mut right,
+            ids.refresh,
+            PreviewAction::Refresh.label(),
             false,
             layout.button_height,
             theme::BG_HEADER,
             has_path,
         );
-        close_action
+        refresh_action
             .response
-            .on_hover_text("Close the preview and return to the live terminal");
-        if close_action.activated {
-            close = true;
+            .on_hover_text("Re-read the selected file");
+        if refresh_action.activated {
+            result.refresh = true;
         }
-        let terminal_action = theme::ghost_action(
+        let copy_action = theme::ghost_action_with(
             &mut right,
-            self.preview_terminal_id(),
-            "Terminal",
+            ids.copy,
+            PreviewAction::CopyPath.label(),
             false,
             layout.button_height,
             theme::BG_HEADER,
+            has_path,
         );
-        terminal_action
+        copy_action
             .response
-            .on_hover_text("Return to the live terminal; the preview stays loaded");
-        let show_terminal = terminal_action.activated;
-        if layout.compact {
-            let more = theme::ghost_action(
-                &mut right,
-                self.preview_action_id(PreviewAction::Refresh).with("menu"),
-                "…",
-                false,
-                layout.button_height,
-                theme::BG_HEADER,
-            );
-            let more_response = more.response;
-            egui::Popup::menu(&more_response).show(|ui| {
-                if ui.button(PreviewAction::Refresh.label()).clicked() {
-                    refresh = true;
-                    ui.close();
-                }
-                if ui.button(PreviewAction::CopyPath.label()).clicked() {
-                    copy_path = true;
-                    ui.close();
-                }
-            });
-            more_response.on_hover_text("Preview actions");
-        } else {
-            let refresh_action = theme::ghost_action_with(
-                &mut right,
-                self.preview_action_id(PreviewAction::Refresh),
-                PreviewAction::Refresh.label(),
-                false,
-                layout.button_height,
-                theme::BG_HEADER,
-                has_path,
-            );
-            refresh_action
-                .response
-                .on_hover_text("Re-read the selected file");
-            if refresh_action.activated {
-                refresh = true;
-            }
-            let copy_action = theme::ghost_action_with(
-                &mut right,
-                self.preview_action_id(PreviewAction::CopyPath),
-                PreviewAction::CopyPath.label(),
-                false,
-                layout.button_height,
-                theme::BG_HEADER,
-                has_path,
-            );
-            copy_action
-                .response
-                .on_hover_text("Copy the selected file path");
-            if copy_action.activated {
-                copy_path = true;
-            }
-        }
-        let right_rect = right.min_rect();
-        let left_rect = egui::Rect::from_min_max(
-            content.min,
-            egui::pos2(
-                (right_rect.left() - 8.0).max(content.left()),
-                content.bottom(),
-            ),
-        );
-        let mut left = ui.new_child(
-            UiBuilder::new()
-                .max_rect(left_rect)
-                .layout(egui::Layout::left_to_right(Align::Center)),
-        );
-        theme::section_label(&mut left, "PREVIEW");
-        if let Some(path) = &self.preview.path {
-            let full = path.display().to_string();
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| full.clone());
-            let remaining = (left_rect.right() - left.min_rect().right() - 6.0).max(0.0);
-            let chars = ((remaining / 6.2).floor() as usize).min(filename_chars);
-            if chars >= 4 {
-                left.label(
-                    RichText::new(theme::truncate_middle(&sanitize_display(&name, 160), chars))
-                        .font(FontId::proportional(12.5))
-                        .color(theme::TEXT_PRIMARY),
-                )
-                .on_hover_text(sanitize_display(&full, 900));
-            }
-        }
-        let pill_space = (left_rect.right() - left.min_rect().right() - 6.0).max(0.0);
-        if pill_space > 74.0 {
-            theme::pill(
-                &mut left,
-                "read-only",
-                theme::SUCCESS,
-                theme::SUCCESS_TINT,
-                18.0,
-            );
-        }
-        if close {
-            self.clear_preview();
-            return PreviewUiAction::Close;
-        }
-        if show_terminal {
-            return PreviewUiAction::ShowTerminal;
-        }
-        if refresh {
-            self.refresh_preview();
-        }
-        if copy_path {
-            if let Some(outcome) = self.apply_preview_action(PreviewAction::CopyPath, ui, log) {
-                return outcome;
-            }
-        }
-        theme::paint_card_border(ui, card_rect, layout);
-
-        let meta_height = if layout.hide_preview_meta { 0.0 } else { 18.0 };
-        let meta_rect = egui::Rect::from_min_size(
-            egui::pos2(card_rect.left(), header_rect.bottom()),
-            egui::vec2(card_rect.width(), meta_height),
-        );
-        let body_top = meta_rect.bottom();
-        let body_rect =
-            egui::Rect::from_min_max(egui::pos2(card_rect.left(), body_top), card_rect.max);
-        let mut body =
-            ui.new_child(UiBuilder::new().max_rect(body_rect.shrink2(egui::vec2(10.0, 6.0))));
-        if !layout.hide_preview_meta {
-            if let Some(document) = &self.preview.document {
-                let meta = preview_meta(document, self.preview.refreshed_at, layout.compact);
-                let mut meta_ui = ui.new_child(
-                    UiBuilder::new()
-                        .max_rect(meta_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
-                        .layout(egui::Layout::left_to_right(Align::Center)),
-                );
-                let full_meta = meta.clone();
-                meta_ui
-                    .add(egui::Label::new(theme::mono(meta, 10.5, theme::TEXT_TERTIARY)).truncate())
-                    .on_hover_text(full_meta);
-            }
-        }
-
-        if self.preview.loading {
-            body.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                ui.label(theme::body("Loading preview…"));
-            });
-        }
-        if let Some(error) = self.preview.error.clone() {
-            tone_strip(
-                &mut body,
-                layout,
-                26.0,
-                theme::ERROR_TINT,
-                theme::ERROR,
-                &sanitize_display(&error, 400),
-                sanitize_display(&error, 700),
-            );
-            body.add_space(4.0);
-        }
-        let Some(document) = self.preview.document.as_ref() else {
-            return PreviewUiAction::None;
-        };
-        if !document.is_text() {
-            preview_state_card(&mut body, document, layout);
-            return PreviewUiAction::None;
-        }
-        if document.lines.is_empty() {
-            preview_empty_card(&mut body, document, layout);
-            return PreviewUiAction::None;
-        }
-        preview_code_ui(&mut body, document);
-        PreviewUiAction::None
-    }
-
-    fn apply_preview_action(
-        &mut self,
-        action: PreviewAction,
-        ui: &Ui,
-        log: &mut DiagnosticLog,
-    ) -> Option<PreviewUiAction> {
-        match action {
-            PreviewAction::Refresh => {
-                self.refresh_preview();
-                None
-            }
-            PreviewAction::CopyPath => {
-                if let Some(path) = &self.preview.path {
-                    let text = sanitize_display(&path.display().to_string(), 4096);
-                    ui.ctx().copy_text(text);
-                    log.record(LogLevel::Info, "preview path copied");
-                }
-                None
-            }
-            PreviewAction::Close => {
-                self.clear_preview();
-                Some(PreviewUiAction::Close)
-            }
+            .on_hover_text("Copy the selected file path");
+        if copy_action.activated {
+            result.copy_path = true;
         }
     }
+    let right_rect = right.min_rect();
+    let left_rect = egui::Rect::from_min_max(
+        content.min,
+        egui::pos2(
+            (right_rect.left() - 8.0).max(content.left()),
+            content.bottom(),
+        ),
+    );
+    let mut left = ui.new_child(
+        UiBuilder::new()
+            .max_rect(left_rect)
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    theme::section_label(&mut left, "PREVIEW");
+    if let Some(name) = state.path_name {
+        let remaining = (left_rect.right() - left.min_rect().right() - 6.0).max(0.0);
+        let chars = ((remaining / 6.2).floor() as usize).min(filename_chars);
+        if chars >= 4 {
+            left.label(
+                RichText::new(theme::truncate_middle(&sanitize_display(name, 160), chars))
+                    .font(FontId::proportional(12.5))
+                    .color(theme::TEXT_PRIMARY),
+            )
+            .on_hover_text(sanitize_display(state.path_full.unwrap_or(name), 900));
+        }
+    }
+    let pill_space = (left_rect.right() - left.min_rect().right() - 6.0).max(0.0);
+    if pill_space > 74.0 {
+        theme::pill(
+            &mut left,
+            "read-only",
+            theme::SUCCESS,
+            theme::SUCCESS_TINT,
+            18.0,
+        );
+    }
+    if result.surface != PreviewUiAction::None {
+        return result;
+    }
+    theme::paint_card_border(ui, card_rect, layout);
+
+    let meta_height = if layout.hide_preview_meta { 0.0 } else { 18.0 };
+    let meta_rect = egui::Rect::from_min_size(
+        egui::pos2(card_rect.left(), header_rect.bottom()),
+        egui::vec2(card_rect.width(), meta_height),
+    );
+    let body_top = meta_rect.bottom();
+    let body_rect = egui::Rect::from_min_max(egui::pos2(card_rect.left(), body_top), card_rect.max);
+    let mut body =
+        ui.new_child(UiBuilder::new().max_rect(body_rect.shrink2(egui::vec2(10.0, 6.0))));
+    if !layout.hide_preview_meta {
+        if let Some(document) = state.document {
+            let meta = preview_meta(document, state.refreshed_at, layout.compact);
+            let mut meta_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(meta_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
+                    .layout(egui::Layout::left_to_right(Align::Center)),
+            );
+            let full_meta = meta.clone();
+            meta_ui
+                .add(egui::Label::new(theme::mono(meta, 10.5, theme::TEXT_TERTIARY)).truncate())
+                .on_hover_text(full_meta);
+        }
+    }
+
+    if state.loading {
+        body.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+            ui.label(theme::body("Loading preview…"));
+        });
+    }
+    if let Some(error) = state.error {
+        tone_strip(
+            &mut body,
+            layout,
+            26.0,
+            theme::ERROR_TINT,
+            theme::ERROR,
+            &sanitize_display(error, 400),
+            sanitize_display(error, 700),
+        );
+        body.add_space(4.0);
+    }
+    let Some(document) = state.document else {
+        return result;
+    };
+    if !document.is_text() {
+        preview_state_card(&mut body, document, layout);
+        return result;
+    }
+    if document.lines.is_empty() {
+        preview_empty_card(&mut body, document, layout);
+        return result;
+    }
+    preview_code_ui(&mut body, document);
+    result
 }
 
 /// Empty space between the folders target and the source-control target.
@@ -2524,15 +3006,6 @@ fn quiet_line(text: &str) -> RichText {
         .color(theme::TEXT_TERTIARY)
 }
 
-/// Highest ring is new, middle is modified, lowest is deleted or conflict.
-/// A rename lights nothing. Directory rows count. A missing snapshot leaves
-/// every ring on the icon color.
-fn open_change_count(status: Option<&GitStatusSnapshot>) -> usize {
-    status
-        .map(|status| status.groups.iter().map(|group| group.rows.len()).sum())
-        .unwrap_or(0)
-}
-
 fn source_control_tooltip(status: Option<&GitStatusSnapshot>) -> String {
     let Some(status) = status else {
         return "Source Control".to_owned();
@@ -2626,78 +3099,16 @@ fn folder_mark_color(mark: &FolderMark) -> Color32 {
     }
 }
 
-fn git_status_row_ui(
-    ui: &mut Ui,
-    id: egui::Id,
-    row: &GitStatusRow,
-    selected: bool,
-) -> Option<GitStatusRow> {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
-    let response = ui.interact(rect, id, Sense::CLICK);
-    let fill = if selected {
-        theme::BG_SELECTED
-    } else if response.hovered() {
-        theme::BG_HOVER
+fn change_kinds_color(kinds: &[ChangeKind]) -> Color32 {
+    if kinds.len() > 1 {
+        theme::ACCENT
     } else {
-        Color32::TRANSPARENT
-    };
-    let row_rect = rect.shrink2(egui::vec2(4.0, 0.0));
-    if fill != Color32::TRANSPARENT {
-        ui.painter()
-            .rect_filled(row_rect, CornerRadius::same(6), fill);
+        kinds
+            .first()
+            .copied()
+            .map(change_kind_color)
+            .unwrap_or(theme::ACCENT)
     }
-    let entry_kind = if row.is_directory {
-        EntryKind::Directory
-    } else {
-        EntryKind::File
-    };
-    let icon_name = row
-        .relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if let Some(icon) = explorer_icons::resolve(icon_name, entry_kind, false) {
-        paint_entry_icon(ui, egui::pos2(rect.left() + 16.0, rect.center().y), icon);
-    }
-    let dot_center = egui::pos2(rect.right() - 8.0 - 3.0, rect.center().y);
-    let relative = sanitize_display(&row.relative.display().to_string(), 240);
-    let text_left = rect.left() + 28.0;
-    let text_right = dot_center.x - 3.0 - 6.0;
-    let width = (text_right - text_left).max(1.0);
-    let name_color = if selected {
-        theme::TEXT_PRIMARY
-    } else {
-        theme::TEXT_SECONDARY
-    };
-    theme::paint_ellipsized_centered(
-        ui.painter(),
-        text_left,
-        rect.center().y,
-        relative,
-        FontId::proportional(12.5),
-        name_color,
-        width,
-    );
-    let pointer_on_dot = paint_status_dot(
-        ui,
-        id.with("status-dot"),
-        rect,
-        dot_center,
-        change_kind_color(row.kind),
-        row.kind.label(),
-    );
-    let mut tooltip = sanitize_display(&row.path.display().to_string(), 600);
-    if let Some(original) = &row.original_relative {
-        tooltip = format!(
-            "{tooltip}\nrenamed from {}",
-            sanitize_display(&original.display().to_string(), 400)
-        );
-    }
-    let clicked = response.clicked();
-    if !pointer_on_dot {
-        response.on_hover_text(tooltip);
-    }
-    clicked.then(|| row.clone())
 }
 
 /// 6px kind dot. The hover strip is the full row height and at least 28px wide,
@@ -3042,250 +3453,446 @@ pub enum RemoteExplorerAction {
     Collapse(made_remote::protocol::RemotePath),
     Select(made_remote::protocol::RemotePath),
     OpenPreview(made_remote::protocol::RemotePath),
-    RefreshPreview,
-    ClosePreview,
-    CopyPath(String),
-    UseRoot(made_remote::protocol::RemotePath),
+    RetryRoot,
 }
 
-/// Draw a remote explorer from an already-applied projection. This function
-/// does not read the host filesystem and does not start a local watcher.
+struct RemoteRow {
+    path: made_remote::protocol::RemotePath,
+    name: String,
+    depth: usize,
+    kind: EntryKind,
+    expanded: bool,
+    selected: bool,
+    tooltip: String,
+    mark: Option<Vec<ChangeKind>>,
+    icon: Option<explorer_icons::IconId>,
+}
+
+#[derive(Default)]
+struct RemoteRows {
+    rows: Vec<RemoteRow>,
+}
+
+impl ExplorerRowSource for RemoteRows {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, index: usize) -> ExplorerRowView<'_> {
+        let row = &self.rows[index];
+        ExplorerRowView {
+            name: Cow::Borrowed(&row.name),
+            depth: row.depth,
+            kind: row.kind,
+            expanded: row.expanded,
+            selected: row.selected,
+            error: None,
+            tooltip: RowTooltip::Text(&row.tooltip),
+            mark: row.mark.as_deref().map(RowMark::Remote),
+            icon: row.icon,
+        }
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.rows.iter().position(|row| row.selected)
+    }
+}
+
+/// Draw a remote explorer from an already-applied projection through the same
+/// card, header, row, and Git renderer used by the local Explorer. This
+/// function does not read the host filesystem and does not start a local
+/// watcher.
 pub fn remote_explorer_ui(
     ui: &mut Ui,
     root: &made_remote::protocol::RemotePath,
     projection: &crate::remote_workspace::WorkspaceProjection,
-    connection: crate::remote_workspace::ConnectionState,
-    integration: crate::remote_workspace::IntegrationState,
-    phase_detail: &str,
     layout: &theme::Layout,
+    scope: egui::Id,
+    native_backdrop: bool,
 ) -> Vec<RemoteExplorerAction> {
-    use crate::remote_workspace::{ConnectionState, ExplorerMode, Freshness, IntegrationState};
-    let mut actions = Vec::new();
-    ui.spacing_mut().item_spacing.y = 4.0;
-    theme::section_label(
-        ui,
-        if projection.mode == ExplorerMode::Git {
-            "REPOS"
-        } else {
-            "EXPLORER"
-        },
-    );
-    let status = match connection {
-        ConnectionState::Connected => "SSH connected",
-        ConnectionState::Disconnected => "SSH disconnected",
-    };
-    let integration_label = match integration {
-        IntegrationState::Connected => "integration connected",
-        IntegrationState::Unavailable => "integration unavailable",
-        IntegrationState::Unknown => "integration unknown",
-    };
-    ui.label(theme::micro(format!("{status} · {integration_label}")));
-    if !phase_detail.is_empty() {
-        ui.label(theme::body(sanitize_display(phase_detail, 240)));
-    }
-    ui.horizontal(|ui| {
-        if ui
-            .selectable_label(projection.mode == ExplorerMode::Files, "Files")
-            .clicked()
-        {
-            actions.push(RemoteExplorerAction::SetMode(ExplorerMode::Files));
-        }
-        if ui
-            .selectable_label(projection.mode == ExplorerMode::Git, "Source Control")
-            .clicked()
-        {
-            actions.push(RemoteExplorerAction::SetMode(ExplorerMode::Git));
-        }
-    });
-    if projection.mode == ExplorerMode::Git {
-        remote_git_ui(ui, projection, &mut actions);
+    use crate::remote_workspace::{ExplorerMode, Freshness};
+
+    let git_view = projection.git_view.as_ref();
+    let show_icon = git_view.is_some_and(|git| git.worktree_name.is_some());
+    let git_open = projection.mode == ExplorerMode::Git && show_icon;
+    let git_header = git_view.map(remote_git_header);
+    let root_full = remote_path_text(root);
+    let root_name = remote_root_name(root);
+    let file_marks = remote_file_marks(git_view);
+    let mut remote_rows = RemoteRows::default();
+    let tree = if git_open {
+        ExplorerTreeBody::Empty
     } else {
-        remote_files_ui(ui, root, projection, &mut actions, layout);
-    }
-    if let Some(preview) = &projection.preview {
-        ui.separator();
-        ui.label(theme::micro("Preview"));
-        let path = remote_path_text(&preview.path);
-        ui.label(theme::body(sanitize_display(&path, 180)));
-        ui.horizontal(|ui| {
-            if ui.button("Copy path").clicked() {
-                actions.push(RemoteExplorerAction::CopyPath(path.clone()));
-            }
-            if ui.button("Refresh").clicked() {
-                actions.push(RemoteExplorerAction::RefreshPreview);
-            }
-            if ui.button("Close").clicked() {
-                actions.push(RemoteExplorerAction::ClosePreview);
-            }
+        let directory = projection.directories.get(root).or_else(|| {
+            projection
+                .requested_root
+                .as_ref()
+                .and_then(|requested| projection.directories.get(requested))
         });
-        match &preview.freshness {
-            Freshness::Stale => {
-                ui.label(theme::micro("Preview is stale"));
+        match directory {
+            None if matches!(projection.root_state, Freshness::Unavailable(_)) => {
+                ExplorerTreeBody::Error("Remote directory unavailable".to_owned())
             }
-            Freshness::Loading => {
-                ui.label(theme::micro("Loading preview"));
+            None => ExplorerTreeBody::Loading,
+            Some(directory) if matches!(directory.freshness, Freshness::Unavailable(_)) => {
+                ExplorerTreeBody::Error("Remote directory unavailable".to_owned())
             }
-            Freshness::Unavailable(code) => {
-                ui.label(theme::micro(format!("Preview unavailable ({code:?})")));
-            }
-            Freshness::Current => {
-                if preview.data.is_empty() {
-                    ui.label(theme::micro("No preview text"));
-                } else if let Ok(text) = std::str::from_utf8(&preview.data) {
-                    ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        ui.label(theme::mono(
-                            sanitize_display(text, 8000),
-                            theme::SMALL_SIZE,
-                            theme::TEXT_SECONDARY,
-                        ));
-                    });
+            Some(directory) => {
+                collect_remote_rows(
+                    &directory.path,
+                    projection,
+                    git_view,
+                    &file_marks,
+                    &mut remote_rows.rows,
+                    0,
+                );
+                if remote_rows.rows.is_empty() {
+                    if matches!(directory.freshness, Freshness::Loading | Freshness::Stale) {
+                        ExplorerTreeBody::Loading
+                    } else {
+                        ExplorerTreeBody::Empty
+                    }
                 } else {
-                    ui.label(theme::micro("Preview is not valid UTF-8"));
+                    ExplorerTreeBody::Rows(&remote_rows)
                 }
             }
         }
-    }
-    let _ = layout;
-    actions
-}
-
-fn remote_files_ui(
-    ui: &mut Ui,
-    root: &made_remote::protocol::RemotePath,
-    projection: &crate::remote_workspace::WorkspaceProjection,
-    actions: &mut Vec<RemoteExplorerAction>,
-    _layout: &theme::Layout,
-) {
-    use crate::remote_workspace::Freshness;
-    let root = projection.directories.get(root).or_else(|| {
-        projection
-            .requested_root
-            .as_ref()
-            .and_then(|requested| projection.directories.get(requested))
-    });
-    let Some(root) = root else {
-        ui.label(theme::micro("Remote listing has not arrived"));
-        return;
     };
-    if root.truncated {
-        ui.label(theme::micro("Listing truncated"));
-    }
-    if matches!(root.freshness, Freshness::Unavailable(_)) {
-        ui.label(theme::micro("Remote directory unavailable"));
-    }
-    ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-        paint_remote_directory(ui, &root.path, projection, actions, 0);
-    });
-}
-
-fn paint_remote_directory(
-    ui: &mut Ui,
-    path: &made_remote::protocol::RemotePath,
-    projection: &crate::remote_workspace::WorkspaceProjection,
-    actions: &mut Vec<RemoteExplorerAction>,
-    depth: usize,
-) {
-    let Some(directory) = projection.directories.get(path) else {
-        return;
+    let git = git_open.then(|| remote_git_body(root, git_view, projection.selected.as_ref()));
+    let view = ExplorerCardView {
+        git_open,
+        show_icon,
+        root_name: Some((root_name, root_full)),
+        git_header: git_header.as_ref(),
+        source_control_tooltip: remote_source_control_tooltip(git_view),
+        source_control_rings: remote_source_control_rings(git_view),
+        root_unavailable: None,
+        tree,
+        git,
+        scroll_to_selection: false,
     };
-    for entry in &directory.entries {
-        let name = remote_file_name(&entry.path);
-        let expanded = projection.expanded.contains(&entry.path);
-        let kind = match entry.kind {
-            made_remote::protocol::EntryKind::Directory => {
-                made_explorer::tree::EntryKind::Directory
-            }
-            made_remote::protocol::EntryKind::File => made_explorer::tree::EntryKind::File,
-            made_remote::protocol::EntryKind::Symlink => made_explorer::tree::EntryKind::Symlink,
-            made_remote::protocol::EntryKind::Other => made_explorer::tree::EntryKind::Other,
+    let result = explorer_card_ui(ui, &view, scope, native_backdrop, layout);
+    let mut actions = Vec::new();
+    if projection.mode == ExplorerMode::Git && !show_icon {
+        actions.push(RemoteExplorerAction::SetMode(ExplorerMode::Files));
+    }
+    if let Some(switch) = result.switch {
+        actions.push(RemoteExplorerAction::SetMode(match switch {
+            ExplorerViewKind::Files => ExplorerMode::Files,
+            ExplorerViewKind::Git => ExplorerMode::Git,
+        }));
+    }
+    if result.retry {
+        actions.push(RemoteExplorerAction::RetryRoot);
+    }
+    if let Some(action) = result.row {
+        let index = match action {
+            ExplorerRowAction::Click(index)
+            | ExplorerRowAction::Select(index)
+            | ExplorerRowAction::Toggle(index)
+            | ExplorerRowAction::Activate(index) => index,
         };
-        ui.horizontal(|ui| {
-            if depth > 0 {
-                ui.add_space(depth as f32 * 12.0);
-            }
-            if let Some(icon) = explorer_icons::resolve(&name, kind, expanded) {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-                paint_entry_icon(ui, rect.center(), icon);
-            }
-            let label = sanitize_display(&name, 120);
-            if ui.selectable_label(false, label).clicked() {
-                actions.push(RemoteExplorerAction::Select(entry.path.clone()));
-                match entry.kind {
-                    made_remote::protocol::EntryKind::Directory => {
-                        if expanded {
-                            actions.push(RemoteExplorerAction::Collapse(entry.path.clone()));
-                        } else {
-                            actions.push(RemoteExplorerAction::Expand(entry.path.clone()));
-                        }
-                    }
-                    made_remote::protocol::EntryKind::File => {
-                        actions.push(RemoteExplorerAction::OpenPreview(entry.path.clone()));
-                    }
-                    _ => {}
-                }
-            }
-        });
-        if expanded && depth < 64 {
-            paint_remote_directory(ui, &entry.path, projection, actions, depth + 1);
-        }
-    }
-}
-
-fn remote_git_ui(
-    ui: &mut Ui,
-    projection: &crate::remote_workspace::WorkspaceProjection,
-    actions: &mut Vec<RemoteExplorerAction>,
-) {
-    let Some(git) = &projection.git_view else {
-        ui.label(theme::micro("Remote Git metadata has not arrived"));
-        return;
-    };
-    let head = if git.detached {
-        git.commit.as_deref().unwrap_or("detached")
-    } else {
-        git.branch.as_deref().unwrap_or("unknown")
-    };
-    ui.label(theme::body(sanitize_display(head, 80)));
-    if let Some(subject) = &git.subject {
-        ui.label(theme::micro(sanitize_display(subject, 160)));
-    }
-    if git.linked_worktree {
-        if let Some(name) = &git.worktree_name {
-            ui.label(theme::micro(format!(
-                "linked worktree {}",
-                sanitize_display(name, 80)
-            )));
-        }
-    }
-    if git.groups.is_empty() {
-        ui.label(theme::micro("No changes"));
-        return;
-    }
-    for group in &git.groups {
-        ui.label(theme::micro(format!(
-            "{} ({})",
-            group.title,
-            group.rows.len()
-        )));
-        for row in &group.rows {
-            let name = remote_file_name(&row.path);
-            if ui
-                .selectable_label(false, sanitize_display(&name, 120))
-                .clicked()
+        if let Some(row) = remote_rows.rows.get(index) {
+            let toggles = matches!(
+                action,
+                ExplorerRowAction::Click(_)
+                    | ExplorerRowAction::Toggle(_)
+                    | ExplorerRowAction::Activate(_)
+            );
+            actions.push(RemoteExplorerAction::Select(row.path.clone()));
+            if toggles && row.kind == EntryKind::Directory {
+                actions.push(if row.expanded {
+                    RemoteExplorerAction::Collapse(row.path.clone())
+                } else {
+                    RemoteExplorerAction::Expand(row.path.clone())
+                });
+            } else if matches!(
+                action,
+                ExplorerRowAction::Click(_) | ExplorerRowAction::Activate(_)
+            ) && row.kind == EntryKind::File
             {
                 actions.push(RemoteExplorerAction::OpenPreview(row.path.clone()));
             }
         }
     }
+    if let Some((group_index, row_index)) = result.git_row {
+        if let Some(row) = git_view
+            .and_then(|git| git.groups.get(group_index))
+            .and_then(|group| group.rows.get(row_index))
+        {
+            actions.push(RemoteExplorerAction::Select(row.path.clone()));
+            if !row.directory {
+                actions.push(RemoteExplorerAction::OpenPreview(row.path.clone()));
+            }
+        }
+    }
+    actions
 }
 
-fn remote_path_text(path: &made_remote::protocol::RemotePath) -> String {
+fn collect_remote_rows(
+    path: &made_remote::protocol::RemotePath,
+    projection: &crate::remote_workspace::WorkspaceProjection,
+    git_view: Option<&crate::remote_workspace::RemoteGitView>,
+    file_marks: &std::collections::HashMap<made_remote::protocol::RemotePath, Vec<ChangeKind>>,
+    rows: &mut Vec<RemoteRow>,
+    depth: usize,
+) {
+    if depth > made_remote::protocol::MAX_TREE_DEPTH
+        || rows.len() >= made_remote::protocol::MAX_TREE_ROWS
+    {
+        return;
+    }
+    let Some(directory) = projection.directories.get(path) else {
+        return;
+    };
+    for entry in &directory.entries {
+        if rows.len() >= made_remote::protocol::MAX_TREE_ROWS {
+            break;
+        }
+        let name = remote_file_name(&entry.path);
+        let expanded = projection.expanded.contains(&entry.path);
+        let kind = remote_entry_kind(entry.kind);
+        let mark = match kind {
+            EntryKind::Directory => git_view
+                .and_then(|git| git.folder_marks.get(&entry.path))
+                .map(|kinds| kinds.iter().copied().map(remote_change_kind).collect()),
+            EntryKind::File => file_marks.get(&entry.path).cloned(),
+            _ => None,
+        };
+        let icon = explorer_icons::resolve(&name, kind, expanded);
+        rows.push(RemoteRow {
+            path: entry.path.clone(),
+            name,
+            depth,
+            kind,
+            expanded,
+            selected: projection.selected.as_ref() == Some(&entry.path),
+            tooltip: remote_path_text(&entry.path),
+            mark,
+            icon,
+        });
+        if expanded && kind == EntryKind::Directory {
+            collect_remote_rows(
+                &entry.path,
+                projection,
+                git_view,
+                file_marks,
+                rows,
+                depth + 1,
+            );
+        }
+    }
+    if directory.truncated && rows.len() < made_remote::protocol::MAX_TREE_ROWS {
+        rows.push(RemoteRow {
+            path: directory.path.clone(),
+            name: "(listing truncated)".to_owned(),
+            depth,
+            kind: EntryKind::Error,
+            expanded: false,
+            selected: false,
+            tooltip: format!(
+                "Directory has more than {} entries; only the first {} are shown.",
+                made_remote::protocol::MAX_TREE_ROWS,
+                made_remote::protocol::MAX_TREE_ROWS
+            ),
+            mark: None,
+            icon: None,
+        });
+    }
+}
+
+fn remote_entry_kind(kind: made_remote::protocol::EntryKind) -> EntryKind {
+    match kind {
+        made_remote::protocol::EntryKind::Directory => EntryKind::Directory,
+        made_remote::protocol::EntryKind::File => EntryKind::File,
+        made_remote::protocol::EntryKind::Symlink => EntryKind::Symlink,
+        made_remote::protocol::EntryKind::Other => EntryKind::Other,
+    }
+}
+
+fn remote_change_kind(kind: made_remote::git::ChangeKind) -> ChangeKind {
+    match kind {
+        made_remote::git::ChangeKind::New => ChangeKind::New,
+        made_remote::git::ChangeKind::Modified => ChangeKind::Modified,
+        made_remote::git::ChangeKind::Deleted => ChangeKind::Deleted,
+        made_remote::git::ChangeKind::Renamed => ChangeKind::Renamed,
+        made_remote::git::ChangeKind::Conflict => ChangeKind::Conflict,
+    }
+}
+
+fn remote_file_marks(
+    git: Option<&crate::remote_workspace::RemoteGitView>,
+) -> std::collections::HashMap<made_remote::protocol::RemotePath, Vec<ChangeKind>> {
+    let mut marks = std::collections::HashMap::new();
+    let Some(git) = git else {
+        return marks;
+    };
+    for group in &git.groups {
+        for row in &group.rows {
+            if row.directory {
+                continue;
+            }
+            let kind = remote_change_kind(row.kind);
+            let kinds = marks.entry(row.path.clone()).or_insert_with(Vec::new);
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+                kinds.sort();
+            }
+        }
+    }
+    marks
+}
+
+fn remote_git_header(git: &crate::remote_workspace::RemoteGitView) -> GitHeader {
+    GitHeader {
+        show_icon: true,
+        branch: git.branch.clone(),
+        detached: git.detached,
+        commit_abbrev: git.commit.clone(),
+        commit_subject: git.subject.clone(),
+        is_linked_worktree: git.linked_worktree,
+        directory_name: git.worktree_name.clone(),
+    }
+}
+
+fn remote_git_body(
+    root: &made_remote::protocol::RemotePath,
+    git_view: Option<&crate::remote_workspace::RemoteGitView>,
+    selected: Option<&made_remote::protocol::RemotePath>,
+) -> GitBodyView {
+    use crate::remote_workspace::Freshness;
+    let Some(git) = git_view else {
+        return GitBodyView {
+            has_status: false,
+            failed: false,
+            groups: Vec::new(),
+        };
+    };
+    let mut groups = Vec::new();
+    for group in &git.groups {
+        if group.rows.is_empty() {
+            continue;
+        }
+        let rows = group
+            .rows
+            .iter()
+            .map(|row| {
+                let name = remote_relative_text(root, &row.path);
+                let name = if name.is_empty() {
+                    remote_file_name(&row.path)
+                } else {
+                    name
+                };
+                let entry_kind = if row.directory {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                GitRowView {
+                    name,
+                    kind: remote_change_kind(row.kind),
+                    selected: selected == Some(&row.path),
+                    icon: explorer_icons::resolve(&remote_file_name(&row.path), entry_kind, false),
+                    tooltip: remote_path_text(&row.path),
+                    original: row.original.as_ref().map(remote_path_text),
+                }
+            })
+            .collect();
+        groups.push(GitGroupView {
+            title: group.title,
+            rows,
+        });
+    }
+    let failed = groups.is_empty() && matches!(git.freshness, Freshness::Unavailable(_));
+    GitBodyView {
+        has_status: true,
+        failed,
+        groups,
+    }
+}
+
+fn remote_source_control_tooltip(git: Option<&crate::remote_workspace::RemoteGitView>) -> String {
+    let Some(git) = git else {
+        return "Source Control".to_owned();
+    };
+    let mut parts = Vec::new();
+    for title in [
+        crate::worktree::GROUP_MERGE,
+        crate::worktree::GROUP_STAGED,
+        crate::worktree::GROUP_CHANGES,
+        crate::worktree::GROUP_UNTRACKED,
+    ] {
+        let count: usize = git
+            .groups
+            .iter()
+            .filter(|group| group.title == title)
+            .map(|group| group.rows.len())
+            .sum();
+        if count > 0 {
+            parts.push(format!("{title} ({count})"));
+        }
+    }
+    if parts.is_empty() {
+        "Source Control".to_owned()
+    } else {
+        format!("Source Control - {}", parts.join(" · "))
+    }
+}
+
+fn remote_source_control_rings(
+    git: Option<&crate::remote_workspace::RemoteGitView>,
+) -> theme::SourceControlRings {
+    let Some(git) = git else {
+        return theme::SourceControlRings::default();
+    };
+    let mut rings = theme::SourceControlRings::default();
+    for row in git.groups.iter().flat_map(|group| &group.rows) {
+        match remote_change_kind(row.kind) {
+            ChangeKind::New => rings.highest = Some(theme::SUCCESS),
+            ChangeKind::Modified => rings.middle = Some(theme::WARNING),
+            ChangeKind::Deleted | ChangeKind::Conflict => rings.lowest = Some(theme::ERROR),
+            ChangeKind::Renamed => {}
+        }
+    }
+    rings
+}
+
+fn remote_relative_text(
+    root: &made_remote::protocol::RemotePath,
+    path: &made_remote::protocol::RemotePath,
+) -> String {
+    let root_bytes = root.as_bytes();
+    let path_bytes = path.as_bytes();
+    let relative = if path_bytes == root_bytes {
+        &[][..]
+    } else if path_bytes.starts_with(root_bytes) {
+        let start = if root_bytes == b"/" {
+            1
+        } else {
+            root_bytes.len() + 1
+        };
+        path_bytes.get(start..).unwrap_or(&[])
+    } else {
+        path_bytes
+    };
+    String::from_utf8_lossy(relative).into_owned()
+}
+
+fn remote_root_name(path: &made_remote::protocol::RemotePath) -> String {
+    let text = remote_path_text(path);
+    text.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(&text)
+        .to_owned()
+}
+
+pub(crate) fn remote_path_text(path: &made_remote::protocol::RemotePath) -> String {
     path.to_utf8()
         .map(str::to_owned)
-        .unwrap_or_else(|_| "remote path".to_owned())
+        .unwrap_or_else(|_| String::from_utf8_lossy(path.as_bytes()).into_owned())
 }
 
-fn remote_file_name(path: &made_remote::protocol::RemotePath) -> String {
+pub(crate) fn remote_file_name(path: &made_remote::protocol::RemotePath) -> String {
     let text = remote_path_text(path);
     text.rsplit('/')
         .find(|part| !part.is_empty())
@@ -3296,6 +3903,7 @@ fn remote_file_name(path: &made_remote::protocol::RemotePath) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::GitStatusRow;
     use std::fs;
 
     fn dummy_document(path: &Path) -> PreviewDocument {
@@ -5915,6 +6523,10 @@ mod tests {
             let expected_directory = directory.canonicalize().unwrap();
             let expected_file = file.canonicalize().unwrap();
             let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
+            // Keyboard behavior is the subject here; a live watcher must not
+            // reorder or reload the fixture rows between key frames.
+            pane.watcher_installer = WatcherInstaller::blocked();
+            pane.watcher_loading = false;
             let mut log = DiagnosticLog::new();
             wait_for_root(&mut pane, &mut log);
             let ctx = egui::Context::default();
@@ -6149,6 +6761,234 @@ mod tests {
             "virtual row window stops short of the explorer body by {gap}px \
              (lowest={lowest}, body_bottom={}, painted={painted}/{total})",
             body.rect.bottom()
+        );
+    }
+
+    fn remote_projection() -> crate::remote_workspace::WorkspaceProjection {
+        use crate::remote_workspace::{
+            DirectoryProjection, ExplorerMode, Freshness, RootSource, WorkspaceProjection,
+        };
+        use made_remote::protocol::{DirectoryEntry, EntryKind as RemoteEntryKind, RemotePath};
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let readme = RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap();
+        let src = RemotePath::new(b"/home/vscode/src".to_vec()).unwrap();
+        let main = RemotePath::new(b"/home/vscode/src/main.rs".to_vec()).unwrap();
+        let mut directories = std::collections::HashMap::new();
+        directories.insert(
+            root.clone(),
+            DirectoryProjection {
+                path: root.clone(),
+                entries: vec![
+                    DirectoryEntry {
+                        path: readme,
+                        kind: RemoteEntryKind::File,
+                    },
+                    DirectoryEntry {
+                        path: src.clone(),
+                        kind: RemoteEntryKind::Directory,
+                    },
+                ],
+                truncated: false,
+                freshness: Freshness::Current,
+            },
+        );
+        directories.insert(
+            src.clone(),
+            DirectoryProjection {
+                path: src.clone(),
+                entries: vec![DirectoryEntry {
+                    path: main,
+                    kind: RemoteEntryKind::File,
+                }],
+                truncated: false,
+                freshness: Freshness::Current,
+            },
+        );
+        WorkspaceProjection {
+            source: RootSource::Launch,
+            requested_root: None,
+            root_state: Freshness::Current,
+            directories,
+            expanded: std::collections::HashSet::from([src]),
+            selected: Some(RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap()),
+            preview: None,
+            git: Vec::new(),
+            git_view: None,
+            sessions: None,
+            session_state: Freshness::Stale,
+            integration_error: None,
+            focus: None,
+            mode: ExplorerMode::Files,
+            cleanup_unconfirmed: false,
+        }
+    }
+
+    fn remote_render(
+        projection: &crate::remote_workspace::WorkspaceProjection,
+        root: &made_remote::protocol::RemotePath,
+    ) -> (egui::FullOutput, Vec<RemoteExplorerAction>) {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let layout = theme::Layout::for_window(1280.0, 800.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(raw, |ui| {
+            actions = remote_explorer_ui(
+                ui,
+                root,
+                projection,
+                &layout,
+                egui::Id::unique("remote-explorer-test"),
+                false,
+            );
+        });
+        output.textures_delta.clear();
+        (output, actions)
+    }
+
+    #[test]
+    fn remote_explorer_uses_local_explorer_chrome_without_ssh_status() {
+        use crate::remote_workspace::{ExplorerMode, Freshness};
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        for expected in ["EXPLORER", "vscode", "README.md", "src", "main.rs"] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        for forbidden in [
+            "SSH connected",
+            "SSH disconnected",
+            "integration unknown",
+            "integration connected",
+            "Files",
+            "Source Control",
+            "Preview",
+            "Remote listing",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "remote explorer must not paint {forbidden:?}: {text:?}"
+            );
+        }
+
+        projection.mode = ExplorerMode::Git;
+        projection.git_view = Some(crate::remote_workspace::RemoteGitView {
+            branch: Some("main".to_owned()),
+            detached: false,
+            commit: None,
+            subject: None,
+            linked_worktree: false,
+            worktree_name: Some("PlantSuite".to_owned()),
+            groups: vec![crate::remote_workspace::RemoteGitGroup {
+                title: crate::worktree::GROUP_CHANGES,
+                rows: vec![crate::remote_workspace::RemoteGitRow {
+                    path: RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap(),
+                    original: None,
+                    letter: 'M',
+                    kind: made_remote::git::ChangeKind::Modified,
+                    directory: false,
+                }],
+            }],
+            freshness: Freshness::Current,
+            folder_marks: std::collections::HashMap::new(),
+        });
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        for expected in ["REPOS", "main", "Changes (1)", "README.md"] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        for forbidden in [
+            "EXPLORER",
+            "SSH connected",
+            "SSH disconnected",
+            "integration unknown",
+            "Files",
+            "Source Control",
+            "Preview",
+            "Remote Git metadata",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "remote source control must not paint {forbidden:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_preview_uses_the_full_left_surface() {
+        use made_remote::protocol::{PreviewKind as RemotePreviewKind, RemotePath};
+
+        let path = RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap();
+        let content = "# PlantSuite\n\nRemote preview.\n";
+        let document = PreviewDocument::from_remote(
+            &path,
+            RemotePreviewKind::Text,
+            content.as_bytes(),
+            &Highlighter::new(),
+        );
+        assert_eq!(document.size, Some(content.len() as u64));
+        assert_eq!(document.line_count(), 3);
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let layout = theme::Layout::for_window(1280.0, 800.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = preview_card_ui(
+                ui,
+                PreviewCardState {
+                    path_name: Some("README.md"),
+                    path_full: Some("/home/vscode/README.md"),
+                    document: Some(&document),
+                    loading: false,
+                    error: None,
+                    refreshed_at: None,
+                    focus_pending: false,
+                },
+                PreviewCardIds {
+                    focus: egui::Id::unique("remote-preview-focus"),
+                    close: egui::Id::unique("remote-preview-close"),
+                    terminal: egui::Id::unique("remote-preview-terminal"),
+                    refresh: egui::Id::unique("remote-preview-refresh"),
+                    copy: egui::Id::unique("remote-preview-copy"),
+                },
+                &layout,
+            );
+        });
+        output.textures_delta.clear();
+        let text = output_text(&output);
+        for expected in [
+            "PREVIEW",
+            "README.md",
+            "read-only",
+            "Copy path",
+            "Refresh",
+            "Close",
+            "Terminal",
+            "1",
+            "PlantSuite",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        assert!(
+            !text.contains("SSH"),
+            "preview must not paint SSH chrome: {text:?}"
         );
     }
 }

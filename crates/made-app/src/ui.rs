@@ -2428,37 +2428,20 @@ impl Workbench {
                             explorer.set_native_backdrop_applied(native_backdrop_applied);
                             explorer.tree_ui(&mut content_ui, self.diag.log_mut(), layout);
                         } else if self.is_remote() {
-                            if let (
-                                Some(root),
-                                Some(projection),
-                                Some(connection),
-                                Some(integration),
-                            ) = (
+                            if let (Some(root), Some(projection)) = (
                                 self.remote_path_label().and_then(|path| {
                                     made_remote::protocol::RemotePath::new(path.into_bytes()).ok()
                                 }),
                                 self.remote_projection().cloned(),
-                                self.remote_connection(),
-                                self.remote_integration(),
                             ) {
-                                let detail = self.remote_detail().unwrap_or("").to_owned();
                                 let actions = crate::explorer_view::remote_explorer_ui(
                                     &mut content_ui,
                                     &root,
                                     &projection,
-                                    connection,
-                                    integration,
-                                    &detail,
                                     layout,
+                                    egui::Id::unique(("made-explorer", self.pane_id())),
+                                    native_backdrop_applied,
                                 );
-                                if let Some(path) = actions.iter().find_map(|action| match action {
-                                    crate::explorer_view::RemoteExplorerAction::CopyPath(path) => {
-                                        Some(path.clone())
-                                    }
-                                    _ => None,
-                                }) {
-                                    content_ui.ctx().copy_text(path);
-                                }
                                 self.apply_remote_actions(actions);
                             }
                         } else if let Some(error) = self.workspace_error.clone() {
@@ -2520,12 +2503,15 @@ impl Workbench {
                 .filter(|pane| pane.preview_path().is_some())
             {
                 pane.focus_preview();
+            } else if self.is_remote() && self.remote_has_preview() {
+                self.remote_preview_focus_pending = true;
             }
         }
 
         let mut preview_loaded = explorer
             .as_ref()
-            .is_some_and(|pane| pane.preview_path().is_some());
+            .is_some_and(|pane| pane.preview_path().is_some())
+            || self.remote_has_preview();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -2549,6 +2535,23 @@ impl Workbench {
                             }
                             PreviewUiAction::None => {}
                         }
+                    } else if self.is_remote() {
+                        match self.remote_preview_ui(ui, layout) {
+                            PreviewUiAction::Close => {
+                                self.close_preview();
+                                self.sync_terminal_visibility(ui.ctx());
+                                self.request_terminal_focus(ui.ctx());
+                                preview_loaded = false;
+                                show_preview = false;
+                            }
+                            PreviewUiAction::ShowTerminal => {
+                                self.set_left_surface(LeftSurface::Terminal);
+                                self.sync_terminal_visibility(ui.ctx());
+                                self.request_terminal_focus(ui.ctx());
+                                show_preview = false;
+                            }
+                            PreviewUiAction::None => {}
+                        }
                     } else {
                         self.close_preview();
                         self.sync_terminal_visibility(ui.ctx());
@@ -2563,6 +2566,8 @@ impl Workbench {
                         self.sync_terminal_visibility(ui.ctx());
                         if let Some(pane) = explorer.as_mut() {
                             pane.focus_preview();
+                        } else if self.is_remote() {
+                            self.remote_preview_focus_pending = true;
                         }
                     }
                 }
