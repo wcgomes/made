@@ -502,7 +502,7 @@ fn git_grouping_uses_remote_bytes_and_filters_subroot_ignored_and_traversal() {
     assert_eq!(git.commit.as_deref(), Some("12345678"));
     assert_eq!(
         git.groups.iter().map(|g| g.title).collect::<Vec<_>>(),
-        ["Merge", "Staged", "Changes", "Untracked"]
+        ["Merge Changes", "Staged Changes", "Changes", "Untracked"]
     );
     assert_eq!(git.groups[3].rows[0].path.as_bytes(), b"/project/raw-\xff");
     assert!(git

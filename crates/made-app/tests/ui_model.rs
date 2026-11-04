@@ -4190,7 +4190,8 @@ fn ssh_header_registration_and_remote_tab_keep_local_work() {
     let output = headless.render();
     let text = output_text(&output);
     assert!(text.contains("EXPLORER"), "{text}");
-    assert!(text.contains("SSH connected"), "{text}");
+    assert!(!text.contains("SSH connected"), "{text}");
+    assert!(!text.contains("integration unknown"), "{text}");
     assert!(text.contains("readme.txt"), "{text}");
     let ssh = headless.response(top_action_id("ssh-servers"));
     assert!(ssh.rect.width() >= 24.0 && ssh.rect.height() >= 24.0);

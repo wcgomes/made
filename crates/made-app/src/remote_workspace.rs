@@ -799,8 +799,8 @@ impl RemoteWorkspace {
         {
             return Err(ProtocolError::Limit);
         }
+        let previous_view = self.projection.git_view.take();
         self.projection.git.clear();
-        self.projection.git_view = None;
         for command in COMMANDS {
             self.enqueue(Operation::GitRead { command }, None, Purpose::User)?;
             self.projection.git.push(GitProjection {
@@ -808,6 +808,12 @@ impl RemoteWorkspace {
                 data: Vec::new(),
                 freshness: Freshness::Loading,
             });
+        }
+        // Keep the last complete view visible while a refresh is in flight,
+        // matching the local Explorer's snapshot-while-loading behavior.
+        if let Some(mut view) = previous_view {
+            view.freshness = Freshness::Loading;
+            self.projection.git_view = Some(view);
         }
         Ok(())
     }
@@ -1599,7 +1605,12 @@ fn remote_git_groups(
             });
         }
     }
-    let titles = ["Merge", "Staged", "Changes", "Untracked"];
+    let titles = [
+        crate::worktree::GROUP_MERGE,
+        crate::worktree::GROUP_STAGED,
+        crate::worktree::GROUP_CHANGES,
+        crate::worktree::GROUP_UNTRACKED,
+    ];
     Ok(groups
         .into_iter()
         .enumerate()

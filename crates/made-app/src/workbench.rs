@@ -20,6 +20,7 @@ use made_bridge::config_guard::{ConfigFileState, ConfigGuard, ConfigVerification
 use made_bridge::security::Token;
 use made_bridge::server::{self, BridgeEvent, BridgeHandle, BridgeOptions};
 use made_bridge::state::SessionSnapshot;
+use made_explorer::highlight::Highlighter;
 use made_explorer::root_switch::RootGeneration;
 use made_platform::{
     host_platform, AppPaths, CompatibleTui, LogIssue, LogIssueSeverity, Platform, PlatformFamily,
@@ -30,7 +31,9 @@ use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
     DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
 };
-use crate::explorer_view::{ExplorerGitChrome, ExplorerPane, GitHeader};
+use crate::explorer_view::{
+    ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
+};
 use crate::integration_status::{IntegrationState, IntegrationStatus};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -320,6 +323,29 @@ impl RemoteTab {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemotePreviewKey {
+    path: made_remote::protocol::RemotePath,
+    freshness: crate::remote_workspace::Freshness,
+    len: usize,
+}
+
+#[derive(Default)]
+struct RemotePreviewView {
+    key: Option<RemotePreviewKey>,
+    document: Option<PreviewDocument>,
+    refreshed_at: Option<Instant>,
+    highlighter: Option<Highlighter>,
+}
+
+impl RemotePreviewView {
+    fn clear(&mut self) {
+        self.key = None;
+        self.document = None;
+        self.refreshed_at = None;
+    }
+}
+
 /// One workspace owner; siblings share no process, bridge or load receiver.
 pub struct Workbench {
     pub(crate) platform: made_platform::HostPlatform,
@@ -401,6 +427,8 @@ pub struct Workbench {
     pending_notice: Option<(String, Instant)>,
     last_title: Option<String>,
     remote: Option<RemoteTab>,
+    remote_preview: RemotePreviewView,
+    pub(crate) remote_preview_focus_pending: bool,
 }
 
 impl std::fmt::Debug for Workbench {
@@ -651,6 +679,8 @@ impl Workbench {
             pending_notice: None,
             last_title: None,
             remote,
+            remote_preview: RemotePreviewView::default(),
+            remote_preview_focus_pending: false,
         };
 
         if let Some(error) = path_error {
@@ -1915,6 +1945,128 @@ impl Workbench {
             .map(|remote| remote.workspace.projection())
     }
 
+    pub fn remote_has_preview(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.workspace.projection().preview.is_some())
+    }
+
+    fn sync_remote_preview(&mut self) {
+        use crate::remote_workspace::Freshness;
+        let Some(remote) = self.remote.as_ref() else {
+            self.remote_preview.clear();
+            return;
+        };
+        let Some(preview) = remote.workspace.projection().preview.as_ref() else {
+            self.remote_preview.clear();
+            return;
+        };
+        let key = RemotePreviewKey {
+            path: preview.path.clone(),
+            freshness: preview.freshness,
+            len: preview.data.len(),
+        };
+        if self.remote_preview.key.as_ref() == Some(&key) {
+            return;
+        }
+        let same_path = self
+            .remote_preview
+            .key
+            .as_ref()
+            .is_some_and(|old| old.path == preview.path);
+        if !same_path {
+            self.remote_preview.document = None;
+            self.remote_preview.refreshed_at = None;
+        }
+        self.remote_preview.key = Some(key);
+        if preview.freshness != Freshness::Current {
+            return;
+        }
+        let Some(kind) = preview.kind else {
+            return;
+        };
+        let highlighter = self
+            .remote_preview
+            .highlighter
+            .get_or_insert_with(Highlighter::new);
+        self.remote_preview.document = Some(PreviewDocument::from_remote(
+            &preview.path,
+            kind,
+            &preview.data,
+            highlighter,
+        ));
+        self.remote_preview.refreshed_at = Some(Instant::now());
+    }
+
+    pub(crate) fn remote_preview_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        layout: &crate::theme::Layout,
+    ) -> PreviewUiAction {
+        use crate::remote_workspace::Freshness;
+        self.sync_remote_preview();
+        let Some(remote) = self.remote.as_ref() else {
+            return PreviewUiAction::Close;
+        };
+        let Some(preview) = remote.workspace.projection().preview.as_ref() else {
+            return PreviewUiAction::Close;
+        };
+        let full = crate::explorer_view::remote_path_text(&preview.path);
+        let name = crate::explorer_view::remote_file_name(&preview.path);
+        let has_document = self.remote_preview.document.is_some();
+        let loading = preview.freshness == Freshness::Loading
+            || (!has_document && preview.freshness == Freshness::Stale);
+        let error = matches!(preview.freshness, Freshness::Unavailable(_))
+            .then(|| "Preview unavailable. Refresh to try again.".to_owned());
+        let scope = egui::Id::unique(("made-remote-preview", self.pane_id()));
+        let result = crate::explorer_view::preview_card_ui(
+            ui,
+            crate::explorer_view::PreviewCardState {
+                path_name: Some(&name),
+                path_full: Some(&full),
+                document: self.remote_preview.document.as_ref(),
+                loading,
+                error: error.as_deref(),
+                refreshed_at: self.remote_preview.refreshed_at,
+                focus_pending: self.remote_preview_focus_pending,
+            },
+            crate::explorer_view::PreviewCardIds {
+                focus: scope.with("preview-focus"),
+                close: scope.with(("preview-action", "Close")),
+                terminal: scope.with(("preview-action", "Terminal")),
+                refresh: scope.with(("preview-action", "Refresh")),
+                copy: scope.with(("preview-action", "Copy path")),
+            },
+            layout,
+        );
+        self.remote_preview_focus_pending = false;
+        if result.copy_path {
+            ui.ctx().copy_text(sanitize_display(&full, 4096));
+            self.diag
+                .log_mut()
+                .record(LogLevel::Info, "preview path copied");
+        }
+        if result.refresh {
+            if let Some(remote) = self.remote.as_mut() {
+                let _ = remote.workspace.refresh_preview();
+            }
+        }
+        if matches!(
+            result.surface,
+            PreviewUiAction::Close | PreviewUiAction::ShowTerminal
+        ) {
+            ui.ctx()
+                .memory_mut(|memory| memory.surrender_focus(scope.with("preview-focus")));
+        }
+        if result.surface == PreviewUiAction::Close {
+            if let Some(remote) = self.remote.as_mut() {
+                let _ = remote.workspace.close_preview();
+            }
+            self.remote_preview.clear();
+        }
+        result.surface
+    }
+
     pub fn remote_sessions_available(&self) -> bool {
         self.remote.as_ref().is_some_and(|remote| {
             remote.workspace.integration() == crate::remote_workspace::IntegrationState::Connected
@@ -1948,6 +2100,7 @@ impl Workbench {
         &mut self,
         actions: Vec<crate::explorer_view::RemoteExplorerAction>,
     ) {
+        let mut open_preview = false;
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
@@ -1956,7 +2109,21 @@ impl Workbench {
                 crate::explorer_view::RemoteExplorerAction::SetMode(mode) => {
                     remote.workspace.set_mode(mode);
                     if mode == crate::remote_workspace::ExplorerMode::Git {
-                        let _ = remote.workspace.refresh_git();
+                        let needs_refresh = remote
+                            .workspace
+                            .projection()
+                            .git_view
+                            .as_ref()
+                            .is_none_or(|git| {
+                                matches!(
+                                    git.freshness,
+                                    crate::remote_workspace::Freshness::Stale
+                                        | crate::remote_workspace::Freshness::Unavailable(_)
+                                )
+                            });
+                        if needs_refresh {
+                            let _ = remote.workspace.refresh_git();
+                        }
                     }
                 }
                 crate::explorer_view::RemoteExplorerAction::Expand(path) => {
@@ -1969,25 +2136,20 @@ impl Workbench {
                     let _ = remote.workspace.select(path);
                 }
                 crate::explorer_view::RemoteExplorerAction::OpenPreview(path) => {
-                    let _ = remote.workspace.open_preview(path);
+                    if remote.workspace.open_preview(path).is_ok() {
+                        open_preview = true;
+                    }
                 }
-                crate::explorer_view::RemoteExplorerAction::RefreshPreview => {
-                    let _ = remote.workspace.refresh_preview();
-                }
-                crate::explorer_view::RemoteExplorerAction::ClosePreview => {
-                    let _ = remote.workspace.close_preview();
-                }
-                crate::explorer_view::RemoteExplorerAction::CopyPath(path) => {
-                    self.pending_notice = Some((
-                        "Copied remote path".to_string(),
-                        Instant::now() + NOTICE_TTL,
-                    ));
-                    let _ = path;
-                }
-                crate::explorer_view::RemoteExplorerAction::UseRoot(path) => {
-                    let _ = remote.workspace.select_root(path);
+                crate::explorer_view::RemoteExplorerAction::RetryRoot => {
+                    let root = remote.workspace.root().clone();
+                    let _ = remote.workspace.load_directory(root);
                 }
             }
+        }
+        if open_preview {
+            self.set_left_surface(LeftSurface::Preview);
+            self.remote_preview.clear();
+            self.remote_preview_focus_pending = true;
         }
     }
 
@@ -5041,6 +5203,8 @@ mod tests {
             pending_notice: None,
             last_title: None,
             remote: None,
+            remote_preview: RemotePreviewView::default(),
+            remote_preview_focus_pending: false,
         }
     }
 
@@ -5476,5 +5640,426 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         assert!(attached, "workbench never attached");
         assert!(listed, "workbench never applied the root listing");
+    }
+    fn ui_text(output: &egui::FullOutput) -> String {
+        fn visit(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(text_shape) => {
+                    text.push_str(&text_shape.galley.job.text);
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    #[ignore = "requires the plantsuite container fixture"]
+    fn real_container_remote_ui_uses_local_surfaces() {
+        use made_remote::protocol::{Identity, Operation, RemotePath, TabCapability};
+        use std::time::Duration;
+
+        let password =
+            std::env::var("MADE_FIXTURE_PASSWORD").unwrap_or_else(|_| "plantsuite".to_owned());
+        let real_home = std::env::var_os("HOME").expect("HOME");
+        let real_known = std::path::PathBuf::from(&real_home)
+            .join("Library/Application Support/Made/ssh-known-hosts");
+        let directory =
+            std::env::temp_dir().join(format!("made-real-remote-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&directory).unwrap();
+        let home = directory.join("home");
+        let app_support = home.join("Library/Application Support/Made");
+        std::fs::create_dir_all(&app_support).unwrap();
+        if real_known.exists() {
+            std::fs::copy(&real_known, app_support.join("ssh-known-hosts")).unwrap();
+        }
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let keys = [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ];
+        let _env = EnvGuard(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+
+        let mut registry = crate::ssh_servers::ServerRegistry::load(
+            crate::ssh_servers::PrivateMetadataStorage::new(&directory),
+        )
+        .unwrap();
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let plant = RemotePath::new(b"/workspaces/PlantSuite".to_vec()).unwrap();
+        let readme = RemotePath::new(b"/workspaces/PlantSuite/README.md".to_vec()).unwrap();
+        let authority = registry
+            .add(crate::ssh_servers::ServerMetadata {
+                display_name: "e2e".to_owned(),
+                host: "plantsuite.container".to_owned(),
+                user: Some("vscode".to_owned()),
+                port: Some(2222),
+                key_file: None,
+                initial_directory: Some(root.clone()),
+            })
+            .unwrap();
+        let snapshot = registry.snapshot(authority).unwrap();
+        let identity = Identity {
+            authority,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        };
+        let workspace =
+            crate::remote_workspace::RemoteWorkspace::new(identity.clone(), root.clone()).unwrap();
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot.clone(),
+            workspace,
+            TerminalTarget::RemoteShell { authority },
+            "e2e",
+        );
+        let session = crate::ssh_servers::connect_companion(
+            snapshot.server().metadata(),
+            crate::APP_VERSION,
+            "aarch64-unknown-linux-gnu",
+            identity,
+            root.clone(),
+        )
+        .expect("companion");
+        let client = session.client.clone();
+        {
+            let remote = workbench.remote.as_mut().unwrap();
+            remote.client = Some(client.clone());
+            remote.failures = session.failures;
+        }
+        let open = client
+            .request(
+                crate::remote_session::first_operation(
+                    crate::remote_session::SessionOpen::New,
+                    root.clone(),
+                    made_remote::protocol::LaunchTarget::Shell,
+                    24,
+                    80,
+                ),
+                None,
+            )
+            .unwrap();
+        workbench.remote.as_mut().unwrap().attach_request = Some(open);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut attached = false;
+        let mut listed = false;
+        while Instant::now() < deadline {
+            if let Some(prompt) = client.poll_prompt() {
+                let answer =
+                    made_platform::ssh_askpass::PromptAnswer::new(password.as_bytes().to_vec())
+                        .ok();
+                let _ = client.answer_prompt(prompt.id, answer);
+            }
+            workbench.pump_remote_client();
+            workbench.pump_remote_terminal();
+            let remote = workbench.remote.as_ref().unwrap();
+            attached |= remote.attached_once;
+            if attached {
+                if let Some(directory) = remote.workspace.projection().directories.get(&root) {
+                    if !directory.entries.is_empty() {
+                        listed = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(attached, "workbench never attached");
+        assert!(listed, "workbench never applied the root listing");
+
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let layout = crate::theme::Layout::for_window(1280.0, 800.0);
+        let scope = egui::Id::unique("real-remote-explorer");
+        let projection = workbench
+            .remote
+            .as_ref()
+            .unwrap()
+            .workspace
+            .projection()
+            .clone();
+        let entries = projection
+            .directories
+            .get(&root)
+            .map(|directory| directory.entries.len())
+            .unwrap_or(0);
+        assert_eq!(entries, 27, "unexpected /home/vscode entry count");
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = crate::explorer_view::remote_explorer_ui(
+                ui,
+                &root,
+                &projection,
+                &layout,
+                scope,
+                false,
+            );
+        });
+        output.textures_delta.clear();
+        let text = ui_text(&output);
+        assert!(text.contains("EXPLORER"), "missing local explorer title");
+        assert!(text.contains("vscode"), "missing root name");
+        for forbidden in [
+            "SSH connected",
+            "SSH disconnected",
+            "integration unknown",
+            "Files",
+            "Source Control",
+            "Preview",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "remote explorer painted SSH chrome {forbidden:?}: {text:?}"
+            );
+        }
+        let painted_rows = (0..entries)
+            .filter(|index| {
+                ctx.read_response(scope.with(("tree-row", *index)))
+                    .is_some()
+            })
+            .count();
+        assert_eq!(painted_rows, entries, "not every root row was painted");
+        eprintln!(
+            "real container: explorer root={} entries={entries} painted_rows={painted_rows}",
+            root.to_utf8().unwrap_or("<non-utf8>")
+        );
+
+        workbench
+            .remote
+            .as_mut()
+            .unwrap()
+            .workspace
+            .select_root(plant.clone())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut plant_listed = false;
+        let mut git_ready = false;
+        while Instant::now() < deadline {
+            if let Some(prompt) = client.poll_prompt() {
+                let answer =
+                    made_platform::ssh_askpass::PromptAnswer::new(password.as_bytes().to_vec())
+                        .ok();
+                let _ = client.answer_prompt(prompt.id, answer);
+            }
+            workbench.pump_remote_client();
+            workbench.pump_remote_terminal();
+            let remote = workbench.remote.as_ref().unwrap();
+            plant_listed |= remote
+                .workspace
+                .projection()
+                .directories
+                .get(&plant)
+                .is_some_and(|directory| !directory.entries.is_empty());
+            git_ready |= remote
+                .workspace
+                .projection()
+                .git_view
+                .as_ref()
+                .is_some_and(|git| git.freshness == crate::remote_workspace::Freshness::Current);
+            if plant_listed && git_ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            plant_listed,
+            "workbench never listed /workspaces/PlantSuite"
+        );
+        assert!(git_ready, "workbench never read PlantSuite git status");
+        let remote = workbench.remote.as_ref().unwrap();
+        let git = remote
+            .workspace
+            .projection()
+            .git_view
+            .as_ref()
+            .expect("git view");
+        let branch = git.branch.as_deref().unwrap_or("<detached>");
+        assert!(!branch.is_empty(), "git view must show a head line");
+        let status = if git.groups.is_empty() {
+            "No changes".to_owned()
+        } else {
+            git.groups
+                .iter()
+                .map(|group| format!("{} ({})", group.title, group.rows.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        eprintln!(
+            "real container: git root={} branch={branch} status={status}",
+            plant.to_utf8().unwrap_or("<non-utf8>"),
+        );
+        let mut git_projection = remote.workspace.projection().clone();
+        git_projection.mode = crate::remote_workspace::ExplorerMode::Git;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = crate::explorer_view::remote_explorer_ui(
+                ui,
+                &plant,
+                &git_projection,
+                &layout,
+                scope,
+                false,
+            );
+        });
+        output.textures_delta.clear();
+        let text = ui_text(&output);
+        assert!(text.contains("REPOS"), "missing local REPOS title");
+        assert!(text.contains(branch), "missing branch line");
+        assert!(
+            text.contains("No changes") || text.contains("Changes"),
+            "missing git status state: {text:?}"
+        );
+        for forbidden in ["SSH", "integration unknown", "Files", "Source Control"] {
+            assert!(
+                !text.contains(forbidden),
+                "remote source control painted SSH chrome {forbidden:?}: {text:?}"
+            );
+        }
+
+        workbench.apply_remote_actions(vec![
+            crate::explorer_view::RemoteExplorerAction::OpenPreview(readme.clone()),
+        ]);
+        assert_eq!(
+            workbench.left_surface(),
+            LeftSurface::Preview,
+            "opening a remote file must use the full-left preview surface"
+        );
+        assert!(workbench.remote_has_preview());
+        assert!(workbench.remote_preview_focus_pending);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut preview_ready = false;
+        while Instant::now() < deadline {
+            if let Some(prompt) = client.poll_prompt() {
+                let answer =
+                    made_platform::ssh_askpass::PromptAnswer::new(password.as_bytes().to_vec())
+                        .ok();
+                let _ = client.answer_prompt(prompt.id, answer);
+            }
+            workbench.pump_remote_client();
+            workbench.pump_remote_terminal();
+            preview_ready |= workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .projection()
+                .preview
+                .as_ref()
+                .is_some_and(|preview| {
+                    preview.freshness == crate::remote_workspace::Freshness::Current
+                });
+            if preview_ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(preview_ready, "workbench never loaded README.md preview");
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            let action = workbench.remote_preview_ui(ui, &layout);
+            assert_eq!(action, PreviewUiAction::None);
+        });
+        output.textures_delta.clear();
+        let text = ui_text(&output);
+        for expected in ["PREVIEW", "README.md", "read-only", "Copy path", "Close"] {
+            assert!(
+                text.contains(expected),
+                "remote preview missing {expected:?}: {text:?}"
+            );
+        }
+        assert!(!text.contains("SSH"), "remote preview painted SSH chrome");
+        assert_eq!(
+            workbench.left_surface(),
+            LeftSurface::Preview,
+            "rendering the preview must keep the left surface"
+        );
+        let document = workbench
+            .remote_preview
+            .document
+            .as_ref()
+            .expect("remote preview document");
+        assert_eq!(document.size, Some(7824), "unexpected README.md size");
+        let preview_path = workbench
+            .remote
+            .as_ref()
+            .unwrap()
+            .workspace
+            .projection()
+            .preview
+            .as_ref()
+            .expect("preview")
+            .path
+            .clone();
+        eprintln!(
+            "real container: preview path={} bytes={} lines={} surface=full-left",
+            preview_path.to_utf8().unwrap_or("<non-utf8>"),
+            document.size.unwrap_or(0),
+            document.line_count()
+        );
+
+        let _ = client.request(Operation::Close, None);
+        std::thread::sleep(Duration::from_millis(100));
+        client.disconnect();
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }
