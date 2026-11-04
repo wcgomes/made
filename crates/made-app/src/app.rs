@@ -664,7 +664,9 @@ impl AppModel {
 
     fn poll_remote_closes(&mut self) {
         let mut notices = Vec::new();
+        let had_reports = !self.remote_closes.is_empty();
         self.remote_closes.retain(|watch| match watch.try_recv() {
+            Ok(crate::remote_session::CloseReport::Confirmed) => false,
             Ok(report) => {
                 notices.push(report.label().to_owned());
                 false
@@ -682,6 +684,8 @@ impl AppModel {
         if let Some(notice) = notices.last() {
             self.remote_close_notice = Some(notice.clone());
             self.ssh_notice = Some(notice.clone());
+        } else if had_reports && self.remote_closes.is_empty() {
+            self.remote_close_notice = None;
         }
     }
 
@@ -1908,6 +1912,56 @@ mod tests {
         );
         assert!(model.native_backdrop().is_applied());
         assert_eq!(model.native_backdrop().reason(), "test status");
+
+        model.shutdown();
+    }
+
+    #[test]
+    fn confirmed_remote_close_shows_no_notice_and_unconfirmed_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let picker = crate::WorkspacePicker::new(temp.path()).unwrap();
+        let mut model = AppModel::from_launch(
+            crate::workspace::WorkspaceLaunch::Picker {
+                picker,
+                error: None,
+            },
+            AppOptions::new(),
+        );
+
+        let (sender, watch) = mpsc::channel();
+        model.remote_closes.push(watch);
+        sender
+            .send(crate::remote_session::CloseReport::Confirmed)
+            .unwrap();
+        model.poll_remote_closes();
+        assert_eq!(model.remote_close_notice(), None);
+        assert_eq!(model.ssh_notice(), None);
+
+        let (sender, watch) = mpsc::channel();
+        model.remote_closes.push(watch);
+        sender
+            .send(crate::remote_session::CloseReport::Unconfirmed)
+            .unwrap();
+        model.poll_remote_closes();
+        assert_eq!(
+            model.remote_close_notice(),
+            Some("remote cleanup unconfirmed")
+        );
+        assert_eq!(model.ssh_notice(), Some("remote cleanup unconfirmed"));
+
+        model.poll_remote_closes();
+        assert_eq!(
+            model.remote_close_notice(),
+            Some("remote cleanup unconfirmed")
+        );
+
+        let (sender, watch) = mpsc::channel();
+        model.remote_closes.push(watch);
+        sender
+            .send(crate::remote_session::CloseReport::Confirmed)
+            .unwrap();
+        model.poll_remote_closes();
+        assert_eq!(model.remote_close_notice(), None);
 
         model.shutdown();
     }
