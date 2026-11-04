@@ -744,6 +744,7 @@ struct GitGroupView {
 struct GitBodyView {
     has_status: bool,
     failed: bool,
+    stale: bool,
     groups: Vec<GitGroupView>,
 }
 
@@ -1875,6 +1876,7 @@ fn local_git_body(
     GitBodyView {
         has_status: status.is_some(),
         failed,
+        stale: false,
         groups,
     }
 }
@@ -2500,8 +2502,15 @@ fn git_body_ui(ui: &mut Ui, body: &GitBodyView, scope: egui::Id, result: &mut Ex
         ui.label(quiet_line(message));
         return;
     }
+    if body.stale {
+        ui.label(quiet_line(
+            "Git status unavailable — showing the last status",
+        ));
+    }
     if body.groups.is_empty() {
-        ui.label(quiet_line("No changes"));
+        if !body.stale {
+            ui.label(quiet_line("No changes"));
+        }
         return;
     }
     let mut clicked = None;
@@ -3868,6 +3877,7 @@ fn remote_git_body(
         return GitBodyView {
             has_status: false,
             failed: false,
+            stale: false,
             groups: Vec::new(),
         };
     };
@@ -3909,10 +3919,12 @@ fn remote_git_body(
             rows,
         });
     }
-    let failed = !git.has_status && matches!(git.freshness, Freshness::Unavailable(_));
+    let unavailable = matches!(git.freshness, Freshness::Unavailable(_));
+    let failed = !git.has_status && unavailable;
     GitBodyView {
         has_status: git.has_status,
         failed,
+        stale: git.has_status && unavailable,
         groups,
     }
 }
@@ -7167,7 +7179,26 @@ mod tests {
         let text = output_text(&output);
         assert!(text.contains("Changes (1)"), "{text}");
         assert!(text.contains("README.md"), "{text}");
-        assert!(!text.contains("Git status unavailable"), "{text}");
+        assert!(text.contains("Git status unavailable"), "{text}");
+        assert!(!text.contains("No changes"), "{text}");
+
+        // A previously clean status must not silently become "No changes"
+        // after a failed refresh.
+        projection.git_view = Some(RemoteGitView {
+            branch: Some("main".to_owned()),
+            detached: false,
+            commit: None,
+            subject: None,
+            linked_worktree: false,
+            worktree_name: Some("PlantSuite".to_owned()),
+            groups: Vec::new(),
+            freshness: Freshness::Unavailable(made_remote::protocol::ErrorCode::Unavailable),
+            folder_marks: std::collections::HashMap::new(),
+            has_status: true,
+        });
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(text.contains("Git status unavailable"), "{text}");
         assert!(!text.contains("No changes"), "{text}");
     }
 

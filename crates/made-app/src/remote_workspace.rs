@@ -409,8 +409,20 @@ impl RemoteWorkspace {
             },
             Err(code) => Operation::Error { code },
         };
+        // Root resolutions are delivered on a dedicated port and may advance
+        // the generation. The generic reply guard compares the envelope
+        // identity to the workspace's current generation, so re-stamp the
+        // reply with the current identity while keeping the server's new
+        // generation in the operation itself.
+        if resolution.identity.authority != self.identity.authority
+            || !resolution.identity.tab.authenticates(&self.identity.tab)
+            || resolution.identity.epoch != self.identity.epoch
+            || resolution.generation < self.identity.generation
+        {
+            return Err(ProtocolError::Identity);
+        }
         self.accept(WireEnvelope::new(
-            resolution.identity,
+            self.identity.clone(),
             resolution.request_id,
             operation,
         ))
@@ -447,6 +459,7 @@ impl RemoteWorkspace {
                     self.root = path.clone();
                     self.identity.generation = generation;
                 }
+                self.projection.requested_root = None;
                 Some(RemoteResult::Root(path))
             }
             Operation::Listed {
@@ -542,6 +555,7 @@ impl RemoteWorkspace {
             preview.freshness = Freshness::Stale;
             self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
         }
+        self.projection.requested_root = None;
         self.projection.sessions = None;
         self.projection.session_state = Freshness::Stale;
         self.projection.focus = None;

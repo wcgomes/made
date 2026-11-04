@@ -612,10 +612,16 @@ fn bounded_requests_and_outside_root_require_explicit_grant() {
 fn root_port_resolution_updates_the_workspace_generation() {
     let mut workspace = model(3);
     let id = workspace.select_root(path("/project/src")).unwrap();
+    assert_eq!(
+        workspace.projection().requested_root.as_ref(),
+        Some(&path("/project/src"))
+    );
     let command = workspace.next_command().unwrap();
     assert_eq!(command.request_id, id);
+    let mut identity = command.identity.clone();
+    identity.generation = 2;
     let resolution = made_remote::protocol::RootResolution {
-        identity: command.identity.clone(),
+        identity,
         request_id: id,
         result: Ok(path("/project/src")),
         generation: 2,
@@ -624,6 +630,20 @@ fn root_port_resolution_updates_the_workspace_generation() {
     assert!(matches!(result, Some(RemoteResult::Root(root)) if root == path("/project/src")));
     assert_eq!(workspace.identity().generation, 2);
     assert_eq!(workspace.root(), &path("/project/src"));
+    assert!(workspace.projection().requested_root.is_none());
+    let mut listed = false;
+    let mut git = false;
+    while let Some(request) = workspace.next_command() {
+        match request.operation {
+            Operation::List { path: listed_path } => {
+                listed |= listed_path == path("/project/src");
+            }
+            Operation::GitRead { .. } => git = true,
+            _ => {}
+        }
+    }
+    assert!(listed, "accepted root must list the new root");
+    assert!(git, "accepted root must refresh Git");
 }
 
 fn accept_git(workspace: &mut RemoteWorkspace, status: Result<&[u8], ErrorCode>) {
@@ -664,6 +684,15 @@ fn accept_git(workspace: &mut RemoteWorkspace, status: Result<&[u8], ErrorCode>)
             ))
             .unwrap();
     }
+}
+
+#[test]
+fn disconnect_clears_a_pending_requested_root() {
+    let mut workspace = model(1);
+    workspace.select_root(path("/project/next")).unwrap();
+    assert!(workspace.projection().requested_root.is_some());
+    workspace.disconnect();
+    assert!(workspace.projection().requested_root.is_none());
 }
 
 #[test]
