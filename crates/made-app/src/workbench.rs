@@ -328,21 +328,137 @@ struct RemotePreviewKey {
     path: made_remote::protocol::RemotePath,
     freshness: crate::remote_workspace::Freshness,
     len: usize,
+    revision: u64,
+}
+
+struct RemotePreviewJob {
+    key: RemotePreviewKey,
+    path: made_remote::protocol::RemotePath,
+    kind: made_remote::protocol::PreviewKind,
+    data: Vec<u8>,
+}
+
+struct RemotePreviewResult {
+    key: RemotePreviewKey,
+    document: PreviewDocument,
+}
+
+struct RemotePreviewWorker {
+    jobs: SyncSender<RemotePreviewJob>,
+    results: Receiver<RemotePreviewResult>,
+}
+
+impl RemotePreviewWorker {
+    fn start() -> Self {
+        let (jobs, job_rx) = mpsc::sync_channel::<RemotePreviewJob>(2);
+        let (result_tx, results) = mpsc::sync_channel::<RemotePreviewResult>(8);
+        thread::Builder::new()
+            .name("made-remote-preview".to_owned())
+            .spawn(move || {
+                let mut highlighter: Option<Highlighter> = None;
+                while let Ok(job) = job_rx.recv() {
+                    let highlighter = highlighter.get_or_insert_with(Highlighter::new);
+                    let document =
+                        PreviewDocument::from_remote(&job.path, job.kind, &job.data, highlighter);
+                    if result_tx
+                        .send(RemotePreviewResult {
+                            key: job.key,
+                            document,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self { jobs, results }
+    }
+
+    fn request(&self, job: RemotePreviewJob) -> bool {
+        self.jobs.try_send(job).is_ok()
+    }
+
+    fn try_recv(&self) -> Option<RemotePreviewResult> {
+        self.results.try_recv().ok()
+    }
 }
 
 #[derive(Default)]
 struct RemotePreviewView {
     key: Option<RemotePreviewKey>,
     document: Option<PreviewDocument>,
+    document_key: Option<RemotePreviewKey>,
     refreshed_at: Option<Instant>,
-    highlighter: Option<Highlighter>,
+    worker: Option<RemotePreviewWorker>,
+    pending: Option<RemotePreviewKey>,
+}
+
+fn remote_error_reason(code: made_remote::protocol::ErrorCode) -> &'static str {
+    use made_remote::protocol::ErrorCode;
+    match code {
+        ErrorCode::Unsupported => "unsupported request",
+        ErrorCode::Unavailable => "the remote path is unavailable",
+        ErrorCode::Unauthorized => "the remote path is not authorized",
+        ErrorCode::InvalidRequest => "the remote request was rejected",
+        ErrorCode::Stale => "the remote state is stale",
+        ErrorCode::Cancelled => "the remote request was cancelled",
+        ErrorCode::Timeout => "the remote request timed out",
+        ErrorCode::Limit => "the remote limit was reached",
+        ErrorCode::SessionLost => "the remote session was lost",
+        ErrorCode::CleanupUnconfirmed => "remote cleanup was not confirmed",
+        ErrorCode::Io => "the remote I/O failed",
+    }
 }
 
 impl RemotePreviewView {
     fn clear(&mut self) {
         self.key = None;
         self.document = None;
+        self.document_key = None;
         self.refreshed_at = None;
+        self.pending = None;
+    }
+
+    fn request(
+        &mut self,
+        key: RemotePreviewKey,
+        path: made_remote::protocol::RemotePath,
+        kind: made_remote::protocol::PreviewKind,
+        data: Vec<u8>,
+    ) -> bool {
+        if self.pending.as_ref() == Some(&key) {
+            return true;
+        }
+        let worker = self.worker.get_or_insert_with(RemotePreviewWorker::start);
+        if worker.request(RemotePreviewJob {
+            key: key.clone(),
+            path,
+            kind,
+            data,
+        }) {
+            self.pending = Some(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll(&mut self) {
+        let mut results = Vec::new();
+        if let Some(worker) = self.worker.as_ref() {
+            while let Some(result) = worker.try_recv() {
+                results.push(result);
+            }
+        }
+        for result in results {
+            if self.key.as_ref() == Some(&result.key) {
+                self.document = Some(result.document);
+                self.document_key = Some(result.key);
+                self.refreshed_at = Some(Instant::now());
+                self.pending = None;
+            }
+        }
     }
 }
 
@@ -428,6 +544,7 @@ pub struct Workbench {
     last_title: Option<String>,
     remote: Option<RemoteTab>,
     remote_preview: RemotePreviewView,
+    remote_explorer_cache: crate::explorer_view::RemoteExplorerCache,
     pub(crate) remote_preview_focus_pending: bool,
 }
 
@@ -680,6 +797,7 @@ impl Workbench {
             last_title: None,
             remote,
             remote_preview: RemotePreviewView::default(),
+            remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
         };
 
@@ -1945,6 +2063,28 @@ impl Workbench {
             .map(|remote| remote.workspace.projection())
     }
 
+    pub(crate) fn remote_explorer_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        root: &made_remote::protocol::RemotePath,
+        layout: &crate::theme::Layout,
+        scope: egui::Id,
+        native_backdrop: bool,
+    ) -> Vec<crate::explorer_view::RemoteExplorerAction> {
+        let Some(remote) = self.remote.as_ref() else {
+            return Vec::new();
+        };
+        crate::explorer_view::remote_explorer_ui(
+            ui,
+            root,
+            remote.workspace.projection(),
+            layout,
+            scope,
+            native_backdrop,
+            &mut self.remote_explorer_cache,
+        )
+    }
+
     pub fn remote_has_preview(&self) -> bool {
         self.remote
             .as_ref()
@@ -1957,7 +2097,8 @@ impl Workbench {
             self.remote_preview.clear();
             return;
         };
-        let Some(preview) = remote.workspace.projection().preview.as_ref() else {
+        let projection = remote.workspace.projection();
+        let Some(preview) = projection.preview.as_ref() else {
             self.remote_preview.clear();
             return;
         };
@@ -1965,37 +2106,37 @@ impl Workbench {
             path: preview.path.clone(),
             freshness: preview.freshness,
             len: preview.data.len(),
+            revision: projection.preview_revision,
         };
-        if self.remote_preview.key.as_ref() == Some(&key) {
-            return;
+        let key_changed = self.remote_preview.key.as_ref() != Some(&key);
+        if key_changed {
+            let same_path = self
+                .remote_preview
+                .key
+                .as_ref()
+                .is_some_and(|old| old.path == preview.path);
+            if !same_path {
+                self.remote_preview.document = None;
+                self.remote_preview.document_key = None;
+                self.remote_preview.refreshed_at = None;
+            }
+            self.remote_preview.key = Some(key.clone());
         }
-        let same_path = self
-            .remote_preview
-            .key
-            .as_ref()
-            .is_some_and(|old| old.path == preview.path);
-        if !same_path {
-            self.remote_preview.document = None;
-            self.remote_preview.refreshed_at = None;
-        }
-        self.remote_preview.key = Some(key);
         if preview.freshness != Freshness::Current {
             return;
         }
         let Some(kind) = preview.kind else {
             return;
         };
-        let highlighter = self
+        if !key_changed
+            && (self.remote_preview.pending.as_ref() == Some(&key)
+                || self.remote_preview.document_key.as_ref() == Some(&key))
+        {
+            return;
+        }
+        let _ = self
             .remote_preview
-            .highlighter
-            .get_or_insert_with(Highlighter::new);
-        self.remote_preview.document = Some(PreviewDocument::from_remote(
-            &preview.path,
-            kind,
-            &preview.data,
-            highlighter,
-        ));
-        self.remote_preview.refreshed_at = Some(Instant::now());
+            .request(key, preview.path.clone(), kind, preview.data.clone());
     }
 
     pub(crate) fn remote_preview_ui(
@@ -2004,6 +2145,7 @@ impl Workbench {
         layout: &crate::theme::Layout,
     ) -> PreviewUiAction {
         use crate::remote_workspace::Freshness;
+        self.remote_preview.poll();
         self.sync_remote_preview();
         let Some(remote) = self.remote.as_ref() else {
             return PreviewUiAction::Close;
@@ -2014,10 +2156,19 @@ impl Workbench {
         let full = crate::explorer_view::remote_path_text(&preview.path);
         let name = crate::explorer_view::remote_file_name(&preview.path);
         let has_document = self.remote_preview.document.is_some();
+        let building =
+            self.remote_preview.document_key.as_ref() != self.remote_preview.key.as_ref();
         let loading = preview.freshness == Freshness::Loading
-            || (!has_document && preview.freshness == Freshness::Stale);
-        let error = matches!(preview.freshness, Freshness::Unavailable(_))
-            .then(|| "Preview unavailable. Refresh to try again.".to_owned());
+            || (!has_document
+                && matches!(preview.freshness, Freshness::Stale | Freshness::Current))
+            || building;
+        let error = match preview.freshness {
+            Freshness::Unavailable(code) => Some(format!(
+                "Preview unavailable: {}. Refresh to try again.",
+                remote_error_reason(code)
+            )),
+            _ => None,
+        };
         let scope = egui::Id::unique(("made-remote-preview", self.pane_id()));
         let result = crate::explorer_view::preview_card_ui(
             ui,
@@ -2098,6 +2249,7 @@ impl Workbench {
 
     pub fn apply_remote_actions(
         &mut self,
+        ctx: &egui::Context,
         actions: Vec<crate::explorer_view::RemoteExplorerAction>,
     ) {
         let mut open_preview = false;
@@ -2109,21 +2261,7 @@ impl Workbench {
                 crate::explorer_view::RemoteExplorerAction::SetMode(mode) => {
                     remote.workspace.set_mode(mode);
                     if mode == crate::remote_workspace::ExplorerMode::Git {
-                        let needs_refresh = remote
-                            .workspace
-                            .projection()
-                            .git_view
-                            .as_ref()
-                            .is_none_or(|git| {
-                                matches!(
-                                    git.freshness,
-                                    crate::remote_workspace::Freshness::Stale
-                                        | crate::remote_workspace::Freshness::Unavailable(_)
-                                )
-                            });
-                        if needs_refresh {
-                            let _ = remote.workspace.refresh_git();
-                        }
+                        let _ = remote.workspace.refresh_git_if_idle();
                     }
                 }
                 crate::explorer_view::RemoteExplorerAction::Expand(path) => {
@@ -2135,19 +2273,28 @@ impl Workbench {
                 crate::explorer_view::RemoteExplorerAction::Select(path) => {
                     let _ = remote.workspace.select(path);
                 }
+                crate::explorer_view::RemoteExplorerAction::SelectGit(path) => {
+                    let _ = remote.workspace.select_git(path);
+                }
                 crate::explorer_view::RemoteExplorerAction::OpenPreview(path) => {
                     if remote.workspace.open_preview(path).is_ok() {
                         open_preview = true;
                     }
                 }
                 crate::explorer_view::RemoteExplorerAction::RetryRoot => {
-                    let root = remote.workspace.root().clone();
+                    let root = remote
+                        .workspace
+                        .projection()
+                        .requested_root
+                        .clone()
+                        .unwrap_or_else(|| remote.workspace.root().clone());
                     let _ = remote.workspace.load_directory(root);
                 }
             }
         }
         if open_preview {
             self.set_left_surface(LeftSurface::Preview);
+            self.sync_terminal_visibility(ctx);
             self.remote_preview.clear();
             self.remote_preview_focus_pending = true;
         }
@@ -2202,19 +2349,21 @@ impl Workbench {
                 ctx.request_repaint_after(delay);
             }
         }
-        if self.remote.as_ref().is_some_and(|remote| {
-            remote.prompt.is_some()
-                || remote.holding_input
-                || remote.upload.is_some()
-                || matches!(
-                    remote.phase,
-                    RemotePhase::Connecting
-                        | RemotePhase::NeedsConsent
-                        | RemotePhase::NeedsHostApproval
-                        | RemotePhase::Staging
-                        | RemotePhase::AwaitingAttach
-                )
-        }) {
+        if self.visible
+            && self.remote.as_ref().is_some_and(|remote| {
+                remote.prompt.is_some()
+                    || remote.holding_input
+                    || remote.upload.is_some()
+                    || matches!(
+                        remote.phase,
+                        RemotePhase::Connecting
+                            | RemotePhase::NeedsConsent
+                            | RemotePhase::NeedsHostApproval
+                            | RemotePhase::Staging
+                            | RemotePhase::AwaitingAttach
+                    )
+            })
+        {
             ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
         }
     }
@@ -5218,6 +5367,7 @@ mod tests {
             last_title: None,
             remote: None,
             remote_preview: RemotePreviewView::default(),
+            remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
         }
     }
@@ -5857,6 +6007,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let mut explorer_cache = crate::explorer_view::RemoteExplorerCache::default();
         let mut output = ctx.run_ui(raw, |ui| {
             let _ = crate::explorer_view::remote_explorer_ui(
                 ui,
@@ -5865,6 +6016,7 @@ mod tests {
                 &layout,
                 scope,
                 false,
+                &mut explorer_cache,
             );
         });
         output.textures_delta.clear();
@@ -5969,6 +6121,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let mut git_explorer_cache = crate::explorer_view::RemoteExplorerCache::default();
         let mut output = ctx.run_ui(raw, |ui| {
             let _ = crate::explorer_view::remote_explorer_ui(
                 ui,
@@ -5977,6 +6130,7 @@ mod tests {
                 &layout,
                 scope,
                 false,
+                &mut git_explorer_cache,
             );
         });
         output.textures_delta.clear();
@@ -5994,9 +6148,12 @@ mod tests {
             );
         }
 
-        workbench.apply_remote_actions(vec![
-            crate::explorer_view::RemoteExplorerAction::OpenPreview(readme.clone()),
-        ]);
+        workbench.apply_remote_actions(
+            &egui::Context::default(),
+            vec![crate::explorer_view::RemoteExplorerAction::OpenPreview(
+                readme.clone(),
+            )],
+        );
         assert_eq!(
             workbench.left_surface(),
             LeftSurface::Preview,
@@ -6039,11 +6196,21 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut output = ctx.run_ui(raw, |ui| {
-            let action = workbench.remote_preview_ui(ui, &layout);
-            assert_eq!(action, PreviewUiAction::None);
-        });
-        output.textures_delta.clear();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_output = None;
+        while Instant::now() < deadline {
+            let mut output = ctx.run_ui(raw.clone(), |ui| {
+                let action = workbench.remote_preview_ui(ui, &layout);
+                assert_eq!(action, PreviewUiAction::None);
+            });
+            output.textures_delta.clear();
+            if workbench.remote_preview.document.is_some() {
+                last_output = Some(output);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = last_output.expect("remote preview document worker");
         let text = ui_text(&output);
         for expected in ["PREVIEW", "README.md", "read-only", "Copy path", "Close"] {
             assert!(
@@ -6085,5 +6252,87 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         client.disconnect();
         let _ = std::fs::remove_dir_all(&directory);
+    }
+    #[test]
+    fn remote_preview_worker_keeps_highlighting_off_the_ui_path() {
+        use made_remote::protocol::{PreviewKind, RemotePath};
+        use std::time::Duration;
+
+        let path = RemotePath::new(b"/project/large.txt".to_vec()).unwrap();
+        let data = b"line of remote preview text\n".repeat(40_000);
+        let key = RemotePreviewKey {
+            path: path.clone(),
+            freshness: crate::remote_workspace::Freshness::Current,
+            len: data.len(),
+            revision: 1,
+        };
+        let mut view = RemotePreviewView {
+            key: Some(key.clone()),
+            ..RemotePreviewView::default()
+        };
+        assert!(view.request(key, path, PreviewKind::Text, data.clone()));
+        assert!(
+            view.document.is_none(),
+            "requesting a remote preview must not build it on the UI path"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.document.is_none() && Instant::now() < deadline {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let document = view.document.expect("worker document");
+        assert_eq!(document.size, Some(data.len() as u64));
+        assert!(!document.lines.is_empty());
+    }
+
+    #[test]
+    fn remote_preview_revision_invalidates_same_length_content_while_hidden() {
+        use made_remote::protocol::{PreviewKind, RemotePath};
+        use std::time::Duration;
+
+        let path = RemotePath::new(b"/project/file.txt".to_vec()).unwrap();
+        let key = |revision| RemotePreviewKey {
+            path: path.clone(),
+            freshness: crate::remote_workspace::Freshness::Current,
+            len: 4,
+            revision,
+        };
+        let mut view = RemotePreviewView {
+            key: Some(key(1)),
+            ..RemotePreviewView::default()
+        };
+        assert!(view.request(key(1), path.clone(), PreviewKind::Text, b"aaaa".to_vec()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view.document.is_none() && Instant::now() < deadline {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::explorer_view::document_text(view.document.as_ref().unwrap()),
+            "aaaa"
+        );
+
+        // A hidden same-length refresh bumps the revision; the old document
+        // stays until the replacement finishes.
+        view.key = Some(key(2));
+        assert!(view.request(key(2), path, PreviewKind::Text, b"bbbb".to_vec()));
+        assert_eq!(
+            crate::explorer_view::document_text(view.document.as_ref().unwrap()),
+            "aaaa"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while view
+            .document
+            .as_ref()
+            .is_some_and(|document| crate::explorer_view::document_text(document) != "bbbb")
+            && Instant::now() < deadline
+        {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            crate::explorer_view::document_text(view.document.as_ref().unwrap()),
+            "bbbb"
+        );
     }
 }

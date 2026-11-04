@@ -625,3 +625,143 @@ fn root_port_resolution_updates_the_workspace_generation() {
     assert_eq!(workspace.identity().generation, 2);
     assert_eq!(workspace.root(), &path("/project/src"));
 }
+
+fn accept_git(workspace: &mut RemoteWorkspace, status: Result<&[u8], ErrorCode>) {
+    for _ in 0..8 {
+        let Some(request) = workspace.next_command() else {
+            break;
+        };
+        let Operation::GitRead { command } = request.operation else {
+            panic!("expected GitRead");
+        };
+        let data: &[u8] = match command {
+            GitRead::ShowToplevel => b"/project\n",
+            GitRead::Branch => b"main\n",
+            GitRead::GitDir => b"/project/.git\n",
+            GitRead::CommonDir => b"/project/.git\n",
+            GitRead::WorktreeList => b"",
+            GitRead::CommitId => b"12345678\n",
+            GitRead::CommitSubject => b"Subject\n",
+            GitRead::Status => match status {
+                Ok(data) => data,
+                Err(code) => {
+                    workspace
+                        .accept(reply(&request, Operation::Error { code }))
+                        .unwrap();
+                    continue;
+                }
+            },
+        };
+        workspace
+            .accept(reply(
+                &request,
+                Operation::GitResult {
+                    command,
+                    offset: 0,
+                    data: Chunk::new(data.to_vec()).unwrap(),
+                    done: true,
+                },
+            ))
+            .unwrap();
+    }
+}
+
+#[test]
+fn git_failure_keeps_the_last_complete_view_and_marks_missing_status() {
+    let mut workspace = model(1);
+    workspace.refresh_git().unwrap();
+    accept_git(&mut workspace, Ok(b" M file\0"));
+    let view = workspace.projection().git_view.as_ref().unwrap();
+    assert!(view.has_status);
+    assert_eq!(view.groups.len(), 1);
+    assert_eq!(view.groups[0].rows.len(), 1);
+
+    workspace.refresh_git().unwrap();
+    accept_git(&mut workspace, Err(ErrorCode::Unavailable));
+    let view = workspace.projection().git_view.as_ref().unwrap();
+    assert!(view.has_status);
+    assert_eq!(view.branch.as_deref(), Some("main"));
+    assert_eq!(view.groups.len(), 1);
+    assert_eq!(view.groups[0].rows.len(), 1);
+
+    let mut fresh = model(2);
+    fresh.refresh_git().unwrap();
+    accept_git(&mut fresh, Err(ErrorCode::Unavailable));
+    let view = fresh.projection().git_view.as_ref().unwrap();
+    assert!(!view.has_status);
+    assert!(view.groups.is_empty());
+    assert_eq!(
+        view.freshness,
+        Freshness::Unavailable(ErrorCode::Unavailable)
+    );
+}
+
+#[test]
+fn entering_git_refreshes_even_when_current_and_dedupes_in_flight() {
+    let mut workspace = model(1);
+    workspace.refresh_git().unwrap();
+    assert_eq!(workspace.projection().git.len(), 8);
+    // A second entry while the first refresh is in flight queues nothing.
+    workspace.refresh_git_if_idle().unwrap();
+    assert_eq!(workspace.projection().git.len(), 8);
+
+    accept_git(&mut workspace, Ok(b""));
+    assert_eq!(
+        workspace.projection().git_view.as_ref().unwrap().freshness,
+        Freshness::Current
+    );
+    workspace.refresh_git_if_idle().unwrap();
+    let request = workspace.next_command().expect("fresh GitRead");
+    assert!(matches!(request.operation, Operation::GitRead { .. }));
+    assert!(workspace
+        .projection()
+        .git
+        .iter()
+        .any(|git| git.freshness == Freshness::Loading));
+}
+
+#[test]
+fn git_selection_is_independent_and_preview_does_not_move_tree_selection() {
+    let mut workspace = model(1);
+    let tree = path("/project/tree");
+    let git = path("/project/git");
+    let preview = path("/project/preview");
+    workspace.select(tree.clone()).unwrap();
+    workspace.select_git(git.clone()).unwrap();
+    assert_eq!(workspace.projection().selected.as_ref(), Some(&tree));
+    assert_eq!(workspace.projection().git_selected.as_ref(), Some(&git));
+    workspace.open_preview(preview).unwrap();
+    assert_eq!(workspace.projection().selected.as_ref(), Some(&tree));
+    assert_eq!(workspace.projection().git_selected.as_ref(), Some(&git));
+}
+
+#[test]
+fn root_listing_error_closes_the_open_preview() {
+    let mut workspace = model(1);
+    workspace.open_preview(path("/project/file")).unwrap();
+    workspace.load_directory(path("/project")).unwrap();
+    let request = loop {
+        let request = workspace.next_command().expect("list request");
+        if matches!(request.operation, Operation::List { .. }) {
+            break request;
+        }
+    };
+    workspace
+        .accept(reply(
+            &request,
+            Operation::Error {
+                code: ErrorCode::Unavailable,
+            },
+        ))
+        .unwrap();
+    assert!(workspace.projection().preview.is_none());
+    assert_eq!(
+        workspace
+            .projection()
+            .directories
+            .get(&path("/project"))
+            .unwrap()
+            .freshness,
+        Freshness::Unavailable(ErrorCode::Unavailable)
+    );
+}

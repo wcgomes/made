@@ -86,6 +86,8 @@ pub struct RemoteGitView {
     pub groups: Vec<RemoteGitGroup>,
     pub freshness: Freshness,
     pub folder_marks: HashMap<RemotePath, Vec<made_remote::git::ChangeKind>>,
+    /// A complete status read has succeeded at least once for this root.
+    pub has_status: bool,
 }
 /// UI reads this projection rather than treating previous-epoch data as live.
 #[derive(Debug, Clone)]
@@ -96,7 +98,15 @@ pub struct WorkspaceProjection {
     pub directories: HashMap<RemotePath, DirectoryProjection>,
     pub expanded: HashSet<RemotePath>,
     pub selected: Option<RemotePath>,
+    /// Source-control row selection is independent of the file-tree selection.
+    pub git_selected: Option<RemotePath>,
+    /// A repository toplevel was observed, before the full Git read finishes.
+    pub git_root_known: bool,
     pub preview: Option<PreviewProjection>,
+    /// Bumped on every preview state change so hidden refreshes invalidate UI caches.
+    pub preview_revision: u64,
+    /// Bumped on projection changes so the UI can cache flattened tree rows.
+    pub revision: u64,
     pub git: Vec<GitProjection>,
     pub git_view: Option<RemoteGitView>,
     pub sessions: Option<made_bridge::state::SessionSnapshot>,
@@ -230,7 +240,11 @@ impl RemoteWorkspace {
                 directories: HashMap::new(),
                 expanded: HashSet::new(),
                 selected: None,
+                git_selected: None,
+                git_root_known: false,
                 preview: None,
+                preview_revision: 0,
+                revision: 0,
                 git: Vec::new(),
                 git_view: None,
                 sessions: None,
@@ -526,6 +540,7 @@ impl RemoteWorkspace {
         }
         if let Some(preview) = &mut self.projection.preview {
             preview.freshness = Freshness::Stale;
+            self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
         }
         self.projection.sessions = None;
         self.projection.session_state = Freshness::Stale;
@@ -611,6 +626,8 @@ impl RemoteWorkspace {
             Operation::Preview { .. } | Operation::Refresh { .. } => {
                 if let Some(preview) = &mut self.projection.preview {
                     preview.freshness = Freshness::Stale;
+                    self.projection.preview_revision =
+                        self.projection.preview_revision.wrapping_add(1);
                 }
             }
             Operation::GitRead { command } => {
@@ -713,14 +730,23 @@ impl RemoteWorkspace {
     pub fn expand(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
         let id = self.load_directory(path.clone())?;
         self.projection.expanded.insert(path);
+        self.projection.revision = self.projection.revision.wrapping_add(1);
         Ok(id)
     }
     pub fn collapse(&mut self, path: &RemotePath) {
         self.projection.expanded.remove(path);
+        self.projection.revision = self.projection.revision.wrapping_add(1);
     }
     pub fn select(&mut self, path: RemotePath) -> Result<(), ProtocolError> {
         self.check_tree_path(&path)?;
         self.projection.selected = Some(path);
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+        Ok(())
+    }
+    /// Select a source-control row without changing the file-tree selection.
+    pub fn select_git(&mut self, path: RemotePath) -> Result<(), ProtocolError> {
+        self.check_tree_path(&path)?;
+        self.projection.git_selected = Some(path);
         Ok(())
     }
     pub fn open_preview(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
@@ -736,13 +762,13 @@ impl RemoteWorkspace {
             None,
             Purpose::User,
         )?;
-        self.projection.selected = Some(path.clone());
         self.projection.preview = Some(PreviewProjection {
             path,
             kind: None,
             data: Vec::new(),
             freshness: Freshness::Loading,
         });
+        self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
         Ok(id)
     }
     pub fn refresh_preview(&mut self) -> Result<Option<u64>, ProtocolError> {
@@ -758,6 +784,7 @@ impl RemoteWorkspace {
         let id = self.enqueue(Operation::Refresh { path }, None, Purpose::User)?;
         if let Some(preview) = &mut self.projection.preview {
             preview.freshness = Freshness::Loading;
+            self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
         }
         Ok(Some(id))
     }
@@ -768,7 +795,9 @@ impl RemoteWorkspace {
                 Operation::Preview { .. } | Operation::Refresh { .. }
             )
         })?;
-        self.projection.preview = None;
+        if self.projection.preview.take().is_some() {
+            self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
+        }
         Ok(())
     }
     fn check_tree_path(&self, path: &RemotePath) -> Result<(), ProtocolError> {
@@ -780,6 +809,24 @@ impl RemoteWorkspace {
             return Err(ProtocolError::Limit);
         }
         Ok(())
+    }
+
+    /// Refresh Git on mode entry, unless the same refresh is already in flight.
+    pub fn refresh_git_if_idle(&mut self) -> Result<(), ProtocolError> {
+        let refreshing = self
+            .projection
+            .git
+            .iter()
+            .any(|git| git.freshness == Freshness::Loading)
+            || self
+                .projection
+                .git_view
+                .as_ref()
+                .is_some_and(|git| git.freshness == Freshness::Loading);
+        if refreshing {
+            return Ok(());
+        }
+        self.refresh_git()
     }
 
     pub fn refresh_git(&mut self) -> Result<(), ProtocolError> {
@@ -1010,7 +1057,11 @@ impl RemoteWorkspace {
         self.projection.directories.clear();
         self.projection.expanded.clear();
         self.projection.selected = None;
+        self.projection.git_selected = None;
+        self.projection.git_root_known = false;
         self.projection.preview = None;
+        self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
+        self.projection.revision = self.projection.revision.wrapping_add(1);
         self.projection.git.clear();
         self.projection.git_view = None;
         self.projection.focus = None;
@@ -1112,6 +1163,7 @@ impl RemoteWorkspace {
         }
         if let Some(preview) = &mut self.projection.preview {
             preview.freshness = Freshness::Stale;
+            self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
         }
         for git in &mut self.projection.git {
             git.freshness = Freshness::Stale;
@@ -1119,6 +1171,7 @@ impl RemoteWorkspace {
         if let Some(view) = &mut self.projection.git_view {
             view.freshness = Freshness::Stale;
         }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -1277,6 +1330,8 @@ impl RemoteWorkspace {
                         data: data.clone(),
                         freshness: Freshness::Current,
                     });
+                    self.projection.preview_revision =
+                        self.projection.preview_revision.wrapping_add(1);
                 }
             }
             RemoteResult::Git { command, data } => {
@@ -1288,6 +1343,9 @@ impl RemoteWorkspace {
                 {
                     git.data.clone_from(data);
                     git.freshness = Freshness::Current;
+                }
+                if *command == GitRead::ShowToplevel && !trim_git_line(data).is_empty() {
+                    self.projection.git_root_known = true;
                 }
                 self.update_git_view()?;
             }
@@ -1350,6 +1408,9 @@ impl RemoteWorkspace {
                     if let Some(directory) = self.projection.directories.get_mut(path) {
                         directory.freshness = Freshness::Unavailable(*code);
                     }
+                    if path == &self.root {
+                        self.close_preview()?;
+                    }
                 }
                 Operation::Preview { .. } | Operation::Refresh { .. } => {
                     if let Some(preview) = &mut self.projection.preview {
@@ -1402,6 +1463,7 @@ impl RemoteWorkspace {
         {
             self.resnapshot = false;
         }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -1415,6 +1477,7 @@ impl RemoteWorkspace {
         {
             return Ok(());
         }
+        let previous = self.projection.git_view.take();
         let get = |command| self.projection.git.iter().find(|g| g.command == command);
         let text = |command| {
             get(command)
@@ -1428,24 +1491,51 @@ impl RemoteWorkspace {
             .filter(|g| g.freshness == Freshness::Current)
             .and_then(|g| RemotePath::new(trim_git_line(&g.data).to_vec()).ok());
         let status = get(GitRead::Status);
-        let freshness = match (&top, status) {
-            (Some(_), Some(status)) if status.freshness == Freshness::Current => Freshness::Current,
-            (_, Some(status)) if matches!(status.freshness, Freshness::Unavailable(_)) => {
-                status.freshness
-            }
-            _ => Freshness::Unavailable(ErrorCode::Unavailable),
-        };
-        let groups = if let (Some(top), Some(status)) =
-            (&top, status.filter(|g| g.freshness == Freshness::Current))
-        {
-            remote_git_groups(&status.data, top, &self.root)?
+        let status_current = status.is_some_and(|status| status.freshness == Freshness::Current);
+        let status_failure = status
+            .filter(|status| matches!(status.freshness, Freshness::Unavailable(_)))
+            .map(|status| status.freshness);
+        let freshness = if top.is_some() && status_current {
+            Freshness::Current
+        } else if let Some(failure) = status_failure {
+            failure
         } else {
-            Vec::new()
+            Freshness::Unavailable(ErrorCode::Unavailable)
+        };
+        // A failed read keeps the last complete groups and header. Only a root
+        // that has never produced a complete status falls back to the failed
+        // empty state.
+        if top.is_none() || !status_current {
+            if let Some(view) = previous.as_ref().filter(|view| view.has_status) {
+                let mut view = view.clone();
+                view.freshness = freshness;
+                self.projection.git_view = Some(view);
+                return Ok(());
+            }
+        }
+        let groups = match (
+            &top,
+            status.filter(|status| status.freshness == Freshness::Current),
+        ) {
+            (Some(top), Some(status)) => match remote_git_groups(&status.data, top, &self.root) {
+                Ok(groups) => groups,
+                Err(error) => {
+                    if let Some(view) = previous.filter(|view| view.has_status) {
+                        let mut view = view;
+                        view.freshness = Freshness::Unavailable(ErrorCode::Unavailable);
+                        self.projection.git_view = Some(view);
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+            },
+            _ => Vec::new(),
         };
         let linked_worktree = match (text(GitRead::GitDir), text(GitRead::CommonDir)) {
             (Some(a), Some(b)) => a != b,
             _ => false,
         };
+        let has_status = top.is_some() && status_current;
         self.projection.git_view = Some(RemoteGitView {
             branch: branch.filter(|s| s != "HEAD"),
             detached,
@@ -1459,6 +1549,7 @@ impl RemoteWorkspace {
             folder_marks: remote_folder_marks(&groups, &self.root)?,
             groups,
             freshness,
+            has_status,
         });
         Ok(())
     }

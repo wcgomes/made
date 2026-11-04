@@ -1692,6 +1692,9 @@ impl ExplorerPane {
                 ExplorerRowAction::Click(index) => {
                     if let Some(row) = self.rows.get(index).cloned() {
                         self.select_row_click(&row);
+                        // Pointer selection must not recenter the tree; only
+                        // keyboard/programmatic movement reveals the row.
+                        self.scroll_to_selection = false;
                     }
                 }
                 ExplorerRowAction::Select(index) => {
@@ -3452,6 +3455,7 @@ pub enum RemoteExplorerAction {
     Expand(made_remote::protocol::RemotePath),
     Collapse(made_remote::protocol::RemotePath),
     Select(made_remote::protocol::RemotePath),
+    SelectGit(made_remote::protocol::RemotePath),
     OpenPreview(made_remote::protocol::RemotePath),
     RetryRoot,
 }
@@ -3471,6 +3475,13 @@ struct RemoteRow {
 #[derive(Default)]
 struct RemoteRows {
     rows: Vec<RemoteRow>,
+}
+
+#[derive(Default)]
+pub struct RemoteExplorerCache {
+    key: Option<(made_remote::protocol::RemotePath, u64)>,
+    rows: RemoteRows,
+    file_marks: std::collections::HashMap<made_remote::protocol::RemotePath, Vec<ChangeKind>>,
 }
 
 impl ExplorerRowSource for RemoteRows {
@@ -3509,56 +3520,74 @@ pub fn remote_explorer_ui(
     layout: &theme::Layout,
     scope: egui::Id,
     native_backdrop: bool,
+    cache: &mut RemoteExplorerCache,
 ) -> Vec<RemoteExplorerAction> {
     use crate::remote_workspace::{ExplorerMode, Freshness};
 
     let git_view = projection.git_view.as_ref();
-    let show_icon = git_view.is_some_and(|git| git.worktree_name.is_some());
+    let show_icon =
+        projection.git_root_known || git_view.is_some_and(|git| git.worktree_name.is_some());
     let git_open = projection.mode == ExplorerMode::Git && show_icon;
+    let header_root = if matches!(
+        projection.root_state,
+        Freshness::Loading | Freshness::Stale | Freshness::Unavailable(_)
+    ) {
+        projection.requested_root.as_ref().unwrap_or(root)
+    } else {
+        root
+    };
     let git_header = git_view.map(remote_git_header);
-    let root_full = remote_path_text(root);
-    let root_name = remote_root_name(root);
-    let file_marks = remote_file_marks(git_view);
-    let mut remote_rows = RemoteRows::default();
+    let root_full = sanitize_display(&remote_path_text(header_root), 900);
+    let root_name = sanitize_display(&remote_root_name(header_root), 160);
+    let mut root_unavailable = None;
     let tree = if git_open {
         ExplorerTreeBody::Empty
     } else {
-        let directory = projection.directories.get(root).or_else(|| {
+        let directory = projection.directories.get(header_root).or_else(|| {
             projection
                 .requested_root
                 .as_ref()
                 .and_then(|requested| projection.directories.get(requested))
         });
-        match directory {
-            None if matches!(projection.root_state, Freshness::Unavailable(_)) => {
-                ExplorerTreeBody::Error("Remote directory unavailable".to_owned())
-            }
-            None => ExplorerTreeBody::Loading,
-            Some(directory) if matches!(directory.freshness, Freshness::Unavailable(_)) => {
-                ExplorerTreeBody::Error("Remote directory unavailable".to_owned())
-            }
-            Some(directory) => {
+        let cache_key = (header_root.clone(), projection.revision);
+        if cache.key.as_ref() != Some(&cache_key) {
+            cache.rows.rows.clear();
+            cache.file_marks = remote_file_marks(git_view);
+            if let Some(directory) = directory {
                 collect_remote_rows(
                     &directory.path,
                     projection,
                     git_view,
-                    &file_marks,
-                    &mut remote_rows.rows,
+                    &cache.file_marks,
+                    &mut cache.rows.rows,
                     0,
                 );
-                if remote_rows.rows.is_empty() {
+            }
+            cache.key = Some(cache_key);
+        }
+        match directory {
+            None if matches!(projection.root_state, Freshness::Unavailable(_)) => {
+                root_unavailable = Some("Remote directory unavailable".to_owned());
+                ExplorerTreeBody::Empty
+            }
+            None => ExplorerTreeBody::Loading,
+            Some(directory) => {
+                if matches!(directory.freshness, Freshness::Unavailable(_)) {
+                    root_unavailable = Some("Remote directory unavailable".to_owned());
+                }
+                if cache.rows.rows.is_empty() {
                     if matches!(directory.freshness, Freshness::Loading | Freshness::Stale) {
                         ExplorerTreeBody::Loading
                     } else {
                         ExplorerTreeBody::Empty
                     }
                 } else {
-                    ExplorerTreeBody::Rows(&remote_rows)
+                    ExplorerTreeBody::Rows(&cache.rows)
                 }
             }
         }
     };
-    let git = git_open.then(|| remote_git_body(root, git_view, projection.selected.as_ref()));
+    let git = git_open.then(|| remote_git_body(root, git_view, projection.git_selected.as_ref()));
     let view = ExplorerCardView {
         git_open,
         show_icon,
@@ -3566,7 +3595,7 @@ pub fn remote_explorer_ui(
         git_header: git_header.as_ref(),
         source_control_tooltip: remote_source_control_tooltip(git_view),
         source_control_rings: remote_source_control_rings(git_view),
-        root_unavailable: None,
+        root_unavailable,
         tree,
         git,
         scroll_to_selection: false,
@@ -3592,7 +3621,7 @@ pub fn remote_explorer_ui(
             | ExplorerRowAction::Toggle(index)
             | ExplorerRowAction::Activate(index) => index,
         };
-        if let Some(row) = remote_rows.rows.get(index) {
+        if let Some(row) = cache.rows.rows.get(index) {
             let toggles = matches!(
                 action,
                 ExplorerRowAction::Click(_)
@@ -3620,7 +3649,7 @@ pub fn remote_explorer_ui(
             .and_then(|git| git.groups.get(group_index))
             .and_then(|group| group.rows.get(row_index))
         {
-            actions.push(RemoteExplorerAction::Select(row.path.clone()));
+            actions.push(RemoteExplorerAction::SelectGit(row.path.clone()));
             if !row.directory {
                 actions.push(RemoteExplorerAction::OpenPreview(row.path.clone()));
             }
@@ -3637,17 +3666,26 @@ fn collect_remote_rows(
     rows: &mut Vec<RemoteRow>,
     depth: usize,
 ) {
-    if depth > made_remote::protocol::MAX_TREE_DEPTH
-        || rows.len() >= made_remote::protocol::MAX_TREE_ROWS
-    {
+    use crate::remote_workspace::Freshness;
+    use made_remote::protocol::{MAX_TREE_DEPTH, MAX_TREE_ROWS};
+    if rows.len() >= MAX_TREE_ROWS {
         return;
     }
     let Some(directory) = projection.directories.get(path) else {
         return;
     };
     for entry in &directory.entries {
-        if rows.len() >= made_remote::protocol::MAX_TREE_ROWS {
-            break;
+        if rows.len() >= MAX_TREE_ROWS {
+            return;
+        }
+        if rows.len() + 1 >= MAX_TREE_ROWS {
+            push_remote_limit_row(
+                rows,
+                path,
+                depth,
+                format!("Tree is limited to {MAX_TREE_ROWS} visible rows."),
+            );
+            return;
         }
         let name = remote_file_name(&entry.path);
         let expanded = projection.expanded.contains(&entry.path);
@@ -3672,17 +3710,60 @@ fn collect_remote_rows(
             icon,
         });
         if expanded && kind == EntryKind::Directory {
-            collect_remote_rows(
-                &entry.path,
-                projection,
-                git_view,
-                file_marks,
-                rows,
-                depth + 1,
-            );
+            if depth + 1 > MAX_TREE_DEPTH {
+                push_remote_limit_row(
+                    rows,
+                    &entry.path,
+                    depth,
+                    format!("Tree expansion is limited to {MAX_TREE_DEPTH} levels."),
+                );
+            } else {
+                match projection.directories.get(&entry.path) {
+                    Some(child) if matches!(child.freshness, Freshness::Unavailable(_)) => {
+                        if rows.len() + 1 >= MAX_TREE_ROWS {
+                            push_remote_limit_row(
+                                rows,
+                                &entry.path,
+                                depth,
+                                format!("Tree is limited to {MAX_TREE_ROWS} visible rows."),
+                            );
+                            return;
+                        }
+                        rows.push(RemoteRow {
+                            path: entry.path.clone(),
+                            name: remote_file_name(&entry.path),
+                            depth: depth + 1,
+                            kind: EntryKind::Error,
+                            expanded: false,
+                            selected: false,
+                            tooltip: "Remote directory unavailable".to_owned(),
+                            mark: None,
+                            icon: None,
+                        });
+                    }
+                    Some(_) => collect_remote_rows(
+                        &entry.path,
+                        projection,
+                        git_view,
+                        file_marks,
+                        rows,
+                        depth + 1,
+                    ),
+                    None => {}
+                }
+            }
         }
     }
-    if directory.truncated && rows.len() < made_remote::protocol::MAX_TREE_ROWS {
+    if directory.truncated && rows.len() < MAX_TREE_ROWS {
+        if rows.len() + 1 >= MAX_TREE_ROWS {
+            push_remote_limit_row(
+                rows,
+                path,
+                depth,
+                format!("Tree is limited to {MAX_TREE_ROWS} visible rows."),
+            );
+            return;
+        }
         rows.push(RemoteRow {
             path: directory.path.clone(),
             name: "(listing truncated)".to_owned(),
@@ -3692,13 +3773,35 @@ fn collect_remote_rows(
             selected: false,
             tooltip: format!(
                 "Directory has more than {} entries; only the first {} are shown.",
-                made_remote::protocol::MAX_TREE_ROWS,
-                made_remote::protocol::MAX_TREE_ROWS
+                made_explorer::tree::MAX_DIR_ENTRIES,
+                made_explorer::tree::MAX_DIR_ENTRIES
             ),
             mark: None,
             icon: None,
         });
     }
+}
+
+fn push_remote_limit_row(
+    rows: &mut Vec<RemoteRow>,
+    path: &made_remote::protocol::RemotePath,
+    depth: usize,
+    message: String,
+) {
+    if rows.len() >= made_remote::protocol::MAX_TREE_ROWS {
+        return;
+    }
+    rows.push(RemoteRow {
+        path: path.clone(),
+        name: "(tree truncated)".to_owned(),
+        depth,
+        kind: EntryKind::Error,
+        expanded: false,
+        selected: false,
+        tooltip: message,
+        mark: None,
+        icon: None,
+    });
 }
 
 fn remote_entry_kind(kind: made_remote::protocol::EntryKind) -> EntryKind {
@@ -3794,7 +3897,10 @@ fn remote_git_body(
                     selected: selected == Some(&row.path),
                     icon: explorer_icons::resolve(&remote_file_name(&row.path), entry_kind, false),
                     tooltip: remote_path_text(&row.path),
-                    original: row.original.as_ref().map(remote_path_text),
+                    original: row
+                        .original
+                        .as_ref()
+                        .map(|path| remote_relative_text(root, path)),
                 }
             })
             .collect();
@@ -3803,9 +3909,9 @@ fn remote_git_body(
             rows,
         });
     }
-    let failed = groups.is_empty() && matches!(git.freshness, Freshness::Unavailable(_));
+    let failed = !git.has_status && matches!(git.freshness, Freshness::Unavailable(_));
     GitBodyView {
-        has_status: true,
+        has_status: git.has_status,
         failed,
         groups,
     }
@@ -6812,7 +6918,11 @@ mod tests {
             directories,
             expanded: std::collections::HashSet::from([src]),
             selected: Some(RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap()),
+            git_selected: None,
+            git_root_known: false,
             preview: None,
+            preview_revision: 0,
+            revision: 0,
             git: Vec::new(),
             git_view: None,
             sessions: None,
@@ -6824,10 +6934,10 @@ mod tests {
         }
     }
 
-    fn remote_render(
+    fn remote_render_ctx(
         projection: &crate::remote_workspace::WorkspaceProjection,
         root: &made_remote::protocol::RemotePath,
-    ) -> (egui::FullOutput, Vec<RemoteExplorerAction>) {
+    ) -> (egui::Context, egui::FullOutput, Vec<RemoteExplorerAction>) {
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let layout = theme::Layout::for_window(1280.0, 800.0);
@@ -6839,6 +6949,7 @@ mod tests {
             ..Default::default()
         };
         let mut actions = Vec::new();
+        let mut cache = RemoteExplorerCache::default();
         let mut output = ctx.run_ui(raw, |ui| {
             actions = remote_explorer_ui(
                 ui,
@@ -6847,9 +6958,18 @@ mod tests {
                 &layout,
                 egui::Id::unique("remote-explorer-test"),
                 false,
+                &mut cache,
             );
         });
         output.textures_delta.clear();
+        (ctx, output, actions)
+    }
+
+    fn remote_render(
+        projection: &crate::remote_workspace::WorkspaceProjection,
+        root: &made_remote::protocol::RemotePath,
+    ) -> (egui::FullOutput, Vec<RemoteExplorerAction>) {
+        let (_ctx, output, actions) = remote_render_ctx(projection, root);
         (output, actions)
     }
 
@@ -6901,6 +7021,7 @@ mod tests {
             }],
             freshness: Freshness::Current,
             folder_marks: std::collections::HashMap::new(),
+            has_status: true,
         });
         let (output, _) = remote_render(&projection, &root);
         let text = output_text(&output);
@@ -6990,5 +7111,208 @@ mod tests {
             !text.contains("SSH"),
             "preview must not paint SSH chrome: {text:?}"
         );
+    }
+    #[test]
+    fn remote_git_failure_uses_the_local_unavailable_state_and_keeps_last_rows() {
+        use crate::remote_workspace::{
+            ExplorerMode, Freshness, RemoteGitGroup, RemoteGitRow, RemoteGitView,
+        };
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.mode = ExplorerMode::Git;
+        projection.git_root_known = true;
+        projection.git_view = Some(RemoteGitView {
+            branch: Some("main".to_owned()),
+            detached: false,
+            commit: None,
+            subject: None,
+            linked_worktree: false,
+            worktree_name: Some("PlantSuite".to_owned()),
+            groups: Vec::new(),
+            freshness: Freshness::Unavailable(made_remote::protocol::ErrorCode::Unavailable),
+            folder_marks: std::collections::HashMap::new(),
+            has_status: false,
+        });
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(text.contains("REPOS"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("Git status unavailable"), "{text}");
+        assert!(!text.contains("No changes"), "{text}");
+
+        projection.git_view = Some(RemoteGitView {
+            branch: Some("main".to_owned()),
+            detached: false,
+            commit: None,
+            subject: None,
+            linked_worktree: false,
+            worktree_name: Some("PlantSuite".to_owned()),
+            groups: vec![RemoteGitGroup {
+                title: crate::worktree::GROUP_CHANGES,
+                rows: vec![RemoteGitRow {
+                    path: RemotePath::new(b"/home/vscode/README.md".to_vec()).unwrap(),
+                    original: None,
+                    letter: 'M',
+                    kind: made_remote::git::ChangeKind::Modified,
+                    directory: false,
+                }],
+            }],
+            freshness: Freshness::Unavailable(made_remote::protocol::ErrorCode::Unavailable),
+            folder_marks: std::collections::HashMap::new(),
+            has_status: true,
+        });
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(text.contains("Changes (1)"), "{text}");
+        assert!(text.contains("README.md"), "{text}");
+        assert!(!text.contains("Git status unavailable"), "{text}");
+        assert!(!text.contains("No changes"), "{text}");
+    }
+
+    #[test]
+    fn remote_root_listing_failure_keeps_the_last_tree_and_shows_the_shared_strip() {
+        use crate::remote_workspace::Freshness;
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.directories.get_mut(&root).unwrap().freshness =
+            Freshness::Unavailable(made_remote::protocol::ErrorCode::Unavailable);
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(
+            text.contains("Active root unavailable — showing the last folder."),
+            "{text}"
+        );
+        assert!(text.contains("README.md"), "{text}");
+        assert!(text.contains("src"), "{text}");
+        assert!(!text.contains("Explorer unavailable"), "{text}");
+    }
+
+    #[test]
+    fn remote_expanded_directory_failure_adds_the_local_error_row() {
+        use crate::remote_workspace::Freshness;
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let src = RemotePath::new(b"/home/vscode/src".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.directories.get_mut(&src).unwrap().freshness =
+            Freshness::Unavailable(made_remote::protocol::ErrorCode::Unavailable);
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(
+            text.matches("src").count() >= 2,
+            "expected the directory row and its error row: {text}"
+        );
+    }
+
+    #[test]
+    fn remote_depth_cap_emits_the_local_tree_limit_row() {
+        use crate::remote_workspace::{
+            DirectoryProjection, ExplorerMode, Freshness, RootSource, WorkspaceProjection,
+        };
+        use made_remote::protocol::{DirectoryEntry, EntryKind as RemoteEntryKind, RemotePath};
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut directories = std::collections::HashMap::new();
+        let mut expanded = std::collections::HashSet::new();
+        let mut current = root.clone();
+        for index in 0..66 {
+            let child = RemotePath::new(format!("/home/vscode/d{index}").into_bytes()).unwrap();
+            directories.insert(
+                current.clone(),
+                DirectoryProjection {
+                    path: current.clone(),
+                    entries: vec![DirectoryEntry {
+                        path: child.clone(),
+                        kind: RemoteEntryKind::Directory,
+                    }],
+                    truncated: false,
+                    freshness: Freshness::Current,
+                },
+            );
+            expanded.insert(current);
+            current = child;
+        }
+        directories.insert(
+            current.clone(),
+            DirectoryProjection {
+                path: current.clone(),
+                entries: Vec::new(),
+                truncated: false,
+                freshness: Freshness::Current,
+            },
+        );
+        expanded.insert(current);
+        let projection = WorkspaceProjection {
+            source: RootSource::Launch,
+            requested_root: None,
+            root_state: Freshness::Current,
+            directories,
+            expanded,
+            selected: None,
+            git_selected: None,
+            git_root_known: false,
+            preview: None,
+            preview_revision: 0,
+            revision: 0,
+            git: Vec::new(),
+            git_view: None,
+            sessions: None,
+            session_state: Freshness::Stale,
+            integration_error: None,
+            focus: None,
+            mode: ExplorerMode::Files,
+            cleanup_unconfirmed: false,
+        };
+        let mut rows = Vec::new();
+        collect_remote_rows(
+            &root,
+            &projection,
+            None,
+            &std::collections::HashMap::new(),
+            &mut rows,
+            0,
+        );
+        assert!(
+            rows.iter().any(|row| row.name == "(tree truncated)"),
+            "expected the local tree limit row"
+        );
+    }
+
+    #[test]
+    fn remote_source_control_icon_appears_when_toplevel_is_known() {
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.git_root_known = true;
+        projection.git_view = None;
+        let (ctx, output, _) = remote_render_ctx(&projection, &root);
+        assert!(
+            ctx.read_response(egui::Id::unique("remote-explorer-test").with("source-control"))
+                .is_some(),
+            "source-control icon must not wait for all eight Git reads"
+        );
+        assert!(output_text(&output).contains("EXPLORER"));
+    }
+
+    #[test]
+    fn remote_header_uses_the_requested_root_while_loading() {
+        use crate::remote_workspace::Freshness;
+        use made_remote::protocol::RemotePath;
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let requested = RemotePath::new(b"/workspaces/PlantSuite".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.root_state = Freshness::Loading;
+        projection.requested_root = Some(requested);
+        let (output, _) = remote_render(&projection, &root);
+        let text = output_text(&output);
+        assert!(text.contains("PlantSuite"), "{text}");
+        assert!(!text.contains("vscode"), "{text}");
     }
 }

@@ -2284,7 +2284,7 @@ impl Workbench {
         self.about_window(&ctx, show_about, layout);
     }
 
-    fn sync_terminal_visibility(&mut self, ctx: &egui::Context) {
+    pub(crate) fn sync_terminal_visibility(&mut self, ctx: &egui::Context) {
         let visible = self.is_visible() && self.left_surface() == LeftSurface::Terminal;
         if let Some(terminal) = self.terminal.as_mut() {
             terminal.set_visible(visible);
@@ -2345,6 +2345,14 @@ impl Workbench {
         if was_explorer_visible && !explorer_visible {
             if let Some(pane) = explorer.as_ref() {
                 pane.release_focus(ui.ctx());
+            }
+            if self.is_remote() {
+                let tree_focus =
+                    egui::Id::unique(("made-explorer", self.pane_id())).with("tree-focus");
+                if ui.ctx().memory(|memory| memory.has_focus(tree_focus)) {
+                    ui.ctx()
+                        .memory_mut(|memory| memory.surrender_focus(tree_focus));
+                }
             }
             if self.left_surface() == LeftSurface::Terminal {
                 self.request_terminal_focus(ui.ctx());
@@ -2428,22 +2436,21 @@ impl Workbench {
                             explorer.set_native_backdrop_applied(native_backdrop_applied);
                             explorer.tree_ui(&mut content_ui, self.diag.log_mut(), layout);
                         } else if self.is_remote() {
-                            if let (Some(root), Some(projection)) = (
-                                self.remote_path_label().and_then(|path| {
-                                    made_remote::protocol::RemotePath::new(path.into_bytes()).ok()
-                                }),
-                                self.remote_projection().cloned(),
-                            ) {
-                                let actions = crate::explorer_view::remote_explorer_ui(
+                            let root = self.remote_path_label().and_then(|path| {
+                                made_remote::protocol::RemotePath::new(path.into_bytes()).ok()
+                            });
+                            let actions = if let Some(root) = root {
+                                self.remote_explorer_ui(
                                     &mut content_ui,
                                     &root,
-                                    &projection,
                                     layout,
                                     egui::Id::unique(("made-explorer", self.pane_id())),
                                     native_backdrop_applied,
-                                );
-                                self.apply_remote_actions(actions);
-                            }
+                                )
+                            } else {
+                                Vec::new()
+                            };
+                            self.apply_remote_actions(ui.ctx(), actions);
                         } else if let Some(error) = self.workspace_error.clone() {
                             unavailable_card(
                                 &mut content_ui,
@@ -2700,7 +2707,8 @@ impl Workbench {
         if self.is_remote()
             && (self.remote_needs_consent()
                 || self.remote_needs_host_approval()
-                || self.remote_auth().is_some())
+                || self.remote_auth().is_some()
+                || self.remote_can_reconnect())
         {
             remote_open_card(&mut body_ui, layout, self);
         } else if let Some(terminal) = terminal.as_mut() {
@@ -4039,6 +4047,7 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
     let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
     let needs_consent = workbench.remote_needs_consent();
     let auth = workbench.remote_auth();
+    let disconnected = workbench.remote_can_reconnect();
     let detail = workbench
         .remote_detail()
         .unwrap_or("Remote session")
@@ -4050,9 +4059,17 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
         .inner_margin(egui::Margin::same(12))
         .show(&mut child, |ui| {
             ui.label(
-                RichText::new("SSH")
-                    .font(FontId::proportional(13.0))
-                    .color(theme::TEXT_PRIMARY),
+                RichText::new(if disconnected {
+                    "Connection lost"
+                } else {
+                    "SSH"
+                })
+                .font(FontId::proportional(13.0))
+                .color(if disconnected {
+                    theme::ERROR
+                } else {
+                    theme::TEXT_PRIMARY
+                }),
             );
             ui.label(theme::body(sanitize_display(&detail, 500)));
             if workbench.remote_needs_host_approval() {
