@@ -4276,6 +4276,282 @@ fn remote_open_prompt_refuses_changed_key_without_a_secret_field() {
     assert!(!text.contains("password"), "no secret field copy: {text}");
 }
 
+fn local_and_remote_headless(temp: &Path, name: &str) -> (Headless, WorkspaceId, WorkspaceId) {
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let root = fixture_workspace(temp, name, "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let local_id = open_workspace(&mut model, &root);
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(authority, workspace, false)
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    assert_ne!(remote_id, local_id);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, local_id);
+    (headless, local_id, remote_id)
+}
+
+#[test]
+fn ssh_prompt_answer_releases_hold_and_local_terminal_takes_each_frame_input() {
+    if isolated("ssh_prompt_answer_releases_hold_and_local_terminal_takes_each_frame_input") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (mut headless, local_id, remote_id) = local_and_remote_headless(temp.path(), "ssh-hold");
+    assert!(headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_remote_prompt("user@server's password:"));
+    let field = ssh_field_id("prompt");
+    for _ in 0..2 {
+        headless.render();
+        assert_eq!(
+            headless.ctx.memory(|memory| memory.focused()),
+            Some(field),
+            "a live SSH prompt must keep its secret field focused"
+        );
+    }
+
+    // Leave the prompt live but hidden for one pass so the end-pass plugin has
+    // to reject its previous-pass response, then answer and type immediately.
+    headless.model.switch_workspace(local_id);
+    headless.render();
+    headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .submit_remote_auth(true);
+    assert_terminal_takes_each_frame_input(&mut headless, local_id);
+}
+
+#[test]
+fn ssh_prompt_cancel_and_tab_close_clear_the_field_focus_hold() {
+    if isolated("ssh_prompt_cancel_and_tab_close_clear_the_field_focus_hold") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (mut headless, local_id, remote_id) =
+        local_and_remote_headless(temp.path(), "ssh-hold-close");
+    let field = ssh_field_id("prompt");
+
+    assert!(headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_remote_prompt("user@server's password:"));
+    for _ in 0..2 {
+        headless.render();
+    }
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(field),
+        "a live SSH prompt must keep its secret field focused"
+    );
+    headless.model.switch_workspace(local_id);
+    headless.render();
+    headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .submit_remote_auth(false);
+    assert!(headless
+        .model
+        .workspace(remote_id)
+        .unwrap()
+        .remote_auth()
+        .is_none());
+    assert_terminal_takes_each_frame_input(&mut headless, local_id);
+
+    headless.model.switch_workspace(remote_id);
+    assert!(headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_remote_prompt("user@server's password:"));
+    for _ in 0..2 {
+        headless.render();
+    }
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(field),
+        "the repainted prompt must hold its field again"
+    );
+    assert!(headless.model.close_workspace(remote_id));
+    assert_terminal_takes_each_frame_input(&mut headless, local_id);
+}
+
+#[test]
+fn ssh_prompt_hidden_passes_repaint_regains_focus_and_dismissal_is_stable() {
+    if isolated("ssh_prompt_hidden_passes_repaint_regains_focus_and_dismissal_is_stable") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (mut headless, local_id, remote_id) =
+        local_and_remote_headless(temp.path(), "ssh-hold-repaint");
+    let field = ssh_field_id("prompt");
+
+    assert!(headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_remote_prompt("user@server's password:"));
+    for _ in 0..2 {
+        headless.render();
+    }
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(field),
+        "a live SSH prompt must keep its secret field focused"
+    );
+
+    headless.click(workspace_tab_id(local_id));
+    for _ in 0..3 {
+        headless.render();
+    }
+    assert!(
+        headless.ctx.read_response(field).is_none(),
+        "the live prompt must stay unpainted for at least two completed passes"
+    );
+
+    headless.click(workspace_tab_id(remote_id));
+    let mut regained = false;
+    for _ in 0..4 {
+        headless.render();
+        if headless.ctx.memory(|memory| memory.focused()) == Some(field) {
+            regained = true;
+            break;
+        }
+    }
+    assert!(
+        regained,
+        "a repainted live SSH prompt must regain its secret field focus without a click"
+    );
+
+    headless.model.switch_workspace(local_id);
+    headless.render();
+    headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .submit_remote_auth(true);
+    assert_terminal_takes_each_frame_input(&mut headless, local_id);
+}
+
+#[test]
+fn ssh_prompt_repaint_keeps_another_live_field_focused() {
+    if isolated("ssh_prompt_repaint_keeps_another_live_field_focused") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (mut headless, local_id, remote_id) =
+        local_and_remote_headless(temp.path(), "ssh-hold-other-field");
+    let prompt = ssh_field_id("prompt");
+    let name = ssh_field_id("name");
+
+    assert!(headless
+        .model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .present_remote_prompt("user@server's password:"));
+    for _ in 0..2 {
+        headless.render();
+    }
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(prompt),
+        "the first prompt paint must focus its secret field"
+    );
+
+    headless.click(workspace_tab_id(local_id));
+    for _ in 0..3 {
+        headless.render();
+    }
+    assert!(headless.ctx.read_response(prompt).is_none());
+
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.click(name);
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(name),
+        "the SSH servers field must own focus before the prompt repaints"
+    );
+
+    headless.click(workspace_tab_id(remote_id));
+    for _ in 0..3 {
+        headless.render();
+        assert_eq!(
+            headless.ctx.memory(|memory| memory.focused()),
+            Some(name),
+            "a repainted prompt must not steal focus from another live SSH field"
+        );
+    }
+    assert!(
+        headless.ctx.read_response(prompt).is_some(),
+        "the live prompt must actually repaint while the other field stays focused"
+    );
+}
+
+fn assert_terminal_takes_each_frame_input(headless: &mut Headless, id: WorkspaceId) {
+    let alphabet = "abcdefghijklmnopqrstuvwxyz";
+    let mut focus_per_frame = Vec::new();
+    for character in alphabet.chars() {
+        headless.render_events(vec![egui::Event::Text(character.to_string())]);
+        focus_per_frame.push(
+            headless
+                .model
+                .workspace(id)
+                .unwrap()
+                .terminal()
+                .unwrap()
+                .is_focused(),
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let echoed = loop {
+        let flat: String = output_text(&headless.render())
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if flat.contains(alphabet) || Instant::now() >= deadline {
+            break flat;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        echoed.contains(alphabet),
+        "the terminal dropped typed characters (focus per frame: {focus_per_frame:?}): {echoed}"
+    );
+    assert!(
+        focus_per_frame.iter().all(|focused| *focused),
+        "the terminal must keep focus on every frame while typing: {focus_per_frame:?}"
+    );
+}
+
 #[test]
 fn remote_open_unknown_host_shows_failure_fingerprint_and_requires_approval() {
     if isolated("remote_open_unknown_host_shows_failure_fingerprint_and_requires_approval") {

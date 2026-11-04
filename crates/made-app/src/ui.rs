@@ -1142,12 +1142,25 @@ fn ssh_window_was_open_id() -> egui::Id {
     egui::Id::unique("made-ssh-window-was-open")
 }
 
+fn ssh_field_painted_pass_id(field: egui::Id) -> egui::Id {
+    egui::Id::unique(("made-ssh-field-painted-pass", field))
+}
+
+fn mark_ssh_field_painted(ctx: &egui::Context, field: egui::Id) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| data.insert_temp(ssh_field_painted_pass_id(field), pass));
+}
+
 fn terminal_hit_rect_id() -> egui::Id {
     egui::Id::unique("made-terminal-hit-rect")
 }
 
+fn held_ssh_field(ctx: &egui::Context) -> Option<egui::Id> {
+    ctx.data(|data| data.get_temp::<egui::Id>(ssh_field_hold_id()))
+}
+
 fn ssh_field_held(ctx: &egui::Context) -> bool {
-    ctx.data(|data| data.get_temp::<egui::Id>(ssh_field_hold_id()).is_some())
+    held_ssh_field(ctx).is_some()
 }
 
 fn hold_ssh_field(ctx: &egui::Context, id: egui::Id) {
@@ -1180,6 +1193,15 @@ fn restore_ssh_field_focus(ui: &mut Ui) {
     let Some(field) = ctx.data(|data| data.get_temp::<egui::Id>(ssh_field_hold_id())) else {
         return;
     };
+    // Prompts and fields disappear without a per-call-site cleanup (answered,
+    // cancelled, transport failure, tab close). `read_response` also exposes
+    // the previous pass, so require this field's paint marker from this exact
+    // pass before reclaiming focus.
+    let painted = ctx.data(|data| data.get_temp::<u64>(ssh_field_painted_pass_id(field)));
+    if painted != Some(ctx.cumulative_pass_nr()) {
+        clear_ssh_field_hold(&ctx);
+        return;
+    }
     let window = ctx.data(|data| data.get_temp::<egui::Rect>(ssh_window_rect_id()));
     let terminal = ctx.data(|data| data.get_temp::<egui::Rect>(terminal_hit_rect_id()));
     let returned_to_terminal = ctx.input(|input| {
@@ -1205,6 +1227,7 @@ fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) {
         edit = edit.password(true);
     }
     let response = ui.add(edit);
+    mark_ssh_field_painted(ui.ctx(), id);
     if response.clicked() {
         response.request_focus();
     }
@@ -4122,8 +4145,15 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
                         let first = ui
                             .ctx()
                             .data(|data| data.get_temp::<bool>(key).is_none());
-                        if first {
-                            let field = ssh_field_id("prompt");
+                        let field = ssh_field_id("prompt");
+                        // A live prompt hidden for a pass loses its hold.
+                        // Re-hold when the field was not painted last pass, but
+                        // not after the user deliberately clicked away from it
+                        // or while another live SSH field owns the hold.
+                        let repainted = ui.ctx().read_response(field).is_none();
+                        let other_field_held =
+                            held_ssh_field(ui.ctx()).is_some_and(|held| held != field);
+                        if first || (repainted && !other_field_held) {
                             ui.memory_mut(|memory| memory.request_focus(field));
                             hold_ssh_field(ui.ctx(), field);
                             ui.ctx()
