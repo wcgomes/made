@@ -2029,8 +2029,16 @@ impl Workbench {
         self.pump_remote_client();
         let terminal_changed = self.pump_remote_terminal();
         self.pump_remote_upload();
+        // Remote output belongs to this tab, not the window. A hidden tab
+        // must not drive an immediate repaint of the active local tab: that
+        // turned every remote output frame into a full-window repaint at the
+        // display refresh rate. Match the local terminal's output cadence;
+        // keyboard input still requests its own immediate repaint in the
+        // terminal view.
         if terminal_changed {
-            ctx.request_repaint();
+            if let Some(delay) = Self::remote_output_repaint_delay(self.visible) {
+                ctx.request_repaint_after(delay);
+            }
         }
         if self.remote.as_ref().is_some_and(|remote| {
             remote.prompt.is_some()
@@ -2047,6 +2055,12 @@ impl Workbench {
         }) {
             ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
         }
+    }
+
+    /// A hidden remote tab must not repaint the active local tab. Its output
+    /// is still pumped; the next visible frame shows it.
+    fn remote_output_repaint_delay(visible: bool) -> Option<Duration> {
+        visible.then_some(crate::metrics::ACTIVE_REPAINT_INTERVAL)
     }
 
     fn poll_remote_prompt(&mut self) {
@@ -5476,5 +5490,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         assert!(attached, "workbench never attached");
         assert!(listed, "workbench never applied the root listing");
+    }
+
+    #[test]
+    fn hidden_remote_output_does_not_schedule_a_repaint() {
+        assert_eq!(Workbench::remote_output_repaint_delay(false), None);
+        assert_eq!(
+            Workbench::remote_output_repaint_delay(true),
+            Some(crate::metrics::ACTIVE_REPAINT_INTERVAL)
+        );
     }
 }
