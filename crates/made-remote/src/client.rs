@@ -65,6 +65,8 @@ struct State {
     connected: bool,
     external_id: u64,
     internal_id: u64,
+    /// External Open/Attach request id that owns unsolicited plugin events.
+    attach_request: Option<u64>,
     discard_through: u64,
     discard_internal_through: u64,
     control: VecDeque<WireEnvelope>,
@@ -96,6 +98,7 @@ impl State {
         self.resnapshot_done = false;
         self.prompt.take();
         self.answer.take();
+        self.attach_request = None;
     }
     fn internal_id(&mut self) -> Result<u64, ProtocolError> {
         self.internal_id = self
@@ -123,6 +126,10 @@ impl State {
         }
         let _ = encode(&frame)?;
         self.external_id = frame.request_id;
+        let attach_request = matches!(
+            &frame.operation,
+            Operation::Open { .. } | Operation::Attach { .. }
+        );
         self.pending.insert(
             frame.request_id,
             Pending {
@@ -136,6 +143,9 @@ impl State {
                 progress: ReplyProgress::new(frame.clone())?,
             },
         );
+        if attach_request {
+            self.attach_request = Some(frame.request_id);
+        }
         self.control.push_back(frame);
         Ok(())
     }
@@ -244,8 +254,14 @@ impl State {
         }
         // A reset or accepted root transition deliberately abandons old-root
         // work. Late replies for those request ids are drained, not treated as
-        // forged replies that would disconnect the new root.
-        if !self.pending.contains_key(&frame.request_id)
+        // forged replies that would disconnect the new root. Unsolicited
+        // SessionSnapshot events reuse the current Open/Attach request id, so
+        // only that event source survives the discard window; downstream
+        // revision/identity validation still rejects stale or foreign state.
+        let unsolicited_snapshot = matches!(frame.operation, Operation::SessionSnapshot { .. })
+            && self.attach_request == Some(frame.request_id);
+        if !unsolicited_snapshot
+            && !self.pending.contains_key(&frame.request_id)
             && ((frame.request_id != 0 && frame.request_id <= self.discard_through)
                 || (frame.request_id >= (1u64 << 63)
                     && frame.request_id <= self.discard_internal_through))
@@ -294,11 +310,19 @@ impl State {
         if done {
             pending.progress.finish()?;
         }
+        let attachment_failed =
+            done && matches!(
+                pending.request.operation,
+                Operation::Open { .. } | Operation::Attach { .. }
+            ) && !matches!(correlated.operation, Operation::Attached);
         let id = correlated.request_id;
         let closed = matches!(correlated.operation, Operation::Closed { .. });
         self.deliver(correlated)?;
         if done {
             self.pending.remove(&id);
+            if attachment_failed {
+                self.attach_request = None;
+            }
         }
         if closed {
             self.connected = false;
@@ -307,6 +331,7 @@ impl State {
             self.control.clear();
             self.data.clear();
             self.terminal_pending.clear();
+            self.attach_request = None;
         }
         Ok(())
     }
@@ -314,6 +339,9 @@ impl State {
         let Some(pending) = self.pending.remove(&id) else {
             return;
         };
+        if self.attach_request == Some(id) {
+            self.attach_request = None;
+        }
         let unsent = self.control.iter().any(|f| f.request_id == id);
         self.control.retain(|f| f.request_id != id);
         if !unsent
@@ -355,6 +383,7 @@ impl RemoteClient {
             connected: true,
             external_id: 0,
             internal_id: 1u64 << 63,
+            attach_request: None,
             discard_through: 0,
             discard_internal_through: 0,
             control: VecDeque::new(),
@@ -402,6 +431,12 @@ impl RemoteClient {
         let mut state = self.state.lock().map_err(|_| ProtocolError::Identity)?;
         state.discard_through = state.external_id;
         state.discard_internal_through = state.internal_id;
+        if state
+            .attach_request
+            .is_some_and(|id| state.pending.contains_key(&id))
+        {
+            state.attach_request = None;
+        }
         state.control.clear();
         state.data.clear();
         state.pending.clear();
@@ -422,6 +457,12 @@ impl RemoteClient {
         }
         state.discard_through = state.external_id;
         state.discard_internal_through = state.internal_id;
+        if state
+            .attach_request
+            .is_some_and(|id| state.pending.contains_key(&id))
+        {
+            state.attach_request = None;
+        }
         state.control.clear();
         state.data.clear();
         state.pending.clear();
@@ -803,6 +844,16 @@ mod tests {
         }
     }
 
+    fn snapshot(revision: u64) -> made_bridge::state::SessionSnapshot {
+        made_bridge::state::SessionSnapshot {
+            revision,
+            active_session_id: None,
+            tabs_enabled: true,
+            view_directory: None,
+            sessions: Vec::new(),
+        }
+    }
+
     #[test]
     fn reset_pending_frees_the_in_flight_queue_for_root_select() {
         let root = RemotePath::new(b"/project".to_vec()).unwrap();
@@ -858,5 +909,88 @@ mod tests {
             state.receive(late_internal).is_ok(),
             "late heartbeat/cancel replies must also be drained"
         );
+    }
+
+    #[test]
+    fn failed_attach_clears_the_unsolicited_event_source() {
+        let root = RemotePath::new(b"/project".to_vec()).unwrap();
+        let client = RemoteClient::new(NullStream, identity(), root).unwrap();
+        let attach = client
+            .request(Operation::Attach { rows: 24, cols: 80 }, None)
+            .unwrap();
+        let mut state = client.state.lock().unwrap();
+        assert_eq!(state.attach_request, Some(attach));
+        let identity = state.identity.clone();
+        state
+            .receive(WireEnvelope::new(
+                identity,
+                attach,
+                Operation::Error {
+                    code: ErrorCode::Unavailable,
+                },
+            ))
+            .unwrap();
+        assert_eq!(state.attach_request, None);
+    }
+
+    #[test]
+    fn new_attachment_replaces_the_unsolicited_event_source() {
+        let root = RemotePath::new(b"/project".to_vec()).unwrap();
+        let client = RemoteClient::new(NullStream, identity(), root.clone()).unwrap();
+        let first = client
+            .request(
+                Operation::Open {
+                    directory: root,
+                    target: LaunchTarget::Shell,
+                    rows: 24,
+                    cols: 80,
+                },
+                None,
+            )
+            .unwrap();
+        {
+            let mut state = client.state.lock().unwrap();
+            let identity = state.identity.clone();
+            state
+                .receive(WireEnvelope::new(identity, first, Operation::Attached))
+                .unwrap();
+            assert_eq!(state.attach_request, Some(first));
+        }
+
+        let second = client
+            .request(Operation::Attach { rows: 24, cols: 80 }, None)
+            .unwrap();
+        {
+            let mut state = client.state.lock().unwrap();
+            let identity = state.identity.clone();
+            state
+                .receive(WireEnvelope::new(identity, second, Operation::Attached))
+                .unwrap();
+            assert_eq!(state.attach_request, Some(second));
+        }
+
+        client.reset_pending().unwrap();
+        let mut state = client.state.lock().unwrap();
+        let old = WireEnvelope::new(
+            state.identity.clone(),
+            first,
+            Operation::SessionSnapshot {
+                snapshot: snapshot(1),
+            },
+        );
+        assert!(state.receive(old).is_ok());
+        assert!(
+            state.sessions.is_empty(),
+            "an old attach id must not remain an authorized event source"
+        );
+        let current = WireEnvelope::new(
+            state.identity.clone(),
+            second,
+            Operation::SessionSnapshot {
+                snapshot: snapshot(2),
+            },
+        );
+        assert!(state.receive(current).is_ok());
+        assert_eq!(state.sessions.len(), 1);
     }
 }

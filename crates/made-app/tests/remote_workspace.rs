@@ -327,6 +327,47 @@ fn unavailable_active_root_does_not_expose_unrelated_root_or_disable_transport()
 }
 
 #[test]
+fn unsolicited_snapshot_events_require_current_identity_and_revision() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    let event = |identity: Identity, revision: u64| {
+        WireEnvelope::new(
+            identity,
+            1,
+            Operation::SessionSnapshot {
+                snapshot: empty_snapshot(revision),
+            },
+        )
+    };
+    let mut foreign = identity.clone();
+    foreign.epoch = 2;
+    assert!(workspace.accept_session_event(event(foreign, 1)).is_err());
+    assert_eq!(workspace.integration(), IntegrationState::Unknown);
+    assert_eq!(workspace.pending_count(), 0);
+
+    workspace
+        .accept_session_event(event(identity.clone(), 2))
+        .unwrap();
+    assert_eq!(workspace.integration(), IntegrationState::Connected);
+    assert_eq!(
+        workspace.projection().sessions.as_ref().unwrap().revision,
+        2
+    );
+
+    assert!(workspace
+        .accept_session_event(event(identity.clone(), 1))
+        .is_err());
+    assert_eq!(
+        workspace.projection().sessions.as_ref().unwrap().revision,
+        2,
+        "a stale event must not overwrite the accepted snapshot"
+    );
+
+    workspace.disconnect();
+    assert!(workspace.accept_session_event(event(identity, 3)).is_err());
+}
+
+#[test]
 fn new_root_clears_preview_and_rejects_pending_generation() {
     let mut workspace = model(1);
     workspace.open_preview(path("/project/a")).unwrap();

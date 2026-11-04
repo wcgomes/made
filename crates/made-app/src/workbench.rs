@@ -2786,8 +2786,12 @@ impl Workbench {
                         );
                         if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
                             reply.request_id = workspace_id;
+                            let _ = remote.workspace.accept(reply);
+                        } else {
+                            // Unsolicited plugin state uses the attach request id,
+                            // which can collide with a workspace request id.
+                            let _ = remote.workspace.accept_session_event(reply);
                         }
-                        let _ = remote.workspace.accept(reply);
                     }
                     (attach_reply, upload_replies, false)
                 }
@@ -6367,6 +6371,598 @@ mod tests {
             "bbbb"
         );
     }
+    mod unsolicited_remote_snapshots {
+        use super::*;
+        use crate::remote_workspace::IntegrationState as RemoteIntegrationState;
+        use made_platform::ssh::SshEvent;
+        use made_remote::protocol::{
+            encode, Chunk, DirectoryEntry, EntryKind, ErrorCode, Identity, LaunchTarget, Operation,
+            RemotePath, WireEnvelope,
+        };
+        use std::collections::VecDeque;
+
+        #[derive(Clone)]
+        struct FakeRemoteStream {
+            events: Arc<Mutex<VecDeque<SshEvent>>>,
+            written: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl made_remote::client::ClientStream for FakeRemoteStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                self.written.lock().unwrap().extend_from_slice(bytes);
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<SshEvent> {
+                self.events.lock().unwrap().pop_front()
+            }
+            fn detach(&mut self) {}
+        }
+
+        struct MemoryServerStorage(Option<Vec<u8>>);
+
+        impl crate::ssh_servers::ServerStorage for MemoryServerStorage {
+            fn read(
+                &mut self,
+                _limit: usize,
+            ) -> Result<Option<Vec<u8>>, crate::ssh_servers::StorageError> {
+                Ok(self.0.clone())
+            }
+            fn replace(&mut self, bytes: &[u8]) -> Result<(), crate::ssh_servers::StorageError> {
+                self.0 = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        struct RemoteBench {
+            workbench: Workbench,
+            stream: FakeRemoteStream,
+            identity: Identity,
+            root: RemotePath,
+        }
+
+        impl RemoteBench {
+            fn send(&self, frame: WireEnvelope) {
+                self.stream
+                    .events
+                    .lock()
+                    .unwrap()
+                    .push_back(SshEvent::Data(encode(&frame).unwrap()));
+            }
+            fn reply(&self, request: &WireEnvelope, operation: Operation) {
+                self.send(WireEnvelope::new(
+                    request.identity.clone(),
+                    request.request_id,
+                    operation,
+                ));
+            }
+            fn pump(&mut self) {
+                self.workbench.pump_remote_client();
+                self.workbench.pump_remote_terminal();
+            }
+            fn take_written(&self) -> Vec<WireEnvelope> {
+                let mut buffer = self.stream.written.lock().unwrap();
+                let mut frames = Vec::new();
+                loop {
+                    if buffer.len() < 4 {
+                        break;
+                    }
+                    let size = u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize;
+                    if buffer.len() < 4 + size {
+                        break;
+                    }
+                    frames.push(serde_json::from_slice(&buffer[4..4 + size]).unwrap());
+                    buffer.drain(..4 + size);
+                }
+                frames
+            }
+            fn attach(&mut self) -> u64 {
+                let client = self
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .clone()
+                    .unwrap();
+                let id = client
+                    .request(
+                        Operation::Open {
+                            directory: self.root.clone(),
+                            target: LaunchTarget::Shell,
+                            rows: 24,
+                            cols: 80,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                self.workbench.remote.as_mut().unwrap().attach_request = Some(id);
+                id
+            }
+        }
+
+        fn remote_path(value: &str) -> RemotePath {
+            RemotePath::new(value.as_bytes().to_vec()).unwrap()
+        }
+
+        fn file_entry(path: &RemotePath) -> DirectoryEntry {
+            DirectoryEntry {
+                path: path.clone(),
+                kind: EntryKind::File,
+            }
+        }
+
+        fn active_snapshot(revision: u64, directory: &str) -> SessionSnapshot {
+            serde_json::from_value(serde_json::json!({
+                "revision": revision,
+                "activeSessionID": "one",
+                "tabsEnabled": true,
+                "sessions": [{
+                    "sessionID": "one",
+                    "title": "Remote",
+                    "active": true,
+                    "directory": directory
+                }]
+            }))
+            .unwrap()
+        }
+
+        fn empty_snapshot(revision: u64) -> SessionSnapshot {
+            SessionSnapshot {
+                revision,
+                active_session_id: None,
+                tabs_enabled: true,
+                view_directory: None,
+                sessions: Vec::new(),
+            }
+        }
+
+        fn remote_bench() -> RemoteBench {
+            let mut registry =
+                crate::ssh_servers::ServerRegistry::load(MemoryServerStorage(None)).unwrap();
+            let authority = registry
+                .add(crate::ssh_servers::ServerMetadata {
+                    display_name: "test".to_owned(),
+                    host: "example".to_owned(),
+                    user: Some("vscode".to_owned()),
+                    port: None,
+                    key_file: None,
+                    initial_directory: None,
+                })
+                .unwrap();
+            let snapshot = registry.snapshot(authority).unwrap();
+            let root = remote_path("/home/vscode");
+            let identity = Identity {
+                authority,
+                tab: made_remote::protocol::TabCapability::random().unwrap(),
+                epoch: 1,
+                generation: 1,
+            };
+            let workspace =
+                crate::remote_workspace::RemoteWorkspace::new(identity.clone(), root.clone())
+                    .unwrap();
+            let mut workbench = idle_workbench(TerminalTarget::RemoteShell { authority }, None);
+            let mut remote = RemoteTab::connecting(snapshot, root.clone()).unwrap();
+            remote.workspace = workspace;
+            remote.phase = RemotePhase::Ready;
+            workbench.remote = Some(remote);
+            let stream = FakeRemoteStream {
+                events: Arc::new(Mutex::new(VecDeque::new())),
+                written: Arc::new(Mutex::new(Vec::new())),
+            };
+            let client = made_remote::client::RemoteClient::new(
+                stream.clone(),
+                identity.clone(),
+                root.clone(),
+            )
+            .unwrap();
+            workbench.remote.as_mut().unwrap().client = Some(client);
+            RemoteBench {
+                workbench,
+                stream,
+                identity,
+                root,
+            }
+        }
+
+        fn pump_until(
+            bench: &mut RemoteBench,
+            mut handle: impl FnMut(&mut RemoteBench, Option<WireEnvelope>) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                bench.pump();
+                for frame in bench.take_written() {
+                    if handle(bench, Some(frame)) {
+                        return;
+                    }
+                }
+                if handle(bench, None) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("remote workbench did not reach the expected state");
+        }
+
+        fn listed(path: &RemotePath) -> Operation {
+            let child = RemotePath::new([path.as_bytes(), b"/README.md"].concat()).unwrap();
+            Operation::Listed {
+                path: path.clone(),
+                entries: vec![file_entry(&child)],
+                truncated: false,
+                done: true,
+            }
+        }
+
+        fn root_result(frame: &WireEnvelope, path: &RemotePath) -> Operation {
+            Operation::RootResult {
+                requested: path.clone(),
+                path: path.clone(),
+                generation: frame.identity.generation,
+            }
+        }
+
+        fn assert_terminal_continues(bench: &RemoteBench, output: u64) {
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(remote.attached_once, "attach marker must survive a switch");
+            assert!(
+                matches!(remote.phase, RemotePhase::Ready),
+                "remote phase must stay Ready across a switch"
+            );
+            assert!(
+                remote.attach_request.is_none(),
+                "switching must not start a new attach"
+            );
+            assert_eq!(
+                bench.workbench.terminal.as_ref().unwrap().output_bytes(),
+                output,
+                "the attached terminal must retain its output state"
+            );
+        }
+
+        fn follow_snapshot(
+            bench: &mut RemoteBench,
+            attach: u64,
+            snapshot: SessionSnapshot,
+            session_root: &RemotePath,
+        ) {
+            let identity = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .identity();
+            bench.send(WireEnvelope::new(
+                identity,
+                attach,
+                Operation::SessionSnapshot { snapshot },
+            ));
+            let mut selected = false;
+            pump_until(bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootSelect { path } => {
+                            assert_eq!(path, session_root);
+                            selected = true;
+                            let mut result = root_result(&frame, path);
+                            if let Operation::RootResult { generation, .. } = &mut result {
+                                *generation += 1;
+                            }
+                            bench.reply(&frame, result);
+                        }
+                        Operation::List { path } if path == session_root => {
+                            bench.reply(&frame, listed(path))
+                        }
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                selected
+                    && remote.workspace.root() == session_root
+                    && remote
+                        .workspace
+                        .projection()
+                        .directories
+                        .contains_key(session_root)
+            });
+        }
+
+        #[test]
+        fn unsolicited_snapshot_after_unavailable_session_connects_and_follows_session_root() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+
+            let root = bench.root.clone();
+            let mut session_unavailable = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        Operation::SessionState => {
+                            session_unavailable = true;
+                            bench.reply(
+                                &frame,
+                                Operation::Error {
+                                    code: ErrorCode::Unavailable,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                session_unavailable
+                    && remote.workspace.integration() == RemoteIntegrationState::Unavailable
+                    && remote
+                        .workspace
+                        .projection()
+                        .directories
+                        .contains_key(&root)
+                    && bench
+                        .workbench
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|terminal| terminal.output_bytes() > 0)
+            });
+            let terminal_output = bench.workbench.terminal.as_ref().unwrap().output_bytes();
+
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(
+                remote.workspace.integration(),
+                RemoteIntegrationState::Connected
+            );
+            assert_eq!(
+                remote.workspace.projection().source,
+                crate::remote_workspace::RootSource::Session
+            );
+            assert!(remote.workspace.projection().sessions.is_some());
+            assert_eq!(remote.workspace.root(), &session_root);
+            assert_terminal_continues(&bench, terminal_output);
+
+            // A later unsolicited snapshot reuses the original attach id even
+            // after the first RootSelect advanced the client discard window.
+            let switched_root = remote_path("/session-two");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(2, "/session-two"),
+                &switched_root,
+            );
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(remote.workspace.root(), &switched_root);
+            assert_eq!(
+                remote
+                    .workspace
+                    .projection()
+                    .sessions
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                2
+            );
+            assert_terminal_continues(&bench, terminal_output);
+
+            let final_root = remote_path("/session-three");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(3, "/session-three"),
+                &final_root,
+            );
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(remote.workspace.root(), &final_root);
+            assert_eq!(
+                remote
+                    .workspace
+                    .projection()
+                    .sessions
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                3
+            );
+            assert_terminal_continues(&bench, terminal_output);
+        }
+
+        #[test]
+        fn attach_id_colliding_with_pending_root_validate_is_applied_as_event() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+
+            let mut root_validate_pending = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    root_validate_pending |=
+                        matches!(frame.operation, Operation::RootValidate { .. });
+                }
+                root_validate_pending
+                    && bench
+                        .workbench
+                        .remote
+                        .as_ref()
+                        .unwrap()
+                        .workspace
+                        .pending_count()
+                        == 1
+            });
+            assert_eq!(attach, 1, "attach request id");
+            assert_eq!(
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .pending_count(),
+                1,
+                "RootValidate must still be pending when the event arrives"
+            );
+
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(
+                remote.workspace.integration(),
+                RemoteIntegrationState::Connected
+            );
+            assert!(remote.workspace.projection().sessions.is_some());
+        }
+
+        #[test]
+        fn unsolicited_snapshot_does_not_consume_numeric_equal_pending_request() {
+            let mut bench = remote_bench();
+            let client = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .clone()
+                .unwrap();
+            // Synthetic id alignment: production's first request is Open/Attach.
+            // Consume client id 1 here so the attach id can collide with the
+            // pending List workspace id in this adversarial test.
+            let _ = client.request(Operation::Capabilities, None).unwrap();
+            let attach = bench.attach();
+            assert_eq!(attach, 2, "attach request id");
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+
+            let mut list_request = None;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::List { .. } if list_request.is_none() => {
+                            list_request = Some(frame.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                list_request.is_some()
+            });
+            let list_request = list_request.unwrap();
+            let pending_before = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .pending_count();
+            assert!(pending_before > 0);
+
+            // The attach id is 2 and the pending List workspace id is also 2.
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::SessionSnapshot {
+                    snapshot: empty_snapshot(1),
+                },
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                bench.pump();
+                if bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .integration()
+                    == RemoteIntegrationState::Connected
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(
+                remote.workspace.integration(),
+                RemoteIntegrationState::Connected,
+                "unsolicited snapshot must be applied as an event"
+            );
+            assert_eq!(
+                remote.workspace.pending_count(),
+                pending_before,
+                "an event must not consume a numeric-equal pending request"
+            );
+
+            bench.reply(&list_request, listed(&bench.root));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                bench.pump();
+                if bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .directories
+                    .contains_key(&bench.root)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .directories
+                    .contains_key(&bench.root),
+                "the correlated List reply must still apply"
+            );
+        }
+    }
+
     #[test]
     fn remote_preview_failure_and_stale_states_do_not_spin() {
         use crate::remote_workspace::{Freshness, PreviewProjection};

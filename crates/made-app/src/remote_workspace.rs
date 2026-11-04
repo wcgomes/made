@@ -534,6 +534,27 @@ impl RemoteWorkspace {
         Ok(result)
     }
 
+    /// Apply an unsolicited session snapshot that was not matched to a pending
+    /// workspace request. It does not consume or complete pending work by
+    /// request id; accepting a newer revision may still trigger the normal
+    /// root-follow transition, which intentionally abandons old-root pending
+    /// work.
+    pub fn accept_session_event(&mut self, event: WireEnvelope) -> Result<(), ProtocolError> {
+        if self.connection != ConnectionState::Connected || !event.identity.matches(&self.identity)
+        {
+            return Err(ProtocolError::Identity);
+        }
+        event.validate()?;
+        let Operation::SessionSnapshot { snapshot } = event.operation else {
+            return Err(ProtocolError::UnexpectedResponse);
+        };
+        self.apply(
+            &RemoteResult::Session(snapshot),
+            &Operation::SessionState,
+            Purpose::User,
+        )
+    }
+
     /// Discard all pending requests; no input, focus or upload is replayed.
     pub fn disconnect(&mut self) {
         self.connection = ConnectionState::Disconnected;
