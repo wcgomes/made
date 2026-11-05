@@ -3703,11 +3703,18 @@ fn same_version_update_waits_for_separate_approval_and_reports_the_real_reason()
     assert!(workbench.companion_spawn_requested());
     assert!(!workbench.remote_needs_update());
     assert!(!workbench.remote_update_approved());
-    model.logic(&ctx);
+    // The stage success also starts an asynchronous companion attach. Its
+    // failure would clear install readiness, so publish the diagnostics
+    // snapshot without ticking the remote tab: that reads this tab's
+    // post-stage provisioning while the attach result is still queued.
+    model.hold_grok_diagnostics(made_app::app::GrokDiagnosticsHold::NotOnPath);
     assert!(
         model.remote_grok_install_ready(authority),
         "a successful matching update stage makes the current path install-ready"
     );
+    // Release the queued attach result now that the stage-success transition
+    // has been observed; the frame loop consumes it and the thread exits.
+    model.logic(&ctx);
 
     // A later exact staging reuse succeeds without another update prompt.
     model
@@ -3718,6 +3725,7 @@ fn same_version_update_waits_for_separate_approval_and_reports_the_real_reason()
     assert!(!workbench.remote_needs_update());
     assert!(!workbench.remote_update_approved());
     assert!(workbench.companion_spawn_requested());
+    drop(model);
 }
 
 #[test]

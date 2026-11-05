@@ -3,7 +3,7 @@ use crate::{filesystem::remote, protocol::*};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -121,11 +121,22 @@ impl Uploads {
     /// Serializes cross-tab retention using a platform file lock. Only generated
     /// regular filenames qualify; symlinks and unrelated entries are untouched.
     pub fn cleanup(&self, current: Option<&Path>, now: SystemTime) -> Result<(), ErrorCode> {
+        self.cleanup_with(current, now, |path| fs::remove_file(path))
+    }
+    /// Best-effort cleanup that returns the first unlink failure after every
+    /// eligible removal has been attempted.
+    fn cleanup_with(
+        &self,
+        current: Option<&Path>,
+        now: SystemTime,
+        remove: impl Fn(&Path) -> io::Result<()>,
+    ) -> Result<(), ErrorCode> {
         let _lock = made_platform::lock_private_file(
             &self.directory.join("retention.lock"),
             Duration::from_secs(1),
         )
         .map_err(|_| ErrorCode::Io)?;
+        let mut failure = None;
         let mut images = Vec::new();
         for entry in fs::read_dir(&self.directory).map_err(|_| ErrorCode::Io)? {
             let entry = entry.map_err(|_| ErrorCode::Io)?;
@@ -156,18 +167,23 @@ impl Uploads {
             if extension == "partial" {
                 let lock_path = path.with_extension("partial.lock");
                 if let Ok(_lock) = made_platform::lock_private_file(&lock_path, Duration::ZERO) {
-                    let _ = fs::remove_file(path);
-                    let _ = fs::remove_file(lock_path);
+                    if remove(&path).is_err() {
+                        failure = failure.or(Some(ErrorCode::Io));
+                    }
+                    if remove(&lock_path).is_err() {
+                        failure = failure.or(Some(ErrorCode::Io));
+                    }
                 }
                 continue;
             }
             if extension != "png" {
                 continue;
             }
-            if now.duration_since(modified).unwrap_or_default() > RETENTION
-                && fs::remove_file(&path).is_ok()
-            {
-                continue;
+            if now.duration_since(modified).unwrap_or_default() > RETENTION {
+                if remove(&path).is_ok() {
+                    continue;
+                }
+                failure = failure.or(Some(ErrorCode::Io));
             }
             images.push((modified, path));
         }
@@ -177,9 +193,11 @@ impl Uploads {
             .saturating_add(usize::from(current.is_some()))
             .saturating_sub(64);
         for (_, path) in images.into_iter().take(excess) {
-            let _ = fs::remove_file(path);
+            if remove(&path).is_err() {
+                failure = failure.or(Some(ErrorCode::Io));
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), |_| Err(ErrorCode::Io))
     }
 }
 impl Drop for Uploads {
@@ -289,5 +307,61 @@ fn validate_png_file(path: &Path) -> Result<(), ErrorCode> {
             }
             return Ok(());
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn generated_name(token: u64, extension: &str) -> String {
+        format!("clipboard-{token:032x}.{extension}")
+    }
+
+    #[cfg(unix)]
+    fn set_age(path: &Path, age: Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - age))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_reports_unlink_failure_after_attempting_all_removals_then_reconciles() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("clipboard-images");
+        let uploads = Uploads::new(directory.clone()).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the image directory stays owner-only while unlink failure is injected"
+        );
+
+        let now = SystemTime::now();
+        let denied = directory.join(generated_name(1, "png"));
+        let removed = directory.join(generated_name(2, "png"));
+        for path in [&denied, &removed] {
+            fs::write(path, b"expired").unwrap();
+            set_age(path, Duration::from_secs(8 * 24 * 3600));
+        }
+        let outcome = uploads.cleanup_with(None, now, |path| {
+            if path == denied.as_path() {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                fs::remove_file(path)
+            }
+        });
+        assert_eq!(outcome, Err(ErrorCode::Io));
+        assert!(denied.exists(), "the failed unlink preserves its file");
+        assert!(
+            !removed.exists(),
+            "cleanup still attempts every other eligible removal"
+        );
+
+        uploads.cleanup(None, SystemTime::now()).unwrap();
+        assert!(!denied.exists(), "a later reachable cleanup reconciles");
     }
 }
