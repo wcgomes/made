@@ -115,8 +115,7 @@ jobs:
             # from contending for the same process groups. `timeout` turns a
             # hung test into a released log instead of a 45-minute job timeout.
             # TEMP release/v0.1.0: temp-annotate.sh publishes failures as annotations.
-            bash .github/scripts/temp-annotate.sh "cargo test" -- timeout -k 20 1200 cargo test --workspace --locked --no-fail-fast \
-              --target "${{ matrix.target }}" -- --test-threads=1 --nocapture
+            bash .github/scripts/temp-test-by-package.sh "${{ matrix.target }}"
           else
             bash .github/scripts/temp-annotate.sh "cargo test" -- cargo test --workspace --locked --no-fail-fast --target "${{ matrix.target }}"
           fi
