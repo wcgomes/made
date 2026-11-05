@@ -3100,7 +3100,7 @@ fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let no_grok_capabilities = Capabilities {
         grok: false,
@@ -3224,7 +3224,7 @@ fn grok_install_consent_is_explicit_bounded_and_withdrawable() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let id = model
@@ -3360,7 +3360,7 @@ fn grok_install_approval_is_gated_until_the_companion_is_provisioned() {
                 shell_cwd: false,
                 helper_version: "probe".to_owned(),
                 grok: true,
-                python3: true,
+                python3: false,
             }),
         )
         .expect("probe result records");
@@ -3408,7 +3408,7 @@ fn grok_install_attempts_stay_independent_across_servers() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let server_a = model

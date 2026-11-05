@@ -263,7 +263,6 @@ pub enum RemoteGrokInstallHold {
 /// Unknown or absent reasons degrade to the generic failed row.
 fn known_install_reason(reason: &str) -> Option<&'static str> {
     match reason {
-        "python3-missing" => Some("python3-missing"),
         "grok-missing" => Some("grok-missing"),
         "staged-plugin-missing" => Some("staged-plugin-missing"),
         "install-failed" => Some("install-failed"),

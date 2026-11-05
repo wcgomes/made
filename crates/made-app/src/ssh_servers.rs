@@ -511,8 +511,9 @@ impl ServerStorage for PrivateMetadataStorage {
 
 /// Parse the fixed OpenSSH probe script. This is not a TUI launch and it does
 /// not look for tmux. `Capabilities.tmux` is encoded false and must be ignored.
-/// Grok and python3 are metadata-only PATH detections reported by the same
-/// probe; absence keeps the honest inventory tier.
+/// Grok is a metadata-only PATH detection reported by the same probe; absence
+/// keeps the honest inventory tier. No interpreter is probed or parsed, and the
+/// frozen `Capabilities.python3` field is encoded false.
 pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let text = std::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidRequest)?;
     let mut lines = text.split('\n');
@@ -523,7 +524,6 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let arch = lines.next().unwrap_or("").trim();
     let opencode = lines.next().unwrap_or("").trim();
     let grok = lines.next().unwrap_or("").trim();
-    let python3 = lines.next().unwrap_or("").trim();
     if os.chars().any(char::is_control) || arch.chars().any(char::is_control) {
         return Err(ErrorCode::InvalidRequest);
     }
@@ -546,7 +546,7 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: detected(grok),
-        python3: detected(python3),
+        python3: false,
     })
 }
 

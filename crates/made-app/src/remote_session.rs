@@ -260,8 +260,7 @@ pub const STAGE_FILES: &[&str] = &[
     "plugins/grok-made/plugin.json",
     "plugins/grok-made/README.md",
     "plugins/grok-made/hooks/hooks.json",
-    "plugins/grok-made/hooks/status_test.py",
-    "plugins/grok-made/hooks/bin/status.py",
+    "plugins/grok-made/hooks/bin/made-grok-status",
 ];
 
 /// Build the Stage stdin body. Consent false is a hard refusal from the
@@ -437,7 +436,7 @@ mod tests {
             .enumerate()
             .map(|(index, _)| vec![b'a' + index as u8])
             .collect();
-        assert_eq!(files.len(), 11);
+        assert_eq!(files.len(), 10);
         assert!(stage_body(false, "0.1.0", "x86_64-unknown-linux-gnu", &files).is_err());
         let body = stage_body(true, "0.1.0", "x86_64-unknown-linux-gnu", &files).unwrap();
         let text = String::from_utf8_lossy(&body);

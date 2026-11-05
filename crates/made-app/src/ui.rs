@@ -4387,11 +4387,6 @@ fn grok_install_consent_card(model: &mut crate::app::AppModel, ui: &mut Ui, layo
                 ));
             }
             Some(crate::app::RemoteGrokInstallState::Failed { reason }) => match reason {
-                Some("python3-missing") => {
-                    ui.label(theme::micro(
-                        "The last install failed: remote python3 is missing.",
-                    ));
-                }
                 Some(reason) => {
                     ui.label(theme::micro(sanitize_display(
                         &format!("The last install failed. The server reported: {reason}."),

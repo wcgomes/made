@@ -1037,23 +1037,29 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
         row.sentence
     );
 
-    // Missing remote python3 is a declared honest failure reason.
-    let row = remote_grok_row(
-        false,
-        true,
+    // No remote Grok state mentions python3: a reason the companion no longer
+    // reports degrades to the generic failed install row, and every state
+    // names no interpreter.
+    for install in [
         None,
-        true,
+        Some(RemoteGrokInstallOutcome::Running),
+        Some(RemoteGrokInstallOutcome::Succeeded),
+        Some(RemoteGrokInstallOutcome::Failed { reason: None }),
         Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
+            reason: Some("install-failed"),
         }),
-        true,
-        true,
-    );
-    assert!(
-        row.sentence.contains("remote python3 is missing"),
-        "{}",
-        row.sentence
-    );
+    ] {
+        for consented in [false, true] {
+            for (detected, running) in [(false, false), (true, false), (true, true)] {
+                let row = remote_grok_row(false, detected, None, consented, install, running, true);
+                assert!(
+                    !row.sentence.to_lowercase().contains("python"),
+                    "{install:?}: {}",
+                    row.sentence
+                );
+            }
+        }
+    }
 
     // A successful install is ready while a session is open; it stays ready
     // even after a withdrawal, because Made never uninstalls.
@@ -1101,7 +1107,7 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         None,
         true,
         Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
+            reason: Some("install-failed"),
         }),
         true,
         true,
@@ -1115,8 +1121,8 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         "the copied report must include the Grok pill: {text}"
     );
     assert!(
-        text.contains("remote python3 is missing"),
-        "the copied report must include the honest reason: {text}"
+        text.contains("the plugin install failed") && !text.contains("python3"),
+        "the copied report must include the honest reason and no interpreter: {text}"
     );
     assert!(
         !text.contains("Grok Build is not on PATH"),

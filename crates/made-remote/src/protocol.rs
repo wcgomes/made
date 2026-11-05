@@ -271,6 +271,9 @@ pub struct Capabilities {
     /// is remote-only and never implies launch or install support.
     #[serde(default)]
     pub grok: bool,
+    /// Frozen within major 1, like `tmux`: always encoded false and ignored by
+    /// every consumer. No interpreter is a prerequisite for any Grok tier, so
+    /// it is never probed; the field stays only for wire compatibility.
     #[serde(default)]
     pub python3: bool,
 }

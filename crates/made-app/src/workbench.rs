@@ -8089,7 +8089,6 @@ mod tests {
             for row in [
                 GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED,
                 GrokDiagnosticsRow::REMOTE_INSTALL_PENDING,
-                GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING,
                 GrokDiagnosticsRow::REMOTE_INSTALL_FAILED,
             ] {
                 bench.workbench.set_grok_diagnostics(row.clone());

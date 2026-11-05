@@ -3,8 +3,8 @@ use made_app::ssh_servers::*;
 use made_remote::protocol::{Capabilities, ErrorCode, RemoteTarget};
 use std::{cell::RefCell, rc::Rc};
 
-fn probe_output(os: &str, arch: &str, opencode: &str, grok: &str, python3: &str) -> Vec<u8> {
-    format!("MADE-PROBE-1\n{os}\n{arch}\n{opencode}\n{grok}\n{python3}\n").into_bytes()
+fn probe_output(os: &str, arch: &str, opencode: &str, grok: &str) -> Vec<u8> {
+    format!("MADE-PROBE-1\n{os}\n{arch}\n{opencode}\n{grok}\n").into_bytes()
 }
 
 #[derive(Default)]
@@ -179,30 +179,34 @@ fn rejects_option_targets_controls_and_zero_ports_before_storage() {
 }
 
 #[test]
-fn probe_parses_grok_and_python3_detection_honestly() {
+fn probe_parses_grok_detection_honestly_and_never_reports_python3() {
     let detected = parse_probe_output(&probe_output(
         "Linux",
         "aarch64",
         "/usr/local/bin/opencode",
         "/home/u/bin/grok",
-        "/usr/bin/python3",
     ))
     .unwrap();
     assert_eq!(detected.target, RemoteTarget::LinuxArm64);
-    assert!(detected.opencode && detected.grok && detected.python3);
+    assert!(detected.opencode && detected.grok && !detected.python3);
+    // A stale probe that still prints an interpreter line cannot set the
+    // frozen field: it is never parsed.
+    let stale =
+        parse_probe_output(b"MADE-PROBE-1\nLinux\nx86_64\n\n/home/u/bin/grok\n/usr/bin/python3\n")
+            .unwrap();
+    assert!(stale.grok && !stale.python3);
     // Relative or option-like text is absence, never a host executable.
     let absent = parse_probe_output(&probe_output(
         "Darwin",
         "x86_64",
         "/usr/local/bin/opencode",
         "grok",
-        "python3",
     ))
     .unwrap();
     assert!(absent.opencode && !absent.grok && !absent.python3);
     assert_eq!(absent.target, RemoteTarget::MacosX64);
     // Missing additive lines are honest absence, not a malformed probe.
-    let short = parse_probe_output(b"MADE-PROBE-1\nLinux\nx86_64\n\n\n\n").unwrap();
+    let short = parse_probe_output(b"MADE-PROBE-1\nLinux\nx86_64\n\n\n").unwrap();
     assert!(!short.opencode && !short.grok && !short.python3);
     // The banner is still required and controls still never claim tmux.
     assert_eq!(
@@ -425,11 +429,11 @@ fn grok_install_invocation_and_report_parsing_are_bounded_and_exact() {
     assert_eq!(report.outcome, GrokInstallOutcome::Skipped);
 
     let report = parse_grok_install_report(
-        br#"{"outcome":"failed","reason":"python3-missing","new_sessions_only":false}"#,
+        br#"{"outcome":"failed","reason":"install-failed","new_sessions_only":false}"#,
     )
     .unwrap();
     assert_eq!(report.outcome, GrokInstallOutcome::Failed);
-    assert_eq!(report.reason.as_deref(), Some("python3-missing"));
+    assert_eq!(report.reason.as_deref(), Some("install-failed"));
 
     // Oversized, non-JSON, multi-line, unknown-outcome and over-long reason
     // replies fail bounded and honest.

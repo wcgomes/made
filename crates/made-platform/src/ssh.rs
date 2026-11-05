@@ -80,9 +80,9 @@ impl SshCommand {
 // hostname, user, prompt or server response here.
 // Detection is metadata-only: command -v performs PATH lookups on the
 // sanitized PATH and never executes or version-checks a program. OpenCode is
-// additionally looked up in fixed user-owned install locations; grok and
-// python3 are PATH-only (SSH-09/SSH-10).
-const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); python3=$(command -v python3 || :); printf "%s\n%s\n" "$grok" "$python3"'"#;
+// additionally looked up in fixed user-owned install locations; grok is
+// PATH-only (SSH-09/SSH-10); no interpreter is looked up.
+const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); printf "%s\n" "$grok"'"#;
 const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --stdio'"#;
 // Consent-gated Grok plugin install: identical version/target/root/stdin
 // discipline, but the staged companion starts in its `--install-grok-plugin`
@@ -93,7 +93,7 @@ const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r ta
 const GROK_PLUGIN_INSTALL: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; test ${#version} -le 128 || exit 64; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --install-grok-plugin'"#;
 
 // First-install bootstrap does not assume an executable already exists. Exactly
-// eleven allowlisted files, length-delimited stdin, remote checksum
+// ten allowlisted files, length-delimited stdin, remote checksum
 // verification, private temporary directory and atomic promotion. Never
 // tar/extract/eval.
 // Header: consent-v1 LF version LF target LF for initial staging/exact reuse,
@@ -350,7 +350,7 @@ if test -e "$base/$target"; then
  existing=1
 fi
 if test "$existing" = 1 && test "$update" = 0; then
-for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/status_test.py plugins/grok-made/hooks/bin/status.py; do
+for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/bin/made-grok-status; do
  IFS= read -r size; IFS= read -r hash
  case "$size" in ""|*[!0-9]*) exit 64;; esac
  test ${#size} -le 9 && test "$size" -gt 0 && test "$size" -le 134217728 || exit 64
@@ -366,7 +366,7 @@ for name in made-remote plugins/opencode-made/package.json plugins/opencode-made
  if test "$checksum" = sha256sum; then actual=$(sha256sum "$file"); else actual=$(shasum -a 256 "$file"); fi
  case "$actual" in "$hash "*) ;; *) update_required;; esac
  case "$name" in
- made-remote|plugins/grok-made/hooks/bin/status.py) test "$(mode_of "$file")" = 700 || update_required;;
+ made-remote|plugins/grok-made/hooks/bin/made-grok-status) test "$(mode_of "$file")" = 700 || update_required;;
  *) test "$(mode_of "$file")" = 600 || update_required;;
  esac
 done
@@ -376,7 +376,7 @@ fi
 mkdir "$stage"
 stage_owned=1
 mkdir "$stage/plugins" "$stage/plugins/opencode-made" "$stage/plugins/opencode-made/src" "$stage/plugins/grok-made" "$stage/plugins/grok-made/hooks" "$stage/plugins/grok-made/hooks/bin"
-for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/status_test.py plugins/grok-made/hooks/bin/status.py; do
+for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/bin/made-grok-status; do
  IFS= read -r size; IFS= read -r hash
  case "$size" in ""|*[!0-9]*) exit 64;; esac
  test ${#size} -le 9 && test "$size" -gt 0 && test "$size" -le 134217728 || exit 64
@@ -389,7 +389,7 @@ for name in made-remote plugins/opencode-made/package.json plugins/opencode-made
  if test "$checksum" = sha256sum; then actual=$(sha256sum "$file"); else actual=$(shasum -a 256 "$file"); fi
  case "$actual" in "$hash "*) ;; *) exit 74;; esac
  case "$name" in
- made-remote|plugins/grok-made/hooks/bin/status.py) chmod 700 "$file"; test "$(mode_of "$file")" = 700 || exit 74;;
+ made-remote|plugins/grok-made/hooks/bin/made-grok-status) chmod 700 "$file"; test "$(mode_of "$file")" = 700 || exit 74;;
  *) test "$(mode_of "$file")" = 600 || exit 74;;
  esac
 done

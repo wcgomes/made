@@ -682,12 +682,6 @@ impl GrokDiagnosticsRow {
         pill: GrokDiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
     };
-    pub(crate) const REMOTE_PYTHON3_MISSING: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed(
-            "Remote Grok Build session-status hooks are unavailable: remote python3 is missing.",
-        ),
-    };
     pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
         pill: GrokDiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
@@ -853,9 +847,6 @@ pub fn remote_grok_row(
         return RemoteGrokReport::from(GrokDiagnosticsRow::READY);
     }
     match install {
-        Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
-        }) => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING),
         Some(RemoteGrokInstallOutcome::Failed { .. }) => {
             RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_INSTALL_FAILED)
         }
@@ -872,7 +863,7 @@ pub enum RemoteGrokInstallOutcome {
     /// The official installer reported installed or already-current.
     Succeeded,
     /// The attempt failed; `reason` is the companion's bounded machine reason
-    /// when one was reported (for example `python3-missing`).
+    /// when one was reported (for example `install-failed`).
     Failed { reason: Option<&'static str> },
 }
 

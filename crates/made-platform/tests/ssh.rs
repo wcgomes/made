@@ -160,7 +160,7 @@ fn probe_fixture_uname(dir: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 #[cfg(unix)]
-fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
+fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3() {
     use std::{os::unix::fs::PermissionsExt, process::Command};
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -215,7 +215,14 @@ fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
     );
     assert_eq!(lines[3], "", "the fixture has no opencode");
     assert_eq!(lines[4], format!("{}/grok", bin.display()));
-    assert_eq!(lines[5], format!("{}/python3", bin.display()));
+    // Grok is the last probe line: python3 sits on the same PATH and is never
+    // looked up, reported or executed.
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[5], "");
+    assert!(
+        !SshCommand::Probe.script().contains("python3"),
+        "the fixed probe must not mention python3"
+    );
     assert!(
         !executed.exists(),
         "detection must never spawn grok or check a version"
@@ -228,10 +235,6 @@ fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
         .map(str::to_owned)
         .collect();
     assert_eq!(lines[4], "", "relative PATH entries must not be detected");
-    assert!(
-        !lines[5].contains("rel-bin"),
-        "relative PATH entries must not be detected for python3"
-    );
 }
 
 #[test]
@@ -377,7 +380,7 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     std::fs::write(&grok_config, b"existing = true\n").unwrap();
     let hash = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
     let mut input = staging_header(true, "1.0", target).unwrap();
-    for _ in 0..11 {
+    for _ in 0..10 {
         input.extend_from_slice(format!("1\n{hash}\nx").as_bytes());
     }
     let mut child = Command::new("/bin/sh")
@@ -423,12 +426,7 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     // The complete shipped grok-made package is staged beside opencode-made
     // with private permissions and the executable hook bit.
     let grok_plugin = destination.join("plugins/grok-made");
-    for name in [
-        "plugin.json",
-        "README.md",
-        "hooks/hooks.json",
-        "hooks/status_test.py",
-    ] {
+    for name in ["plugin.json", "README.md", "hooks/hooks.json"] {
         assert_eq!(std::fs::read(grok_plugin.join(name)).unwrap(), b"x");
         assert_eq!(
             std::fs::metadata(grok_plugin.join(name))
@@ -440,11 +438,11 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
         );
     }
     assert_eq!(
-        std::fs::read(grok_plugin.join("hooks/bin/status.py")).unwrap(),
+        std::fs::read(grok_plugin.join("hooks/bin/made-grok-status")).unwrap(),
         b"x"
     );
     assert_eq!(
-        std::fs::metadata(grok_plugin.join("hooks/bin/status.py"))
+        std::fs::metadata(grok_plugin.join("hooks/bin/made-grok-status"))
             .unwrap()
             .permissions()
             .mode()
@@ -480,7 +478,7 @@ mod fixed_staging {
         process::{Child, Command, Output, Stdio},
     };
 
-    pub const ARTIFACTS: [&str; 11] = [
+    pub const ARTIFACTS: [&str; 10] = [
         "made-remote",
         "plugins/opencode-made/package.json",
         "plugins/opencode-made/tui.ts",
@@ -490,8 +488,7 @@ mod fixed_staging {
         "plugins/grok-made/plugin.json",
         "plugins/grok-made/README.md",
         "plugins/grok-made/hooks/hooks.json",
-        "plugins/grok-made/hooks/status_test.py",
-        "plugins/grok-made/hooks/bin/status.py",
+        "plugins/grok-made/hooks/bin/made-grok-status",
     ];
     pub const UPDATE_REQUIRED: &str = "MADE-STAGE-UPDATE-REQUIRED";
     pub const RECOVERY_REQUIRED: &str = "MADE-STAGE-RECOVERY-REQUIRED";

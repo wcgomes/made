@@ -9869,7 +9869,7 @@ fn ssh_management_actions_save_test_remove_have_model_effects() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: false,
-        python3: true,
+        python3: false,
     };
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "ssh-actions", "main.rs");
@@ -12232,7 +12232,7 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let no_grok_capabilities = Capabilities {
         grok: false,
@@ -12373,15 +12373,16 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
         sentence(&headless)
     );
 
-    // python3 missing is a declared honest failure reason.
+    // A bounded companion reason names the failed install and no interpreter.
     headless.model.hold_remote_grok_install(
         authority,
         RemoteGrokInstallHold::Failed {
-            reason: Some("python3-missing"),
+            reason: Some("install-failed"),
         },
     );
     assert!(
-        sentence(&headless).contains("remote python3 is missing"),
+        sentence(&headless).contains("the plugin install failed")
+            && !sentence(&headless).contains("python3"),
         "{}",
         sentence(&headless)
     );
@@ -12487,7 +12488,7 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let with_grok = model
