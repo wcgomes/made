@@ -21,10 +21,13 @@ import hashlib
 import importlib.util
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -85,6 +88,45 @@ def seed(automatic: bool) -> dict[str, str]:
     return digests
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003 - urllib signature
+        return None
+
+
+def channel(form: str) -> str:
+    if form == "setup":
+        return "win-x64"
+    if form == "appimage":
+        return "linux-x64"
+    return "osx-arm64" if platform.machine() == "arm64" else "osx-x64"
+
+
+def wait_for_latest(form: str, latest: str, timeout: float = 600) -> None:
+    """Bounded wait until GitHub's `latest` feed redirect names the new tag.
+
+    Right after publishing, `releases/latest/download/` can still redirect
+    to the previous release for a short while (observed for ~20 s), so a
+    check started immediately would correctly find nothing newer.
+    """
+    url = f"https://github.com/wcgomes/made/releases/latest/download/releases.{channel(form)}.json"
+    expected = f"/releases/download/v{latest}/"
+    opener = urllib.request.build_opener(_NoRedirect)
+    deadline = time.time() + timeout
+    location = ""
+    while time.time() < deadline:
+        try:
+            opener.open(urllib.request.Request(url, method="HEAD"), timeout=30)
+        except urllib.error.HTTPError as error:
+            location = error.headers.get("Location", "")
+            if expected in location:
+                print(f"latest feed now resolves to v{latest}", flush=True)
+                return
+        except urllib.error.URLError as error:
+            location = str(error)
+        time.sleep(10)
+    smoke.check(False, f"GitHub's latest feed resolves to v{latest} (last: {location})")
+
+
 def wait_for_exit(pid: int, timeout: float = 600) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -108,6 +150,7 @@ def main() -> int:
     version = smoke.run(command + ["--version"])
     smoke.check(version.stdout.strip() == f"Made {args.previous}", f"the previous release {args.previous} is installed")
     digests = seed(args.automatic == "on")
+    wait_for_latest(args.form, args.latest)
 
     download = smoke.run(command + ["--update"], timeout=900)
     smoke.check(download.returncode == 0, "the command-line entry checks and downloads")
