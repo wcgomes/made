@@ -1,0 +1,87 @@
+# TEMP release/v0.1.0: phase-0 probe for specs/changes/grok-native-hook.
+# Records how `grok plugin install` treats a package on each platform. Remove
+# this file once the results are recorded in the change's decision index.
+name: Probe grok plugin install
+
+on:
+  push:
+    branches: [release/v0.1.0] # TEMP release/v0.1.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04, windows-2025]
+    steps:
+      - name: Install grok (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://x.ai/cli/install.sh | bash
+          echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+
+      - name: Install grok (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://x.ai/cli/install.ps1 | iex
+          Get-Command grok -ErrorAction SilentlyContinue
+          "$env:USERPROFILE\.grok\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Probe plugin install (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          grok --version
+          export GROK_HOME="$RUNNER_TEMP/ghome"
+          pkg="$RUNNER_TEMP/pkg"
+          mkdir -p "$pkg/hooks/bin" "$GROK_HOME"
+          printf '{"name":"grok-made","version":"0.1.0"}\n' > "$pkg/plugin.json"
+          printf '{"hooks":{}}\n' > "$pkg/hooks/hooks.json"
+          for m in 700 755 644; do
+            printf '#!/bin/sh\n' > "$pkg/hooks/bin/m$m"
+            chmod "$m" "$pkg/hooks/bin/m$m"
+          done
+          grok plugin install "$pkg" --trust
+          echo "--- installed tree"
+          find "$GROK_HOME/installed-plugins" -maxdepth 5 -ls
+          echo "--- symlinks (expect none)"
+          find "$GROK_HOME/installed-plugins" -type l
+          echo "--- registry"
+          cat "$GROK_HOME/installed-plugins/registry.json"
+          echo "--- modes (source / installed)"
+          for m in 700 755 644; do
+            if [ "$(uname)" = Darwin ]; then
+              src=$(stat -f '%Lp' "$pkg/hooks/bin/m$m")
+              dst=$(stat -f '%Lp' "$GROK_HOME"/installed-plugins/*/hooks/bin/m$m)
+            else
+              src=$(stat -c '%a' "$pkg/hooks/bin/m$m")
+              dst=$(stat -c '%a' "$GROK_HOME"/installed-plugins/*/hooks/bin/m$m)
+            fi
+            echo "m$m source=$src installed=$dst"
+          done
+
+      - name: Probe plugin install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          grok --version
+          $env:GROK_HOME = Join-Path $env:RUNNER_TEMP 'ghome'
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          New-Item -ItemType Directory -Force "$pkg\hooks\bin", $env:GROK_HOME | Out-Null
+          '{"name":"grok-made","version":"0.1.0"}' | Set-Content "$pkg\plugin.json"
+          '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bin/made-grok-status","timeout":5}]}]}}' | Set-Content "$pkg\hooks\hooks.json"
+          'x' | Set-Content "$pkg\hooks\bin\made-grok-status.exe"
+          grok plugin install $pkg --trust
+          Write-Host '--- installed tree'
+          Get-ChildItem -Recurse "$env:GROK_HOME\installed-plugins" | Format-Table FullName, Attributes, LinkType
+          Get-Content "$env:GROK_HOME\installed-plugins\registry.json"
+          Write-Host '--- inspect'
+          grok inspect
