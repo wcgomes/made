@@ -1,0 +1,43 @@
+# TEMP release/v0.1.0: locate the Linux test step that hangs the CI job by
+# running each package in its own short-lived job with the CI flags.
+name: Probe Linux tests
+
+on:
+  push:
+    branches: [release/v0.1.0] # TEMP release/v0.1.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  package:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [made-app, made-bridge, made-explorer, made-grok-hook, made-platform, made-remote, made-terminal]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libegl1-mesa-dev libgl1-mesa-dev libvulkan-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: probe-target-${{ matrix.package }}
+      - name: Test the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 900 cargo test -p ${{ matrix.package }} --locked --no-fail-fast --target x86_64-unknown-linux-gnu -- --test-threads=1 --nocapture
