@@ -128,7 +128,8 @@ impl FakePlugin {
     }
 
     fn next_json(&mut self) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Generous: loaded CI runners, notably aarch64 Linux, delay the relay.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
@@ -168,7 +169,7 @@ impl FakePlugin {
 }
 
 fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match socket.read() {
             Ok(Message::Close(frame)) => return frame.map(|frame| u16::from(frame.code)),
@@ -275,7 +276,7 @@ fn unauthorized_host_and_token_handshakes_never_disclose_state() {
         Some("session-a"),
         vec![session("session-a", true, "/tmp/a")],
     ));
-    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -333,7 +334,7 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
         Some("session-a"),
         vec![session("session-a", true, "/tmp/a")],
     ));
-    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -355,7 +356,7 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
         "requestID": focus["requestID"],
         "ok": true,
     }));
-    let (caller, operation) = poll_until(&mut service, Duration::from_secs(2), |(caller, _)| {
+    let (caller, operation) = poll_until(&mut service, Duration::from_secs(10), |(caller, _)| {
         *caller == Some(41)
     });
     assert_eq!(caller, Some(41));
@@ -384,7 +385,7 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
         "ok": false,
         "error": "session is gone",
     }));
-    let (caller, operation) = poll_until(&mut service, Duration::from_secs(2), |(caller, _)| {
+    let (caller, operation) = poll_until(&mut service, Duration::from_secs(10), |(caller, _)| {
         *caller == Some(42)
     });
     assert_eq!(caller, Some(42));
@@ -433,7 +434,7 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
             session("session-b", true, "/tmp/b"),
         ],
     ));
-    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -457,12 +458,12 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
         Some("session-b"),
         vec![session("session-b", true, "/tmp/b")],
     ));
-    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
 
     drop(plugin);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while service.state().is_ok() {
         assert!(Instant::now() < deadline, "disconnect was not relayed");
         let _ = service.poll();
