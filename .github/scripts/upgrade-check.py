@@ -31,6 +31,10 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# First release whose command-line apply records its outcome and whose
+# Windows hand-off says it is not complete yet.
+RECORDS_APPLY_OUTCOME_SINCE = (0, 1, 7)
+
 _spec = importlib.util.spec_from_file_location("smoke_installed", HERE / "smoke-installed.py")
 smoke = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smoke)
@@ -142,15 +146,25 @@ def main() -> int:
     digests = seed(args.automatic == "on")
     wait_for_latest(args.form, args.latest)
 
+    # GitHub's edge caches can keep serving the previous `latest` feed to
+    # one client after another already sees the new one; each `--update` is
+    # a real check, repeated within a bounded window until the new release
+    # is offered (or the window ends and the check fails).
+    ready = f"Made {args.latest} is ready to install."
+    deadline = time.time() + 600
     download = smoke.run(command + ["--update"], timeout=900)
+    while ready not in download.stdout and download.returncode == 0 and time.time() < deadline:
+        time.sleep(20)
+        download = smoke.run(command + ["--update"], timeout=900)
     smoke.check(download.returncode == 0, "the command-line entry checks and downloads")
-    smoke.check(f"Made {args.latest} is ready to install." in download.stdout, f"{args.latest} is downloaded and verified")
+    smoke.check(ready in download.stdout, f"{args.latest} is downloaded and verified")
     after_download = smoke.run(command + ["--version"])
     smoke.check(after_download.stdout.strip() == f"Made {args.previous}", "a download alone changes nothing installed")
 
     apply = smoke.run(command + ["--update", "--apply"], timeout=900)
     smoke.check(apply.returncode == 0, "the command-line apply succeeds with no Made window open")
-    if re.search(r"helper process \d+", apply.stdout):
+    records_outcome = tuple(int(part) for part in args.previous.split(".")) >= RECORDS_APPLY_OUTCOME_SINCE
+    if records_outcome and re.search(r"helper process \d+", apply.stdout):
         smoke.check("not complete yet" in apply.stdout, "the hand-off says the apply is not complete yet")
     # Bounded wait while the apply (or the Windows helper) holds the install
     # lock: `--update` then reports "apply in progress" with exit status 75.
@@ -161,10 +175,13 @@ def main() -> int:
         time.sleep(5)
         status = smoke.run(command + ["--update"], timeout=900)
     smoke.check(status.returncode != 75, "the apply finished within ten minutes")
-    smoke.check(
-        f"Last command-line apply: installed Made {args.latest}." in status.stdout,
-        "the next --update reports the recorded apply outcome",
-    )
+    # The apply outcome is recorded by the version that performs the apply,
+    # so it exists only when the previous release already records it.
+    if records_outcome:
+        smoke.check(
+            f"Last command-line apply: installed Made {args.latest}." in status.stdout,
+            "the next --update reports the recorded apply outcome",
+        )
 
     updated = smoke.run(command + ["--version"])
     smoke.check(updated.stdout.strip() == f"Made {args.latest}", f"the installed build now reports {args.latest}")
