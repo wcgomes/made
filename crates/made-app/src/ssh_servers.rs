@@ -1487,12 +1487,31 @@ mod stage_tests {
             .mode(0o600)
             .open(&known_hosts)
             .unwrap();
+        // The fixture executables are written by a child process, never through
+        // a write descriptor in this test process: another test thread forking
+        // while such a descriptor is open would make exec fail with ETXTBSY.
+        let write_executable = |path: &std::path::Path, content: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat > \"$1\" && chmod 700 \"$1\"")
+                .arg("sh")
+                .arg(path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(content.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+        };
         let ssh = root.join("ssh");
-        std::fs::write(&ssh, script).unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&ssh, script);
         let askpass = root.join("askpass");
-        std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&askpass, "#!/bin/sh\nexit 0\n");
         SshProcess::spawn(SshOptions {
             executable: ssh,
             askpass_executable: askpass,
