@@ -62,8 +62,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          # TEMP release/v0.1.0: temp-annotate.sh publishes failures as annotations.
-          bash .github/scripts/temp-annotate.sh "companion build" -- docker run --rm \
+          docker run --rm \
             --platform "${{ matrix.platform }}" \
             -v "$GITHUB_WORKSPACE:/src" \
             -w /src \
@@ -145,7 +144,7 @@ jobs:
       - name: Build and test the headless companion
         env:
           TARGET: ${{ matrix.target }}
-        run: bash .github/scripts/temp-annotate.sh "macos companion build" -- bash .github/scripts/build-macos-companion.sh # TEMP release/v0.1.0
+        run: bash .github/scripts/build-macos-companion.sh
 
       - name: Upload the macOS companion
         uses: actions/upload-artifact@v7
@@ -285,7 +284,7 @@ jobs:
 
       - name: Harness contract tests
         working-directory: tests/ssh
-        run: bash ../../.github/scripts/temp-annotate.sh "harness tests" -- python3 test_harness.py # TEMP release/v0.1.0
+        run: python3 test_harness.py
 
       - name: Real SSH companion capabilities
         working-directory: tests/ssh
@@ -303,7 +302,7 @@ jobs:
         working-directory: tests/ssh
         env:
           HOST_COMPANION: ${{ runner.temp }}/ssh-companion/made-remote
-        run: bash ../../.github/scripts/temp-annotate.sh "grok parity" -- python3 parity.py grok-parity --host-companion "$HOST_COMPANION" # TEMP release/v0.1.0
+        run: python3 parity.py grok-parity --host-companion "$HOST_COMPANION"
 
       - name: Clean up isolated SSH fixtures
         if: always()

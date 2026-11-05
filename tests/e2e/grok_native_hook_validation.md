@@ -24,8 +24,13 @@ nothing here certifies parity for an unexecuted combination.
 
 ## Local targets
 
-Install of the packaged layout and a no-Python hook run are recorded from workflow `probe-grok-acceptance.yml`
-(run 41975051827 annotations) and `ci-artifacts.yml` (packaged-layout test, task 5.10).
+Install of the packaged layout and the installed-hook run were recorded by a temporary probe workflow
+(run 42020323478 and run 41975051827, since removed): on every target `grok plugin install <packaged
+plugins/grok-made> --trust` exited 0 with real grok 1.0.70, installed no symlinks, copied the executable hook
+(`-rwxr-xr-x` on macOS arm64/x64 and Linux, `made-grok-status.exe` on Windows), and the installed copy, run with
+an empty PATH and one event, appended exactly one line (`"event":"UserPromptSubmit"`, `"status":"working"`, a
+numeric `pid`). The packaged-hook test of task 5.10 (`ci-artifacts.yml`, `tests/packaged.rs`) runs the staged
+hook with Python removed from PATH on all four targets.
 
 | Step | macOS arm64 | macOS x64 | Linux x64 | Windows x64 |
 |---|---|---|---|---|
@@ -41,7 +46,7 @@ Install of the packaged layout and a no-Python hook run are recorded from workfl
 | Step | Linux x86_64 | Linux aarch64 | macOS x86_64 | macOS arm64 |
 |---|---|---|---|---|
 | Hook built per target under glibc 2.31 / macOS 12, checked, manifest-recorded, staged as the 10th artifact | CI-test (`ci-ssh-remote.yml`) | CI-test | CI-test | CI-test |
-| Consented install, native hook ingested on a PATH without python3 (loopback, fixture grok) | CI-test (`tests/ssh/parity.py grok-parity`, Linux runner only) | UNVERIFIED: loopback job runs x86_64 only | UNVERIFIED: no macOS loopback server | UNVERIFIED |
+| Consented install, native hook ingested on a PATH without python3 (loopback, fixture grok) | CI-test (`tests/ssh/parity.py grok-parity`, scenarios `install-without-python3` and `native-hook-without-python3`, both PASS, 17 of 17 scenarios; x86_64 Linux runner only) | UNVERIFIED: loopback job runs x86_64 only | UNVERIFIED: no macOS loopback server | UNVERIFIED |
 | Real remote grok session producing hook lines | UNVERIFIED: grok not signed in | UNVERIFIED | UNVERIFIED | UNVERIFIED |
 
 The Linux loopback job is regression evidence for the protocol and harness surface only, not a substitute for the
