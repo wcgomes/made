@@ -6029,7 +6029,9 @@ mod tests {
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
         let mut registry = crate::ssh_servers::ServerRegistry::load(
-            crate::ssh_servers::PrivateMetadataStorage::new(&directory),
+            // A Windows registry directory must carry the protected owner-only
+            // DACL, which the store applies when it creates the directory.
+            crate::ssh_servers::PrivateMetadataStorage::new(directory.join("registry")),
         )
         .unwrap();
         let authority = registry

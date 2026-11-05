@@ -280,6 +280,21 @@ fn status_filters_ignored_and_outside_rows_and_keeps_partial_staging() {
     }
 }
 
+/// The error of a call that must fail, retried while the freshly written
+/// script is still open for writing in a sibling thread's forked child
+/// (ETXTBSY, a race between parallel tests, not a runner behavior).
+#[cfg(unix)]
+fn err_retrying_busy<T: std::fmt::Debug>(call: impl Fn() -> io::Result<T>) -> io::Error {
+    for _ in 0..50 {
+        let error = call().unwrap_err();
+        if !error.to_string().contains("Text file busy") {
+            return error;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    call().unwrap_err()
+}
+
 #[cfg(unix)]
 #[test]
 fn runner_bounds_output_and_time_and_reports_failures_honestly() {
@@ -299,29 +314,30 @@ fn runner_bounds_output_and_time_and_reports_failures_honestly() {
     let failing = script("failing.sh", "#!/bin/sh\nprintf boom >&2\nexit 3\n");
     let timeout = script("timeout.sh", "#!/bin/sh\nsleep 30\n");
 
-    let error = GitRunner::with_program(&output_cap)
-        .read_bytes(GitCommand::Status, temp.path())
-        .unwrap_err();
+    let error = err_retrying_busy(|| {
+        GitRunner::with_program(&output_cap).read_bytes(GitCommand::Status, temp.path())
+    });
     assert_eq!(error.to_string(), "git output limit");
 
     assert_eq!(GitRunner::new().limits(), GitLimits::BOUNDED);
 
-    let error = GitRunner::with_program(&failing)
-        .read_bytes(GitCommand::Status, temp.path())
-        .unwrap_err();
+    let error = err_retrying_busy(|| {
+        GitRunner::with_program(&failing).read_bytes(GitCommand::Status, temp.path())
+    });
     assert_eq!(error.to_string(), "git exited with 3: boom");
     assert!(error.to_string().contains("boom"));
 
     let started = Instant::now();
-    let error = GitRunner::with_limits(
-        &timeout,
-        GitLimits {
-            deadline: Some(Duration::from_millis(150)),
-            ..GitLimits::BOUNDED
-        },
-    )
-    .read_bytes(GitCommand::Status, temp.path())
-    .unwrap_err();
+    let error = err_retrying_busy(|| {
+        GitRunner::with_limits(
+            &timeout,
+            GitLimits {
+                deadline: Some(Duration::from_millis(150)),
+                ..GitLimits::BOUNDED
+            },
+        )
+        .read_bytes(GitCommand::Status, temp.path())
+    });
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(error.to_string(), "git read deadline");
     assert!(

@@ -1092,6 +1092,7 @@ fn staged_artifacts_list_the_complete_shipped_grok_made_package() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn grok_detection_is_metadata_only_over_absolute_path_entries() {
     let root = tempfile::tempdir().unwrap();
@@ -1226,6 +1227,7 @@ fn read_manifest_version(path: &Path) -> String {
     text[start..].split('"').next().unwrap().to_owned()
 }
 
+#[cfg(unix)]
 #[test]
 fn install_runs_without_any_interpreter_prerequisite() {
     let root = tempfile::tempdir().unwrap();
@@ -1243,6 +1245,7 @@ fn install_runs_without_any_interpreter_prerequisite() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     let root = tempfile::tempdir().unwrap();
@@ -1297,6 +1300,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn install_never_edits_config_toml_or_redirects_grok_home() {
     let root = tempfile::tempdir().unwrap();
@@ -1333,6 +1337,7 @@ fn install_never_edits_config_toml_or_redirects_grok_home() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
     let root = tempfile::tempdir().unwrap();
@@ -1373,6 +1378,7 @@ fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
     assert_eq!(report.reason, Some("lock-timeout"));
 }
 
+#[cfg(unix)]
 #[test]
 fn install_reports_a_bounded_honest_line() {
     let root = tempfile::tempdir().unwrap();

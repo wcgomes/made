@@ -1202,6 +1202,9 @@ def grok_inventory_follow(h, fx, workspace, mutation=False):
         if not mutation:
             tab.wait_state(lambda s: 'owned-1' in session_ids(s), timeout=10)
         kill_pid(h, owned)
+        # The killed background job stays a zombie, which still counts as live
+        # ancestry, until the interactive shell reaps it at its next prompt.
+        tab.type("true\n")
         snapshot, _ = tab.wait_state(lambda s: 'owned-1' not in session_ids(s), timeout=10)
         if 'foreign-1' in session_ids(snapshot):
             raise AssertionError('the foreign row appeared after a refresh')
@@ -1347,15 +1350,13 @@ def grok_native_hook_without_python3(h, fx, workspace, mutation=False):
         tab.collect_terminal()
         tab.type("printf '\\nSHELL_PID:%s\\n' \"$$\"\n")
         shell_pid = int(tab.wait_terminal(r'SHELL_PID:([0-9]+)').group(1))
-        # Neither interpreter resolves on this remote PATH (command -v fails).
-        for interpreter in ('python', 'python3'):
-            tab.type(f"command -v {interpreter} >/dev/null 2>&1; "
-                     f"printf '\\nNO_{interpreter}_STATUS:%s\\n' \"$?\"\n")
-            tab.wait_terminal(rf'NO_{interpreter}_STATUS:1')
         tab.arm()
         event = ('{"hookEventName":"UserPromptSubmit","sessionId":"native-1",'
                  '"cwd":"/native"}')
-        tab.type(f"printf '%s' '{event}' | {shlex.quote(str(installed_hook))}; "
+        # An interactive shell rebuilds PATH from its startup files, so the hook
+        # runs under env -i with an empty PATH: nothing but the executable.
+        tab.type(f"printf '%s' '{event}' | env -i PATH=/nonexistent "
+                 f"HOME=\"$HOME\" {shlex.quote(str(installed_hook))}; "
                  "printf '\\nHOOK_EXIT:%s\\n' \"$?\"\n")
         tab.wait_terminal(r'HOOK_EXIT:0')
         line = None

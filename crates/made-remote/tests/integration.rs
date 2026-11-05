@@ -227,6 +227,7 @@ fn quiet_for(service: &mut Integration, timeout: Duration) {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unauthorized_host_and_token_handshakes_never_disclose_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -306,6 +307,7 @@ fn bridge_is_actual_remote_loopback_and_launch_config_is_immutable() {
     assert!(service.verify_config().unwrap().is_unchanged());
 }
 
+#[cfg(unix)]
 #[test]
 fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
     let temp = tempfile::tempdir().unwrap();
