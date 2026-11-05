@@ -596,8 +596,11 @@ mod fixed_staging {
     /// simulate an uncatchable SIGKILL of the whole attempt (EXIT traps do not
     /// run) without leaving fixture children behind.
     pub fn spawn_with_path(home: &Path, payload: &[u8], path: &Path) -> Child {
+        // The fixed script is itself `sh -c '...'`. bash execs a last command
+        // in place but dash forks it, which would make the killed pid differ
+        // from the lock owner's `$$`; `exec` pins the same pid on every host.
         let mut child = Command::new("/bin/sh")
-            .args(["-c", SshCommand::Stage.script()])
+            .args(["-c", &format!("exec {}", SshCommand::Stage.script())])
             .env_clear()
             .env("HOME", home)
             .env("XDG_DATA_HOME", home.join("data"))
