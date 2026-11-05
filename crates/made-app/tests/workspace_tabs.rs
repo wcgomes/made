@@ -808,6 +808,17 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(5));
     }
+    // A loaded host can start a shell or tick a tab later than the fixed
+    // window above; wait on the condition, bounded, before asserting it.
+    let settled = Instant::now() + Duration::from_secs(10);
+    while ids.iter().any(|id| {
+        let workbench = model.workspace(*id).unwrap();
+        !workbench.terminal().unwrap().is_running() || workbench.tick_count() <= 1
+    }) && Instant::now() < settled
+    {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
     for id in &ids {
         let workbench = model.workspace(*id).unwrap();
         assert!(workbench.terminal().unwrap().is_running());
@@ -2905,8 +2916,6 @@ sleep 30\n",
         made_platform::PLUGIN_DIR_ENV,
         plugins.package("opencode-made"),
     );
-    // The shipped grok-made package is the staged copy beside the install root.
-    support::stage_shipped_grok_plugin();
     let output = command.output().unwrap();
     assert!(
         output.status.success(),

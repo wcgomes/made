@@ -325,12 +325,18 @@ fn malformed_empty_or_late_input_writes_nothing() {
         assert_silent_no_line(payload, true);
         assert_silent_no_line(payload, false);
     }
-    // Invalid JSON, truncated JSON and silence never complete: about two seconds.
-    for payload in [
-        &b"not json at all"[..],
-        b"{\"hookEventName\":\"SessionSta",
-        b"",
-    ] {
+    // Invalid JSON can never be repaired by later bytes, so it ends the run at
+    // once even with standard input still open.
+    for payload in [&b"not json at all"[..], b"{]"] {
+        let outcome = assert_silent_no_line(payload, false);
+        assert!(
+            outcome.elapsed < Duration::from_millis(1_500),
+            "{payload:?} took {:?}",
+            outcome.elapsed
+        );
+    }
+    // Truncated JSON and silence never complete: about two seconds.
+    for payload in [&b"{\"hookEventName\":\"SessionSta"[..], b""] {
         let outcome = assert_silent_no_line(payload, false);
         assert!(
             outcome.elapsed >= Duration::from_millis(1_500)

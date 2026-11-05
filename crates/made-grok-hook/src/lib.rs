@@ -63,8 +63,11 @@ where
         match values.next() {
             Some(Ok(Value::Object(event))) => return Some(event),
             Some(Ok(_)) => return None,
-            // Truncated or invalid so far: wait for more bytes until the deadline.
-            Some(Err(_)) | None => continue,
+            // Truncated so far: wait for more bytes until the deadline. A syntax
+            // error can never be repaired by later bytes, so it ends the read.
+            Some(Err(error)) if error.is_eof() => continue,
+            Some(Err(_)) => return None,
+            None => continue,
         }
     }
 }
@@ -257,6 +260,29 @@ mod tests {
         )
         .expect("object");
         assert_eq!(text_of(&event, &["cwd"]), "/caf\u{e9}");
+    }
+
+    #[test]
+    fn chunk_reader_stops_at_a_syntax_error_but_waits_on_truncation() {
+        let started = Instant::now();
+        let bad = read_event_with(
+            |_| Chunk::Data(b"not json".to_vec()),
+            Duration::from_secs(5),
+        );
+        assert!(bad.is_none() && started.elapsed() < Duration::from_secs(1));
+        let mut sent = false;
+        let truncated = read_event_with(
+            |_| {
+                if sent {
+                    Chunk::Idle
+                } else {
+                    sent = true;
+                    Chunk::Data(b"{\"a\":".to_vec())
+                }
+            },
+            Duration::from_millis(300),
+        );
+        assert!(truncated.is_none() && started.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]

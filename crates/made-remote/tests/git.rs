@@ -283,6 +283,7 @@ fn status_filters_ignored_and_outside_rows_and_keeps_partial_staging() {
 /// The error of a call that must fail, retried while the freshly written
 /// script is still open for writing in a sibling thread's forked child
 /// (ETXTBSY, a race between parallel tests, not a runner behavior).
+// POSIX-only: it supports the /bin/sh script runner test.
 #[cfg(unix)]
 fn err_retrying_busy<T: std::fmt::Debug>(call: impl Fn() -> io::Result<T>) -> io::Error {
     for _ in 0..50 {

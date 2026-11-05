@@ -127,34 +127,40 @@ impl FakePlugin {
             .unwrap();
     }
 
-    fn next_json(&mut self) -> Value {
-        // Generous: loaded CI runners, notably aarch64 Linux, delay the relay.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match self.socket.read() {
-                Ok(Message::Text(text)) => {
-                    return serde_json::from_str(text.as_str()).unwrap();
-                }
-                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
-                    let _ = self.socket.flush();
-                }
-                Ok(Message::Binary(_)) => panic!("bridge sent binary data"),
-                Ok(Message::Close(frame)) => panic!("bridge closed: {frame:?}"),
-                Err(WsError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    assert!(
-                        Instant::now() < deadline,
-                        "timed out waiting for a bridge message"
-                    );
-                }
-                Err(error) => panic!("bridge read failed: {error}"),
+    /// One text message if it arrives within a short read, else `None`.
+    fn try_next_json(&mut self) -> Option<Value> {
+        match self.socket.read() {
+            Ok(Message::Text(text)) => Some(serde_json::from_str(text.as_str()).unwrap()),
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
+                let _ = self.socket.flush();
+                None
             }
+            Ok(Message::Binary(_)) => panic!("bridge sent binary data"),
+            Ok(Message::Close(frame)) => panic!("bridge closed: {frame:?}"),
+            Err(WsError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("bridge read failed: {error}"),
+        }
+    }
+
+    fn next_json(&mut self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(value) = self.try_next_json() {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a bridge message"
+            );
         }
     }
 
@@ -166,10 +172,33 @@ impl FakePlugin {
             }
         }
     }
+
+    /// Read until a message of `kind` arrives while driving the service. The
+    /// bridge queues its connection event after the welcome, and the service
+    /// only acts on it (requesting state) when polled, so a plain blocking read
+    /// can wait for a message that only a later poll triggers.
+    fn read_until_polling(&mut self, service: &mut Integration, kind: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                service.poll().is_empty(),
+                "unexpected relay event while waiting for {kind}"
+            );
+            if let Some(value) = self.try_next_json() {
+                if value["type"] == kind {
+                    return value;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bridge message {kind}"
+            );
+        }
+    }
 }
 
 fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match socket.read() {
             Ok(Message::Close(frame)) => return frame.map(|frame| u16::from(frame.code)),
@@ -228,7 +257,6 @@ fn quiet_for(service: &mut Integration, timeout: Duration) {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn unauthorized_host_and_token_handshakes_never_disclose_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -266,17 +294,13 @@ fn unauthorized_host_and_token_handshakes_never_disclose_state() {
 
     // Positive control: only the authorized plugin can cause a disclosure.
     let mut plugin = FakePlugin::connect(&service);
-    assert!(
-        service.poll().is_empty(),
-        "only connection lifecycle so far"
-    );
-    plugin.read_until("request_state");
+    plugin.read_until_polling(&mut service, "request_state");
     plugin.send(&state(
         7,
         Some("session-a"),
         vec![session("session-a", true, "/tmp/a")],
     ));
-    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -308,24 +332,8 @@ fn bridge_is_actual_remote_loopback_and_launch_config_is_immutable() {
     assert!(service.verify_config().unwrap().is_unchanged());
 }
 
-/// The relay scenario is timing sensitive on loaded aarch64 Linux runners,
-/// where the bridge occasionally stalls past its heartbeat window. Each attempt
-/// uses a fresh service and bridge; only the final attempt may fail the test.
-#[cfg(unix)]
 #[test]
 fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
-    for attempt in 1..=3 {
-        let result = std::panic::catch_unwind(focus_state_and_attachment_epochs_relay_once);
-        match result {
-            Ok(()) => return,
-            Err(payload) if attempt == 3 => std::panic::resume_unwind(payload),
-            Err(_) => eprintln!("relay attempt {attempt} failed; retrying with a fresh bridge"),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn focus_state_and_attachment_epochs_relay_once() {
     let temp = tempfile::tempdir().unwrap();
     let plugin = plugin_fixture(temp.path(), "plugin");
     let config = user_config(temp.path());
@@ -339,17 +347,13 @@ fn focus_state_and_attachment_epochs_relay_once() {
     );
 
     let mut plugin = FakePlugin::connect(&service);
-    assert!(
-        service.poll().is_empty(),
-        "only connection lifecycle so far"
-    );
-    plugin.read_until("request_state");
+    plugin.read_until_polling(&mut service, "request_state");
     plugin.send(&state(
         1,
         Some("session-a"),
         vec![session("session-a", true, "/tmp/a")],
     ));
-    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -371,7 +375,7 @@ fn focus_state_and_attachment_epochs_relay_once() {
         "requestID": focus["requestID"],
         "ok": true,
     }));
-    let (caller, operation) = poll_until(&mut service, Duration::from_secs(10), |(caller, _)| {
+    let (caller, operation) = poll_until(&mut service, Duration::from_secs(2), |(caller, _)| {
         *caller == Some(41)
     });
     assert_eq!(caller, Some(41));
@@ -400,7 +404,7 @@ fn focus_state_and_attachment_epochs_relay_once() {
         "ok": false,
         "error": "session is gone",
     }));
-    let (caller, operation) = poll_until(&mut service, Duration::from_secs(10), |(caller, _)| {
+    let (caller, operation) = poll_until(&mut service, Duration::from_secs(2), |(caller, _)| {
         *caller == Some(42)
     });
     assert_eq!(caller, Some(42));
@@ -449,7 +453,7 @@ fn focus_state_and_attachment_epochs_relay_once() {
             session("session-b", true, "/tmp/b"),
         ],
     ));
-    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
     let Operation::SessionSnapshot { snapshot } = service.state().unwrap() else {
@@ -473,12 +477,12 @@ fn focus_state_and_attachment_epochs_relay_once() {
         Some("session-b"),
         vec![session("session-b", true, "/tmp/b")],
     ));
-    poll_until(&mut service, Duration::from_secs(10), |(_, operation)| {
+    poll_until(&mut service, Duration::from_secs(2), |(_, operation)| {
         matches!(operation, Operation::SessionSnapshot { .. })
     });
 
     drop(plugin);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(2);
     while service.state().is_ok() {
         assert!(Instant::now() < deadline, "disconnect was not relayed");
         let _ = service.poll();

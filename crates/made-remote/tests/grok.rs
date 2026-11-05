@@ -1,9 +1,10 @@
 //! Companion Grok ingestion and the consented installer (SSH-10, tasks
 //! 2.38/2.40). Every fixture is a temp directory or a fake process chain; no
 //! live grok install, no server execution, no Grok-home writes.
-use made_remote::grok::{
-    self, GrokFiles, GrokSources, GrokTracker, InstallInputs, InstallOutcome, INVENTORY_CADENCE,
-};
+use made_remote::grok::{self, GrokFiles, GrokSources, GrokTracker, INVENTORY_CADENCE};
+// POSIX-only: used by the installer tests that drive a /bin/sh fake grok.
+#[cfg(unix)]
+use made_remote::grok::{InstallInputs, InstallOutcome};
 use made_remote::protocol::{
     GrokActivity, GrokEventKind, GrokSessionEvent, GrokSessionSnapshot, Operation,
 };
@@ -1092,6 +1093,7 @@ fn staged_artifacts_list_the_complete_shipped_grok_made_package() {
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn grok_detection_is_metadata_only_over_absolute_path_entries() {
@@ -1147,12 +1149,16 @@ fn grok_state_requests_are_generation_exempt_like_session_state() {
 
 // --------------------------------------------------------------- installer
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 struct FakeGrok {
     grok: PathBuf,
     argv_log: PathBuf,
     env_log: PathBuf,
     data_dir: PathBuf,
 }
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 impl FakeGrok {
     /// A fake `grok` executable that records its argv and inherited
     /// `GROK_HOME`, then runs `body`. The fixture home path is baked into the
@@ -1193,6 +1199,8 @@ impl FakeGrok {
     }
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 /// The fake installer body: creates an installed grok-made copy at the
 /// fixture home, like the real plugin install would.
 fn installer_body(home: &Path) -> String {
@@ -1202,6 +1210,8 @@ fn installer_body(home: &Path) -> String {
     )
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 fn install_inputs(fake: &FakeGrok, home: &Path, staged: &Path, budget: Duration) -> InstallInputs {
     InstallInputs {
         grok: Some(fake.grok.clone()),
@@ -1214,12 +1224,40 @@ fn install_inputs(fake: &FakeGrok, home: &Path, staged: &Path, budget: Duration)
     }
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 const INSTALL_BUDGET: Duration = Duration::from_secs(120);
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 fn installer_fake(root: &Path, home: &Path) -> FakeGrok {
     FakeGrok::new(root, &installer_body(home))
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
+/// Run the installer, retrying while the freshly written fake script is still
+/// open for writing in a sibling test thread's forked child (ETXTBSY). A spawn
+/// that never ran leaves no argv entry, so a retry cannot double-count a run.
+fn install_retrying_busy(
+    fake: &FakeGrok,
+    home: &Path,
+    staged: &Path,
+    budget: Duration,
+) -> grok::InstallReport {
+    let mut report = grok::install_grok_plugin(install_inputs(fake, home, staged, budget));
+    for _ in 0..50 {
+        if report.reason != Some("install-failed") || !fake.argv().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        report = grok::install_grok_plugin(install_inputs(fake, home, staged, budget));
+    }
+    report
+}
+
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 fn read_manifest_version(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     let marker = "\"version\":\"";
@@ -1227,6 +1265,7 @@ fn read_manifest_version(path: &Path) -> String {
     text[start..].split('"').next().unwrap().to_owned()
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn install_runs_without_any_interpreter_prerequisite() {
@@ -1235,7 +1274,7 @@ fn install_runs_without_any_interpreter_prerequisite() {
     write_manifest(&staged, "0.1.0");
     let home = grok_home(root.path());
     let fake = installer_fake(root.path(), &home);
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(report.reason, None);
     assert_eq!(
@@ -1245,6 +1284,7 @@ fn install_runs_without_any_interpreter_prerequisite() {
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
@@ -1255,7 +1295,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     let fake = installer_fake(root.path(), &home);
 
     // Missing: runs once and the installed copy appears.
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert!(report.new_sessions_only, "hooks apply only to new sessions");
     assert_eq!(
@@ -1266,7 +1306,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Equal: skipped, no second run.
     let ran_once = fake.argv().len();
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Skipped);
     assert_eq!(
         fake.argv().len(),
@@ -1276,7 +1316,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Newer installed copy: skipped and left in place.
     write_manifest(&home.join("installed-plugins/grok-made"), "9.9.9");
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Skipped);
     assert_eq!(
         fake.argv().len(),
@@ -1291,7 +1331,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Older installed copy: exactly one more run.
     write_manifest(&home.join("installed-plugins/grok-made"), "0.0.1");
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(
         fake.argv().len(),
@@ -1300,6 +1340,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn install_never_edits_config_toml_or_redirects_grok_home() {
@@ -1314,7 +1355,7 @@ fn install_never_edits_config_toml_or_redirects_grok_home() {
     write_manifest(&staged, "0.1.0");
     let before_grok_home = std::env::var_os("GROK_HOME");
 
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(
         std::fs::read(&config).unwrap(),
@@ -1337,6 +1378,7 @@ fn install_never_edits_config_toml_or_redirects_grok_home() {
     }
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
@@ -1378,6 +1420,7 @@ fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
     assert_eq!(report.reason, Some("lock-timeout"));
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
 #[cfg(unix)]
 #[test]
 fn install_reports_a_bounded_honest_line() {
@@ -1386,7 +1429,7 @@ fn install_reports_a_bounded_honest_line() {
     write_manifest(&staged, "0.1.0");
     let home = grok_home(root.path());
     let fake = installer_fake(root.path(), &home);
-    let report = grok::install_grok_plugin(install_inputs(&fake, &home, &staged, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     let line = report.line();
     assert!(line.len() < 512, "the report line is bounded: {line}");
     let value: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
