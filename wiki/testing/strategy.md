@@ -78,6 +78,10 @@ XDG_RUNTIME_DIR="$root/runtime" \
 
 `--smoke-test` with a workspace starts the real workbench and can read real app paths/config. The folder-less form stays on the picker surface so CI does not start a shell in the user's home. `unset WAYLAND_DISPLAY` when forcing X11; set `LIBGL_ALWAYS_SOFTWARE=1` for software rendering. The per-test re-exec isolation in `ui_model`/`workspace_tabs` adds `TMPDIR`/`XDG_RUNTIME_DIR`; the top-level command must still set them for every other app test.
 
+Tests that construct an `AppModel` or add saved SSH server metadata must run through the existing isolated child helper (`isolated()` in `ui_model` and `workspace_tabs`), which re-execs the test binary with a temp HOME and a `MADE_*_TEST_HOME` marker, instead of building the model in the parent test process. Every registry-capable helper must assert that the resolved app-data directory starts with that temp root before its first write, and before any `AppModel` construction in that helper, failing closed otherwise; `add_ssh_metadata` persists immediately, so there is no safe later check.
+
+Guard the guard with the non-destructive canary: re-run one helper in a child whose HOME is a disposable directory but with the isolation marker removed, then assert that the helper panics and that no registry file exists anywhere under that canary root. This detects ambient writes without touching the developer's real registry; the canary must never call the unisolated helper in the parent process, and a full workspace run must still leave the real registry unchanged.
+
 ## Current status
 
 - Rust: 658 passed, 0 failed, 2 ignored across 49 binaries on Linux x64 WSL2; fmt/clippy clean.

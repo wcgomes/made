@@ -6,7 +6,7 @@ Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-wo
 
 `made-platform::detect_compatible_tuis` performs a metadata-only `PATH` lookup on a background thread started at launch. It never spawns the program, verifies its version, or waits for a service, and empty or relative `PATH` segments are ignored rather than resolved against the current directory. Shell and explorer startup never depend on the result.
 
-The `+` control follows the integrated-TUI catalog in [Grok](grok.md): `Terminal` stays first, then detected programs in catalog order OpenCode, then Grok. Undetected programs are omitted. With no detected TUI it opens the folder picker and shows no menu. The OpenCode row keeps the vendored 16px `opencode.svg` and its launch injection. Choosing OpenCode starts the absolute path that the same lookup finds, never the bare name `opencode`, as the PTY child of a new home-directory tab — no shell first and no picker — while the current tab keeps running. Revealed About diagnostics use the same short row as Grok: inactive while OpenCode is not connected, ready while session follow is connected, and not on PATH when detection does not find it. The wording lives in the active [Grok session-follow spec](../../specs/grok-session-follow.md).
+The `+` control follows the integrated-TUI catalog in [Grok](grok.md): `Terminal` stays first, then detected programs in catalog order OpenCode, then Grok. Undetected programs are omitted. With no detected TUI and no saved SSH server it opens the folder picker and shows no menu; saved servers add their per-server SSH launch rows after the local rows. The OpenCode row keeps the vendored 16px `opencode.svg` and its launch injection. Choosing OpenCode starts the absolute path that the same lookup finds, never the bare name `opencode`, as the PTY child of a new home-directory tab — no shell first and no picker — while the current tab keeps running. Revealed About diagnostics use the same short row as Grok: inactive while OpenCode is not connected, ready while session follow is connected, and not on PATH when detection does not find it. The wording lives in the active [Grok session-follow spec](../../specs/grok-session-follow.md).
 
 
 ## Topology
@@ -23,7 +23,15 @@ Made workspace tab
 
 Each workspace tab owns its listener, pane id, and 256-bit token. There is no shared multiplexed bridge. A second authenticated connection for the same pane replaces the first with close code `4409`; a cross-pane hello is rejected before replacement or state disclosure.
 
+In an SSH workspace the same bridge runs inside the server-side companion, and normalized state reaches the client only over the SSH transport; the tab's `OpenCode` label, icon, dots, and diagnostics come from that tab's remote integration and session state, never from the host. See the active [SSH remote workspaces contract](../../specs/changes/ssh-remote-workspaces/spec.md).
+
 OpenCode v2 is not a single process. Default `opencode` uses a managed background service, while `opencode --standalone` still starts a private `serve --stdio --port 0`. Made does not own either service lifecycle and does not attach to the user's service. The Phase 0 full session-follow harness used `--standalone`; managed mode was load-tested only.
+
+## Companion updates
+
+The server-side companion ships under one app-owned version path. A missing version target is staged once after the per-server/version consent, and an existing same-version set that verifies exactly is reused without rewriting. A same-version target with missing, corrupt or different artifacts is never repaired silently: Made writes and deletes nothing, reports a sanitized update-required state naming the version and target, and waits for an explicit `Update companion` approval for the current attempt. An approved update writes all 11 shipped artifacts into a private temporary sibling, verifies every size, hash and required executable mode there, replaces the current version path through a rollback-safe swap, and removes the temporary and replaced app-owned directories, so per-build copies do not accumulate. A failure before the swap leaves the original byte-for-byte intact. A running companion, supervisor or terminal is never signaled and keeps its own OS process lifecycle, while later companion and Grok-install launches resolve the updated path and the next attempt verifies and reuses the updated set exactly.
+
+A crashed or concurrent attempt is serialized by an owner-token lock, and the fixed `.replace` path preserves the original across a swap; the next attempt restores it before any other work and cleans only demonstrably dead-owned temporary state. Full requirements and scenarios stay in the active [SSH remote workspaces contract](../../specs/changes/ssh-remote-workspaces/spec.md).
 
 ## Plugin package
 
@@ -127,6 +135,6 @@ The plugin is pinned to this observed surface. Bridge protocol version gates maj
 - App-level live session switching on the revised terminal-first build is still pending; the current evidence for bridge/config/root precedence is test-level plus historical real-OpenCode runs.
 - Connected view-directory follow is TUI-only; a folder selected in the OpenCode desktop app's own picker is not observable.
 - WSL-hosted OpenCode, ACP, and other agents are out of scope.
-- SSH remote workspaces are an active change, not an out-of-scope exclusion. The contract is [specs/changes/ssh-remote-workspaces/](../../specs/changes/ssh-remote-workspaces/spec.md). Made does not depend on tmux; the native supervisor is the chosen mechanism. Real SSH proof has not been executed.
+- SSH remote workspaces are covered by the active [contract](../../specs/changes/ssh-remote-workspaces/spec.md). Made does not depend on tmux; the native supervisor is the chosen mechanism. Remote tab presentation and diagnostics consume that tab's remote integration and session state, never the host's. Host-companion tests run over a real loopback `sshd` with the release companion; the live plantsuite/native GUI matrix remains pending, and no external-server validation is claimed.
 
 Related: [Security](../security.md), [Runtime terminal-first](../runtime/terminal-first.md), [Phase 0 record](../records/20261025-phase-0-gate.md).

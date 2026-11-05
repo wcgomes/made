@@ -94,12 +94,13 @@ OpenCode v2 TUI (user-run child inside the workspace PTY)
   -> normalized SessionSnapshot
   -> session_follow root precedence: connected active session directory
      > usable connected view directory (tabs enabled, no active session)
+     > newest open Grok session directory (local or remote, while OpenCode is not connected)
      > latest shell cwd
   -> explorer root in that tab
-  -> disconnect/exit falls back to latest shell cwd
+  -> disconnect/exit falls back to the newest open Grok session, then latest shell cwd
 ```
 
-The connected view directory is cleared on disconnect/exit, unsupported integration, session tabs becoming unavailable, or a new connection epoch.
+The authoritative root order and fallback details are defined in [Root precedence](runtime/terminal-first.md#root-precedence). The connected view directory is cleared on disconnect/exit, unsupported integration, session tabs becoming unavailable, or a new connection epoch.
 
 A snapshot or event from another workspace, an unauthenticated client, a foreign disconnect, or a stale epoch cannot change a healthy workspace. Focus requests are scoped to the owning bridge and to open sessions.
 
