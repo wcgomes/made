@@ -145,6 +145,50 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
             check(path.is_file() and bool(path.stat().st_mode & stat.S_IXUSR), f"{path.name} in {path.parent.name} is executable")
 
 
+def check_extraction_guard(image: Path, version: str) -> None:
+    """Security M2: the AppImage extracts only into a private per-user directory.
+
+    Runs the installed AppImage normally, then with the extraction target
+    pre-planted as a directory owned by another user, a directory with group
+    and other permission bits, and a symlink; each planted case must refuse.
+    """
+    target = Path.home() / ".cache" / "made" / f"appimage-{version}"
+    real = target.with_name(f"appimage-{version}-real")
+    for path in (target, real):
+        run(["sudo", "rm", "-rf", path])
+    keep = dict(os.environ, NO_CLEANUP="1")
+    result = run([image, "--version"], env=keep)
+    check(result.returncode == 0 and result.stdout.strip() == f"Made {version}", "the AppImage starts from its private target")
+    check(target.is_dir() and not target.is_symlink(), f"extraction goes to {target}")
+    if target.is_dir():
+        info = target.stat()
+        check(info.st_uid == os.getuid() and info.st_mode & 0o077 == 0, "the extraction directory is owned by the user with mode 0700")
+    check(not list(Path(tempfile.gettempdir()).glob("appimage_extracted_*")), "nothing is extracted under the shared temp directory")
+    if not target.is_dir():
+        return
+    target.rename(real)
+
+    def refused(label: str) -> None:
+        result = run([image, "--version"])
+        check(result.returncode != 0 and f"Made {version}" not in result.stdout, f"a pre-planted target ({label}) is refused")
+
+    run(["sudo", "cp", "-a", real, target])
+    run(["sudo", "chown", "-R", "root:root", target])
+    run(["sudo", "chmod", "755", target])
+    refused("owned by another user")
+    run(["sudo", "rm", "-rf", target])
+    shutil.copytree(real, target, symlinks=True)
+    target.chmod(0o777)
+    refused("group and other writable")
+    shutil.rmtree(target)
+    target.symlink_to(real)
+    refused("a symlink")
+    target.unlink()
+    shutil.rmtree(real)
+    result = run([image, "--version"])
+    check(result.returncode == 0 and result.stdout.strip() == f"Made {version}", "the AppImage starts again once the planted target is gone")
+
+
 def smoke(command: list[str], version: str) -> None:
     result = run(command + ["--version"])
     check(result.returncode == 0 and result.stdout.strip() == f"Made {version}", f"--version reports Made {version}")
@@ -179,6 +223,8 @@ def main() -> int:
     args = parser.parse_args()
     command, exe_dir, install_root = install(args.form, args.assets, args.version)
     check_layout(exe_dir, install_root)
+    if args.form == "appimage":
+        check_extraction_guard(Path(command[0]), args.version)
     smoke(command, args.version)
     if FAILURES:
         print(f"{len(FAILURES)} installed-layout check(s) failed:", file=sys.stderr)

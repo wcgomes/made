@@ -211,7 +211,7 @@ jobs:
           set -euo pipefail
           curl -fsSL -o "$RUNNER_TEMP/uruntime" "$URUNTIME_URL"
           echo "$URUNTIME_SHA256  $RUNNER_TEMP/uruntime" | sha256sum -c -
-          python3 .github/scripts/linux-appimage-runtime.py --out dist/vpk --channel "$CHANNEL" --runtime "$RUNNER_TEMP/uruntime"
+          python3 .github/scripts/linux-appimage-runtime.py --out dist/vpk --channel "$CHANNEL" --runtime "$RUNNER_TEMP/uruntime" --version "$VERSION"
 
       - name: Finish the release assets
         shell: bash
