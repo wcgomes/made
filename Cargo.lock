@@ -1788,7 +1788,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "made-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "made-bridge"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "getrandom 0.4.3",
  "serde",
@@ -1819,7 +1819,7 @@ dependencies = [
 
 [[package]]
 name = "made-explorer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "notify",
  "syntect",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "made-grok-hook"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "made-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arboard",
  "image",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "made-remote"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "made-terminal"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "made-platform",

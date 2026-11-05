@@ -1,6 +1,6 @@
 {
   "name": "opencode-made",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "App-owned OpenCode v2 TUI plugin that reports session tabs to Made's loopback bridge",

@@ -1,5 +1,5 @@
 {
   "name": "grok-made",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Reports Grok session status to a local log for Made"
 }
