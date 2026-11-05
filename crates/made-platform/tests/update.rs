@@ -889,7 +889,7 @@ mod seam {
     }
 
     fn lock_child(mode: &str, dir: &Path) -> (std::process::Child, u32) {
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["seam::install_lock_child", "--exact", "--nocapture"])
             .env("MADE_LOCK_CHILD", format!("{mode}|{}", dir.display()))
             .spawn()
@@ -904,6 +904,8 @@ mod seam {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = child.kill();
+        let _ = child.wait();
         panic!("the {mode} lock child never became ready");
     }
 
