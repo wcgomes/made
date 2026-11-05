@@ -4,7 +4,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::time::Duration;
 
+#[cfg(unix)]
+use made_app::worktree::GitLimits;
 use made_app::worktree::{
     is_read_only_git_args, ChangeKind, GitCommand, GitRunner, GitStatusRead, MetadataStatus,
     GIT_PROGRAM_ENV, GROUP_CHANGES, GROUP_MERGE, GROUP_STAGED, GROUP_UNTRACKED,
@@ -165,6 +169,23 @@ fn the_git_binary_can_be_overridden_by_environment() {
 
     assert_eq!(configured.program(), missing.as_os_str());
     assert_eq!(metadata.status, MetadataStatus::Unavailable);
+}
+
+#[test]
+fn worktree_git_types_unify_with_the_shared_made_remote_contract() {
+    // These parameters only accept the `made_remote::git` types. Passing the
+    // app types proves they are re-exports, not a second implementation.
+    fn remote_command(_: made_remote::git::GitCommand) {}
+    fn remote_metadata(_: made_remote::git::WorktreeMetadata) {}
+    fn remote_status(_: made_remote::git::GitStatusRead) {}
+
+    remote_command(GitCommand::ShowToplevel);
+    remote_metadata(made_app::worktree::WorktreeMetadata::unknown(
+        "compatibility",
+    ));
+    remote_status(GitStatusRead::Failed {
+        reason: String::new(),
+    });
 }
 
 #[test]
@@ -477,5 +498,112 @@ fn missing_directory_is_unknown_and_never_panics() {
     let missing: PathBuf = temp.path().join("missing");
     let metadata = runner().read_metadata(&missing);
     assert_eq!(metadata.status, MetadataStatus::Unknown);
-    assert!(metadata.reason.is_some());
+    assert!(metadata
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("cannot inspect")));
+}
+
+#[cfg(unix)]
+fn script_in(directory: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = directory.join(name);
+    fs::write(&path, body).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn spawn_and_git_failures_keep_their_os_stderr_and_exit_details() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("plain");
+    fs::create_dir(&directory).unwrap();
+    let failing = script_in(
+        temp.path(),
+        "failing.sh",
+        "#!/bin/sh\nprintf boom >&2\nexit 3\n",
+    );
+
+    let metadata = GitRunner::with_program(&failing).read_metadata(&directory);
+    assert_eq!(metadata.status, MetadataStatus::Unknown);
+    assert_eq!(
+        metadata.reason.as_deref(),
+        Some("not a git repository or git failed: boom")
+    );
+    let status = GitRunner::with_program(&failing).read_status(&directory, None);
+    assert_eq!(
+        status,
+        GitStatusRead::Failed {
+            reason: "git exited with 3: boom".to_owned()
+        }
+    );
+
+    let missing = temp.path().join("missing-git-binary");
+    let metadata = GitRunner::with_program(&missing).read_metadata(&directory);
+    assert_eq!(metadata.status, MetadataStatus::Unavailable);
+    let reason = metadata.reason.as_deref().unwrap();
+    assert!(reason.contains("could not run git"));
+    assert!(
+        reason.to_lowercase().contains("no such file")
+            || reason.to_lowercase().contains("cannot find"),
+        "the spawn OS reason is preserved: {reason}"
+    );
+
+    let non_executable = script_in(temp.path(), "non-executable.sh", "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    let metadata = GitRunner::with_program(&non_executable).read_metadata(&directory);
+    assert_eq!(metadata.status, MetadataStatus::Unavailable);
+    assert!(metadata
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.to_lowercase().contains("permission denied")));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_runner_keeps_unbounded_output_and_deadline_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let large = script_in(
+        temp.path(),
+        "large-status.sh",
+        "#!/bin/sh\ndd if=/dev/zero bs=2097153 count=1 2>/dev/null | tr '\\0' 'a'\n",
+    );
+    let slow = script_in(
+        temp.path(),
+        "slow-status.sh",
+        "#!/bin/sh\nsleep 0.3\nprintf '?? local.txt\\0'\n",
+    );
+
+    let local = GitRunner::with_program(&large);
+    assert_eq!(local.limits(), GitLimits::UNBOUNDED);
+    assert!(matches!(
+        local.read_status(temp.path(), None),
+        GitStatusRead::Ready(_)
+    ));
+
+    let remote = made_remote::git::GitRunner::with_limits(
+        &slow,
+        made_remote::git::GitLimits {
+            deadline: Some(Duration::from_millis(50)),
+            max_output_bytes: None,
+        },
+    );
+    assert!(matches!(
+        remote.read_status(temp.path(), None),
+        GitStatusRead::Failed { reason } if reason.contains("deadline")
+    ));
+    let GitStatusRead::Ready(snapshot) =
+        GitRunner::with_program(&slow).read_status(temp.path(), None)
+    else {
+        panic!("the local compatibility runner must not inherit the remote deadline");
+    };
+    assert!(snapshot
+        .groups
+        .iter()
+        .flat_map(|group| &group.rows)
+        .any(|row| row.relative.ends_with("local.txt")));
 }
