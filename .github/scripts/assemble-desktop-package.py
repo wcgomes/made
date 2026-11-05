@@ -29,6 +29,11 @@ FILES = (
     "plugins/opencode-made/index.ts",
     "plugins/opencode-made/src/protocol.ts",
     "plugins/opencode-made/src/integration.ts",
+    "plugins/grok-made/plugin.json",
+    "plugins/grok-made/README.md",
+    "plugins/grok-made/hooks/hooks.json",
+    "plugins/grok-made/hooks/status_test.py",
+    "plugins/grok-made/hooks/bin/status.py",
 )
 MAX_BYTES = 128 * 1024 * 1024
 
@@ -139,6 +144,10 @@ def copy_tree(source: Path, destination: Path) -> None:
     if not made.is_file() or made.stat().st_size <= 0:
         fail(f"copied companion is missing: {made}")
     made.chmod(made.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    hook = destination / "plugins/grok-made/hooks/bin/status.py"
+    if not hook.is_file() or hook.stat().st_size <= 0:
+        fail(f"copied hook script is missing: {hook}")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def verify_askpass(path: Path, manifest_path: Path, expected_target: str) -> dict:
@@ -185,6 +194,9 @@ def main() -> None:
     plugin = stage / "plugins" / "opencode-made" / "package.json"
     if not plugin.is_file() or plugin.stat().st_size <= 0:
         fail("desktop stage is missing plugins/opencode-made")
+    grok_plugin = stage / "plugins" / "grok-made" / "plugin.json"
+    if not grok_plugin.is_file() or grok_plugin.stat().st_size <= 0:
+        fail("desktop stage is missing plugins/grok-made")
     if (stage / "plugin").exists():
         fail("desktop stage contains the obsolete plugin/ path")
 
@@ -233,6 +245,8 @@ def main() -> None:
         fail("askpass diverged from the written manifest")
     if not plugin.is_file():
         fail("assembly removed the desktop plugin")
+    if not grok_plugin.is_file():
+        fail("assembly removed the shipped grok-made plugin")
     print(f"assembled companions and {askpass['name']} into {stage}")
 
 

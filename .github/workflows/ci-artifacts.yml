@@ -79,8 +79,9 @@ jobs:
           node-version: 24
 
       # Development artifacts only: debug binaries, the app-owned OpenCode
-      # plugin package, README, and version metadata. Companions and the
-      # native askpass are added after this step; they do not replace it.
+      # plugin package, the shipped Grok plugin package, README, and version
+      # metadata. Companions and the native askpass are added after this step;
+      # they do not replace it.
       # No signing, notarization, installer, or auto-update payload is produced.
       - name: Stage the development artifact
         shell: bash
@@ -99,6 +100,15 @@ jobs:
           cp -R plugins/opencode-made "$stage/plugins/opencode-made"
           rm -rf "$stage/plugins/opencode-made/node_modules"
           test -f "$stage/plugins/opencode-made/package.json"
+          # The shipped grok-made package rides in every desktop package so
+          # both the local install and the staged remote copy never download.
+          cp -R plugins/grok-made "$stage/plugins/grok-made"
+          test -f "$stage/plugins/grok-made/plugin.json"
+          test -f "$stage/plugins/grok-made/hooks/hooks.json"
+          test -f "$stage/plugins/grok-made/hooks/bin/status.py"
+          # The hook runs bin/status.py directly; keep the shipped executable
+          # bit regardless of the runner umask.
+          chmod 755 "$stage/plugins/grok-made/hooks/bin/status.py"
           test ! -e "$stage/plugin"
 
           node - "$stage" <<'NODE'

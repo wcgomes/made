@@ -27,11 +27,16 @@ files=(
   plugins/opencode-made/index.ts
   plugins/opencode-made/src/protocol.ts
   plugins/opencode-made/src/integration.ts
+  plugins/grok-made/plugin.json
+  plugins/grok-made/README.md
+  plugins/grok-made/hooks/hooks.json
+  plugins/grok-made/hooks/status_test.py
+  plugins/grok-made/hooks/bin/status.py
 )
 
 max_bytes=$((128 * 1024 * 1024))
 rm -rf "$out"
-mkdir -p "$out/plugins/opencode-made/src"
+mkdir -p "$out/plugins/opencode-made/src" "$out/plugins/grok-made/hooks/bin"
 
 cp "$binary" "$out/made-remote"
 chmod 755 "$out/made-remote"
@@ -40,6 +45,14 @@ cp "$root/plugins/opencode-made/tui.ts" "$out/plugins/opencode-made/tui.ts"
 cp "$root/plugins/opencode-made/index.ts" "$out/plugins/opencode-made/index.ts"
 cp "$root/plugins/opencode-made/src/protocol.ts" "$out/plugins/opencode-made/src/protocol.ts"
 cp "$root/plugins/opencode-made/src/integration.ts" "$out/plugins/opencode-made/src/integration.ts"
+cp "$root/plugins/grok-made/plugin.json" "$out/plugins/grok-made/plugin.json"
+cp "$root/plugins/grok-made/README.md" "$out/plugins/grok-made/README.md"
+cp "$root/plugins/grok-made/hooks/hooks.json" "$out/plugins/grok-made/hooks/hooks.json"
+cp "$root/plugins/grok-made/hooks/status_test.py" "$out/plugins/grok-made/hooks/status_test.py"
+cp "$root/plugins/grok-made/hooks/bin/status.py" "$out/plugins/grok-made/hooks/bin/status.py"
+# The hook runs bin/status.py directly; the shipped executable bit must survive
+# packaging exactly like the companion binary's.
+chmod 755 "$out/plugins/grok-made/hooks/bin/status.py"
 
 linkage_kind="${LINKAGE_KIND:?LINKAGE_KIND required}"
 case "$linkage_kind" in
