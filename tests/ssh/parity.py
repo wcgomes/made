@@ -569,8 +569,10 @@ class GrokFixture:
     def prefix(self, grok=False, python3=False, opencode=True, extra=None):
         """env -i prefix with absolute PATH entries only (the detection rule).
         /usr/bin carries the host python3, so it is excluded exactly when a
-        scenario needs python3 to be absent; the fake opencode is omitted only
-        when a scenario needs opencode to be absent."""
+        scenario needs python3 to be absent; Ubuntu's usrmerge also makes /bin
+        a symlink to /usr/bin, so Linux uses a private coreutils-only shadow
+        directory instead of /bin in that case. The fake opencode is omitted
+        only when a scenario needs opencode to be absent."""
         home = str(self.root / 'home')
         entries = []
         if grok:
@@ -579,9 +581,12 @@ class GrokFixture:
             entries.append(str(self.scripts['pybin']))
         if opencode:
             entries.append(str(self.scripts['ocbin']))
-        entries += ['/bin', '/usr/sbin', '/sbin']
         if python3:
-            entries.append('/usr/bin')
+            entries += ['/bin', '/usr/sbin', '/sbin', '/usr/bin']
+        elif platform.system() == 'Linux':
+            entries += [self.coreutils_path(), '/usr/sbin', '/sbin']
+        else:
+            entries += ['/bin', '/usr/sbin', '/sbin']
         environment = {
             'PATH': ':'.join(entries),
             'HOME': home,
@@ -594,6 +599,31 @@ class GrokFixture:
         environment.update(extra or {})
         return 'env -i ' + ' '.join(f'{key}={shlex.quote(value)}'
                                     for key, value in environment.items())
+
+    def coreutils_path(self):
+        """A PATH entry with the host's coreutils and no python3 executable.
+
+        The product detects python3 with `command -v`, so a merged /bin must be
+        shadowed rather than merely omitted. Symlinks stay inside this
+        disposable root and never modify the host."""
+        shadow = self.root / 'corebin'
+        if shadow.is_dir():
+            return str(shadow)
+        shadow.mkdir(mode=0o700)
+        for directory in ('/bin', '/usr/bin'):
+            try:
+                entries = sorted(pathlib.Path(directory).iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name == 'python3' or entry.name.startswith('python3.'):
+                    continue
+                target = shadow / entry.name
+                if target.exists() or target.is_symlink():
+                    continue
+                if entry.is_symlink() or entry.is_file():
+                    target.symlink_to(entry)
+        return str(shadow)
 
     def frontend_command(self, prefix, mode='--stdio'):
         return prefix + ' ' + shlex.quote(str(self.binary)) + ' ' + mode
@@ -931,12 +961,14 @@ def diagnose_supervisor_failure(h, identity, error, stderr=''):
     with the observed supervisor/frontend evidence and adds known-cause
     guidance only when that evidence matches it."""
     name = runtime_dir_name(identity)
-    shown = '$HOME/Library/Application Support/Made'
+    data_root = host_data_root(h)
+    shown = ('$HOME/Library/Application Support/Made' if platform.system() == 'Darwin'
+             else '$HOME/.local/share/made')
     runtime = f'{shown}/remote/runtime/{name}'
     try:
         listing = h.ssh_run(
-            'ls -a "$HOME/Library/Application Support/Made/remote/runtime/'
-            + name + '" 2>/dev/null || true').stdout
+            'ls -a ' + shlex.quote(str(data_root / 'remote' / 'runtime' / name))
+            + ' 2>/dev/null || true').stdout
     except (subprocess.SubprocessError, OSError):
         listing = b''
     seen = [line for line in listing.decode(errors='replace').splitlines()
@@ -1731,10 +1763,19 @@ def _unsupported_native_target():
         f'no fixed staging target for {platform.system()}/{platform.machine()}')
 
 
-def host_data_root(h):
+def host_data_root_for(root):
+    home = pathlib.Path(str(root)) / 'home'
     if platform.system() == 'Darwin':
-        return h.root / 'home' / 'Library' / 'Application Support' / 'Made'
-    return h.root / 'home' / 'data' / 'made'
+        return home / 'Library' / 'Application Support' / 'Made'
+    # Matches the fixed Linux branch: XDG_DATA_HOME when absolute, else
+    # ~/.local/share. sshd leaves XDG unset, but the companion-launching
+    # prefixes used with this harness root pin XDG_DATA_HOME to
+    # <home>/.local/share, so both branches name the same directory.
+    return home / '.local' / 'share' / 'made'
+
+
+def host_data_root(h):
+    return host_data_root_for(h.root)
 
 
 def staged_artifact_bytes(companion):

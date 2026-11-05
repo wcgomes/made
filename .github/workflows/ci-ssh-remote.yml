@@ -191,3 +191,164 @@ jobs:
           path: dist/ssh-askpass-x86_64-pc-windows-msvc/
           if-no-files-found: error
           retention-days: 14
+
+  # One bounded regression check for the acceptance harness. It certifies the
+  # real loopback protocol surface only; it is not a native GUI or live-matrix
+  # claim. The staged glibc 2.31 x86_64 companion is downloaded, never rebuilt.
+  ssh-smoke:
+    name: SSH smoke (isolated loopback)
+    needs: linux-companion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Prepare isolated sshd
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends openssh-server
+          fi
+          # Ubuntu's sshd requires its privilege-separation directory even when
+          # it runs as the unprivileged runner account on a high port.
+          sudo mkdir -p /run/sshd
+          sudo chmod 0755 /run/sshd
+          sshd -V 2>&1 | sed -n '1p' || true
+
+      - name: Download the staged x86_64 Linux companion
+        uses: actions/download-artifact@v7
+        with:
+          name: ssh-companion-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/ssh-companion
+
+      - name: Verify the companion artifact
+        run: |
+          set -euo pipefail
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "RUNNER_TEMP is empty; refusing artifact verification" >&2
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/ssh-companion"
+          sha256sum -c SHA256SUMS
+          # Artifact upload/download does not preserve file modes.
+          chmod 755 made-remote plugins/grok-made/hooks/bin/status.py
+          test -x made-remote
+          test -x plugins/grok-made/hooks/bin/status.py
+          # SHA256SUMS and manifest.json are produced by the same build, so the
+          # manifest's target/linkage fields plus the actual ELF identity are
+          # what tie the bytes to the expected glibc 2.31 x86_64 companion.
+          file_output="$(file made-remote)"
+          printf '%s\n' "$file_output"
+          case "$file_output" in
+            *"ELF 64-bit LSB"*"x86-64"*) ;;
+            *)
+              echo "made-remote is not an x86-64 ELF: $file_output" >&2
+              exit 1
+              ;;
+          esac
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          manifest = json.loads(pathlib.Path('manifest.json').read_text())
+          assert manifest['schema'] == 1, manifest
+          assert manifest['target'] == 'x86_64-unknown-linux-gnu', manifest
+          assert manifest['profile'] == 'release', manifest
+          linkage = manifest['linkage']
+          assert linkage == {'kind': 'glibc', 'system': '2.31',
+                             'max_symbol': '2.31'}, linkage
+          entry = next(item for item in manifest['files']
+                       if item['name'] == 'made-remote')
+          assert entry['size'] == pathlib.Path('made-remote').stat().st_size, entry
+          PY
+
+      - name: Harness contract tests
+        working-directory: tests/ssh
+        run: python3 test_harness.py
+
+      - name: Real SSH companion capabilities
+        working-directory: tests/ssh
+        env:
+          PROBE: ${{ runner.temp }}/ssh-companion/made-remote --probe
+        run: python3 parity.py capabilities --frontend "$PROBE"
+
+      - name: Real SSH 60s loss and same-PID reattach
+        working-directory: tests/ssh
+        env:
+          FRONTEND: ${{ runner.temp }}/ssh-companion/made-remote --stdio
+        run: python3 parity.py survival --frontend "$FRONTEND"
+
+      - name: Grok parity through real companion entry points
+        working-directory: tests/ssh
+        env:
+          HOST_COMPANION: ${{ runner.temp }}/ssh-companion/made-remote
+        run: python3 parity.py grok-parity --host-companion "$HOST_COMPANION"
+
+      - name: Clean up isolated SSH fixtures
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${RUNNER_TEMP:-}" ]; then
+            echo "RUNNER_TEMP is empty; refusing cleanup" >&2
+            exit 1
+          fi
+          patterns=("$RUNNER_TEMP/made-ssh-" "$RUNNER_TEMP/made-container-"
+                    "$RUNNER_TEMP/ssh-companion/made-remote")
+          pids=""
+          for pattern in "${patterns[@]}"; do
+            found="$(pgrep -f -- "$pattern" || true)"
+            if [ -n "$found" ]; then pids="$pids $found"; fi
+          done
+          if [ -n "${pids// /}" ]; then
+            kill $pids 2>/dev/null || true
+            sleep 1
+          fi
+          remaining=""
+          for pattern in "${patterns[@]}"; do
+            found="$(pgrep -f -- "$pattern" || true)"
+            if [ -n "$found" ]; then remaining="$remaining $found"; fi
+          done
+          if [ -n "${remaining// /}" ]; then
+            kill -9 $remaining 2>/dev/null || true
+          fi
+          rm -rf -- "$RUNNER_TEMP"/made-ssh-* "$RUNNER_TEMP"/made-container-* \
+            "$RUNNER_TEMP/ssh-companion"
+          left_dirs="$(find "$RUNNER_TEMP" -maxdepth 1 \
+            \( -name 'made-ssh-*' -o -name 'made-container-*' -o -name 'ssh-companion' \) \
+            -print 2>/dev/null)"
+          if [ -n "$left_dirs" ]; then
+            echo "isolated SSH fixture directories survived cleanup:" >&2
+            printf '%s\n' "$left_dirs" >&2
+            exit 1
+          fi
+          leftovers=""
+          for pattern in "${patterns[@]}"; do
+            found="$(pgrep -f -- "$pattern" || true)"
+            if [ -n "$found" ]; then leftovers="$leftovers $found"; fi
+          done
+          if [ -n "${leftovers// /}" ]; then
+            echo "isolated SSH fixture processes survived cleanup:$leftovers" >&2
+            exit 1
+          fi
+
+      - name: Record the acceptance boundary
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## SSH smoke boundary'
+            echo ''
+            if [ "$JOB_STATUS" = 'success' ]; then
+              echo '- Certified here: real OpenSSH loopback with isolated HOME, config, and known_hosts; the staged x86_64 glibc 2.31 companion; companion Capabilities; a real 60s owned-SSH loss with the same shell PID on reattach; and Grok fixture parity through real companion entry points.'
+            else
+              echo "- NOT certified: this job concluded \`$JOB_STATUS\`. No scenario result from this run is certified, and every claim below remains UNVERIFIED."
+            fi
+            echo '- Not certified here: native GUI behavior, real grok or OpenCode executables, auth-fault/netem matrices, or the live multi-host SSH matrix.'
+            echo '- Companion provenance: artifact `ssh-companion-x86_64-unknown-linux-gnu` from the glibc 2.31 linux-companion job.'
+          } >> "$GITHUB_STEP_SUMMARY"

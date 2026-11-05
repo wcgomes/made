@@ -5,10 +5,10 @@ tmux is not a prerequisite and is never installed or executed. Rust and system
 packages are never installed on the host or the remote.
 """
 import base64
-import getpass
 import hashlib
 import os
 import pathlib
+import pwd
 import re
 import shlex
 import shutil
@@ -18,7 +18,13 @@ import subprocess
 import tempfile
 import time
 
-BASE = pathlib.Path('/private/var/folders/qp/v8kk3jkj5ssb7g2_jj4gnkn80000gn/T/opencode')
+# Fixtures live under a private base. CI supplies RUNNER_TEMP (or MADE_SSH_TEMP);
+# local macOS runs keep the approved short opencode temp directory.
+DEFAULT_BASE = pathlib.Path(
+    '/private/var/folders/qp/v8kk3jkj5ssb7g2_jj4gnkn80000gn/T/opencode')
+BASE = pathlib.Path(os.environ.get('MADE_SSH_TEMP')
+                    or os.environ.get('RUNNER_TEMP')
+                    or DEFAULT_BASE)
 PREREQUISITES = ('ssh', 'sshd', 'ssh-keygen')
 GLIBC_CEILING = (2, 39)
 
@@ -27,10 +33,27 @@ class PrerequisiteError(RuntimeError):
     pass
 
 
+def sshd_executable():
+    """Resolve sshd even when the caller's PATH omits the sbin directories."""
+    candidates = [os.environ.get('MADE_SSHD'), shutil.which('sshd'),
+                  '/usr/sbin/sshd', '/usr/local/sbin/sshd', '/opt/homebrew/sbin/sshd']
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def tools():
-    return {name: shutil.which(name) for name in
-            ('ssh', 'sshd', 'ssh-keygen', 'ssh-keyscan', 'opencode', 'docker', 'podman',
-             'git', 'cargo', 'rustc', 'rustup', 'python3')}
+    found = {name: shutil.which(name) for name in
+             ('ssh', 'ssh-keygen', 'ssh-keyscan', 'opencode', 'docker', 'podman',
+              'git', 'cargo', 'rustc', 'rustup', 'python3')}
+    found['sshd'] = sshd_executable()
+    return found
+
+
+def local_user():
+    """The account sshd authenticates; never assume an env-provided user name."""
+    return pwd.getpwuid(os.getuid()).pw_name
 
 
 def run(args, **kwargs):
@@ -40,7 +63,7 @@ def run(args, **kwargs):
 
 def process_table():
     """Return (pid, argv) rows without matching process names broadly."""
-    result = run(['ps', '-axo', 'pid=,command='])
+    result = run(['ps', '-axo', 'pid=,command=', '-ww'])
     rows = []
     for line in result.stdout.decode(errors='replace').splitlines():
         fields = line.strip().split(None, 1)
@@ -132,7 +155,8 @@ class Harness:
             f'BASH_ENV={self.root / "home" / "empty"} ENV={self.root / "home" / "empty"}',
             'PrintMotd no', 'LogLevel ERROR',
         ]) + '\n')
-        check = subprocess.run(['sshd', '-t', '-f', str(config)], stdout=subprocess.PIPE,
+        check = subprocess.run([tools()['sshd'], '-t', '-f', str(config)],
+                               stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         if check.returncode:
             raise PrerequisiteError('sshd configuration/preflight failed: ' +
@@ -165,7 +189,7 @@ class Harness:
                 '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'StrictHostKeyChecking=yes',
                 '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no', '-o', 'ClearAllForwardings=yes',
                 '-o', 'PermitLocalCommand=no', '-o', 'ConnectTimeout=5', '-o', 'ConnectionAttempts=5',
-                f'{getpass.getuser()}@127.0.0.1']
+                f'{local_user()}@127.0.0.1']
 
     def ssh_run(self, command, timeout=10):
         return run(self.ssh_args() + [command], timeout=timeout)
