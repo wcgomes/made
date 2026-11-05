@@ -104,8 +104,16 @@ def stage(work: Path, os_name: str, exe: Path, version: str) -> Path:
         root = bin_dir
     shutil.copy2(exe, bin_dir / f"made-app{suffix}")
     shutil.copy2(exe, bin_dir / f"made-askpass{suffix}")
-    companion = bin_dir / "remote" / "x86_64-unknown-linux-gnu" / "made-remote"
-    companion.parent.mkdir(parents=True)
+    if os_name == "macos":
+        # Non-Mach-O files keep their signature only outside Contents/MacOS
+        # (nupkg drops the xattrs that sign them there): companions live in
+        # Resources and Contents/MacOS/remote is a relative symlink.
+        companion = res_dir / "remote" / "x86_64-unknown-linux-gnu" / "made-remote"
+        companion.parent.mkdir(parents=True)
+        (bin_dir / "remote").symlink_to("../Resources/remote")
+    else:
+        companion = bin_dir / "remote" / "x86_64-unknown-linux-gnu" / "made-remote"
+        companion.parent.mkdir(parents=True)
     companion.write_text("#!/bin/sh\necho companion\n", encoding="utf-8")
     plugin = plugin_root / "plugins" / "opencode-made"
     plugin.mkdir(parents=True)
@@ -113,7 +121,7 @@ def stage(work: Path, os_name: str, exe: Path, version: str) -> Path:
     (plugin_root / "LICENSE").write_text("MIT probe\n")
     if version == V2:
         # Large enough that extraction takes long enough to kill mid-copy.
-        (bin_dir / "payload.bin").write_bytes(os.urandom(48 * 1024 * 1024))
+        (plugin_root / "payload.bin").write_bytes(os.urandom(48 * 1024 * 1024))
     for path in [bin_dir / f"made-app{suffix}", bin_dir / f"made-askpass{suffix}", companion]:
         make_exec(path)
     return root
@@ -392,19 +400,22 @@ def linux_flow(args, work: Path, out1: Path, out2: Path) -> None:
             fallback1, fallback2 = work / "fallback-v1.AppImage", work / "fallback-v2.AppImage"
             replace_runtime(appimage1, runtime, fallback1)
             replace_runtime(appimage2, runtime, fallback2)
-            helptext = run([fallback1, "--appimage-help"])
-            variants = {}
-            for name, value in (("URUNTIME_EXTRACT", "1"), ("URUNTIME_EXTRACT", "2"), ("URUNTIME_EXTRACT", "3"),
-                                ("APPIMAGE_EXTRACT_AND_RUN", "1")):
-                result = run([fallback1, "report"], env={**os.environ, name: value})
-                variants[f"{name}={value}"] = {"exit_code": result.returncode, "stderr": result.stderr[-300:]}
-            record("1.4 fallback runtime options", None, help=(helptext.stdout + helptext.stderr)[-5000:],
-                   variants=variants)
+            # Fallback (A): uruntime with extract-and-run embedded, so the
+            # AppImage never needs FUSE, fusermount or user namespaces.
+            for image in (fallback1, fallback2):
+                run([image, "--appimage-addenvs", "APPIMAGE_EXTRACT_AND_RUN=1"])
+            envs = run([fallback1, "--appimage-envs"])
+            record("1.4 fallback runtime embedded envs", "APPIMAGE_EXTRACT_AND_RUN=1" in envs.stdout,
+                   envs=envs.stdout.strip(), stderr=envs.stderr[-300:])
+            started = time.time()
+            timing = report(fallback1)
+            record("1.4 fallback runtime launch time", None, seconds=round(time.time() - started, 2),
+                   exit_code=timing.get("exit_code"))
             feed = work / "feed-fallback"
             shutil.copytree(out2, feed)
             rewrite_nupkg(feed, channel, fallback2)
             record("1.4 FUSE absent for fallback", not any(fuse_absent()["tools"].values()), **fuse_absent())
-            if try_runtime("fallback runtime (A)", fallback1, feed):
+            if try_runtime("fallback runtime (A) extract-and-run", fallback1, feed):
                 out2 = feed
                 appimage1 = fallback1
     pre = prerelease_feed(out2, channel, work)
