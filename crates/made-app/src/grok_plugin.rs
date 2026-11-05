@@ -80,8 +80,10 @@ fn detected_grok() -> Option<PathBuf> {
 }
 
 fn shipped_grok_plugin() -> Option<(PathBuf, Vec<u64>)> {
+    // The staged copy beside the install root; a missing one is an install
+    // failure, and the repository's source-only package is never a fallback.
     let paths = host_platform().app_paths().ok()?;
-    let directory = std::fs::canonicalize(paths.plugin_dir.with_file_name("grok-made")).ok()?;
+    let directory = std::fs::canonicalize(paths.grok_plugin_dir?).ok()?;
     if !directory.is_dir() {
         return None;
     }

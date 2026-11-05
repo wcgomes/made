@@ -25,6 +25,13 @@
 //!   created/validated with mode 0700 on Unix, and a pre-existing symlink or
 //!   non-directory at that path is rejected.
 //!
+//! [`AppPaths::grok_plugin_dir`] is the shipped grok-made package at
+//! `<install_root>/plugins/grok-made` for development and release builds
+//! alike. It is resolved only from the install root of the running
+//! executable, so a development build never falls back to the repository's
+//! source-only `plugins/grok-made`; when the root cannot be derived it is
+//! `None`.
+//!
 //! In release builds [`AppPaths::plugin_dir`] is always
 //! `<install_root>/plugins/opencode-made`. Development builds first prefer a
 //! complete staged package at `<install_root>/plugins/opencode-made`
@@ -820,6 +827,12 @@ pub struct AppPaths {
     pub plugin_root: PathBuf,
     /// Directory containing the app-owned OpenCode plugin package.
     pub plugin_dir: PathBuf,
+    /// The shipped grok-made package, `<install_root>/plugins/grok-made`.
+    ///
+    /// `None` when the install root could not be derived from the running
+    /// executable. There is no repository fallback: the repository's
+    /// `plugins/grok-made` holds source only and is never installed.
+    pub grok_plugin_dir: Option<PathBuf>,
     /// Where [`Self::plugin_dir`] came from.
     pub plugin_source: PluginDirSource,
     /// User OpenCode CLI configuration (`cli.json`), read only by composition.
@@ -872,6 +885,10 @@ pub struct PathsInputs {
     /// Read-only application install/resource root. Required; resolution fails
     /// when it cannot be derived from the executable or supplied by the caller.
     pub install_root: Option<PathBuf>,
+    /// The shipped grok-made package. [`PathsInputs::from_env`] derives it from
+    /// the running executable's install root only, never from the repository
+    /// fallback that [`Self::install_root`] may carry in development.
+    pub grok_plugin_dir: Option<PathBuf>,
     /// Base temp directory used by macOS/Windows and as a fallback input.
     pub temp_dir: PathBuf,
     /// Stable per-user token used in the private temp directory name. On Unix
@@ -938,6 +955,7 @@ impl PathsInputs {
             resolve_user_home(family, home.as_deref(), user_profile.as_deref()).ok()
         };
         let development = cfg!(debug_assertions);
+        let executable_root = install_root_from_current_executable(family);
         Self {
             family,
             home,
@@ -947,8 +965,10 @@ impl PathsInputs {
             xdg_runtime_dir: var_path("XDG_RUNTIME_DIR"),
             app_data: var_path("APPDATA"),
             local_app_data: var_path("LOCALAPPDATA"),
-            install_root: install_root_from_current_executable(family)
-                .or_else(|| development.then(repository_root)),
+            grok_plugin_dir: executable_root
+                .as_ref()
+                .map(|root| root.join("plugins").join("grok-made")),
+            install_root: executable_root.or_else(|| development.then(repository_root)),
             temp_dir: env::temp_dir(),
             user_token: current_user_token(family),
             plugin_override: var_path(PLUGIN_DIR_ENV),
@@ -1163,6 +1183,7 @@ impl AppPaths {
             data_dir,
             plugin_root,
             plugin_dir,
+            grok_plugin_dir: inputs.grok_plugin_dir.clone(),
             plugin_source,
             opencode_config_path,
             log_dir,

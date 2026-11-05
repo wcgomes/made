@@ -1,3 +1,5 @@
+#![allow(dead_code)] // each test binary uses a different subset of these helpers
+
 //! Shared support for made-app integration tests that run the app in an
 //! isolated child process.
 
@@ -68,4 +70,26 @@ impl Drop for StagedPlugins {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// Stage the shipped grok-made copy where the app resolves it: beside the
+/// plugins of the running test executable's install root. The content is the
+/// same for every caller and is written through a rename, so parallel tests in
+/// one binary can all call this without observing a partial file.
+pub fn stage_shipped_grok_plugin() -> PathBuf {
+    let directory = install_root_from_current_executable(PlatformFamily::current())
+        .expect("test executable install root")
+        .join("plugins")
+        .join("grok-made");
+    std::fs::create_dir_all(&directory).expect("staged grok-made directory");
+    let source = repository_root()
+        .join("plugins")
+        .join("grok-made")
+        .join("plugin.json");
+    let contents = std::fs::read(&source)
+        .unwrap_or_else(|error| panic!("repository plugin file {source:?} is required: {error}"));
+    let scratch = directory.join(format!(".plugin.json.{}", std::process::id()));
+    std::fs::write(&scratch, contents).expect("staged grok-made manifest");
+    std::fs::rename(&scratch, directory.join("plugin.json")).expect("staged grok-made manifest");
+    directory
 }

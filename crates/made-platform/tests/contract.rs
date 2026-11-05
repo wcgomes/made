@@ -53,6 +53,7 @@ fn path_inputs(family: PlatformFamily) -> PathsInputs {
         app_data: Some(PathBuf::from("/windows/roaming")),
         local_app_data: Some(PathBuf::from("/windows/local")),
         install_root: Some(PathBuf::from("/opt/made")),
+        grok_plugin_dir: Some(PathBuf::from("/opt/made/plugins/grok-made")),
         temp_dir: PathBuf::from("/tmp"),
         user_token: "1000".to_owned(),
         plugin_override: None,
@@ -927,6 +928,34 @@ fn host_paths_are_absolute_and_contain_the_plugin_location() {
         assert!(
             paths.plugin_is_development_only(),
             "non-installed plugin sources must be development-only"
+        );
+    }
+}
+
+#[test]
+fn grok_plugin_dir_is_the_staged_copy_in_development_and_release() {
+    for development in [false, true] {
+        let inputs = PathsInputs {
+            development,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        let paths = AppPaths::resolve(&inputs).expect("paths");
+        assert_eq!(
+            paths.grok_plugin_dir,
+            Some(PathBuf::from("/opt/made/plugins/grok-made")),
+            "development={development}"
+        );
+        let unresolved = PathsInputs {
+            development,
+            grok_plugin_dir: None,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        assert_eq!(
+            AppPaths::resolve(&unresolved)
+                .expect("paths")
+                .grok_plugin_dir,
+            None,
+            "no repository fallback, development={development}"
         );
     }
 }

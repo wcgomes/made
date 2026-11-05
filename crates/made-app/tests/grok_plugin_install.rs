@@ -14,7 +14,7 @@ use eframe::egui;
 use made_app::app::{AppModel, AppOptions};
 use made_app::workspace::{LaunchPlan, WorkspaceLaunch, WorkspaceSource};
 use made_app::{CompatibleTui, ExplorerPane, Workbench};
-use made_platform::Platform;
+use made_platform::{AppPaths, PathsInputs, PlatformFamily};
 
 #[test]
 fn shipped_grok_plugin_install_follows_the_detected_version() {
@@ -22,9 +22,48 @@ fn shipped_grok_plugin_install_follows_the_detected_version() {
         run_case();
         return;
     }
-    for case in ["missing", "lexical-older", "equal", "newer"] {
+    for case in [
+        "missing",
+        "lexical-older",
+        "equal",
+        "newer",
+        "staged-missing",
+    ] {
         spawn_case(case);
     }
+}
+
+#[test]
+fn development_and_release_builds_resolve_the_staged_grok_plugin_beside_the_install_root() {
+    let root = made_platform::install_root_from_current_executable(PlatformFamily::current())
+        .expect("test executable install root");
+    let expected = root.join("plugins").join("grok-made");
+    for development in [true, false] {
+        let mut inputs = PathsInputs::from_env(PlatformFamily::current());
+        inputs.development = development;
+        inputs.plugin_override = None;
+        let paths = AppPaths::resolve(&inputs).expect("app paths");
+        assert_eq!(
+            paths.grok_plugin_dir.as_deref(),
+            Some(expected.as_path()),
+            "development={development}"
+        );
+    }
+}
+
+#[test]
+fn development_build_never_falls_back_to_the_repository_grok_plugin() {
+    let mut inputs = PathsInputs::from_env(PlatformFamily::current());
+    inputs.development = true;
+    // No executable-derived install root: only the repository fallback remains.
+    inputs.grok_plugin_dir = None;
+    inputs.install_root = Some(made_platform::repository_root());
+    let paths = AppPaths::resolve(&inputs).expect("app paths");
+    assert_eq!(paths.grok_plugin_dir, None);
+    let repository = made_platform::repository_root()
+        .join("plugins")
+        .join("grok-made");
+    assert_ne!(paths.grok_plugin_dir.as_deref(), Some(repository.as_path()));
 }
 
 fn spawn_case(case: &str) {
@@ -102,6 +141,13 @@ sleep 30\n",
     // canonicalize into; cargo never packages a plugin beside the test
     // binary.
     let plugins = support::StagedPlugins::stage(&format!("grok-{case}"));
+    // The shipped package is the staged copy beside the install root. The
+    // source `plugins/grok-made` of the repository is never the shipped copy.
+    let shipped = ShippedGrokPlugin::plant(if case == "staged-missing" {
+        None
+    } else {
+        Some("0.10.0")
+    });
     command.env(
         made_platform::PLUGIN_DIR_ENV,
         plugins.package("opencode-made"),
@@ -124,6 +170,7 @@ sleep 30\n",
         .unwrap();
     }
     let output = command.output().unwrap();
+    drop(shipped);
     assert!(
         output.status.success(),
         "{case}\n{}\n{}",
@@ -142,19 +189,11 @@ fn run_case() {
         std::env::var_os("MADE_GROK_INSTALL_RELEASE").unwrap(),
     ));
     match case.as_str() {
-        "missing" => expect_install(None, None),
-        "lexical-older" => {
-            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
-            expect_install(Some("0.2.0"), Some(shipped));
-        }
-        "equal" => {
-            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
-            expect_skip("0.10.0", &shipped);
-        }
-        "newer" => {
-            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
-            expect_skip("0.10.1", &shipped);
-        }
+        "missing" => expect_install(None),
+        "lexical-older" => expect_install(Some("0.2.0")),
+        "equal" => expect_skip("0.10.0", &staged_grok_plugin_dir()),
+        "newer" => expect_skip("0.10.1", &staged_grok_plugin_dir()),
+        "staged-missing" => expect_staged_missing(),
         other => panic!("unknown case {other}"),
     }
 }
@@ -167,13 +206,20 @@ impl Drop for Release {
     }
 }
 
-fn expect_install(installed: Option<&str>, shipped: Option<PathBuf>) {
+fn expect_install(installed: Option<&str>) {
     let config = grok_config_path();
     if let Some(version) = installed {
         plant_installed(version);
     }
     let before = std::fs::read(&config).ok();
-    let shipped = shipped.unwrap_or_else(resolved_grok_plugin_dir);
+    let shipped = staged_grok_plugin_dir();
+    assert_ne!(
+        shipped,
+        made_platform::repository_root()
+            .join("plugins")
+            .join("grok-made"),
+        "the repository source is never the shipped package"
+    );
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
         AppOptions::new().with_compatible_tui_detection(),
@@ -317,6 +363,80 @@ fn expect_skip(installed: &str, shipped: &Path) {
     );
 }
 
+/// The staged copy is absent: no install command runs, hooks are recorded as
+/// unavailable, and the shell, explorer and Grok still start.
+fn expect_staged_missing() {
+    assert!(
+        !staged_grok_plugin_path().exists(),
+        "this case runs without a staged copy"
+    );
+    let config = grok_config_path();
+    let before = std::fs::read(&config).ok();
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    model.open_plan(LaunchPlan::open(root.path(), WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let ctx = egui::Context::default();
+    wait_until(
+        Duration::from_secs(6),
+        "a missing staged copy must record that hooks are unavailable",
+        || {
+            model.logic(&ctx);
+            hooks_unavailable(&model)
+        },
+    );
+    let quiet = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < quiet {
+        model.logic(&ctx);
+        assert!(
+            !install_started(),
+            "a missing staged copy must not run grok plugin install"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        shell_ready(&model),
+        "shell and explorer must start without the staged copy"
+    );
+    let shell_id = model.workspace_ids().next().unwrap();
+    model.begin_tui_workspace(CompatibleTui::Grok);
+    wait_until(
+        Duration::from_secs(6),
+        "Grok must still start without the staged copy",
+        || {
+            model.logic(&ctx);
+            model.workspace_ids().any(|id| {
+                id != shell_id
+                    && model
+                        .workspace(id)
+                        .and_then(Workbench::terminal)
+                        .is_some_and(|terminal| terminal.is_running())
+            })
+        },
+    );
+    assert!(!env_path("MADE_GROK_INSTALL_ARGS").exists());
+    assert_eq!(std::fs::read(&config).ok(), before);
+}
+
+fn hooks_unavailable(model: &AppModel) -> bool {
+    model.workspace_ids().any(|id| {
+        model
+            .workspace(id)
+            .unwrap()
+            .diagnostics()
+            .log()
+            .entries()
+            .any(|entry| {
+                entry
+                    .message
+                    .contains("session-status hooks are unavailable")
+            })
+    })
+}
+
 fn wait_until(limit: Duration, message: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
     while !ready() {
@@ -373,24 +493,39 @@ fn plant_installed(version: &str) {
     .unwrap();
 }
 
-fn plant_controlled_shipped(version: &str) -> (PathBuf, support::StagedPlugins) {
-    let staged = support::StagedPlugins::stage("grok-controlled");
-    std::fs::write(
-        staged.package("grok-made").join("plugin.json"),
-        format!("{{\n  \"name\": \"grok-made\",\n  \"version\": \"{version}\"\n}}\n"),
-    )
-    .unwrap();
-    std::env::set_var(
-        made_platform::PLUGIN_DIR_ENV,
-        staged.package("opencode-made"),
-    );
-    let grok = std::fs::canonicalize(staged.package("grok-made")).unwrap();
-    (grok, staged)
+fn staged_grok_plugin_path() -> PathBuf {
+    made_platform::install_root_from_current_executable(PlatformFamily::current())
+        .expect("test executable install root")
+        .join("plugins")
+        .join("grok-made")
 }
 
-fn resolved_grok_plugin_dir() -> PathBuf {
-    let paths = made_platform::host_platform()
-        .app_paths()
-        .expect("app paths");
-    std::fs::canonicalize(paths.plugin_dir.with_file_name("grok-made")).expect("shipped grok-made")
+fn staged_grok_plugin_dir() -> PathBuf {
+    std::fs::canonicalize(staged_grok_plugin_path()).expect("staged grok-made")
+}
+
+/// The build-staged grok-made copy beside the test executable's install root.
+/// Removed again on drop so the test leaves no staged package behind.
+struct ShippedGrokPlugin;
+
+impl ShippedGrokPlugin {
+    fn plant(version: Option<&str>) -> Self {
+        let directory = staged_grok_plugin_path();
+        let _ = std::fs::remove_dir_all(&directory);
+        if let Some(version) = version {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("plugin.json"),
+                format!("{{\n  \"name\": \"grok-made\",\n  \"version\": \"{version}\"\n}}\n"),
+            )
+            .unwrap();
+        }
+        Self
+    }
+}
+
+impl Drop for ShippedGrokPlugin {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(staged_grok_plugin_path());
+    }
 }

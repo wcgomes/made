@@ -36,11 +36,11 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 - [ ] verify 2.5 passes on Linux and macOS CI
 
 ## 3. Local install and development resolution
-- [ ] 3.1 Add tests: development and release builds both resolve `<install_root>/plugins/grok-made`; a development build never falls back to the repository source, which is never passed to `grok plugin install`; a missing staged copy runs no install and records hooks unavailable; and, only when 0.2 selected the fallback, the installed hook mode is restored after install; confirm they fail (path: crates/made-app/tests/grok_plugin_install.rs)
-- [ ] 3.2 Add the grok-made resolution at `<install_root>/plugins/grok-made` for development and release builds, without a repository fallback (path: crates/made-platform/src/lib.rs)
-- [ ] 3.3 Use that resolution in the ensure flow, treat a missing package as install failure, and apply the 0.2 mode-restore fallback only when selected (path: crates/made-app/src/grok_plugin.rs)
-- [ ] 3.4 [P] Update the platform contract fixture for the staged grok-made path (path: crates/made-platform/tests/contract.rs)
-- [ ] 3.5 [P] Point the manual install at the staged `<install_root>/plugins/grok-made` path and describe the native hook (path: plugins/grok-made/README.md)
+- [x] 3.1 Add tests: development and release builds both resolve `<install_root>/plugins/grok-made`; a development build never falls back to the repository source, which is never passed to `grok plugin install`; a missing staged copy runs no install and records hooks unavailable; and, only when 0.2 selected the fallback, the installed hook mode is restored after install; confirm they fail (path: crates/made-app/tests/grok_plugin_install.rs)
+- [x] 3.2 Add the grok-made resolution at `<install_root>/plugins/grok-made` for development and release builds, without a repository fallback (path: crates/made-platform/src/lib.rs)
+- [x] 3.3 Use that resolution in the ensure flow, treat a missing package as install failure, and apply the 0.2 mode-restore fallback only when selected (path: crates/made-app/src/grok_plugin.rs)
+- [x] 3.4 [P] Update the platform contract fixture for the staged grok-made path (path: crates/made-platform/tests/contract.rs)
+- [x] 3.5 [P] Point the manual install at the staged `<install_root>/plugins/grok-made` path and describe the native hook (path: plugins/grok-made/README.md)
 
 ## Checkpoint
 - [ ] verify scenarios `Missing or older plugin is installed`, `Same version skips install`, `Newer installed copy stays`, `Development run installs only the staged copy` and `Install failure leaves hooks unavailable` map to passing tests

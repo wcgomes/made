@@ -2905,6 +2905,8 @@ sleep 30\n",
         made_platform::PLUGIN_DIR_ENV,
         plugins.package("opencode-made"),
     );
+    // The shipped grok-made package is the staged copy beside the install root.
+    support::stage_shipped_grok_plugin();
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
