@@ -1,13 +1,22 @@
 use made_bridge::{config_guard::ConfigSnapshot, security::Token};
 use made_remote::integration::{resolve_config, Integration};
-use made_remote::protocol::{ErrorCode, Operation};
-use serde_json::{json, Value};
+use made_remote::protocol::ErrorCode;
+use serde_json::Value;
 use std::{
     fs,
-    net::TcpStream,
     path::{Path, PathBuf},
+};
+// POSIX-only: these serve the bridge relay tests and helpers gated to Unix.
+#[cfg(unix)]
+use made_remote::protocol::Operation;
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
+use std::{
+    net::TcpStream,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
 use tungstenite::{client::IntoClientRequest, http::header, Error as WsError, Message, WebSocket};
 fn plugin_fixture(root: &Path, name: &str) -> PathBuf {
     let plugin = root.join(name);
@@ -27,6 +36,7 @@ fn user_config(root: &Path) -> PathBuf {
     config
 }
 
+#[cfg(unix)]
 fn session(id: &str, active: bool, directory: &str) -> Value {
     json!({
         "sessionID": id,
@@ -36,6 +46,7 @@ fn session(id: &str, active: bool, directory: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn state(revision: u64, active: Option<&str>, sessions: Vec<Value>) -> Value {
     json!({
         "type": "state",
@@ -46,10 +57,12 @@ fn state(revision: u64, active: Option<&str>, sessions: Vec<Value>) -> Value {
     })
 }
 
+#[cfg(unix)]
 struct FakePlugin {
     socket: WebSocket<TcpStream>,
 }
 
+#[cfg(unix)]
 fn hello(token: &Token, pane: &str) -> Value {
     json!({
         "type": "hello",
@@ -63,6 +76,7 @@ fn hello(token: &Token, pane: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn bridge_details(service: &Integration) -> (String, Token, String) {
     let (_, content) = service.environment();
     let value: Value = serde_json::from_str(content).unwrap();
@@ -76,6 +90,7 @@ fn bridge_details(service: &Integration) -> (String, Token, String) {
 /// Perform the WebSocket upgrade with a generous timeout and an optional Host
 /// override. The bridge must reject a non-authority Host before disclosing any
 /// handshake state.
+#[cfg(unix)]
 fn connect_socket(url: &str, host: Option<&str>) -> Result<WebSocket<TcpStream>, String> {
     use tungstenite::http::HeaderValue;
 
@@ -103,6 +118,7 @@ fn connect_socket(url: &str, host: Option<&str>) -> Result<WebSocket<TcpStream>,
         .map_err(|error| error.to_string())
 }
 
+#[cfg(unix)]
 impl FakePlugin {
     fn connect(service: &Integration) -> Self {
         let (url, token, pane) = bridge_details(service);
@@ -197,6 +213,7 @@ impl FakePlugin {
     }
 }
 
+#[cfg(unix)]
 fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -226,6 +243,7 @@ fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
     }
 }
 
+#[cfg(unix)]
 fn poll_until(
     service: &mut Integration,
     timeout: Duration,
@@ -246,6 +264,7 @@ fn poll_until(
     }
 }
 
+#[cfg(unix)]
 fn quiet_for(service: &mut Integration, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -257,6 +276,9 @@ fn quiet_for(service: &mut Integration, timeout: Duration) {
     }
 }
 
+// POSIX-only: the relayed session state uses POSIX remote paths, which the bridge
+// rejects on a Windows host (the relay never arrives).
+#[cfg(unix)]
 #[test]
 fn unauthorized_host_and_token_handshakes_never_disclose_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -332,6 +354,9 @@ fn bridge_is_actual_remote_loopback_and_launch_config_is_immutable() {
     assert!(service.verify_config().unwrap().is_unchanged());
 }
 
+// POSIX-only: the relayed session state uses POSIX remote paths, which the bridge
+// rejects on a Windows host (the relay never arrives).
+#[cfg(unix)]
 #[test]
 fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
     let temp = tempfile::tempdir().unwrap();
