@@ -1,14 +1,16 @@
 import os
 import pathlib
+import signal
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 from harness import (
-    PREREQUISITES, cross_build_blockage, linux_arm64_elf, remote_proof_directory, tools,
-    wipe_secret,
+    Harness, PREREQUISITES, cleanup_owned_companions, cross_build_blockage,
+    linux_arm64_elf, owned_companion_pids, remote_proof_directory, tools, wipe_secret,
 )
-from parity import LIMIT, encode, envelope, receive
+from parity import LIMIT, diagnose_supervisor_failure, encode, envelope, receive
 
 
 class FramingTests(unittest.TestCase):
@@ -32,6 +34,37 @@ class FramingTests(unittest.TestCase):
         finally:
             os.close(r)
             os.close(w)
+
+
+class DiagnosisTextTests(unittest.TestCase):
+    def diagnose(self, stderr='', error=None, listing=b''):
+        h = mock.Mock()
+        h.ssh_run.return_value = mock.Mock(stdout=listing)
+        identity = {'tab': [1] * 32}
+        return diagnose_supervisor_failure(
+            h, identity, error or RuntimeError('supervisor exited'), stderr)
+
+    def test_reports_captured_evidence_and_acknowledges_temp_fallback(self):
+        text = self.diagnose('made-remote: operation failed',
+                             RuntimeError('supervisor exited'),
+                             b'.\n..\nendpoint.json\n')
+        self.assertIn('made-remote: operation failed', text)
+        self.assertIn('RuntimeError: supervisor exited', text)
+        self.assertIn('endpoint published', text)
+        self.assertIn('103-byte', text)
+        self.assertIn('short OS temp root', text)
+        self.assertNotIn('product defect', text)
+        self.assertNotIn('cannot start on a macOS remote', text)
+        self.assertNotIn('fix belongs in made-platform', text)
+        self.assertNotIn('Known cause matched', text)
+
+    def test_long_path_guidance_only_when_observed_error_matches(self):
+        matched = self.diagnose('bind: File name too long',
+                                OSError('File name too long'))
+        self.assertIn('Known cause matched', matched)
+        unmatched = self.diagnose('bind: Permission denied',
+                                  PermissionError('Permission denied'))
+        self.assertNotIn('Known cause matched', unmatched)
 
 
 def elf(interp, extra=b''):
@@ -101,6 +134,76 @@ class HarnessContractTests(unittest.TestCase):
             secret.write_text('not-a-real-password\n')
             wipe_secret(secret)
             self.assertFalse(secret.exists())
+
+
+class CompanionCleanupTests(unittest.TestCase):
+    def harness_double(self):
+        harness = object.__new__(Harness)
+        harness.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(harness.temp.cleanup)
+        harness.root = pathlib.Path(harness.temp.name)
+        harness.processes = []
+        return harness
+
+    def test_ownership_requires_the_exact_instance_executable_and_mode(self):
+        root = pathlib.Path('/tmp/made-ssh-current')
+        binary = str(root / 'companion' / 'made-remote')
+        other = '/tmp/made-ssh-other/companion/made-remote'
+        rows = [
+            (10, [binary, '--stdio']),
+            (11, [binary, '--supervisor']),
+            (12, [other, '--stdio']),
+            (13, ['/usr/bin/made-remote', '--stdio']),
+            (14, [binary + '.old', '--stdio']),
+            (15, [binary, '--child']),
+            (16, [binary, '--stdio', 'extra']),
+            (17, ['/bin/sleep', '30']),
+        ]
+        with mock.patch('harness.process_table', return_value=rows):
+            self.assertEqual(owned_companion_pids(root), {10, 11})
+
+    def test_term_is_followed_by_kill_only_for_survivors(self):
+        root = pathlib.Path('/tmp/made-ssh-current')
+        with mock.patch('harness.owned_companion_pids',
+                        side_effect=[{10, 11}, {11}, set()]), \
+                mock.patch('harness.os.kill') as kill:
+            cleanup_owned_companions(root, term_timeout=0, kill_timeout=0)
+        self.assertEqual(kill.call_args_list, [
+            mock.call(10, signal.SIGTERM),
+            mock.call(11, signal.SIGTERM),
+            mock.call(11, signal.SIGKILL),
+        ])
+
+    def test_success_teardown_cleans_companions_and_removes_temp_root(self):
+        harness = self.harness_double()
+        root = harness.root
+        with mock.patch('harness.cleanup_owned_companions') as cleanup:
+            harness.__exit__()
+        cleanup.assert_called_once_with(root)
+        self.assertFalse(root.exists())
+
+    def test_exception_and_intended_failure_teardown_remove_temp_root(self):
+        for exception_type in (RuntimeError, AssertionError):
+            with self.subTest(exception=exception_type.__name__):
+                harness = self.harness_double()
+                root = harness.root
+                with mock.patch('harness.cleanup_owned_companions') as cleanup:
+                    with self.assertRaises(exception_type):
+                        try:
+                            raise exception_type('scenario failure')
+                        finally:
+                            harness.__exit__()
+                cleanup.assert_called_once_with(root)
+                self.assertFalse(root.exists())
+
+    def test_temp_root_survives_failed_companion_verification(self):
+        harness = self.harness_double()
+        root = harness.root
+        with mock.patch('harness.cleanup_owned_companions',
+                        side_effect=RuntimeError('still running')):
+            with self.assertRaisesRegex(RuntimeError, 'still running'):
+                harness.__exit__()
+        self.assertTrue(root.exists())
 
 
 if __name__ == '__main__':
