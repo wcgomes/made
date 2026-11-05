@@ -1237,8 +1237,8 @@ fn install_runs_without_any_interpreter_prerequisite() {
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(report.reason, None);
     assert_eq!(
-        fake.argv().len(),
-        1,
+        fake.argv(),
+        vec!["plugin", "install", staged.to_str().unwrap(), "--trust"],
         "the official installer ran exactly once with no interpreter input"
     );
 }
