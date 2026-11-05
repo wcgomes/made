@@ -290,7 +290,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [ ] No probe files, dead references or new warnings remain; `cargo clippy --workspace` and all CI workflows are green
 
 ## 11. Security-review fixes
-- [ ] 11.1 Write failing tests for the Windows hand-off (path: crates/made-platform/tests/update.rs):
+- [x] 11.1 Write failing tests for the Windows hand-off (path: crates/made-platform/tests/update.rs):
   - the install lock passes from the command-line entry to the helper with no gap;
   - the helper holds the lock until its swap ends;
   - a failed helper start releases the lock and changes no installed files;
