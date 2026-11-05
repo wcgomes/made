@@ -90,7 +90,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 3.12 Make askpass staging profile-aware with a debug default, so `ci-ssh-remote.yml` is unchanged; confirm 3.11 passes (path: .github/scripts/stage-askpass.sh)
 
 ## Checkpoint
-- [ ] verify REL-04 "Dependency inspection" for release binaries of all four targets (Linux `NEEDED` allowlist and glibc 2.35, Windows imports, macOS minos 12.0); development artifacts still build, and the `grok-native-hook` 5.10 step still runs
+- [x] verify REL-04 "Dependency inspection" for release binaries of all four targets (Linux `NEEDED` allowlist and glibc 2.35, Windows imports, macOS minos 12.0); development artifacts still build, and the `grok-native-hook` 5.10 step still runs
 
 ## 4. Update capability in made-platform
 - [x] 4.1 Add the pinned `velopack` dependency confirmed in 1.8 (path: crates/made-platform/Cargo.toml)
@@ -110,7 +110,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 4.5 Run the startup hook first in `main`, and pass smoke-test mode so updates are disabled under `--smoke-test` (path: crates/made-app/src/main.rs)
 
 ## Checkpoint
-- [ ] verify at the capability level: REL-08 "Tampered package rejected", "Non-GitHub or HTTP source refused" and "Wrong embedded version rejected"; REL-06 "Older or prerelease versions never offered" and "Check reveals no private data" (client-boundary request test); REL-11 "Developer build"
+- [x] verify at the capability level: REL-08 "Tampered package rejected", "Non-GitHub or HTTP source refused" and "Wrong embedded version rejected"; REL-06 "Older or prerelease versions never offered" and "Check reveals no private data" (client-boundary request test); REL-11 "Developer build"
 
 ## 5. Update scheduling, preference and diagnostics in made-app
 - [x] 5.1 Write failing tests for the update preference (path: crates/made-app/tests/update_preference.rs):
@@ -143,7 +143,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 5.10 Add the non-interactive command-line upgrade entry for the REL-12 check; confirm 5.7 passes (path: crates/made-app/src/cli.rs)
 
 ## Checkpoint
-- [ ] verify:
+- [x] verify:
   - REL-06 "Newer version available", "Periodic check while running" and "No newer version";
   - REL-07 all scenarios;
   - REL-09 "Launch offline", "GitHub unreachable or malformed feed" and "Interrupted download";
@@ -164,32 +164,32 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 6.2 Implement the wordmark indicator, its accessible name and the About Updates section with inline confirmation; confirm 6.1 passes (path: crates/made-app/src/ui.rs)
 
 ## Checkpoint
-- [ ] verify:
+- [x] verify:
   - MODIFIED `Minimal Workspace Layout`: "Update-ready indicator" and all existing scenarios;
   - MODIFIED `About Presentation`: "About default content", "About Updates controls in an installed build", "Restart confirmation inside About", "About in a non-installed build" and the existing About scenarios;
   - MODIFIED `Keyboard Focus and Accessibility`: "Icon actions expose accessible names" and the other existing scenarios.
 
 ## 7. Release pipeline
-- [ ] 7.1 Write failing tests for release asset finishing (path: .github/scripts/test_release_assets.py):
+- [x] 7.1 Write failing tests for release asset finishing (path: .github/scripts/test_release_assets.py):
   - end-user downloads are renamed to `made-<version>-<os>-<arch>` names per target;
   - feed-referenced files are unchanged per 1.7;
   - `SHA256SUMS` lists every other asset with a correct digest.
-- [ ] 7.2 Implement release asset finishing; confirm 7.1 passes (path: .github/scripts/release-assets.py)
-- [ ] 7.3 Write the release-notes template [P] (path: .github/release-notes.md). It covers:
+- [x] 7.2 Implement release asset finishing; confirm 7.1 passes (path: .github/scripts/release-assets.py)
+- [x] 7.3 Write the release-notes template [P] (path: .github/release-notes.md). It covers:
   - per-OS install steps;
   - the exact SmartScreen and Gatekeeper first-run steps from 1.3, and the note that they may repeat after an update;
   - the AppImage `chmod +x` step;
   - no global-disable advice;
   - `SHA256SUMS` usage, stated as corruption detection, not proof of publisher.
-- [ ] 7.4 Write failing tests for the release gate with a fake GitHub API (path: .github/scripts/test_release_gate.py). It refuses:
+- [x] 7.4 Write failing tests for the release gate with a fake GitHub API (path: .github/scripts/test_release_gate.py). It refuses:
   - prerelease tags;
   - versions not greater than the latest published stable release;
   - already-published tags;
   - any REL-02 disagreement.
 
   It also deletes an unpublished draft left by a failed run for the same tag.
-- [ ] 7.5 Implement the release gate; confirm 7.4 passes (path: .github/scripts/release-gate.py)
-- [ ] 7.6 Write failing structure tests for the release workflows (path: .github/scripts/test_release_workflow.py):
+- [x] 7.5 Implement the release gate; confirm 7.4 passes (path: .github/scripts/release-gate.py)
+- [x] 7.6 Write failing structure tests for the release workflows (path: .github/scripts/test_release_workflow.py):
   - job order: gate, then build-and-pack, then installed smoke, then publish, then the post-publish upgrade check;
   - publish needs every target, runs in the protected `release` environment, and alone has `contents: write`;
   - no cache restore in any release job;
@@ -197,7 +197,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - `make_latest` is set explicitly;
   - the upgrade-check workflow has `workflow_dispatch` and `workflow_call` triggers and read-only permissions;
   - no release build step enables the test-only update seam feature.
-- [ ] 7.7 Write the installed-layout smoke harness (path: .github/scripts/smoke-installed.py). Per OS:
+- [x] 7.7 Write the installed-layout smoke harness (path: .github/scripts/smoke-installed.py). Per OS:
   - install per-user (Windows installer; macOS `.pkg` and `.zip`; Linux AppImage);
   - launch `--smoke-test` and assert the 5.7 markers, including `update_repo` equal to the production repository;
   - hash the 10-artifact companion set against the manifest;
@@ -205,8 +205,8 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - check executable bits;
   - assert the packaged binary was built without the test-only update seam feature, for example through a build-metadata marker on the smoke line;
   - fail on any miss.
-- [ ] 7.8 Add the version-gate job on `v*` tags, running `release-gate.py` (path: .github/workflows/release.yml)
-- [ ] 7.9 Add the build-and-pack job (path: .github/workflows/release.yml):
+- [x] 7.8 Add the version-gate job on `v*` tags, running `release-gate.py` (path: .github/workflows/release.yml)
+- [x] 7.9 Add the build-and-pack job (path: .github/workflows/release.yml):
   - consume the 10-artifact companion set from `ci-ssh-remote.yml` (built by `build-linux-companion.sh`/`build-macos-companion.sh` and staged by `stage-companion.sh`);
   - build release-profile `made-app`, the host-target `made-grok-status`, and askpass through `stage-askpass.sh` with `PROFILE=release`, with `--locked` on `windows-2025` (crt-static), `macos-15` and `macos-15-intel` (`MACOSX_DEPLOYMENT_TARGET=12.0`), and `ubuntu-22.04`;
   - run the glibc 2.35, Linux `NEEDED`, Windows import and macOS minos checks;
@@ -214,15 +214,15 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - compose the macOS bundle per 1.3;
   - pack with Velopack per target channel, with the pack version read from `[workspace.package].version`;
   - finish assets with `release-assets.py`.
-- [ ] 7.10 Add the installed-smoke job running `smoke-installed.py` on each target's packaged output; any failure blocks publishing (path: .github/workflows/release.yml)
-- [ ] 7.11 Add the post-publish upgrade check, with manual and callable triggers and read-only permissions (path: .github/workflows/upgrade-check.yml):
+- [x] 7.10 Add the installed-smoke job running `smoke-installed.py` on each target's packaged output; any failure blocks publishing (path: .github/workflows/release.yml)
+- [x] 7.11 Add the post-publish upgrade check, with manual and callable triggers and read-only permissions (path: .github/workflows/upgrade-check.yml):
   - per target, and on macOS for both the `.pkg` and the `.zip` install, download the previous published stable release's asset from the production repository and install it per-user;
   - run once with the REL-10 choice seeded on and once with it seeded off, along with SSH server records and settings;
   - with no GUI instance running, run the 5.10 command-line entry to download, then again with the apply flag to update to the latest published release;
   - assert `--version` reports the latest version, the app data and the seeded REL-10 value are preserved, and the smoke line shows the production `update_repo`;
   - with only one published release, report the first-release exemption and pass.
-- [ ] 7.12 Call the upgrade check from the release workflow after the publish job; a failure is reported for remedy by a fixed newer release and does not modify the published release (path: .github/workflows/release.yml)
-- [ ] 7.13 Add the publish job, which runs after every target's build and smoke succeed (path: .github/workflows/release.yml):
+- [x] 7.12 Call the upgrade check from the release workflow after the publish job; a failure is reported for remedy by a fixed newer release and does not modify the published release (path: .github/workflows/release.yml)
+- [x] 7.13 Add the publish job, which runs after every target's build and smoke succeed (path: .github/workflows/release.yml):
   - remove any stale draft for the tag;
   - create a draft and upload all assets and `SHA256SUMS`;
   - apply the notes template;
@@ -239,12 +239,12 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - REL-12 "Post-publish upgrade check" (exemption path on the first release), "Command-line upgrade uses the same path", "GUI startup refused during command-line apply" and "Command-line apply refused while Made runs" (with 5.7).
 
 ## 8. Documentation
-- [ ] 8.1 Replace the "no installers … auto-update" statement in the README (path: README.md) with:
+- [x] 8.1 Replace the "no installers … auto-update" statement in the README (path: README.md) with:
   - per-OS install and first-run steps, plus the repeat-after-update note;
   - the update opt-out;
   - `SHA256SUMS` as corruption detection only;
   - a short pointer to the release procedure in `wiki/operations/release-ci.md`.
-- [ ] 8.2 Document the bump-and-release procedure (explicitly scoped wiki edit) (path: wiki/operations/release-ci.md):
+- [x] 8.2 Document the bump-and-release procedure (explicitly scoped wiki edit) (path: wiki/operations/release-ci.md):
   - run `scripts/bump-version.sh X.Y.Z`, then commit through a pull request;
   - after merge, `git tag vX.Y.Z && git push origin vX.Y.Z`;
   - what CI does: gate, build and pack, installed smoke, approval in the protected `release` environment, publish as latest, then the post-publish upgrade check; a failed upgrade check is remedied by a fixed newer release;
@@ -256,10 +256,10 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - the one-time rollout cleanup: delete all iteration releases first, then their tags, then re-release `v0.1.0`, and follow the proposal's per-machine cleanup.
 
 ## Checkpoint
-- [ ] verify REL-05 documentation clauses against the README and the notes template, and that the 8.2 procedure matches `release.yml` and `bump-version.sh`
+- [x] verify REL-05 documentation clauses against the README and the notes template, and that the 8.2 procedure matches `release.yml` and `bump-version.sh`
 
 ## 9. Native acceptance and first release
-- [ ] 9.1 Create the release acceptance checklist and record evidence there (path: tests/e2e/release_validation.md):
+- [x] 9.1 Create the release acceptance checklist and record evidence there (path: tests/e2e/release_validation.md):
   - fresh Windows 10 1809 and Windows 11 without admin;
   - fresh macOS 12+ on arm64 and x64, with both `.pkg` and `.zip`;
   - Ubuntu 22.04, Ubuntu 24.04 and current Fedora (VM) in X11 and Wayland, without libfuse or `fusermount`;
