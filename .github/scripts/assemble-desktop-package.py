@@ -146,6 +146,9 @@ def copy_tree(source: Path, destination: Path) -> None:
     hook = destination / "plugins/grok-made/hooks/bin/made-grok-status"
     if not hook.is_file() or hook.stat().st_size <= 0:
         fail(f"copied native hook is missing or empty: {hook}")
+    # Workflow artifact download does not preserve modes, so the executable bit
+    # is restored here exactly like the companion's, then checked.
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     if not hook.stat().st_mode & stat.S_IXUSR:
         fail(f"copied native hook is not executable: {hook}")
 
