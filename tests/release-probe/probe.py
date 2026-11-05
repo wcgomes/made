@@ -126,6 +126,9 @@ def vpk_pack(stage_root: Path, version: str, channel: str, out: Path, os_name: s
         "--mainExe", main, "--channel", channel, "--outputDir", out, "--packTitle", "Made",
         "--delta", "None", "--yes",
     ]
+    if os_name == "macos":
+        # 1.3 signature fallback: ad-hoc identity, no certificate.
+        cmd += ["--signAppIdentity", "-"]
     return run(cmd, timeout=1200)
 
 
@@ -183,22 +186,44 @@ def kill_updater(os_name: str) -> str:
     return ";".join(outputs)
 
 
+def updater_running(os_name: str) -> bool:
+    for name in updater_names(os_name):
+        if os_name == "windows":
+            out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}"], capture_output=True, text=True).stdout
+            if name.lower() in out.lower():
+                return True
+        elif subprocess.run(["pgrep", "-x", name], capture_output=True).returncode == 0:
+            return True
+    return False
+
+
 def kill_points(os_name: str, reset, exe_of, feed: str) -> None:
     results = []
-    for delay in (0.0, 0.25, 0.75, 1.5, 3.0):
+    for delay in (0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
         reset()
         exe = exe_of()
         before = report(exe)
-        run([exe, "update", feed, "--apply-norestart"], timeout=300)
+        process = subprocess.Popen([str(exe), "update", feed, "--apply-norestart"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        seen = False
+        deadline = time.time() + 120
+        while time.time() < deadline and not seen:
+            seen = updater_running(os_name)
+            if not seen:
+                time.sleep(0.005)
         time.sleep(delay)
-        killed = kill_updater(os_name)
-        time.sleep(3)
-        kill_updater(os_name)
+        alive = updater_running(os_name)
+        killed = kill_updater(os_name) if alive else "already exited"
+        process.wait(timeout=120)
+        time.sleep(2)
+        if updater_running(os_name):
+            kill_updater(os_name)
         after = report(exe_of())
         launchable = after.get("exit_code") == 0 and after.get("version") in (V1, V2)
         results.append({
-            "delay_s": delay, "before": before.get("version"), "after": after.get("version"),
-            "exit_code": after.get("exit_code"), "killed": killed, "launchable": launchable,
+            "delay_s": delay, "seen": seen, "alive_at_kill": alive, "before": before.get("version"),
+            "after": after.get("version"), "exit_code": after.get("exit_code"), "killed": killed,
+            "launchable": launchable,
         })
     record("1.7 kill points leave a launchable version", all(r["launchable"] for r in results), points=results)
 
@@ -323,7 +348,10 @@ def linux_flow(args, work: Path, out1: Path, out2: Path) -> None:
     appimage1 = next(out1.glob("*.AppImage"))
     appimage2 = next(out2.glob("*.AppImage"))
     inspect_linux(appimage1, work)
-    run(["sudo", "apt-get", "purge", "-y", "fuse", "fuse3", "libfuse2", "libfuse2t64", "libfuse3-3", "libfuse3-4"])
+    owners = run(["sh", "-c", "dpkg -S 'libfuse*.so*' 'fusermount*' 2>/dev/null | cut -d: -f1 | sort -u"]).stdout.split()
+    for package in sorted(set(owners) | {"fuse", "fuse3", "libfuse2", "libfuse2t64", "libfuse3-3"}):
+        run(["sudo", "apt-get", "purge", "-y", package])
+    run(["sudo", "sh", "-c", "rm -f /lib/x86_64-linux-gnu/libfuse* /usr/lib/x86_64-linux-gnu/libfuse* && ldconfig"])
     run(["sudo", "sh", "-c", "rm -f /bin/fusermount* /usr/bin/fusermount* /sbin/mount.fuse*"])
     absent = fuse_absent()
     record("1.4 FUSE absent", not any(absent["tools"].values()) and not absent["libfuse"], **absent)
@@ -332,9 +360,15 @@ def linux_flow(args, work: Path, out1: Path, out2: Path) -> None:
     apps.mkdir(exist_ok=True)
     installed = apps / "Made.AppImage"
 
+    def place(image: Path) -> None:
+        run(["pkill", "-9", "-f", str(installed)])
+        staging = installed.with_suffix(".tmp")
+        shutil.copy2(image, staging)
+        make_exec(staging)
+        os.replace(staging, installed)
+
     def try_runtime(label: str, image1: Path, feed_dir: Path) -> bool:
-        shutil.copy2(image1, installed)
-        make_exec(installed)
+        place(image1)
         first = report(installed)
         record(f"1.4 {label} launch without FUSE", first.get("exit_code") == 0 and first.get("installed") is True,
                report=first)
@@ -358,6 +392,14 @@ def linux_flow(args, work: Path, out1: Path, out2: Path) -> None:
             fallback1, fallback2 = work / "fallback-v1.AppImage", work / "fallback-v2.AppImage"
             replace_runtime(appimage1, runtime, fallback1)
             replace_runtime(appimage2, runtime, fallback2)
+            helptext = run([fallback1, "--appimage-help"])
+            variants = {}
+            for name, value in (("URUNTIME_EXTRACT", "1"), ("URUNTIME_EXTRACT", "2"), ("URUNTIME_EXTRACT", "3"),
+                                ("APPIMAGE_EXTRACT_AND_RUN", "1")):
+                result = run([fallback1, "report"], env={**os.environ, name: value})
+                variants[f"{name}={value}"] = {"exit_code": result.returncode, "stderr": result.stderr[-300:]}
+            record("1.4 fallback runtime options", None, help=(helptext.stdout + helptext.stderr)[-5000:],
+                   variants=variants)
             feed = work / "feed-fallback"
             shutil.copytree(out2, feed)
             rewrite_nupkg(feed, channel, fallback2)
@@ -366,7 +408,7 @@ def linux_flow(args, work: Path, out1: Path, out2: Path) -> None:
                 out2 = feed
                 appimage1 = fallback1
     pre = prerelease_feed(out2, channel, work)
-    common_checks(args, installed_exe=lambda: installed, reset=lambda: shutil.copy2(appimage1, installed),
+    common_checks(args, installed_exe=lambda: installed, reset=lambda: place(appimage1),
                   out2=out2, pre=pre, work=work)
 
 
