@@ -1,0 +1,100 @@
+# TEMP release/v0.1.0: records the install part of the real-grok acceptance
+# (specs/changes/grok-native-hook task 7.3) on the four local targets. A hosted
+# runner has no signed-in grok, so sessions, prompts and the pid-versus-Grok
+# comparison cannot run here. Remove this file once the results are recorded in
+# tests/e2e/grok_native_hook_validation.md.
+name: Probe grok acceptance
+
+on:
+  push:
+    branches: [release/v0.1.0] # TEMP release/v0.1.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Acceptance install (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            exe: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            exe: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and stage the native hook
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          cargo build -p made-grok-hook --locked --release --target "$TARGET"
+          bash .github/scripts/stage-grok-plugin.sh "$TARGET" \
+            "target/${TARGET}/release/made-grok-status${EXE}" dist/pkg/plugins/grok-made
+
+      - name: Install grok (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://x.ai/cli/install.sh | bash
+          echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+
+      - name: Install grok (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://x.ai/cli/install.ps1 | iex
+          "$env:USERPROFILE\.grok\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install the packaged plugin and run the installed hook
+        shell: bash
+        env:
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -uo pipefail
+          emit() { printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')"; }
+          native() { if [ "$RUNNER_OS" = Windows ]; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+          pkg="$PWD/dist/pkg/plugins/grok-made"
+          home="$PWD/ghome"
+          mkdir -p "$home"
+          export GROK_HOME="$(native "$home")"
+          emit "grok version" "$(grok --version 2>&1)"
+          out="$(grok plugin install "$(native "$pkg")" --trust 2>&1)"; code=$?
+          emit "install" "exit=$code $out"
+          emit "installed tree" "$(find "$home/installed-plugins" -type f ! -name 'registry.*' | sort | while read -r f; do printf '%s %s\n' "$(ls -l "$f" | awk '{print $1, $5}')" "${f#$home/}"; done)"
+          emit "symlinks" "count=$(find "$home/installed-plugins" -type l | wc -l | tr -d ' ')"
+          emit "inspect hooks" "$(grok inspect 2>&1 | sed -n '/Plugins (/,/Config Sources/p')"
+          hook="$(find "$home/installed-plugins" -name "made-grok-status${EXE}" -type f | head -1)"
+          emit "installed hook path" "${hook#$home/}"
+          # Run the installed copy as Grok would (one event, stdin left open
+          # until exit), with a PATH that holds no python.
+          if [ "$RUNNER_OS" = Windows ]; then
+            cmd=(powershell -NoProfile -Command "\$env:PATH='C:\\Windows\\System32'; \$p = Start-Process -FilePath '$(native "$hook")' -PassThru -NoNewWindow -RedirectStandardInput \"$(native "$PWD")\\event.json\"; \$p.WaitForExit(); exit \$p.ExitCode")
+            printf '%s' '{"hookEventName":"UserPromptSubmit","sessionId":"acceptance","cwd":"/work"}' > event.json
+            "${cmd[@]}"; hcode=$?
+          else
+            printf '%s' '{"hookEventName":"UserPromptSubmit","sessionId":"acceptance","cwd":"/work"}' \
+              | env -i PATH=/nonexistent GROK_HOME="$GROK_HOME" "$hook"; hcode=$?
+          fi
+          emit "hook run" "exit=$hcode; log: $(cat "$home/made-grok-status.jsonl" 2>&1)"
