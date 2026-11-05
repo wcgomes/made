@@ -28,6 +28,7 @@ use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRo
 use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
 use crate::tui::TerminalTarget;
+use crate::updates::{UpdateAction, UpdatePanel};
 use crate::workbench::{LeftSurface, Workbench};
 use crate::{APP_DESCRIPTION, APP_NAME, APP_VERSION};
 use made_platform::{Clipboard, CompatibleTui, LogIssueSeverity, PlatformError};
@@ -1743,6 +1744,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
 pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let layout = Layout::for_window(ui.available_width(), ui.ctx().content_rect().height());
     let active = model.active_workspace_id();
+    let update_ready = model.update_ready();
     let tabs: Vec<WorkspaceTabInfo> = model
         .workspace_ids()
         .filter_map(|id| {
@@ -1963,8 +1965,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                     .max_rect(wordmark_rect)
                     .layout(egui::Layout::left_to_right(Align::Center)),
             );
-            let trigger =
-                theme::wordmark_about_action(&mut wordmark, layout.tab_height, theme::BG_CLEAR);
+            let trigger = theme::wordmark_about_action(
+                &mut wordmark,
+                layout.tab_height,
+                theme::BG_CLEAR,
+                update_ready && active.is_some(),
+            );
             if trigger.activated && active.is_some() {
                 about = true;
             }
@@ -2570,6 +2576,7 @@ impl Workbench {
         ui: &mut Ui,
         show_sessions: &mut bool,
         show_about: &mut bool,
+        updates: &mut UpdatePanel,
         native_backdrop_applied: bool,
     ) {
         if !self.is_visible() {
@@ -2585,7 +2592,7 @@ impl Workbench {
             bottom: layout.gutter as i8,
         };
         egui::Frame::NONE.inner_margin(margin).show(ui, |ui| {
-            self.workspace_ui(ui, &layout, show_about, native_backdrop_applied);
+            self.workspace_ui(ui, &layout, show_about, updates, native_backdrop_applied);
         });
         self.set_sessions_visible(*show_sessions);
     }
@@ -2595,6 +2602,7 @@ impl Workbench {
         ui: &mut Ui,
         layout: &Layout,
         show_about: &mut bool,
+        updates: &mut UpdatePanel,
         native_backdrop_applied: bool,
     ) {
         ui.ctx()
@@ -2604,7 +2612,7 @@ impl Workbench {
         self.apply_terminal_focus_boost(ui.ctx());
         let ctx = ui.ctx().clone();
         self.toast(&ctx, layout);
-        self.about_window(&ctx, show_about, layout);
+        self.about_window(&ctx, show_about, updates, layout);
     }
 
     pub(crate) fn sync_terminal_visibility(&mut self, ctx: &egui::Context) {
@@ -3344,7 +3352,13 @@ impl Workbench {
         cache
     }
 
-    fn about_window(&mut self, ctx: &egui::Context, show_about: &mut bool, layout: &Layout) {
+    fn about_window(
+        &mut self,
+        ctx: &egui::Context,
+        show_about: &mut bool,
+        updates: &mut UpdatePanel,
+        layout: &Layout,
+    ) {
         if !*show_about {
             if ctx.data(|data| data.get_temp::<bool>(about_open_id()).unwrap_or(false)) {
                 ctx.data_mut(|data| data.insert_temp(about_open_id(), false));
@@ -3379,7 +3393,8 @@ impl Workbench {
         let mut copy_requested = false;
         let mut previous_copy_requested = false;
         let mut detail_visible = self.about_diagnostics_visible;
-        let collapsed_height = 220.0;
+        // The compact card fits the Updates section and its confirmation.
+        let collapsed_height = 220.0 + updates_section_height(updates);
         let expanded_height = (content.height() - 48.0).max(360.0);
         let reveal_id = egui::Id::unique((
             "made-about-diagnostics-reveal",
@@ -3447,6 +3462,8 @@ impl Workbench {
                 ui.label(theme::body("Minimal Agentic Development Environment"));
                 ui.label(theme::micro(APP_DESCRIPTION));
                 ui.add_space(6.0);
+                updates_section(ui, updates, layout);
+                ui.add_space(6.0);
                 if reveal <= 0.001 {
                     let remaining = ui.available_height().max(0.0);
                     ui.add_space(remaining);
@@ -3505,7 +3522,7 @@ impl Workbench {
                     );
                 }
 
-                let detail_height = (ui.available_height() - 90.0).max(120.0);
+                let detail_height = (ui.available_height() - 90.0).max(48.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .max_height(detail_height)
@@ -3836,6 +3853,9 @@ impl Workbench {
                 ui.add_space(remaining);
             });
 
+        if !open && updates.confirming {
+            updates.actions.push(UpdateAction::Dismiss);
+        }
         *show_about = open;
         self.about_diagnostics_visible = detail_visible;
         if previous_copy_requested {
@@ -3852,6 +3872,147 @@ impl Workbench {
             ctx.copy_text(fresh.copy.clone());
         }
         ctx.data_mut(|data| data.insert_temp(about_open_id(), open));
+    }
+}
+
+/// Stable id of About's `Check for updates` button.
+pub fn about_update_check_id() -> egui::Id {
+    egui::Id::unique("made-about-update-check")
+}
+
+/// Stable id of About's `Check for updates automatically` toggle.
+pub fn about_update_automatic_id() -> egui::Id {
+    egui::Id::unique("made-about-update-automatic")
+}
+
+/// Stable id of About's `Restart to update` button.
+pub fn about_update_restart_id() -> egui::Id {
+    egui::Id::unique("made-about-update-restart")
+}
+
+/// Stable id of the inline confirmation's `Restart now` button.
+pub fn about_update_restart_now_id() -> egui::Id {
+    egui::Id::unique("made-about-update-restart-now")
+}
+
+/// Stable id of the inline confirmation's `Not now` button.
+pub fn about_update_not_now_id() -> egui::Id {
+    egui::Id::unique("made-about-update-not-now")
+}
+
+/// Wording of the inline restart confirmation.
+pub fn restart_confirmation_text(version: &str) -> String {
+    format!(
+        "Restart into Made {version}? Every open workspace, terminal and running session, \
+         including OpenCode, Grok and SSH sessions, will close and will not be restored."
+    )
+}
+
+fn updates_section_height(updates: &UpdatePanel) -> f32 {
+    let mut height = 24.0;
+    if updates.controls {
+        height += 34.0;
+    }
+    if updates.confirming {
+        height += 74.0;
+    }
+    height
+}
+
+/// The About Updates section: one status line, and for an installed build
+/// the check button, the automatic-check toggle, the restart action and its
+/// inline confirmation. A non-installed build shows only its status line.
+fn updates_section(ui: &mut Ui, updates: &mut UpdatePanel, layout: &Layout) {
+    ui.horizontal(|ui| {
+        ui.label(theme::mono("UPDATES", 10.0, theme::TEXT_TERTIARY));
+        ui.label(theme::micro(&updates.status_line));
+    });
+    if !updates.controls {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let check = theme::secondary_action(
+            ui,
+            about_update_check_id(),
+            "Check for updates",
+            layout.button_height,
+            !updates.busy,
+            theme::BG_CARD,
+        );
+        check.response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Button, !updates.busy, "Check for updates")
+        });
+        if check.activated && !updates.busy {
+            updates.actions.push(UpdateAction::CheckNow);
+        }
+        let toggle = theme::toggle_action(
+            ui,
+            about_update_automatic_id(),
+            "Check for updates automatically",
+            updates.automatic,
+            layout.button_height,
+            theme::BG_CARD,
+        );
+        if toggle.activated {
+            updates
+                .actions
+                .push(UpdateAction::SetAutomatic(!updates.automatic));
+        }
+        if updates.ready.is_some() && !updates.confirming {
+            let restart = theme::primary_action(
+                ui,
+                about_update_restart_id(),
+                "Restart to update",
+                layout.button_height,
+                true,
+                theme::BG_CARD,
+            );
+            restart.response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, true, "Restart to update")
+            });
+            if restart.activated {
+                updates.actions.push(UpdateAction::RequestRestart);
+            }
+        }
+    });
+    if let (true, Some(version)) = (updates.confirming, updates.ready.clone()) {
+        egui::Frame::NONE
+            .fill(theme::BG_ELEVATED)
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.label(theme::micro(restart_confirmation_text(&version)));
+                ui.horizontal(|ui| {
+                    let now = theme::primary_action(
+                        ui,
+                        about_update_restart_now_id(),
+                        "Restart now",
+                        layout.button_height,
+                        true,
+                        theme::BG_ELEVATED,
+                    );
+                    now.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Button, true, "Restart now")
+                    });
+                    if now.activated {
+                        updates.actions.push(UpdateAction::RestartNow);
+                    }
+                    let later = theme::secondary_action(
+                        ui,
+                        about_update_not_now_id(),
+                        "Not now",
+                        layout.button_height,
+                        true,
+                        theme::BG_ELEVATED,
+                    );
+                    later.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Button, true, "Not now")
+                    });
+                    if later.activated {
+                        updates.actions.push(UpdateAction::Dismiss);
+                    }
+                });
+            });
     }
 }
 

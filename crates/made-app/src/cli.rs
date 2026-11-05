@@ -7,6 +7,7 @@
 //! - `made --workspace <path>`
 //! - `made --picker`
 //! - `made --smoke-test [<milliseconds>]` (also `MADE_SMOKE_TEST_MS`)
+//! - `made --update [--apply]` (non-interactive update entry, REL-12)
 //!
 //! An explicit workspace (`--workspace` or positional) takes precedence over
 //! `--picker`; with neither, startup resolves the platform home. Parsing never
@@ -47,6 +48,19 @@ pub enum CliAction {
     Help,
     /// Print the version and exit successfully.
     Version,
+    /// Non-interactive update entry (REL-12): check and download; with
+    /// `apply`, also apply without starting the GUI.
+    Update {
+        /// `--apply` was given: apply the verified update.
+        apply: bool,
+    },
+    /// Hidden Windows apply helper started by `--update --apply`.
+    ApplyHelper {
+        /// Process the helper waits for before applying.
+        wait_pid: u32,
+        /// Install root being updated.
+        root: PathBuf,
+    },
 }
 
 /// Argument parsing failure. The process exits with status 2 and prints usage.
@@ -108,6 +122,8 @@ where
     let mut picker = false;
     let mut smoke = false;
     let mut smoke_duration = DEFAULT_SMOKE_DURATION;
+    let mut update = false;
+    let mut apply = false;
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         let text = arg.to_string_lossy();
@@ -115,6 +131,21 @@ where
             "--help" | "-h" => return Ok(CliAction::Help),
             "--version" | "-V" => return Ok(CliAction::Version),
             "--picker" => picker = true,
+            "--update" => update = true,
+            "--apply" => apply = true,
+            made_platform::update::WINDOWS_HELPER_FLAG => {
+                let pid = args
+                    .next()
+                    .and_then(|value| value.to_string_lossy().parse::<u32>().ok())
+                    .ok_or_else(|| CliError::new("the apply helper needs a process id"))?;
+                let root = args
+                    .next()
+                    .ok_or_else(|| CliError::new("the apply helper needs an install root"))?;
+                return Ok(CliAction::ApplyHelper {
+                    wait_pid: pid,
+                    root: PathBuf::from(root),
+                });
+            }
             "--smoke-test" => {
                 smoke = true;
                 // Accept an optional numeric duration. A following token that
@@ -159,6 +190,17 @@ where
         }
     }
 
+    if apply && !update {
+        return Err(CliError::new("--apply requires --update"));
+    }
+    if update {
+        if workspace.is_some() || picker || smoke {
+            return Err(CliError::new(
+                "--update cannot be combined with a workspace, --picker or --smoke-test",
+            ));
+        }
+        return Ok(CliAction::Update { apply });
+    }
     let workspace = match workspace {
         Some(path) => WorkspaceSelection::Explicit(path),
         None if picker => WorkspaceSelection::Picker,
@@ -172,11 +214,14 @@ where
 
 /// Usage text printed for `--help`, parse errors, and `--version`.
 pub fn usage() -> &'static str {
-    "Usage: made [workspace]\n       made --workspace <folder> [--smoke-test [ms]]\n       made --picker [--smoke-test [ms]]\n\n\
+    "Usage: made [workspace]\n       made --workspace <folder> [--smoke-test [ms]]\n       made --picker [--smoke-test [ms]]\n       made --update [--apply]\n\n\
      With no workspace, Made opens the current user's home folder.\n\
      --picker opens the in-app folder picker instead; an explicit workspace\n\
      (positional or --workspace) takes precedence over --picker.\n\
-     --smoke-test creates the real window, pumps frames for ~2 seconds, then exits."
+     --smoke-test creates the real window, pumps frames for ~2 seconds, then exits.\n\
+     --update checks for and downloads a newer release of an installed Made;\n\
+     --update --apply also installs it, without starting Made, when no Made\n\
+     window of this install is open."
 }
 
 fn set_workspace(slot: &mut Option<PathBuf>, value: OsString) -> Result<(), CliError> {

@@ -23,6 +23,7 @@ use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, S
 use crate::theme;
 use crate::tui::TerminalTarget;
 use crate::ui;
+use crate::updates::{UpdateAction, UpdatePanel, UpdateScheduler};
 use crate::workbench::{platform_family_label, Workbench};
 use crate::workspace::{
     LaunchPlan, WorkspaceError, WorkspaceLaunch, WorkspaceSelection, WorkspaceSource,
@@ -454,6 +455,18 @@ pub struct AppModel {
     remote_launch: Option<RemoteLaunchDraft>,
     remote_closes: Vec<Receiver<crate::remote_session::CloseReport>>,
     remote_close_notice: Option<String>,
+    /// Update scheduling and state. Non-installed and smoke builds hold an
+    /// unavailable scheduler that never makes a request.
+    updates: UpdateScheduler,
+    /// Where the REL-10 choice is stored; `None` keeps it in memory only.
+    update_store: Option<crate::preferences::PreferenceStore>,
+    /// The inline `Restart to update` confirmation is shown.
+    update_confirming: bool,
+    /// Set once `Restart now` handed the update to the updater; the window
+    /// then closes so the updater can apply and relaunch.
+    update_restarting: bool,
+    /// Recent update log lines, replayed into workspaces opened later.
+    update_history: Vec<(crate::diagnostics::LogLevel, String)>,
 }
 
 impl std::fmt::Debug for AppModel {
@@ -559,6 +572,11 @@ impl AppModel {
             remote_launch: None,
             remote_closes: Vec::new(),
             remote_close_notice: None,
+            updates: UpdateScheduler::unavailable(false),
+            update_store: None,
+            update_confirming: false,
+            update_restarting: false,
+            update_history: Vec::new(),
         }
     }
 
@@ -1903,6 +1921,9 @@ impl AppModel {
         if let Some(current) = self.workbench_mut() {
             current.set_visible(false);
         }
+        for (level, message) in &self.update_history {
+            workbench.diag.log_mut().record(*level, message.clone());
+        }
         let id = WorkspaceId(self.next_workspace);
         self.next_workspace = self
             .next_workspace
@@ -2320,6 +2341,7 @@ impl AppModel {
             workbench.tick(ctx);
         }
         self.push_grok_diagnostics();
+        self.poll_updates(ctx);
         if ctx.input(|input| input.viewport().close_requested()) {
             self.shutdown();
         }
@@ -2347,10 +2369,11 @@ impl AppModel {
         };
         let status = self.smoke_summary();
         println!(
-            "made smoke: window_ready=1 ui_frames={} frames={frames} elapsed_ms={} platform={} {status}",
+            "made smoke: window_ready=1 ui_frames={} frames={frames} elapsed_ms={} platform={} {status} {}",
             self.ui_frames,
             elapsed.as_millis(),
-            platform_family_label()
+            platform_family_label(),
+            self.smoke_layout_markers()
         );
         println!("made smoke: OK");
         self.shutdown();
@@ -2399,6 +2422,7 @@ impl AppModel {
         }
         let active = self.active;
         let native_backdrop_applied = self.native_backdrop.is_applied();
+        let mut panel = self.update_panel();
         if let Some((id, workbench)) = self
             .workspaces
             .iter_mut()
@@ -2409,11 +2433,20 @@ impl AppModel {
                     ui,
                     &mut self.show_sessions,
                     &mut self.show_about,
+                    &mut panel,
                     native_backdrop_applied,
                 )
             });
         } else {
             ui::starting_ui(self, ui);
+        }
+        if !self.show_about {
+            self.update_confirming = false;
+        }
+        let actions = std::mem::take(&mut panel.actions);
+        if !actions.is_empty() {
+            let ctx = ui.ctx().clone();
+            self.handle_update_actions(&ctx, &actions);
         }
     }
 
@@ -2460,6 +2493,169 @@ impl AppModel {
     /// Smoke mode enabled.
     pub fn smoke_mode(&self) -> bool {
         self.smoke.is_some()
+    }
+
+    /// Install the update scheduler and the REL-10 preference store. The
+    /// default is an unavailable scheduler (non-installed build).
+    pub fn set_updates(
+        &mut self,
+        scheduler: UpdateScheduler,
+        store: Option<crate::preferences::PreferenceStore>,
+    ) {
+        self.updates = scheduler;
+        self.update_store = store;
+    }
+
+    /// Record an update-related line in every workspace's diagnostics log,
+    /// now and for workspaces opened later (bounded).
+    pub fn record_update_note(&mut self, level: crate::diagnostics::LogLevel, message: String) {
+        let message = crate::sanitize::sanitize_log_text(&message);
+        for (_, workbench) in &mut self.workspaces {
+            workbench.diag.log_mut().record(level, message.clone());
+        }
+        self.update_history.push((level, message));
+        if self.update_history.len() > 32 {
+            self.update_history.remove(0);
+        }
+    }
+
+    /// The update scheduler.
+    pub fn updates(&self) -> &UpdateScheduler {
+        &self.updates
+    }
+
+    /// Whether a verified update is ready (the wordmark indicator).
+    pub fn update_ready(&self) -> bool {
+        self.updates.ready_version().is_some()
+    }
+
+    /// Whether `Restart now` handed the update to the updater.
+    pub fn update_restarting(&self) -> bool {
+        self.update_restarting
+    }
+
+    fn update_panel(&self) -> UpdatePanel {
+        UpdatePanel {
+            controls: self.updates.available(),
+            status_line: self
+                .updates
+                .status()
+                .line(crate::updates::format_check_time),
+            busy: self.updates.busy(),
+            automatic: self.updates.automatic(),
+            ready: self.updates.ready_version().map(str::to_owned),
+            confirming: self.update_confirming && self.updates.ready_version().is_some(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        self.updates.tick(Instant::now());
+        let events = self.updates.take_events();
+        if !events.is_empty() {
+            for event in &events {
+                let (level, message) = crate::diagnostics::update_log_message(event);
+                self.record_update_note(level, message);
+            }
+            ctx.request_repaint();
+        }
+        if self.updates.busy() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// Apply About Updates actions taken in this frame.
+    pub fn handle_update_actions(&mut self, ctx: &egui::Context, actions: &[UpdateAction]) {
+        for action in actions {
+            match action {
+                UpdateAction::CheckNow => self.updates.check_now(),
+                UpdateAction::SetAutomatic(enabled) => {
+                    self.updates.set_automatic(*enabled, Instant::now());
+                    let saved = self
+                        .update_store
+                        .as_ref()
+                        .map(|store| store.set_automatic_checks(*enabled));
+                    if let Some(Err(error)) = saved {
+                        self.record_update_note(crate::diagnostics::LogLevel::Warn, error);
+                    }
+                }
+                UpdateAction::RequestRestart => {
+                    self.update_confirming = self.updates.ready_version().is_some();
+                }
+                UpdateAction::Dismiss => self.update_confirming = false,
+                UpdateAction::RestartNow => self.restart_to_update(ctx),
+            }
+        }
+    }
+
+    /// `Restart now`: close every workspace, then hand the verified update to
+    /// the updater and close the window so it can apply and relaunch.
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        self.update_confirming = false;
+        if self.updates.ready_version().is_none() {
+            return;
+        }
+        self.show_about = false;
+        self.shutdown();
+        match self.updates.restart() {
+            Ok(_) => {
+                self.update_restarting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                eprintln!("made: could not start the update: {error}");
+            }
+        }
+    }
+
+    /// Smoke markers for the installed-layout check (REL-03, REL-11): the
+    /// OpenCode plugin source, `made-grok-status`, companion and askpass
+    /// resolution, the update state, the production update repository and
+    /// whether the test-only update seam was compiled in.
+    pub fn smoke_layout_markers(&self) -> String {
+        const COMPANION_TARGETS: [&str; 4] = [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ];
+        let paths = made_platform::host_platform().app_paths().ok();
+        let plugin = paths
+            .as_ref()
+            .map(|paths| {
+                let found = paths.plugin_dir.join("package.json").is_file();
+                format!(
+                    "{}{}",
+                    paths.plugin_source.name(),
+                    if found { "" } else { ":missing" }
+                )
+            })
+            .unwrap_or_else(|| "unresolved".to_owned());
+        let hook = format!("made-grok-status{}", std::env::consts::EXE_SUFFIX);
+        let grok = paths
+            .as_ref()
+            .and_then(|paths| paths.grok_plugin_dir.clone())
+            .map(|dir| dir.join("hooks").join("bin").join(&hook).is_file())
+            .map(|found| if found { "present" } else { "missing" })
+            .unwrap_or("unresolved");
+        let companions = COMPANION_TARGETS
+            .iter()
+            .filter(|target| crate::ssh_servers::companion_artifact(target).is_some())
+            .count();
+        let askpass = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                exe.parent()
+                    .map(|dir| dir.join(made_platform::askpass_file_name()))
+            })
+            .is_some_and(|path| path.is_file());
+        format!(
+            "version={APP_VERSION} opencode_plugin={plugin} grok_status={grok} companions={companions}/4 askpass={} updates={} update_repo={} update_seam={}",
+            if askpass { "found" } else { "missing" },
+            if self.updates.available() { "enabled" } else { "disabled" },
+            made_platform::update::UPDATE_REPOSITORY,
+            u8::from(made_platform::update::TEST_SEAM_ENABLED),
+        )
     }
 
     /// Version banner.

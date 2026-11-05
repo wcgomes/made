@@ -300,6 +300,73 @@ impl DiagnosticLog {
     }
 }
 
+/// Fixed log wording for an update outcome.
+pub fn update_log_message(event: &crate::updates::UpdateEvent) -> (LogLevel, String) {
+    use crate::updates::UpdateEvent;
+    let version = |version: &str| {
+        if version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+            && version.len() <= 64
+        {
+            version.to_owned()
+        } else {
+            "unknown".to_owned()
+        }
+    };
+    match event {
+        UpdateEvent::KeptFound(v) => (
+            LogLevel::Info,
+            format!("update: kept verified update {} found", version(v)),
+        ),
+        UpdateEvent::CheckStarted { manual: true } => {
+            (LogLevel::Info, "update: manual check started".to_owned())
+        }
+        UpdateEvent::CheckStarted { manual: false } => {
+            (LogLevel::Info, "update: automatic check started".to_owned())
+        }
+        UpdateEvent::UpToDate => (LogLevel::Info, "update: up to date".to_owned()),
+        UpdateEvent::Available(v) => (
+            LogLevel::Info,
+            format!("update: version {} available, downloading", version(v)),
+        ),
+        UpdateEvent::CheckFailed => (
+            LogLevel::Warn,
+            "update: check failed: the update service could not be reached".to_owned(),
+        ),
+        UpdateEvent::Ready(v) => (
+            LogLevel::Info,
+            format!("update: version {} downloaded and verified", version(v)),
+        ),
+        UpdateEvent::DownloadFailed(v) => (
+            LogLevel::Warn,
+            format!("update: download of version {} failed", version(v)),
+        ),
+        UpdateEvent::VerificationFailed(v) => (
+            LogLevel::Warn,
+            format!(
+                "update: version {} failed verification and was discarded",
+                version(v)
+            ),
+        ),
+        UpdateEvent::Busy => (
+            LogLevel::Info,
+            "update: another update operation was in progress".to_owned(),
+        ),
+        UpdateEvent::RestartRequested(v) => (
+            LogLevel::Info,
+            format!("update: restart into version {} confirmed", version(v)),
+        ),
+        UpdateEvent::RestartFailed(v) => (
+            LogLevel::Error,
+            format!(
+                "update: the updater for version {} could not start",
+                version(v)
+            ),
+        ),
+    }
+}
+
 /// Diagnostics container owned by the app.
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
@@ -372,6 +439,14 @@ impl Diagnostics {
     /// Mutable log for integration lifecycle entries.
     pub fn log_mut(&mut self) -> &mut DiagnosticLog {
         &mut self.log
+    }
+
+    /// Record one update outcome (REL-08, REL-09). Only fixed wording and
+    /// validated version numbers reach the log: never a path, user name,
+    /// token or transport detail.
+    pub fn record_update(&mut self, event: &crate::updates::UpdateEvent) {
+        let (level, message) = update_log_message(event);
+        self.log.record(level, sanitize_log_text(&message));
     }
 
     /// Log file location.

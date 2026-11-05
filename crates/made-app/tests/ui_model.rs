@@ -12686,3 +12686,370 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
         "withdrawal is disclosed: {withdrawn}"
     );
 }
+
+// ── Update UI (add-release-auto-update task 6.1) ───────────────────────────
+
+#[derive(Clone, Default)]
+struct FakeUpdates {
+    kept: Option<String>,
+    offer: Option<String>,
+    check_delay: Duration,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl made_app::updates::UpdateCapability for FakeUpdates {
+    fn kept(&mut self) -> Option<String> {
+        self.kept.clone()
+    }
+    fn check(&mut self) -> Result<Option<String>, made_app::updates::UpdateFailure> {
+        std::thread::sleep(self.check_delay);
+        self.calls.lock().unwrap().push("check".into());
+        Ok(self.offer.clone())
+    }
+    fn download(&mut self, version: &str) -> Result<String, made_app::updates::UpdateFailure> {
+        Ok(version.to_owned())
+    }
+    fn restarter(&self) -> made_app::updates::Restarter {
+        let calls = self.calls.clone();
+        Box::new(move |version: &str| {
+            calls.lock().unwrap().push(format!("restart {version}"));
+            Ok(())
+        })
+    }
+}
+
+fn installed_updates(model: &mut AppModel, fake: &FakeUpdates) {
+    let store = made_app::preferences::PreferenceStore::from_app_paths();
+    model.set_updates(
+        made_app::updates::UpdateScheduler::start(Box::new(fake.clone()), false, Instant::now()),
+        store,
+    );
+}
+
+fn accent_dots_in(output: &egui::FullOutput, rect: egui::Rect) -> usize {
+    circle_shapes(output)
+        .iter()
+        .filter(|circle| {
+            circle.fill == made_app::theme::ACCENT && rect.expand(1.0).contains(circle.center)
+        })
+        .count()
+}
+
+fn wordmark_rect(headless: &Headless) -> egui::Rect {
+    headless.response(made_app::theme::wordmark_id()).rect
+}
+
+#[test]
+fn update_indicator_appears_only_when_ready_on_the_active_header_wordmark() {
+    if isolated("update_indicator_appears_only_when_ready_on_the_active_header_wordmark") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "update-dot", "main.rs");
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        // Non-installed and installed-without-ready builds show no indicator.
+        let mut rects = Vec::new();
+        for ready in [None, Some("0.3.0")] {
+            let mut model =
+                AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+            let fake = FakeUpdates {
+                kept: ready.map(str::to_owned),
+                ..FakeUpdates::default()
+            };
+            installed_updates(&mut model, &fake);
+            let id = open_workspace(&mut model, &root);
+            let mut headless = Headless::new(model, width, height);
+            wait_explorer_ready(&mut headless, id);
+            headless.pump_until(|model| model.update_ready() == ready.is_some());
+            let output = headless.render();
+            let rect = wordmark_rect(&headless);
+            rects.push(rect);
+            assert_eq!(
+                accent_dots_in(&output, rect),
+                usize::from(ready.is_some()),
+                "{width}x{height} ready={ready:?}"
+            );
+            let name = if ready.is_some() {
+                "About, update ready"
+            } else {
+                "About"
+            };
+            headless.ctx.enable_accesskit();
+            let output = headless.render();
+            let (role, label, _) = accesskit_row_state(&output, made_app::theme::wordmark_id());
+            assert_eq!(role, egui::Role::Button);
+            assert_eq!(
+                label.as_deref(),
+                Some(name),
+                "accessibility name at {width}x{height}"
+            );
+        }
+        assert_eq!(
+            rects[0], rects[1],
+            "the indicator never changes the wordmark target"
+        );
+    }
+
+    // A non-installed build never shows it; the picker wordmark never does.
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    let output = headless.render();
+    assert_eq!(accent_dots_in(&output, wordmark_rect(&headless)), 0);
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    installed_updates(
+        &mut model,
+        &FakeUpdates {
+            kept: Some("0.3.0".into()),
+            ..FakeUpdates::default()
+        },
+    );
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.pump_until(AppModel::update_ready);
+    let picker = headless.render();
+    assert!(
+        circle_shapes(&picker)
+            .iter()
+            .all(|circle| circle.fill != made_app::theme::ACCENT
+                || circle.radius != made_app::theme::UPDATE_DOT_RADIUS),
+        "the picker wordmark never shows the indicator"
+    );
+    // Opening a workspace shows the ready update again.
+    let id = open_workspace(&mut headless.model, &root);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    let output = headless.render();
+    assert_eq!(
+        accent_dots_in(&output, wordmark_rect(&headless)),
+        1,
+        "dots: {:?} wordmark: {:?}",
+        circle_shapes(&output)
+            .iter()
+            .map(|c| (c.center, c.radius))
+            .collect::<Vec<_>>(),
+        wordmark_rect(&headless)
+    );
+}
+
+#[test]
+fn about_updates_section_shows_status_and_controls_for_the_build() {
+    if isolated("about_updates_section_shows_status_and_controls_for_the_build") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "update-about", "main.rs");
+
+    // Non-installed: the status line only, no controls, no error treatment.
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(made_app::theme::wordmark_id());
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("UPDATES") && text.contains("Updates are not available for this build."),
+        "{text}"
+    );
+    for absent in ["Check for updates", "Restart to update"] {
+        assert!(
+            !text.contains(absent),
+            "{absent} in a non-installed build: {text}"
+        );
+    }
+
+    // Installed, nothing ready, automatic checks off.
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let fake = FakeUpdates {
+            check_delay: Duration::from_millis(400),
+            ..FakeUpdates::default()
+        };
+        installed_updates(&mut model, &fake);
+        let id = open_workspace(&mut model, &root);
+        let mut headless = Headless::new(model, width, height);
+        wait_explorer_ready(&mut headless, id);
+        headless.click(made_app::theme::wordmark_id());
+        let text = output_text(&headless.render());
+        for expected in [
+            "UPDATES",
+            "Not checked for updates yet.",
+            "Check for updates",
+            "Check for updates automatically",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected:?} at {width}x{height}: {text}"
+            );
+        }
+        assert!(!text.contains("Restart to update"));
+
+        headless.click(made_app::ui::about_update_check_id());
+        assert!(headless.model.updates().busy());
+        assert!(output_text(&headless.render()).contains("Checking for updates"));
+        headless.click(made_app::ui::about_update_check_id());
+        headless.pump_until(|model| !model.updates().busy());
+        assert_eq!(
+            fake.calls.lock().unwrap().len(),
+            1,
+            "Check for updates is unavailable while a check runs"
+        );
+        assert!(output_text(&headless.render()).contains("Up to date. Last checked just now."));
+
+        assert!(!headless.model.updates().automatic());
+        headless.click(made_app::ui::about_update_automatic_id());
+        headless.pump_until(|model| !model.updates().busy());
+        assert!(
+            headless.model.updates().automatic(),
+            "the toggle changes the REL-10 choice"
+        );
+        assert!(
+            made_app::preferences::PreferenceStore::from_app_paths()
+                .unwrap()
+                .load()
+                .automatic_checks
+        );
+        headless.click(made_app::ui::about_update_automatic_id());
+        assert!(
+            !made_app::preferences::PreferenceStore::from_app_paths()
+                .unwrap()
+                .load()
+                .automatic_checks
+        );
+
+        let window = headless
+            .ctx
+            .memory(|memory| {
+                let pane = headless.model.workspace(id).unwrap().pane_id().to_owned();
+                memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str())))
+            })
+            .expect("About window rect");
+        headless.pump_until(|model| !model.updates().busy());
+        for control in [
+            made_app::ui::about_update_check_id(),
+            made_app::ui::about_update_automatic_id(),
+        ] {
+            assert!(
+                window.contains_rect(headless.response(control).rect),
+                "control clipped at {width}x{height}"
+            );
+            assert!(
+                headless.response(control).rect.height() >= 24.0,
+                "minimum target"
+            );
+            headless.focus(control);
+            let focused = headless.render();
+            assert!(
+                !focus_ring_rects(&focused, headless.response(control).rect.expand(6.0)).is_empty(),
+                "visible focus ring on {control:?} (focused: {:?})",
+                headless.ctx.memory(|memory| memory.focused())
+            );
+        }
+    }
+}
+
+#[test]
+fn restart_confirmation_lives_inside_about_and_not_now_touches_nothing() {
+    if isolated("restart_confirmation_lives_inside_about_and_not_now_touches_nothing") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let first = fixture_workspace(temp.path(), "update-one", "main.rs");
+    let second = fixture_workspace(temp.path(), "update-two", "lib.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let fake = FakeUpdates {
+        kept: Some("0.3.0".into()),
+        ..FakeUpdates::default()
+    };
+    installed_updates(&mut model, &fake);
+    let one = open_workspace(&mut model, &first);
+    let two = open_workspace(&mut model, &second);
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    wait_explorer_ready(&mut headless, two);
+    headless.pump_until(AppModel::update_ready);
+    let confirmation = made_app::ui::restart_confirmation_text("0.3.0");
+
+    headless.click(made_app::theme::wordmark_id());
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("Made 0.3.0 is ready to install.") && text.contains("Restart to update"),
+        "{text}"
+    );
+    headless.click(made_app::ui::about_update_restart_id());
+    let text = output_text(&headless.render());
+    for expected in [
+        "0.3.0",
+        "OpenCode, Grok and SSH sessions",
+        "will not be restored",
+        "Restart now",
+        "Not now",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?}: {text}");
+    }
+    let pane = headless.model.workspace(two).unwrap().pane_id().to_owned();
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str()))))
+        .unwrap();
+    assert!(
+        window.contains_rect(
+            headless
+                .response(made_app::ui::about_update_not_now_id())
+                .rect
+        ),
+        "the compact card fits the confirmation"
+    );
+
+    headless.click(made_app::ui::about_update_not_now_id());
+    let text = output_text(&headless.render());
+    assert!(
+        !text.contains("Restart now"),
+        "Not now dismisses the confirmation"
+    );
+    assert!(fake.calls.lock().unwrap().is_empty());
+    for id in [one, two] {
+        assert!(
+            headless.model.workspace(id).is_some(),
+            "workspaces untouched"
+        );
+    }
+
+    // Closing About dismisses it; reopening shows the ready state only.
+    headless.click(made_app::ui::about_update_restart_id());
+    assert!(output_text(&headless.render()).contains("Restart now"));
+    headless.click(made_app::theme::wordmark_id());
+    headless.render();
+    headless.click(made_app::theme::wordmark_id());
+    let text = output_text(&headless.render());
+    assert!(
+        text.contains("Restart to update") && !text.contains("Restart now"),
+        "{text}"
+    );
+    assert!(!text.contains(&confirmation[..20]));
+
+    // Restart now closes every workspace, then hands 0.3.0 to the updater.
+    headless.click(made_app::ui::about_update_restart_id());
+    assert!(output_text(&headless.render()).contains("Restart now"));
+    headless.click(made_app::ui::about_update_restart_now_id());
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        vec!["restart 0.3.0".to_owned()],
+        "ready={:?} restarting={}",
+        headless.model.updates().ready_version(),
+        headless.model.update_restarting()
+    );
+    assert!(headless.model.update_restarting());
+    for id in [one, two] {
+        let running = headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.is_running());
+        assert!(
+            !running,
+            "workspace {id:?} must be closed before the update applies"
+        );
+    }
+}

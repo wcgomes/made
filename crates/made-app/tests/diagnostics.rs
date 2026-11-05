@@ -1201,3 +1201,64 @@ fn remote_grok_failure_names_the_actual_failure_not_generic_transport() {
         "the copy must not replace the stage failure with transport: {text}"
     );
 }
+
+#[test]
+fn update_outcomes_reach_the_bounded_redacted_log() {
+    use made_app::updates::UpdateEvent;
+    let mut diagnostics = Diagnostics::new("/home/alice/.local/state/made/log/integration.log");
+    let events = [
+        UpdateEvent::KeptFound("0.3.0".into()),
+        UpdateEvent::CheckStarted { manual: false },
+        UpdateEvent::CheckStarted { manual: true },
+        UpdateEvent::UpToDate,
+        UpdateEvent::Available("0.3.0".into()),
+        UpdateEvent::CheckFailed,
+        UpdateEvent::Ready("0.3.0".into()),
+        UpdateEvent::DownloadFailed("0.3.0".into()),
+        UpdateEvent::VerificationFailed("0.3.0".into()),
+        UpdateEvent::Busy,
+        UpdateEvent::RestartRequested("0.3.0".into()),
+        UpdateEvent::RestartFailed("0.3.0".into()),
+        // A version string carrying a path, user name or token never reaches the log.
+        UpdateEvent::Available(format!("/home/alice/{}", "0123456789abcdef".repeat(4))),
+    ];
+    for event in &events {
+        diagnostics.record_update(event);
+    }
+    let text: Vec<String> = diagnostics
+        .log()
+        .entries()
+        .map(|entry| entry.message.clone())
+        .collect();
+    assert_eq!(text.len(), events.len());
+    for expected in [
+        "update: kept verified update 0.3.0 found",
+        "update: automatic check started",
+        "update: manual check started",
+        "update: up to date",
+        "update: check failed: the update service could not be reached",
+        "update: version 0.3.0 downloaded and verified",
+        "update: download of version 0.3.0 failed",
+        "update: version 0.3.0 failed verification and was discarded",
+        "update: restart into version 0.3.0 confirmed",
+        "update: version unknown available, downloading",
+    ] {
+        assert!(
+            text.iter().any(|line| line == expected),
+            "missing {expected:?} in {text:?}"
+        );
+    }
+    for line in &text {
+        assert!(
+            !line.contains("alice") && !line.contains('/') && !line.contains("0123456789abcdef"),
+            "{line}"
+        );
+    }
+    for _ in 0..(MAX_LOG_ENTRIES + 50) {
+        diagnostics.record_update(&UpdateEvent::CheckFailed);
+    }
+    assert!(
+        diagnostics.log().len() <= MAX_LOG_ENTRIES,
+        "the log stays bounded"
+    );
+}
