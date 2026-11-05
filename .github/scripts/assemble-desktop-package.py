@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import stat
 import sys
@@ -149,7 +150,8 @@ def copy_tree(source: Path, destination: Path) -> None:
     # Workflow artifact download does not preserve modes, so the executable bit
     # is restored here exactly like the companion's, then checked.
     hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    if not hook.stat().st_mode & stat.S_IXUSR:
+    # Windows has no executable mode bit; the remote targets are POSIX only.
+    if os.name != "nt" and not hook.stat().st_mode & stat.S_IXUSR:
         fail(f"copied native hook is not executable: {hook}")
 
 
