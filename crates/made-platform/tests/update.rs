@@ -730,6 +730,109 @@ mod seam {
         assert!(!head.contains('?'), "no query string: {head}");
     }
 
+    /// Child half of the CLI apply test: a running GUI instance.
+    #[test]
+    fn instance_holder_child() {
+        let Ok(dirs) = std::env::var("MADE_INSTANCE_CHILD") else {
+            return;
+        };
+        let (packages, data) = dirs.split_once('|').unwrap();
+        let installation = seam::installation(packages.into(), data.into(), "0.2.0");
+        let _guard = made_platform::update::register_instance(&installation).unwrap();
+        std::fs::write(Path::new(packages).join("child-ready"), b"").unwrap();
+        let stop = Path::new(packages).join("child-stop");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !stop.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_apply_refuses_while_made_runs_holds_the_install_lock_and_never_restarts() {
+        use made_platform::update::{register_instance, CliApplyOutcome};
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let package = nupkg("Made", "0.3.0");
+        let listed = asset("0.3.0", &package);
+        fixture.feed(std::slice::from_ref(&listed));
+        fixture.publish("0.3.0", &package, &listed);
+        let updater = fixture.updater("0.2.0");
+        let ready = updater
+            .download(&updater.check().unwrap().unwrap())
+            .unwrap();
+        let args = fixture.packages.join("updater-args");
+        let script = fixture.packages.join("Update");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\nsleep 2\n", args.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A running GUI instance of this install refuses the apply.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["seam::instance_holder_child", "--exact", "--nocapture"])
+            .env(
+                "MADE_INSTANCE_CHILD",
+                format!("{}|{}", fixture.packages.display(), fixture.data.display()),
+            )
+            .spawn()
+            .unwrap();
+        let ready_flag = fixture.packages.join("child-ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready_flag.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the instance child never registered"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        match updater.apply_from_cli(&ready) {
+            Err(UpdateError::InstanceRunning(pids)) => assert_eq!(pids, vec![child.id()]),
+            other => panic!("apply was not refused: {other:?}"),
+        }
+        assert!(!args.exists(), "a refused apply changes no installed files");
+        std::fs::write(fixture.packages.join("child-stop"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+
+        // While the apply runs it holds the install lock; GUI startup refuses.
+        let installation =
+            seam::installation(fixture.packages.clone(), fixture.data.clone(), "0.2.0");
+        let applying = std::thread::spawn(move || updater.apply_from_cli(&ready));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !args.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the updater never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refused = register_instance(&installation);
+        assert!(
+            refused.is_err(),
+            "GUI startup must refuse during a command-line apply"
+        );
+        assert!(refused.err().unwrap().to_string().contains("being applied"));
+        assert_eq!(
+            applying.join().unwrap().unwrap(),
+            CliApplyOutcome::Applied("0.3.0".into())
+        );
+        let recorded = std::fs::read_to_string(&args).unwrap();
+        for expected in ["apply", "--package", "--silent", "--norestart"] {
+            assert!(recorded.contains(expected), "{recorded}");
+        }
+        assert!(
+            !recorded.contains("--waitPid"),
+            "the CLI apply waits for no GUI and starts none"
+        );
+        assert!(
+            register_instance(&installation).is_ok(),
+            "startup works again after the apply"
+        );
+    }
+
     #[test]
     fn the_production_transport_refuses_plain_http() {
         let transport = seam::production_transport();
