@@ -1933,7 +1933,7 @@ def grok_update_in_place(h, fx, workspace, mutation=False):
     version_root = data_root / 'remote' / version
     destination = version_root / target
 
-    files_a = staged_artifact_bytes(fx.binary)
+    files_a = staged_artifact_bytes(fx.host_companion)
     updated_companion = b'#!/bin/sh\nprintf \'updated:%s\\n\' "$1"\n'
     files_b = dict(files_a)
     files_b['made-remote'] = updated_companion
