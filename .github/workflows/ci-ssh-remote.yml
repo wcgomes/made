@@ -64,6 +64,8 @@ jobs:
       # smoke happen in Debian 11, whose libc is 2.31. This is target-native
       # execution, not a cross-compiler and not the host toolchain.
       - name: Build and test the companion on glibc 2.31
+        # A hung test fails here within minutes instead of stalling a release.
+        timeout-minutes: 30
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -151,6 +153,7 @@ jobs:
           key: companion-${{ matrix.target }}
 
       - name: Build and test the headless companion
+        timeout-minutes: 30
         env:
           TARGET: ${{ matrix.target }}
         run: bash .github/scripts/build-macos-companion.sh
