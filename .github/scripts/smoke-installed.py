@@ -90,6 +90,12 @@ def install(form: str, assets: Path, version: str) -> tuple[list[str], Path, Pat
             pkg = one(assets, f"made-{version}-macos-*.pkg")
             result = run(["installer", "-pkg", pkg, "-target", "CurrentUserHomeDirectory"])
             check(result.returncode == 0, "the .pkg installs for the current user without administrator rights")
+            # The package opens Made once after installing; close that window.
+            time.sleep(8)
+            run(["pkill", "-x", "made-app"])
+            deadline = time.time() + 30
+            while time.time() < deadline and run(["pgrep", "-x", "made-app"]).returncode == 0:
+                time.sleep(1)
             # The package starts Made once after installing; close that window.
             time.sleep(8)
             run(["pkill", "-x", "made-app"])
