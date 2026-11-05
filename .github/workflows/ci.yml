@@ -135,6 +135,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # REL-02: every version site must equal [workspace.package].version. The
+  # release helper scripts' own tests run here too.
+  versions:
+    name: Version sites and release scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Check that every version site agrees
+        run: python3 .github/scripts/check-versions.py
+
+      - name: Test the release helper scripts
+        run: |
+          set -euo pipefail
+          for test in .github/scripts/test_*.py; do
+            echo "::group::$test"
+            python3 "$test" -v
+            echo "::endgroup::"
+          done
+
   # The plugin is platform-neutral TypeScript; one Linux runner is
   # representative. Native OpenCode distribution checks live in the per-OS
   # smoke workflows.

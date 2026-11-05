@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -322,7 +323,10 @@ test("connects, sends hello, waits for welcome, and sends initial state", async 
     assert.equal(hello.protocolVersion, PROTOCOL_VERSION);
     assert.equal(hello.token, TOKEN);
     assert.equal(hello.paneId, "pane-test");
-    assert.equal(hello.pluginVersion, "0.1.0");
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    assert.equal(hello.pluginVersion, manifest.version);
     assert.equal(hello.opencodeVersion, "2.1.4");
     assert.equal(hello.pid, process.pid);
     assert.equal(hello.cwd, process.cwd());
