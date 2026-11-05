@@ -16,3 +16,6 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Python bytecode from the CI helper scripts
+__pycache__/
