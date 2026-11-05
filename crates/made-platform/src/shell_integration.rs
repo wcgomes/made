@@ -341,18 +341,118 @@ pub struct CwdReportSink {
     directory: PathBuf,
     path: PathBuf,
 }
+/// AF_UNIX `sockaddr_un.sun_path` holds 104 bytes on macOS and 108 on Linux,
+/// terminator included. 103 is the strictest portable endpoint-path budget.
+#[cfg(unix)]
+const AF_UNIX_ENDPOINT_CHARS: usize = 103;
+
+/// Temp-root sink name for one exclusive directory. Clock nanoseconds keep
+/// the name unknowable before its creation, so a hostile local user cannot
+/// pre-create the path and displace the sink; the process-unique counter
+/// keeps concurrent attempts distinct.
+#[cfg(unix)]
+fn sink_directory_name(next: &AtomicU64) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "cwd-{}-{}-{:x}",
+        std::process::id(),
+        next.fetch_add(1, Ordering::Relaxed),
+        nanos
+    )
+}
+
+/// Sink directory under the OS temp root for session runtime paths that
+/// exceed [`AF_UNIX_ENDPOINT_CHARS`]. The temp root never grows with HOME or
+/// data roots, and `/tmp` is the last resort when TMPDIR itself is too long.
+/// The directory is created exclusively, published owner-only, and must then
+/// be a real owner-only directory owned by this user: a symlinked, foreign or
+/// permissive leftover is refused, never repaired. Nothing about the endpoint
+/// or its owner is encoded in the name. A crashed owner leaves one 0700
+/// directory for the OS temp cleaner.
+#[cfg(unix)]
+fn temp_root_sink_directory(name: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // SAFETY: getuid only reads the real user id.
+    let uid = unsafe { libc::getuid() };
+    let mut last = None;
+    for root in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        let directory = root.join(name);
+        if directory.join("report.sock").as_os_str().len() > AF_UNIX_ENDPOINT_CHARS {
+            continue;
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {}
+            Err(error) => {
+                last = Some(error);
+                continue;
+            }
+        }
+        // umask can only clear bits; publish the exact owner-only mode the
+        // same way the private temp directory discipline does.
+        let _ = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700));
+        let meta = fs::symlink_metadata(&directory)?;
+        if meta.file_type().is_symlink()
+            || !meta.is_dir()
+            || meta.uid() != uid
+            || meta.permissions().mode() & 0o777 != 0o700
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cwd sink directory is not a private owner-only directory",
+            ));
+        }
+        return Ok(directory);
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::other("no temp root is short enough for a cwd sink endpoint")
+    }))
+}
+
 #[cfg(unix)]
 impl CwdReportSink {
+    /// Binds one private datagram endpoint. The endpoint lives under `parent`
+    /// while that path fits the kernel AF_UNIX address limit; otherwise it
+    /// lives in its own owner-only directory under the OS temp root, so a long
+    /// HOME or data root cannot prevent publication. Exclusive creation keeps
+    /// a reused pid from aliasing a live or stale sink. Dropping the sink
+    /// removes the endpoint and its directory.
     pub fn new(parent: &Path) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::DirBuilderExt;
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let directory = parent.join(format!(
-            "cwd-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let mut directory = None;
+        let mut last = None;
+        for _ in 0..16 {
+            let name = format!(
+                "cwd-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let attempt = if parent.join(&name).join("report.sock").as_os_str().len()
+                <= AF_UNIX_ENDPOINT_CHARS
+            {
+                let directory = parent.join(name);
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&directory)
+                    .map(|()| directory)
+            } else {
+                temp_root_sink_directory(&sink_directory_name(&NEXT))
+            };
+            match attempt {
+                Ok(created) => {
+                    directory = Some(created);
+                    break;
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        let Some(directory) = directory else {
+            return Err(last.unwrap_or_else(|| std::io::Error::other("no cwd sink directory")));
+        };
         let path = directory.join("report.sock");
         let socket = match std::os::unix::net::UnixDatagram::bind(&path) {
             Ok(s) => s,

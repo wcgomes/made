@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Lock the grok-made status hook contract.
 
-One JSON object on stdin, with stdin left open, must append sessionId, cwd,
-event, and status, then exit 0. PreToolUse ask_user_question and a permission
-notification are attention. PostToolUse ask_user_question returns to working.
+One JSON object on stdin, with stdin left open, must append sessionId, pid,
+cwd, event, and status, then exit 0. PreToolUse ask_user_question and a
+permission notification are attention. PostToolUse ask_user_question returns
+to working.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -21,25 +23,24 @@ HOOKS_JSON = HOOKS / "hooks.json"
 
 def run_status(event, grok_home):
     """Run one event and require exit before stdin is closed."""
-    proc = subprocess.Popen(
+    with subprocess.Popen(
         [sys.executable, str(STATUS)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={"GROK_HOME": str(grok_home), "PATH": "/usr/bin:/bin"},
-    )
-    assert proc.stdin is not None
-    proc.stdin.write(json.dumps(event).encode())
-    proc.stdin.flush()
-    try:
-        code = proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise AssertionError("status.py waited for stdin to close") from None
-    stdout = proc.stdout.read() if proc.stdout is not None else b""
-    stderr = proc.stderr.read() if proc.stderr is not None else b""
-    proc.stdin.close()
+    ) as proc:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(event).encode())
+        proc.stdin.flush()
+        try:
+            code = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise AssertionError("status.py waited for stdin to close") from None
+        stdout = proc.stdout.read() if proc.stdout is not None else b""
+        stderr = proc.stderr.read() if proc.stderr is not None else b""
     assert code == 0, stderr.decode()
     assert stdout == b""
     assert stderr == b""
@@ -52,32 +53,31 @@ def run_status(event, grok_home):
 class StatusHookTest(unittest.TestCase):
     def test_one_object_appends_fields_while_stdin_stays_open(self):
         with tempfile.TemporaryDirectory() as grok_home:
-            proc = subprocess.Popen(
+            with subprocess.Popen(
                 [sys.executable, str(STATUS)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={"GROK_HOME": grok_home, "PATH": "/usr/bin:/bin"},
-            )
-            assert proc.stdin is not None
-            payload = json.dumps(
-                {
-                    "hookEventName": "UserPromptSubmit",
-                    "sessionId": "sess-1",
-                    "cwd": "/work/app",
-                }
-            ).encode()
-            proc.stdin.write(payload)
-            proc.stdin.flush()
-            try:
-                code = proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                self.fail("status.py waited for stdin to close")
-            stdout = proc.stdout.read() if proc.stdout is not None else b""
-            stderr = proc.stderr.read() if proc.stderr is not None else b""
-            proc.stdin.close()
+            ) as proc:
+                assert proc.stdin is not None
+                payload = json.dumps(
+                    {
+                        "hookEventName": "UserPromptSubmit",
+                        "sessionId": "sess-1",
+                        "cwd": "/work/app",
+                    }
+                ).encode()
+                proc.stdin.write(payload)
+                proc.stdin.flush()
+                try:
+                    code = proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    self.fail("status.py waited for stdin to close")
+                stdout = proc.stdout.read() if proc.stdout is not None else b""
+                stderr = proc.stderr.read() if proc.stderr is not None else b""
             self.assertEqual(code, 0, stderr.decode())
             self.assertEqual(stdout, b"")
             self.assertEqual(stderr, b"")
@@ -187,33 +187,47 @@ class StatusHookTest(unittest.TestCase):
                     self.assertEqual(line["event"], event["hookEventName"])
                     self.assertEqual(line["status"], status)
 
+    def test_logged_line_records_the_hook_parent_pid(self):
+        # The hook command runs as a child of the Grok session process, so the
+        # logged pid is the parent of the hook process: here the test process,
+        # in production the Grok session the hook ran under.
+        with tempfile.TemporaryDirectory() as grok_home:
+            line = run_status(
+                {
+                    "hookEventName": "UserPromptSubmit",
+                    "sessionId": "s",
+                    "cwd": "/work",
+                },
+                grok_home,
+            )
+            self.assertEqual(line["pid"], os.getpid())
+
     def test_unrecognized_event_is_not_logged(self):
         with tempfile.TemporaryDirectory() as grok_home:
-            proc = subprocess.Popen(
+            with subprocess.Popen(
                 [sys.executable, str(STATUS)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={"GROK_HOME": grok_home, "PATH": "/usr/bin:/bin"},
-            )
-            assert proc.stdin is not None
-            proc.stdin.write(
-                json.dumps(
-                    {
-                        "hookEventName": "NotARealHook",
-                        "sessionId": "s",
-                        "cwd": "/work",
-                    }
-                ).encode()
-            )
-            proc.stdin.flush()
-            try:
-                code = proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                self.fail("status.py waited for stdin to close")
-            proc.stdin.close()
+            ) as proc:
+                assert proc.stdin is not None
+                proc.stdin.write(
+                    json.dumps(
+                        {
+                            "hookEventName": "NotARealHook",
+                            "sessionId": "s",
+                            "cwd": "/work",
+                        }
+                    ).encode()
+                )
+                proc.stdin.flush()
+                try:
+                    code = proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    self.fail("status.py waited for stdin to close")
             self.assertEqual(code, 0)
             log = Path(grok_home) / "made-grok-status.jsonl"
             text = log.read_text(encoding="utf-8") if log.exists() else ""

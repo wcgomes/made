@@ -94,12 +94,25 @@ pub struct ProvisionConsent {
     pub version: String,
 }
 
+/// Explicit SSH-10 approval to run the official Grok plugin installer for one
+/// shipped plugin version on this server. Refusal is the absence of consent;
+/// it is never recorded as approval and no secret is persisted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokInstallConsent {
+    pub version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedServer {
     id: AuthorityId,
     metadata: ServerMetadata,
     consent: Option<ProvisionConsent>,
+    /// Distinct per-server/version consent kind. `#[serde(default)]` keeps
+    /// schema-v1 documents written before this kind loading with it absent.
+    #[serde(default)]
+    grok_consent: Option<GrokInstallConsent>,
 }
 impl SavedServer {
     pub fn id(&self) -> AuthorityId {
@@ -111,8 +124,16 @@ impl SavedServer {
     pub fn consent(&self) -> Option<&ProvisionConsent> {
         self.consent.as_ref()
     }
+    pub fn grok_consent(&self) -> Option<&GrokInstallConsent> {
+        self.grok_consent.as_ref()
+    }
     pub fn allows_provision(&self, version: &str) -> bool {
         self.consent
+            .as_ref()
+            .is_some_and(|consent| consent.version == version)
+    }
+    pub fn allows_grok_install(&self, version: &str) -> bool {
+        self.grok_consent
             .as_ref()
             .is_some_and(|consent| consent.version == version)
     }
@@ -198,6 +219,9 @@ impl<S: ServerStorage> ServerRegistry<S> {
                     if let Some(consent) = &server.consent {
                         validate_version(&consent.version).map_err(|_| RegistryError::Corrupt)?;
                     }
+                    if let Some(consent) = &server.grok_consent {
+                        validate_version(&consent.version).map_err(|_| RegistryError::Corrupt)?;
+                    }
                 }
                 document.servers
             }
@@ -251,6 +275,7 @@ impl<S: ServerStorage> ServerRegistry<S> {
             id,
             metadata,
             consent: None,
+            grok_consent: None,
         });
         self.persist(servers)?;
         Ok(id)
@@ -270,6 +295,7 @@ impl<S: ServerStorage> ServerRegistry<S> {
             .ok_or(RegistryError::NotFound)?;
         server.metadata = metadata;
         server.consent = None;
+        server.grok_consent = None;
         self.persist(servers)?;
         Ok(self.invalidate_probe(id))
     }
@@ -297,6 +323,25 @@ impl<S: ServerStorage> ServerRegistry<S> {
             .find(|s| s.id == id)
             .ok_or(RegistryError::NotFound)?
             .consent = version.map(|version| ProvisionConsent { version });
+        self.persist(servers)
+    }
+    /// Grant or withdraw the separate SSH-10 Grok plugin install consent for
+    /// one server and shipped plugin version. `None` is a withdrawal; a
+    /// refusal is simply never granted and never stored as approval.
+    pub fn set_grok_consent(
+        &mut self,
+        id: AuthorityId,
+        version: Option<String>,
+    ) -> Result<(), RegistryError> {
+        if let Some(v) = &version {
+            validate_version(v)?;
+        }
+        let mut servers = self.servers.clone();
+        servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(RegistryError::NotFound)?
+            .grok_consent = version.map(|version| GrokInstallConsent { version });
         self.persist(servers)
     }
     fn invalidate_probe(&mut self, id: AuthorityId) -> Option<ProbeTicket> {
@@ -360,6 +405,37 @@ impl<S: ServerStorage> ServerRegistry<S> {
     }
     pub fn can_launch_opencode(&self, id: AuthorityId) -> bool {
         matches!(self.probes.get(&id), Some(ProbeState::Complete(capabilities)) if capabilities.opencode)
+    }
+    /// Whether this server's own probe detected grok on its remote PATH.
+    /// Detection never starts grok or installs anything.
+    pub fn can_launch_grok(&self, id: AuthorityId) -> bool {
+        matches!(self.probes.get(&id), Some(ProbeState::Complete(capabilities)) if capabilities.grok)
+    }
+    /// Record a finished probe outcome for one server without any SSH attempt.
+    ///
+    /// Test-only seam: the product flow arrives through a live
+    /// [`ProbeAttempt`] and [`Self::finish_probe`]. Validation matches
+    /// [`Self::finish_probe`].
+    pub fn record_probe_result(
+        &mut self,
+        id: AuthorityId,
+        result: Result<Capabilities, ErrorCode>,
+    ) -> Result<(), RegistryError> {
+        if let Ok(capabilities) = &result {
+            made_remote::protocol::Operation::CapabilitiesResult {
+                capabilities: capabilities.clone(),
+            }
+            .validate()
+            .map_err(|_| RegistryError::InvalidMetadata)?;
+        }
+        self.probes.insert(
+            id,
+            match result {
+                Ok(capabilities) => ProbeState::Complete(capabilities),
+                Err(code) => ProbeState::Failed(code),
+            },
+        );
+        Ok(())
     }
 }
 fn validate_version(version: &str) -> Result<(), RegistryError> {
@@ -435,6 +511,8 @@ impl ServerStorage for PrivateMetadataStorage {
 
 /// Parse the fixed OpenSSH probe script. This is not a TUI launch and it does
 /// not look for tmux. `Capabilities.tmux` is encoded false and must be ignored.
+/// Grok and python3 are metadata-only PATH detections reported by the same
+/// probe; absence keeps the honest inventory tier.
 pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let text = std::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidRequest)?;
     let mut lines = text.split('\n');
@@ -444,6 +522,8 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let os = lines.next().unwrap_or("").trim();
     let arch = lines.next().unwrap_or("").trim();
     let opencode = lines.next().unwrap_or("").trim();
+    let grok = lines.next().unwrap_or("").trim();
+    let python3 = lines.next().unwrap_or("").trim();
     if os.chars().any(char::is_control) || arch.chars().any(char::is_control) {
         return Err(ErrorCode::InvalidRequest);
     }
@@ -456,15 +536,17 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     };
     // An absolute path is the only accepted detection signal. Empty, relative,
     // or option-like text is absence, not a host executable to run.
-    let opencode_present = opencode.starts_with('/')
-        && !opencode.chars().any(char::is_control)
-        && opencode.len() <= 4096;
+    let detected = |value: &str| {
+        value.starts_with('/') && !value.chars().any(char::is_control) && value.len() <= 4096
+    };
     Ok(Capabilities {
         target,
         tmux: false,
-        opencode: opencode_present,
+        opencode: detected(opencode),
         shell_cwd: false,
         helper_version: "probe".to_owned(),
+        grok: detected(grok),
+        python3: detected(python3),
     })
 }
 
@@ -504,7 +586,9 @@ impl AttemptError {
         match self.class {
             SshFailureClass::Timeout => ErrorCode::Timeout,
             SshFailureClass::Cancelled => ErrorCode::Cancelled,
-            SshFailureClass::MissingCapability => ErrorCode::Unavailable,
+            SshFailureClass::MissingCapability | SshFailureClass::UpdateRequired => {
+                ErrorCode::Unavailable
+            }
             SshFailureClass::AuthFailed => ErrorCode::Unauthorized,
             SshFailureClass::UnknownHost
             | SshFailureClass::ChangedHostKey
@@ -773,11 +857,39 @@ fn run_stage(
         made_platform::ssh::SshCommand::Stage,
         Some(std::time::Duration::from_secs(180)),
     )?;
+    drive_stage(
+        &mut process,
+        payload,
+        prompts,
+        answers,
+        cancel,
+        std::time::Instant::now() + std::time::Duration::from_secs(180),
+    )
+}
+
+/// Drive one already-spawned Stage process to a terminal outcome.
+///
+/// The fixed script can exit 74 before consuming the remaining artifact bytes,
+/// which closes its stdin. That writer error is a generic Io event, but the
+/// child's classified update-required failure is the real reason. A generic Io
+/// event therefore never decides the result by itself: the loop waits for the
+/// child's terminal state, so a delayed reap can still replace it with a
+/// classified failure. Once the child is terminal without one, the stored (or
+/// generic) I/O error is returned immediately instead of waiting for the
+/// overall deadline.
+fn drive_stage(
+    process: &mut made_platform::ssh::SshProcess,
+    payload: &[u8],
+    prompts: &std::sync::mpsc::SyncSender<made_platform::ssh_askpass::PromptRequest>,
+    answers: &std::sync::mpsc::Receiver<ProbeAnswer>,
+    cancel: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Instant,
+) -> Result<(), AttemptError> {
     // SshProcess::write accepts one bounded chunk, not the whole multi-megabyte
     // Stage payload. Send it in chunks and keep draining prompts so the writer
     // cannot deadlock on a full queue.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     let mut stdout = Vec::new();
+    let mut io_failure: Option<made_platform::ssh::SshFailure> = None;
     let mut offset = 0;
     while offset < payload.len() {
         if cancel.load(std::sync::atomic::Ordering::Acquire) {
@@ -817,17 +929,29 @@ fn run_stage(
                         return Err(AttemptError::code(ErrorCode::Timeout))
                     }
                     Some(made_platform::ssh::SshEvent::Failed(failure)) => {
-                        return Err(AttemptError::from_failure(&failure))
+                        if failure.kind() == made_platform::ssh::SshFailureKind::Io {
+                            if let Some(stored) = io_failure.take() {
+                                return Err(AttemptError::from_failure(&stored));
+                            }
+                            io_failure = Some(failure);
+                        } else {
+                            return Err(AttemptError::from_failure(&failure));
+                        }
                     }
                     Some(made_platform::ssh::SshEvent::Eof)
                     | Some(made_platform::ssh::SshEvent::Exited(_)) => {
-                        return Err(AttemptError::code(ErrorCode::Io))
+                        return match io_failure {
+                            Some(failure) => Err(AttemptError::from_failure(&failure)),
+                            None => Err(AttemptError::from_code(ErrorCode::Io)),
+                        };
                     }
                     None => {}
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            Err(_) => return Err(AttemptError::code(ErrorCode::Io)),
+            // The writer closed stdin because the fixed script exited. Poll the
+            // child to keep its classified failure instead of a generic Io.
+            Err(_) => break,
         }
     }
     loop {
@@ -865,9 +989,27 @@ fn run_stage(
                 return Err(AttemptError::code(ErrorCode::Timeout))
             }
             Some(made_platform::ssh::SshEvent::Failed(failure)) => {
-                return Err(AttemptError::from_failure(&failure))
+                if failure.kind() == made_platform::ssh::SshFailureKind::Io {
+                    // The writer's closed-stdin error is not the child's
+                    // outcome: a delayed classified exit still wins. Keep the
+                    // first Io and finish only once the child is terminal.
+                    io_failure.get_or_insert(failure);
+                } else {
+                    return Err(AttemptError::from_failure(&failure));
+                }
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(15)),
+            None => {
+                if process.is_finished() {
+                    // No further event can arrive. The child terminated without
+                    // a classified failure, so surface the stored writer Io or
+                    // the generic Io instead of waiting for the deadline.
+                    return Err(match io_failure {
+                        Some(failure) => AttemptError::from_failure(&failure),
+                        None => AttemptError::from_code(ErrorCode::Io),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
         }
     }
     if stdout
@@ -880,7 +1022,7 @@ fn run_stage(
     }
 }
 
-/// Read the six packaged files for one target. Missing files are a preflight
+/// Read the eleven packaged files for one target. Missing files are a preflight
 /// failure. File bytes are not included in the error.
 pub fn load_stage_files(target: &str) -> Result<Vec<Vec<u8>>, String> {
     let exe = std::env::current_exe().map_err(|_| {
@@ -916,6 +1058,26 @@ pub fn spawn_consented_stage(
     version: String,
     target: String,
 ) -> StageAttempt {
+    spawn_stage_attempt(metadata, version, target, false)
+}
+
+/// Stage only after this attempt's explicit `Update companion` approval. The
+/// fixed platform script replaces the existing same-version target through its
+/// private temp/verify/swap path; this function never deletes anything itself.
+pub fn spawn_approved_update_stage(
+    metadata: ServerMetadata,
+    version: String,
+    target: String,
+) -> StageAttempt {
+    spawn_stage_attempt(metadata, version, target, true)
+}
+
+fn spawn_stage_attempt(
+    metadata: ServerMetadata,
+    version: String,
+    target: String,
+    update: bool,
+) -> StageAttempt {
     let (prompt_tx, prompts) = std::sync::mpsc::sync_channel(4);
     let (answers, answer_rx) = std::sync::mpsc::channel();
     let (done_tx, done) = std::sync::mpsc::channel();
@@ -925,7 +1087,11 @@ pub fn spawn_consented_stage(
         .name("made-ssh-stage".to_owned())
         .spawn(move || {
             let result = load_stage_files(&target).and_then(|files| {
-                crate::remote_session::stage_body(true, &version, &target, &files)
+                if update {
+                    crate::remote_session::update_stage_body(true, &version, &target, &files)
+                } else {
+                    crate::remote_session::stage_body(true, &version, &target, &files)
+                }
             });
             let result = match result {
                 Ok(payload) => {
@@ -945,6 +1111,215 @@ pub fn spawn_consented_stage(
         cancel,
         done,
     }
+}
+
+/// The desktop-side outcome of one consented remote Grok plugin install. The
+/// companion prints exactly one bounded honest JSON report line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokInstallOutcome {
+    /// The official installer ran and succeeded.
+    Installed,
+    /// An installed grok-made was already equal or newer, so the command was
+    /// skipped and the installed copy stays in place.
+    Skipped,
+    /// The attempt failed; `reason` carries the bounded machine reason.
+    Failed,
+}
+
+/// One parsed install report. `new_sessions_only` discloses that plugin hooks
+/// attach when Grok starts, so they apply only to sessions started after the
+/// install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokInstallReport {
+    pub outcome: GrokInstallOutcome,
+    pub reason: Option<String>,
+    pub new_sessions_only: bool,
+}
+
+/// The exact staged helper invocation's stdin: the fixed script reads the
+/// companion version and target triple, then execs the staged
+/// `made-remote --install-grok-plugin`. No other bytes are sent.
+pub fn grok_install_body(version: &str, target: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(version.len() + target.len() + 2);
+    body.extend_from_slice(version.as_bytes());
+    body.push(b'\n');
+    body.extend_from_slice(target.as_bytes());
+    body.push(b'\n');
+    body
+}
+
+/// Parse the companion's one-line install report. Oversized, non-JSON,
+/// multi-object or unknown-outcome replies fail bounded and honest.
+pub fn parse_grok_install_report(bytes: &[u8]) -> Result<GrokInstallReport, ErrorCode> {
+    if bytes.len() > 4096 {
+        return Err(ErrorCode::Limit);
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ErrorCode::InvalidRequest)?
+        .trim();
+    if text.is_empty() || text.contains('\n') {
+        return Err(ErrorCode::InvalidRequest);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Wire {
+        outcome: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        new_sessions_only: bool,
+    }
+    let wire: Wire = serde_json::from_str(text).map_err(|_| ErrorCode::InvalidRequest)?;
+    let outcome = match wire.outcome.as_str() {
+        "installed" => GrokInstallOutcome::Installed,
+        "skipped" => GrokInstallOutcome::Skipped,
+        "failed" => GrokInstallOutcome::Failed,
+        _ => return Err(ErrorCode::InvalidRequest),
+    };
+    let reason = match wire.reason {
+        Some(reason) if reason.is_empty() => None,
+        Some(reason) if reason.len() <= 64 && !reason.chars().any(char::is_control) => Some(reason),
+        Some(_) => return Err(ErrorCode::InvalidRequest),
+        None => None,
+    };
+    Ok(GrokInstallReport {
+        outcome,
+        reason,
+        new_sessions_only: wire.new_sessions_only,
+    })
+}
+
+/// In-flight OpenSSH invocation of the fixed `SshCommand::GrokPluginInstall`
+/// script. Auth prompts are one-use and never retained here.
+pub struct GrokInstallAttempt {
+    prompts: std::sync::mpsc::Receiver<made_platform::ssh_askpass::PromptRequest>,
+    answers: std::sync::mpsc::Sender<ProbeAnswer>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: std::sync::mpsc::Receiver<Result<GrokInstallReport, AttemptError>>,
+}
+
+impl GrokInstallAttempt {
+    pub fn poll_prompt(&self) -> Option<made_platform::ssh_askpass::PromptRequest> {
+        self.prompts.try_recv().ok()
+    }
+
+    pub fn answer(
+        &self,
+        id: u64,
+        answer: Option<made_platform::ssh_askpass::PromptAnswer>,
+    ) -> bool {
+        self.answers.send(ProbeAnswer { id, answer }).is_ok()
+    }
+
+    pub fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn poll(&self) -> Option<Result<GrokInstallReport, AttemptError>> {
+        self.done.try_recv().ok()
+    }
+}
+
+/// Start the consented install on a worker. The caller must already have
+/// persisted the per-server/version consent and resolved the staged target.
+/// Missing OpenSSH or askpass fails closed; nothing is executed locally.
+pub fn spawn_grok_install(
+    metadata: ServerMetadata,
+    version: String,
+    target: String,
+) -> GrokInstallAttempt {
+    let (prompt_tx, prompts) = std::sync::mpsc::sync_channel(4);
+    let (answers, answer_rx) = std::sync::mpsc::channel();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancel = std::sync::Arc::clone(&cancel);
+    let _ = std::thread::Builder::new()
+        .name("made-ssh-grok-install".to_owned())
+        .spawn(move || {
+            let result = run_grok_install(
+                &metadata,
+                &version,
+                &target,
+                &prompt_tx,
+                &answer_rx,
+                &worker_cancel,
+            );
+            let _ = done_tx.send(result);
+        });
+    GrokInstallAttempt {
+        prompts,
+        answers,
+        cancel,
+        done,
+    }
+}
+
+const GROK_INSTALL_TIMEOUT_SECONDS: u64 = 300;
+
+fn run_grok_install(
+    metadata: &ServerMetadata,
+    version: &str,
+    target: &str,
+    prompts: &std::sync::mpsc::SyncSender<made_platform::ssh_askpass::PromptRequest>,
+    answers: &std::sync::mpsc::Receiver<ProbeAnswer>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<GrokInstallReport, AttemptError> {
+    let body = grok_install_body(version, target);
+    let mut process = spawn_ssh(
+        metadata,
+        made_platform::ssh::SshCommand::GrokPluginInstall,
+        Some(std::time::Duration::from_secs(GROK_INSTALL_TIMEOUT_SECONDS)),
+    )?;
+    // The body is two short lines; SshProcess::write accepts one bounded chunk.
+    if process.write(&body).is_err() {
+        process.cancel();
+        return Err(AttemptError::code(ErrorCode::Io));
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(GROK_INSTALL_TIMEOUT_SECONDS);
+    let mut stdout = Vec::new();
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            process.cancel();
+            return Err(AttemptError::code(ErrorCode::Cancelled));
+        }
+        if std::time::Instant::now() >= deadline {
+            process.cancel();
+            return Err(AttemptError::code(ErrorCode::Timeout));
+        }
+        while let Ok(answer) = answers.try_recv() {
+            if process.answer_prompt(answer.id, answer.answer).is_err() {
+                process.cancel();
+                return Err(AttemptError::code(ErrorCode::Io));
+            }
+        }
+        if let Some(prompt) = process.poll_prompt() {
+            if prompts.try_send(prompt).is_err() {
+                process.cancel();
+                return Err(AttemptError::code(ErrorCode::Limit));
+            }
+        }
+        match process.poll() {
+            Some(made_platform::ssh::SshEvent::Data(bytes)) => {
+                if stdout.len().saturating_add(bytes.len()) > 4096 {
+                    process.cancel();
+                    return Err(AttemptError::code(ErrorCode::Limit));
+                }
+                stdout.extend(bytes);
+            }
+            Some(made_platform::ssh::SshEvent::Eof)
+            | Some(made_platform::ssh::SshEvent::Exited(_)) => break,
+            Some(made_platform::ssh::SshEvent::TimedOut) => {
+                return Err(AttemptError::code(ErrorCode::Timeout))
+            }
+            Some(made_platform::ssh::SshEvent::Failed(failure)) => {
+                return Err(AttemptError::from_failure(&failure))
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(15)),
+        }
+    }
+    parse_grok_install_report(&stdout).map_err(AttemptError::from_code)
 }
 
 /// Shared slot for a failure the remote client would otherwise discard.
@@ -1087,5 +1462,156 @@ pub fn probe_failure_detail(code: ErrorCode) -> &'static str {
         }
         ErrorCode::Io => "The connection test failed. Check the host, key file, and network.",
         _ => "The connection test failed. No local workspace was started in its place.",
+    }
+}
+
+#[cfg(test)]
+mod stage_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use made_platform::ssh::{SshCommand, SshDestination, SshOptions, SshProcess};
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    fn spawned_stage(root: &std::path::Path, script: &str) -> SshProcess {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let known_hosts = root.join("known_hosts");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&known_hosts)
+            .unwrap();
+        let ssh = root.join("ssh");
+        std::fs::write(&ssh, script).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let askpass = root.join("askpass");
+        std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        SshProcess::spawn(SshOptions {
+            executable: ssh,
+            askpass_executable: askpass,
+            private_directory: root.to_path_buf(),
+            known_hosts,
+            destination: SshDestination {
+                host: "fixture.example".to_owned(),
+                user: None,
+                port: None,
+                identity_file: None,
+            },
+            command: SshCommand::Stage,
+            timeout: Some(Duration::from_secs(4)),
+        })
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn drive(
+        process: &mut SshProcess,
+        payload: &[u8],
+        deadline: Duration,
+    ) -> Result<(), AttemptError> {
+        let (prompt_tx, _prompts) = std::sync::mpsc::sync_channel(4);
+        let (_answers, answer_rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        drive_stage(
+            process,
+            payload,
+            &prompt_tx,
+            &answer_rx,
+            &cancel,
+            Instant::now() + deadline,
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delayed_update_required_exit_beats_writer_epipe() {
+        // Close stdin before reading the payload, advertise the fixed marker,
+        // then keep the child alive well past the old 750ms hold before exit.
+        let temp = tempfile::tempdir().unwrap();
+        let mut process = spawned_stage(
+            temp.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\n\
+             exec 0<&-\n\
+             printf 'MADE-STAGE-UPDATE-REQUIRED\\nhash=deadbeef\\n' >&2\n\
+             sleep 1.2\n\
+             exit 74\n",
+        );
+        let payload = vec![7u8; made_platform::ssh::SSH_CHUNK_BYTES * 2];
+        let started = Instant::now();
+        let error = drive(&mut process, &payload, Duration::from_secs(4))
+            .expect_err("the stage must not succeed");
+        assert_eq!(
+            error.class,
+            crate::remote_session::SshFailureClass::UpdateRequired,
+            "writer EPIPE must not replace the classified exit: {error:?}"
+        );
+        assert!(
+            started.elapsed() > Duration::from_millis(900),
+            "the regression must outlive the removed 750ms window"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unclassified_exit_after_consuming_payload_returns_io_without_waiting_for_deadline() {
+        // Consume the complete payload and exit without the update marker or
+        // any other classified stderr. No second Io event follows the child's
+        // terminal exit, so the driver must not keep polling None until its own
+        // (production: 180s) deadline.
+        let temp = tempfile::tempdir().unwrap();
+        let mut process = spawned_stage(
+            temp.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\n\
+             dd bs=65536 count=2 of=/dev/null 2>/dev/null\n\
+             exit 73\n",
+        );
+        let payload = vec![7u8; made_platform::ssh::SSH_CHUNK_BYTES * 2];
+        let started = Instant::now();
+        let error = drive(&mut process, &payload, Duration::from_secs(4))
+            .expect_err("the stage must not succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.class,
+            crate::remote_session::SshFailureClass::Other,
+            "an unclassified exit must remain a generic Io failure: {error:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the driver must return once the child is terminal instead of waiting for its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delayed_classified_failure_survives_a_closed_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("auth");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut process = spawned_stage(
+            &root,
+            "#!/bin/sh\n\
+             if [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\n\
+             exec 0<&-\n\
+             printf 'Permission denied (publickey).\\n' >&2\n\
+             sleep 0.9\n\
+             exit 255\n",
+        );
+        let payload = vec![7u8; made_platform::ssh::SSH_CHUNK_BYTES * 2];
+        let error = drive(&mut process, &payload, Duration::from_secs(4))
+            .expect_err("the stage must not succeed");
+        assert_eq!(
+            error.class,
+            crate::remote_session::SshFailureClass::AuthFailed,
+            "{error:?}"
+        );
     }
 }

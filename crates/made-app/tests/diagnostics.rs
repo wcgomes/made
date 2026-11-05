@@ -775,3 +775,423 @@ fn opencode_reason_sentences_follow_the_grok_wording() {
         "opencode_missing",
     );
 }
+
+/// The owning remote tab's OpenCode integration state, reported instead of
+/// the host-local integration so SSH transport loss stays distinguishable
+/// from remote integration loss.
+#[test]
+fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
+    use made_app::diagnostics::remote_opencode_report;
+    use made_app::remote_workspace::{ConnectionState, IntegrationState as RemoteIntegration};
+    use made_remote::protocol::ErrorCode;
+
+    // Before the SSH session attaches, the remote integration has not been
+    // observed; no host sentence may stand in for it.
+    let report = remote_opencode_report(
+        false,
+        None,
+        ConnectionState::Disconnected,
+        RemoteIntegration::Unknown,
+        None,
+    );
+    assert_eq!(report.status, IntegrationStatus::Inactive);
+    assert_eq!(report.code, "inactive");
+    assert!(
+        report.reason.contains("remote"),
+        "the reason names the remote integration: {}",
+        report.reason
+    );
+
+    // A healthy transport with a connected remote integration.
+    let report = remote_opencode_report(
+        true,
+        None,
+        ConnectionState::Connected,
+        RemoteIntegration::Connected,
+        None,
+    );
+    assert_eq!(report.status, IntegrationStatus::Connected);
+    assert_eq!(report.code, "connected");
+    assert_eq!(report.reason, "OpenCode session follow is ready.");
+
+    // The remote integration failed while the transport stayed healthy: the
+    // reason blames the integration, not the transport.
+    let report = remote_opencode_report(
+        true,
+        None,
+        ConnectionState::Connected,
+        RemoteIntegration::Unavailable,
+        Some(ErrorCode::Unavailable),
+    );
+    assert_eq!(report.status, IntegrationStatus::Degraded);
+    assert_eq!(report.code, "unavailable");
+    assert!(
+        report
+            .reason
+            .contains("remote OpenCode integration is unavailable"),
+        "the reason blames the integration: {}",
+        report.reason
+    );
+    assert!(
+        !report.reason.contains("transport"),
+        "an integration failure must not claim a transport failure: {}",
+        report.reason
+    );
+
+    // The transport dropped while attached: the reason blames the transport
+    // and never claims the integration closed.
+    let report = remote_opencode_report(
+        true,
+        None,
+        ConnectionState::Disconnected,
+        RemoteIntegration::Unknown,
+        None,
+    );
+    assert_eq!(report.status, IntegrationStatus::Degraded);
+    assert!(
+        report.reason.contains("SSH transport"),
+        "the transport reason stays honest: {}",
+        report.reason
+    );
+
+    // A failed tab reports its own failure sentence.
+    let report = remote_opencode_report(
+        false,
+        Some("SSH disconnected. Queued input was discarded and will not be replayed."),
+        ConnectionState::Disconnected,
+        RemoteIntegration::Unknown,
+        None,
+    );
+    assert_eq!(report.status, IntegrationStatus::Degraded);
+    assert_eq!(
+        report.reason,
+        "SSH disconnected. Queued input was discarded and will not be replayed."
+    );
+
+    // Applying the report replaces the host-local status in the snapshot and
+    // the copied report, with the owning tab's SSH rows still present.
+    let diagnostics = Diagnostics::new("/home/user/.local/state/made/log/integration.log")
+        .with_app_version("9.9.9");
+    let mut view = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(view.reason, "OpenCode is not running.");
+    view.attach_workspace(WorkspaceDiagnostics {
+        identity: "pane".to_owned(),
+        label: "Remote".to_owned(),
+        ssh_authority: Some("server-a".to_owned()),
+        remote_root: Some("/project".to_owned()),
+        ssh_transport: Some("disconnected".to_owned()),
+        ssh_integration: Some("unknown".to_owned()),
+        ..WorkspaceDiagnostics::default()
+    });
+    view.set_remote_opencode(report);
+    assert_eq!(view.status, IntegrationStatus::Degraded);
+    assert_eq!(view.status_label, "degraded");
+    assert!(
+        view.reason.contains("SSH disconnected"),
+        "the snapshot carries the owning tab's reason: {}",
+        view.reason
+    );
+    let text = view.to_text();
+    assert!(text.contains("status: degraded"), "{text}");
+    assert!(text.contains("ssh transport: disconnected"), "{text}");
+    assert!(text.contains("ssh integration: unknown"), "{text}");
+}
+
+#[test]
+fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
+    use made_app::diagnostics::{remote_grok_row, RemoteGrokInstallOutcome};
+
+    // Before the SSH session attaches, nothing remote may be claimed.
+    let row = remote_grok_row(false, false, None, true, None, false, true);
+    assert_eq!(
+        row.pill,
+        made_app::diagnostics::GrokDiagnosticsPill::Inactive
+    );
+    assert!(
+        row.sentence.contains("not known yet"),
+        "an unattached tab claims no Grok state: {}",
+        row.sentence
+    );
+
+    // A failed tab (transport loss) outranks every Grok claim, even with a
+    // pre-disconnect running projection: no stale claim may survive.
+    let row = remote_grok_row(
+        true,
+        false,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Succeeded),
+        true,
+        true,
+    );
+    assert_eq!(
+        row.pill,
+        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+    );
+    assert!(
+        row.sentence.contains("SSH transport is disconnected"),
+        "the transport failure must name the transport: {}",
+        row.sentence
+    );
+    assert!(
+        !row.sentence.contains("ready"),
+        "a transport failure must not claim readiness: {}",
+        row.sentence
+    );
+    // The same transport failure with nothing running stays transport-shaped.
+    let row = remote_grok_row(true, false, None, true, None, false, false);
+    assert!(
+        row.sentence.contains("SSH transport is disconnected"),
+        "{}",
+        row.sentence
+    );
+
+    // Grok was not detected by this tab's own probe.
+    let row = remote_grok_row(false, true, None, false, None, false, true);
+    assert_eq!(
+        row.pill,
+        made_app::diagnostics::GrokDiagnosticsPill::Inactive
+    );
+    assert!(
+        row.sentence.contains("not detected on this server"),
+        "{}",
+        row.sentence
+    );
+
+    // The bounded install attempt is busy while it runs.
+    let row = remote_grok_row(
+        false,
+        true,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Running),
+        true,
+        false,
+    );
+    assert!(
+        row.sentence.contains("Installing the Grok Build plugin"),
+        "{}",
+        row.sentence
+    );
+
+    // Nothing running: the honest row is not running, whatever the tier.
+    for install in [
+        None,
+        Some(RemoteGrokInstallOutcome::Succeeded),
+        Some(RemoteGrokInstallOutcome::Failed { reason: None }),
+    ] {
+        let row = remote_grok_row(false, true, None, true, install, true, false);
+        assert!(
+            row.sentence.contains("Grok Build is not running."),
+            "install {install:?} with nothing open: {}",
+            row.sentence
+        );
+    }
+
+    // Inventory tier without consent: the reason says the install was not
+    // approved, and never claims hook readiness.
+    let row = remote_grok_row(false, true, None, true, None, false, true);
+    assert_eq!(
+        row.pill,
+        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+    );
+    assert!(
+        row.sentence.contains("hooks are unavailable"),
+        "{}",
+        row.sentence
+    );
+    assert!(
+        row.sentence.contains("not approved"),
+        "the inventory reason names the missing approval: {}",
+        row.sentence
+    );
+
+    // Consent granted but the install has not run in this session.
+    let row = remote_grok_row(false, true, None, true, None, true, true);
+    assert!(
+        row.sentence.contains("has not run on this server yet"),
+        "{}",
+        row.sentence
+    );
+
+    // A failed install keeps the inventory tier and names the failure.
+    let row = remote_grok_row(
+        false,
+        true,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Failed {
+            reason: Some("install-failed"),
+        }),
+        true,
+        true,
+    );
+    assert!(
+        row.sentence.contains("the plugin install failed"),
+        "{}",
+        row.sentence
+    );
+
+    // Missing remote python3 is a declared honest failure reason.
+    let row = remote_grok_row(
+        false,
+        true,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Failed {
+            reason: Some("python3-missing"),
+        }),
+        true,
+        true,
+    );
+    assert!(
+        row.sentence.contains("remote python3 is missing"),
+        "{}",
+        row.sentence
+    );
+
+    // A successful install is ready while a session is open; it stays ready
+    // even after a withdrawal, because Made never uninstalls.
+    let row = remote_grok_row(
+        false,
+        true,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Succeeded),
+        false,
+        true,
+    );
+    assert_eq!(row.pill, made_app::diagnostics::GrokDiagnosticsPill::Ready);
+    assert_eq!(row.sentence, "Grok Build session follow is ready.");
+}
+
+#[test]
+fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
+    use made_app::diagnostics::{remote_grok_row, RemoteGrokInstallOutcome};
+
+    let diagnostics = Diagnostics::new("/home/user/.local/state/made/log/integration.log")
+        .with_app_version("9.9.9");
+    let mut view = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    // The host row starts as the local one; a remote tab replaces it.
+    view.attach_workspace(WorkspaceDiagnostics {
+        identity: "pane".to_owned(),
+        label: "Remote".to_owned(),
+        ssh_authority: Some("server-a".to_owned()),
+        remote_root: Some("/project".to_owned()),
+        ..WorkspaceDiagnostics::default()
+    });
+    assert_eq!(
+        view.grok_sentence, "Grok Build is not on PATH.",
+        "the pre-existing host sentence is what a remote tab must replace"
+    );
+
+    let report = remote_grok_row(
+        false,
+        true,
+        None,
+        true,
+        Some(RemoteGrokInstallOutcome::Failed {
+            reason: Some("python3-missing"),
+        }),
+        true,
+        true,
+    );
+    view.set_remote_grok(report.clone());
+    assert_eq!(view.grok_pill, report.pill);
+    assert_eq!(view.grok_sentence, report.sentence);
+    let text = view.to_text();
+    assert!(
+        text.contains("grok status: degraded"),
+        "the copied report must include the Grok pill: {text}"
+    );
+    assert!(
+        text.contains("remote python3 is missing"),
+        "the copied report must include the honest reason: {text}"
+    );
+    assert!(
+        !text.contains("Grok Build is not on PATH"),
+        "the host sentence must not survive the remote row: {text}"
+    );
+}
+
+#[test]
+fn remote_grok_failure_names_the_actual_failure_not_generic_transport() {
+    use made_app::diagnostics::remote_grok_row;
+
+    // A vanished grok is an opening failure with its own sentence. It must not
+    // be flattened into the generic transport row.
+    let detail = "Grok was not detected on this server. Nothing ran locally.";
+    let row = remote_grok_row(true, false, Some(detail), false, None, false, false);
+    assert_eq!(
+        row.pill,
+        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+    );
+    assert!(
+        row.sentence
+            .contains("Grok was not detected on this server"),
+        "the row must keep the tab's failure detail: {}",
+        row.sentence
+    );
+    assert!(
+        !row.sentence.contains("SSH transport is disconnected"),
+        "an opening failure must not claim transport loss: {}",
+        row.sentence
+    );
+
+    // Stage and companion failures use the same distinction.
+    let detail = "A packaged companion file is missing. Made did not start a local shell.";
+    let row = remote_grok_row(true, false, Some(detail), true, None, false, false);
+    assert!(
+        row.sentence
+            .contains("A packaged companion file is missing"),
+        "{}",
+        row.sentence
+    );
+    assert!(!row.sentence.contains("SSH transport is disconnected"));
+
+    // A later transport loss with no opening failure is still transport.
+    let row = remote_grok_row(true, false, None, true, None, false, false);
+    assert!(
+        row.sentence.contains("SSH transport is disconnected"),
+        "{}",
+        row.sentence
+    );
+
+    // The copyable report carries the same detail rather than the generic one.
+    let diagnostics = Diagnostics::new("/home/user/.local/state/made/log/integration.log")
+        .with_app_version("9.9.9");
+    let mut view = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    view.set_remote_grok(row);
+    let text = view.to_text();
+    assert!(
+        text.contains("SSH transport is disconnected"),
+        "a real transport loss still reaches the copy: {text}"
+    );
+
+    let row = remote_grok_row(true, false, Some(detail), true, None, false, false);
+    view.set_remote_grok(row);
+    let text = view.to_text();
+    assert!(
+        text.contains("A packaged companion file is missing"),
+        "the copy must carry the actual stage failure: {text}"
+    );
+    assert!(
+        !text.contains("SSH transport is disconnected"),
+        "the copy must not replace the stage failure with transport: {text}"
+    );
+}

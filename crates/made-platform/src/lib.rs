@@ -122,6 +122,28 @@ pub use private_metadata::{
     MAX_PRIVATE_METADATA_BYTES,
 };
 
+/// Whether an existing app-owned staged artifact has the private permission
+/// bits required by the fixed staging contract.
+///
+/// Unix requires exactly `0700` for executable artifacts and `0600` otherwise.
+/// Other platforms have no POSIX permission bits; their private-file/DACL
+/// checks happen when the file is created, so this returns `true` and the
+/// caller's file-kind, size and hash checks still apply. This inspects the
+/// metadata the caller already obtained without following a symlink; it does
+/// not read the artifact.
+pub fn artifact_permissions_match(metadata: &std::fs::Metadata, executable: bool) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o777 == if executable { 0o700 } else { 0o600 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, executable);
+        true
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]

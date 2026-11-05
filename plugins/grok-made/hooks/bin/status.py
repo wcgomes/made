@@ -131,6 +131,10 @@ def main():
     line = {
         "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sessionId": text_of(event, "sessionId", "session_id"),
+        # The parent of this hook process: the Grok session process that ran
+        # the hook. Companions sharing the server-global log use it to prove
+        # which tab the event belongs to.
+        "pid": os.getppid(),
         "cwd": text_of(event, "cwd"),
         "event": text_of(event, "hookEventName", "hook_event_name"),
         "notification": text_of(event, "notificationType", "notification_type"),

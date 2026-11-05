@@ -1,6 +1,8 @@
 //! Headless egui UI-model test: picker -> selected folder -> workspace
 //! surfaces, without a display, GPU, window, PTY, or bridge.
 
+mod support;
+
 use std::fs;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
     diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
     new_tab_menu_item_id, picker_control_id, picker_current_target, picker_list_id, picker_path_id,
-    ssh_field_id, ssh_servers_window_id, top_action_id, top_workspace_action_id,
+    ssh_field_id, ssh_server_row_id, ssh_servers_window_id, top_action_id, top_workspace_action_id,
     workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
@@ -605,6 +607,46 @@ fn send_state(socket: &mut WebSocket<TcpStream>, revision: u64, directory: &Path
         "sessions":[{"sessionID":"ui-session", "title":"Owned session", "active":true, "busy":false, "attention":false, "unread":false,
         "promptPulse":0, "renaming":false, "directory":directory, "subpath":null, "projectID":null}]}),
     );
+}
+
+/// Keep the fake plugin's bridge connection alive on a worker.
+///
+/// The bridge server drops a client that misses three heartbeat pings, so a
+/// test that stops reading its socket after `send_state` must keep answering
+/// the protocol's JSON pings while it pumps the model; under load a slow run
+/// otherwise loses the session state the assertions render.
+fn service_bridge_heartbeat(socket: WebSocket<TcpStream>) {
+    std::thread::spawn(move || {
+        let mut socket = socket;
+        let _ = socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(250)));
+        loop {
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if value["type"] == "ping" {
+                        let reply = Message::Text(
+                            json!({"type":"pong", "nonce":value["nonce"]})
+                                .to_string()
+                                .into(),
+                        );
+                        if socket.send(reply).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => continue,
+                Err(tungstenite::Error::Io(error)) => match error.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => continue,
+                    _ => return,
+                },
+                Err(_) => return,
+            }
+        }
+    });
 }
 
 /// Send a session snapshot with explicit `(id, busy, attention)` rows.
@@ -1209,6 +1251,10 @@ fn letterform_center_y(label: &PaintedMenuLabel) -> f32 {
     (label.ink.top() + label.baseline_y) * 0.5
 }
 
+/// Set by the isolated-child helper so fixture helpers that persist app data
+/// can prove they resolve their app-data directory under the test temp root.
+const ISOLATED_TEST_HOME_ENV: &str = "MADE_UI_MODEL_TEST_HOME";
+
 fn isolated(name: &str) -> bool {
     if std::env::var_os("MADE_UI_MODEL_CHILD").is_some() {
         return false;
@@ -1234,6 +1280,7 @@ fn isolated(name: &str) -> bool {
     command
         .args(["--exact", name, "--nocapture"])
         .env("MADE_UI_MODEL_CHILD", "1")
+        .env(ISOLATED_TEST_HOME_ENV, home.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -1259,6 +1306,15 @@ fn isolated(name: &str) -> bool {
     if std::path::Path::new("/bin/bash").exists() {
         command.env("SHELL", "/bin/bash");
     }
+    // Hand the child an explicit fixture plugin package staged inside the
+    // install root, which release builds require the plugin override to
+    // canonicalize into; cargo never packages a plugin beside the test
+    // binary.
+    let plugins = support::StagedPlugins::stage("ui-model");
+    command.env(
+        made_platform::PLUGIN_DIR_ENV,
+        plugins.package("opencode-made"),
+    );
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -1267,6 +1323,140 @@ fn isolated(name: &str) -> bool {
         String::from_utf8_lossy(&output.stderr)
     );
     true
+}
+
+/// Refuse to touch the SSH registry unless app-data resolves under the temp
+/// root handed to an isolated-child run. `add_ssh_metadata` persists
+/// immediately, so a direct, unisolated caller would otherwise write the
+/// developer's real registry.
+fn assert_ssh_fixture_is_isolated(context: &str) {
+    use made_platform::Platform;
+    let test_root = std::env::var_os(ISOLATED_TEST_HOME_ENV).unwrap_or_else(|| {
+        panic!("{context} requires an isolated temporary HOME (run through isolated())")
+    });
+    let app_data = made_platform::host_platform()
+        .app_paths()
+        .expect("test app paths")
+        .data_dir;
+    assert!(
+        app_data.starts_with(&test_root),
+        "{context} would write the host app-data registry at {}",
+        app_data.display()
+    );
+}
+
+fn registry_file_exists(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name() == Some(std::ffi::OsStr::new(made_app::ssh_servers::REGISTRY_FILE)) {
+            return true;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) && registry_file_exists(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+fn canary_environment(home: &Path) -> std::process::Command {
+    let tmp = home.join("tmp");
+    let runtime = home.join("runtime");
+    let roaming = home.join("AppData").join("Roaming");
+    let local = home.join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local);
+    command.env_remove(ISOLATED_TEST_HOME_ENV);
+    command.env_remove("MADE_UI_MODEL_CHILD");
+    command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    command.env_remove(made_platform::SHELL_ENV);
+    command
+}
+
+/// The guard must reject an unisolated caller before it builds an AppModel or
+/// persists the private SSH registry.
+#[test]
+fn unisolated_ui_model_helper_guard_child() {
+    if std::env::var_os("MADE_UI_MODEL_CANARY_CHILD").is_none() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let remote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = local_and_remote_headless(workspace.path(), "unisolated-helper");
+    }));
+    assert!(
+        remote.is_err(),
+        "local_and_remote_headless must reject an unisolated app-data root"
+    );
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let inventory = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = add_ssh_inventory(&mut model, 1);
+    }));
+    assert!(
+        inventory.is_err(),
+        "add_ssh_inventory must reject an unisolated app-data root"
+    );
+    model.shutdown();
+
+    let home = std::env::var_os("HOME").expect("canary HOME");
+    assert!(
+        !registry_file_exists(Path::new(&home)),
+        "an unisolated caller wrote the private SSH registry"
+    );
+}
+
+/// Non-destructive canary: run one helper in a child HOME with no isolation
+/// marker. The helper must panic before writing anything, leaving the canary
+/// registry absent.
+#[test]
+fn unisolated_ui_model_helpers_fail_before_writing_the_registry() {
+    if std::env::var_os("MADE_UI_MODEL_CHILD").is_some()
+        || std::env::var_os("MADE_UI_MODEL_CANARY_CHILD").is_some()
+    {
+        return;
+    }
+    let canary = tempfile::tempdir().unwrap();
+    let output = canary_environment(canary.path())
+        .args([
+            "--exact",
+            "unisolated_ui_model_helper_guard_child",
+            "--nocapture",
+        ])
+        .env("MADE_UI_MODEL_CANARY_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !registry_file_exists(canary.path()),
+        "the unisolated helper wrote {} under the canary root",
+        made_app::ssh_servers::REGISTRY_FILE
+    );
 }
 
 fn open_workspace(model: &mut AppModel, path: &Path) -> WorkspaceId {
@@ -1315,6 +1505,86 @@ fn fixture_workspace(temp: &Path, name: &str, file: &str) -> PathBuf {
     fs::create_dir(&path).unwrap();
     fs::write(path.join(file), "fixture contents\n").unwrap();
     path.canonicalize().unwrap()
+}
+
+fn authority_hex(id: made_remote::protocol::AuthorityId) -> String {
+    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn text_in_rect(output: &egui::FullOutput, rect: egui::Rect) -> String {
+    fn visit(shape: &egui::Shape, rect: egui::Rect, text: &mut String) {
+        match shape {
+            egui::Shape::Text(run) => {
+                let line = egui::Rect::from_min_size(run.pos, run.galley.size());
+                if rect.intersects(line) {
+                    text.push_str(&run.galley.job.text);
+                    text.push('\n');
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, rect, text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, rect, &mut text);
+    }
+    text
+}
+
+fn accesskit_row_state(
+    output: &egui::FullOutput,
+    id: egui::Id,
+) -> (egui::Role, Option<String>, Option<egui::accesskit::Toggled>) {
+    let update = output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("accesskit update was not produced");
+    let (_, node) = update
+        .nodes
+        .iter()
+        .find(|(node_id, _)| *node_id == id.accesskit_id())
+        .unwrap_or_else(|| panic!("no accessible node for {id:?}"));
+    (node.role(), node.label().map(str::to_owned), node.toggled())
+}
+
+fn add_ssh_inventory(
+    model: &mut AppModel,
+    count: usize,
+) -> Vec<made_remote::protocol::AuthorityId> {
+    use made_app::ssh_servers::ServerMetadata;
+    assert_ssh_fixture_is_isolated("add_ssh_inventory");
+    (0..count)
+        .map(|index| {
+            model
+                .add_ssh_metadata(ServerMetadata {
+                    display_name: format!("Plant {index:03}"),
+                    host: format!("plant-{index:03}.example"),
+                    user: None,
+                    port: None,
+                    key_file: None,
+                    initial_directory: None,
+                })
+                .expect("server metadata saves")
+        })
+        .collect()
+}
+
+fn wheel_over(headless: &mut Headless, position: egui::Pos2, delta: egui::Vec2) {
+    headless.render_events(vec![egui::Event::PointerMoved(position)]);
+    headless.render_events(vec![egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    headless.advance(0.6);
 }
 
 #[test]
@@ -3754,6 +4024,7 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
     let plus = headless.response(top_action_id("open-folder")).rect;
     let overflow = headless.response(top_action_id("workspace-overflow")).rect;
     let wordmark = headless.response(made_app::theme::wordmark_id()).rect;
+    let ssh = headless.response(top_action_id("ssh-servers")).rect;
     let layout = made_app::theme::Layout::for_window(720.0, 480.0);
     let gap = made_app::theme::wordmark_gap(true);
     let active = headless
@@ -3805,7 +4076,7 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
             .all(|tab| tab.right() <= plus.left() + 0.5),
         "no visible tab may overlap the plus: tabs {visible_tabs:?}, plus {plus:?}"
     );
-    for (name, rect) in [("plus", plus), ("overflow", overflow)] {
+    for (name, rect) in [("plus", plus), ("overflow", overflow), ("ssh", ssh)] {
         assert!(
             rect.width() >= 24.0 && rect.height() >= 24.0,
             "{name} target below 24px or clipped: {rect:?}"
@@ -3814,6 +4085,7 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
     for (name, rect) in [
         ("plus", plus),
         ("overflow", overflow),
+        ("ssh", ssh),
         ("wordmark", wordmark),
     ] {
         assert!(
@@ -4217,6 +4489,985 @@ fn ssh_header_registration_and_remote_tab_keep_local_work() {
 }
 
 #[test]
+fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
+    if isolated("remote_opencode_tab_shows_local_label_icon_and_session_dots") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_bridge::state::SessionSnapshot;
+    use made_remote::protocol::{Identity, Operation, RemotePath, TabCapability, WireEnvelope};
+
+    let name = "remote-opencode-parity";
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+    let initial_output = headless.render();
+    let initial_tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&initial_output, name, 55.0)
+            .iter()
+            .any(|rect| initial_tab.contains_rect(*rect)),
+        "a remote shell tab without OpenCode keeps the server-name label"
+    );
+    assert!(
+        tab_session_dots(&initial_output, initial_tab).is_empty(),
+        "a remote shell tab without OpenCode paints no session dots"
+    );
+
+    // The real current-attach snapshot path: an unsolicited session snapshot
+    // riding the attach request id connects the owning remote integration and
+    // populates that tab's remote session map.
+    let snapshot: SessionSnapshot = serde_json::from_value(json!({
+        "revision": 1,
+        "activeSessionID": "busy-1",
+        "tabsEnabled": true,
+        "sessions": [
+            {
+                "sessionID": "busy-1",
+                "title": "Busy",
+                "active": true,
+                "busy": true,
+                "directory": "/project"
+            },
+            {
+                "sessionID": "atten-1",
+                "title": "Attention",
+                "active": false,
+                "attention": true,
+                "directory": "/project"
+            },
+            {
+                "sessionID": "idle-1",
+                "title": "Idle",
+                "active": false,
+                "directory": "/project"
+            }
+        ]
+    }))
+    .unwrap();
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_session_event(WireEnvelope::new(
+                identity,
+                1,
+                Operation::SessionSnapshot { snapshot },
+            ))
+            .expect("the current-attach session snapshot applies");
+    }
+    headless.pump_until(|model| {
+        model
+            .workspace(remote_id)
+            .unwrap()
+            .session_map()
+            .rows()
+            .len()
+            == 3
+    });
+    // The extra pass settles the tab geometry after the branding switch.
+    headless.render();
+
+    let output = headless.render_events_at(Vec::new(), headless.last_time + 0.5);
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a connected remote OpenCode tab must be labeled OpenCode"
+    );
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the server name must not be the tab label while the integration is connected"
+    );
+    let opencode_icon = icon_named("opencode.svg");
+    let icon_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("a connected remote OpenCode tab must paint opencode.svg in its tab");
+    assert_eq!(
+        icon_image.texture,
+        icon_texture(&headless.ctx, opencode_icon),
+        "the tab must reuse the vendored opencode.svg bytes"
+    );
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(
+        dots.len(),
+        3,
+        "busy, attention and idle remote sessions each paint one dot"
+    );
+    for (index, dot) in dots.iter().enumerate() {
+        assert!(
+            (dot.center - session_dot_center(tab, index, 3)).length() < 0.75,
+            "dots must be right-aligned in row order: {dot:?}"
+        );
+    }
+    assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the busy dot");
+    assert_session_dot_color(&dots[1], made_app::theme::WARNING, "the attention dot");
+    assert_session_dot_color(&dots[2], made_app::theme::TEXT_TERTIARY, "the idle dot");
+
+    headless.hover(workspace_tab_id(remote_id));
+    headless.advance(0.2);
+    let hovered = output_text(&headless.render());
+    for expected in ["Sessions: 1 running", "1 needs attention", "1 idle"] {
+        assert!(
+            hovered.contains(expected),
+            "the remote OpenCode tab tooltip must summarize its remote sessions: {hovered}"
+        );
+    }
+}
+
+#[test]
+fn remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect() {
+    if isolated("remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect") {
+        return;
+    }
+    use made_app::remote_workspace::{IntegrationState as RemoteIntegrationState, RemoteWorkspace};
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let name = "remote-opencode-direct";
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            true,
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    assert_eq!(
+        model.workspace(remote_id).unwrap().terminal_target(),
+        TerminalTarget::RemoteOpenCode { authority },
+        "the direct launch must own the OpenCode SSH target"
+    );
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.render();
+
+    // The directly launched remote OpenCode keeps the local OpenCode
+    // presentation while its remote process is alive, even before the first
+    // integration handshake.
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a directly launched remote OpenCode tab keeps the OpenCode label before the first handshake"
+    );
+    let opencode_icon = icon_named("opencode.svg");
+    let icon_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("the directly launched remote OpenCode tab must paint opencode.svg");
+    assert_eq!(
+        icon_image.texture,
+        icon_texture(&headless.ctx, opencode_icon),
+        "the tab must reuse the vendored opencode.svg bytes"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "no remote sessions are open yet, so no dots may paint"
+    );
+
+    // The remote OpenCode exits normally: the owning tab returns to the
+    // server-name presentation and the shared session map stays empty.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .integration_changed(&identity, RemoteIntegrationState::Unavailable)
+            .expect("the remote integration change applies");
+    }
+    headless.pump_until(|model| {
+        model
+            .workspace(remote_id)
+            .unwrap()
+            .session_map()
+            .rows()
+            .is_empty()
+    });
+    // The extra pass settles the tab geometry after the presentation reverts.
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the tab returns to the server-name presentation after the remote OpenCode exits"
+    );
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "no OpenCode label may survive the remote exit"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "stale session dots must clear with the remote exit"
+    );
+    assert_eq!(
+        headless
+            .model
+            .workspace(remote_id)
+            .unwrap()
+            .terminal_target(),
+        TerminalTarget::RemoteOpenCode { authority },
+        "the exit must not restart or replace the remote terminal target"
+    );
+
+    // A connected integration restores the presentation, and a transport
+    // disconnect reverts it again without touching the tab.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .integration_changed(&identity, RemoteIntegrationState::Connected)
+            .expect("the remote integration reconnect applies");
+    }
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a connected remote integration restores the OpenCode presentation"
+    );
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        workbench.remote_workspace_mut().unwrap().disconnect();
+    }
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the tab returns to the server-name presentation after the transport disconnects"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "the disconnect must leave no session dots"
+    );
+}
+
+#[test]
+fn remote_grok_tab_shows_grok_build_branding_and_dots() {
+    if isolated("remote_grok_tab_shows_grok_build_branding_and_dots") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{
+        GrokActivity, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, RemotePath,
+        TabCapability, WireEnvelope,
+    };
+
+    let name = "remote-grok-parity";
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    // A remote shell tab where the user typed `grok` manually: the target is
+    // the shell, so branding comes from owned sessions, not from a process.
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+
+    let session = |id: &str, cwd: &str, opened_at: u64, activity: GrokActivity| GrokSessionInfo {
+        session_id: id.to_owned(),
+        cwd: Some(RemotePath::new(cwd.as_bytes().to_vec()).unwrap()),
+        opened_at,
+        activity,
+    };
+    let push = |headless: &mut Headless, snapshot: GrokSessionSnapshot| {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot { snapshot },
+            ))
+            .expect("the current-attach Grok snapshot applies");
+    };
+
+    // A living sessionless grok process does not brand a shell tab: only the
+    // tab's own managed grok process earns the label before any session.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 1,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a remote shell tab stays on the server name until a Grok session opens"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "a remote shell tab paints no Grok dots before a session"
+    );
+
+    // One owned session is enough: the tab is branded Grok Build with the
+    // official mark and the local dot treatment.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 2,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![session("a", "/grok-a", 1, GrokActivity::Idle)],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "an owned remote Grok session must brand the shell tab Grok Build"
+    );
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the server name must not be the label while a Grok session is open"
+    );
+    let grok_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("a branded remote Grok tab must paint the official grok.svg mark");
+    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
+    assert_eq!(
+        grok_image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://grok.svg",
+            include_bytes!("../assets/grok.svg"),
+            grok_px.x as u32,
+            grok_px.y as u32,
+        ),
+        "the leading slot must use grok.svg"
+    );
+    headless.hover(workspace_tab_id(remote_id));
+    headless.advance(0.2);
+    let hovered = output_text(&headless.render());
+    assert!(
+        hovered.contains("1 idle") && !hovered.contains("/project"),
+        "a branded Grok tab tooltip summarizes sessions and omits the path: {hovered}"
+    );
+
+    // Owned sessions in three states paint the local dots in attachment
+    // order: idle, working (busy tone), attention.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 3,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![
+                session("a", "/grok-a", 1, GrokActivity::Idle),
+                session("b", "/grok-b", 2, GrokActivity::Working),
+                session("c", "/grok-c", 3, GrokActivity::Attention),
+            ],
+        },
+    );
+    // Move the pointer off the tab so the close reveal fades and the dots
+    // paint at full strength, as they do without a pointer over the tab.
+    headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+        4.0,
+        headless.height - 4.0,
+    ))]);
+    headless.advance(0.3);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(dots.len(), 3, "each owned Grok session paints one dot");
+    for (index, dot) in dots.iter().enumerate() {
+        assert!(
+            (dot.center - session_dot_center(tab, index, 3)).length() < 0.75,
+            "dots must be right-aligned in attachment order: {dot:?}"
+        );
+    }
+    assert_session_dot_color(&dots[0], made_app::theme::TEXT_TERTIARY, "the idle dot");
+    assert_session_dot_color(&dots[1], made_app::theme::ACCENT, "the working dot");
+    assert_session_dot_color(&dots[2], made_app::theme::WARNING, "the attention dot");
+    headless.hover(workspace_tab_id(remote_id));
+    headless.advance(0.2);
+    let hovered = output_text(&headless.render());
+    for expected in ["Sessions: 1 running", "1 needs attention", "1 idle"] {
+        assert!(
+            hovered.contains(expected),
+            "the remote Grok tab tooltip must summarize its sessions: {hovered}"
+        );
+    }
+    assert!(
+        !hovered.contains("/project"),
+        "a Grok Build tab tooltip must omit the workspace path: {hovered}"
+    );
+}
+
+#[test]
+fn remote_grok_direct_launch_brands_before_a_session_and_exits() {
+    if isolated("remote_grok_direct_launch_brands_before_a_session_and_exits") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{
+        GrokSessionSnapshot, Identity, Operation, RemotePath, TabCapability, WireEnvelope,
+    };
+
+    let name = "remote-grok-direct";
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_grok_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    assert_eq!(
+        model.workspace(remote_id).unwrap().terminal_target(),
+        TerminalTarget::RemoteGrok { authority },
+        "the direct launch must own the Grok SSH target"
+    );
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+
+    let push = |headless: &mut Headless, snapshot: GrokSessionSnapshot| {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot { snapshot },
+            ))
+            .expect("the current-attach Grok snapshot applies");
+    };
+
+    // The tab's remote target is a living grok process: the label is
+    // `Grok Build` with the official mark before any session exists.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 1,
+            running: true,
+            hooks_ready: false,
+            sessions: vec![],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a directly launched remote grok must be labeled Grok Build before any session"
+    );
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the server name must not be the label while the remote grok process runs"
+    );
+    let grok_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("a branded remote Grok tab must paint the official grok.svg mark");
+    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
+    assert_eq!(
+        grok_image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://grok.svg",
+            include_bytes!("../assets/grok.svg"),
+            grok_px.x as u32,
+            grok_px.y as u32,
+        ),
+        "the leading slot must use grok.svg"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "a sessionless Grok tab paints no dots"
+    );
+    headless.hover(workspace_tab_id(remote_id));
+    headless.advance(0.2);
+    let hovered = output_text(&headless.render());
+    assert!(
+        !hovered.contains("/project") && !hovered.contains("Sessions:"),
+        "a sessionless Grok Build tab must omit the workspace path tooltip: {hovered}"
+    );
+
+    // When the grok process is gone and no session remains, the tab returns
+    // to the server-name label and terminal glyph.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 2,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "an exited remote grok with no sessions restores the server-name label"
+    );
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the Grok Build label must drop when the process exits with no sessions"
+    );
+    assert!(
+        !painted_images(&output).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75 && tab.contains_rect(image.rect)
+        }),
+        "the official grok mark must drop when the process exits"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "an exited remote grok leaves no stale dots"
+    );
+}
+
+#[test]
+fn remote_grok_exit_disconnect_and_opencode_precedence() {
+    if isolated("remote_grok_exit_disconnect_and_opencode_precedence") {
+        return;
+    }
+    use made_app::remote_workspace::{IntegrationState as RemoteIntegrationState, RemoteWorkspace};
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{
+        GrokActivity, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, RemotePath,
+        TabCapability, WireEnvelope,
+    };
+
+    let name = "remote-grok-exit";
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: name.into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+
+    let push = |headless: &mut Headless, snapshot: GrokSessionSnapshot| {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot { snapshot },
+            ))
+            .expect("the Grok snapshot applies");
+    };
+    let session = |id: &str, cwd: &str, opened_at: u64, activity: GrokActivity| GrokSessionInfo {
+        session_id: id.to_owned(),
+        cwd: Some(RemotePath::new(cwd.as_bytes().to_vec()).unwrap()),
+        opened_at,
+        activity,
+    };
+    let pointer_away = |headless: &mut Headless| {
+        headless.render_events(vec![egui::Event::PointerMoved(egui::pos2(
+            4.0,
+            headless.height - 4.0,
+        ))]);
+        headless.advance(0.3);
+    };
+
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 1,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![session("a", "/grok-a", 1, GrokActivity::Working)],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the fixture starts branded Grok Build with one open session"
+    );
+
+    // OpenCode keeps precedence: a connected remote integration owns the
+    // label, icon and dots even while Grok sessions are open.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .integration_changed(&identity, RemoteIntegrationState::Connected)
+            .expect("the remote integration connects");
+    }
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "a connected remote OpenCode integration owns the tab presentation"
+    );
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the Grok Build label must yield to the connected OpenCode integration"
+    );
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 2,
+            running: true,
+            hooks_ready: false,
+            sessions: vec![session("a", "/grok-a", 1, GrokActivity::Working)],
+        },
+    );
+    pointer_away(&mut headless);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "OpenCode keeps the label even when Grok sessions exist"
+    );
+    let opencode_icon = icon_named("opencode.svg");
+    let icon_image = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .expect("the OpenCode tab must keep opencode.svg");
+    assert_eq!(
+        icon_image.texture,
+        icon_texture(&headless.ctx, opencode_icon),
+        "the tab must keep the vendored opencode.svg bytes"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "no OpenCode sessions are open, so Grok dots must not paint either"
+    );
+
+    // The integration becomes unavailable again: the owned Grok session
+    // retakes the presentation above the shell fallback.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .integration_changed(&identity, RemoteIntegrationState::Unavailable)
+            .expect("the remote integration becomes unavailable");
+    }
+    pointer_away(&mut headless);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the open Grok session retakes the presentation when OpenCode leaves"
+    );
+    assert_eq!(
+        tab_session_dots(&output, tab).len(),
+        1,
+        "the owned Grok session paints its dot again"
+    );
+
+    // The grok process exits and no session remains: the tab returns to the
+    // server-name label and terminal glyph, with no stale dots.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 3,
+            running: false,
+            hooks_ready: false,
+            sessions: vec![],
+        },
+    );
+    pointer_away(&mut headless);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "an exited remote grok with no open sessions restores the server-name label"
+    );
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the Grok Build label must drop when grok exits with no sessions"
+    );
+    assert!(
+        !painted_images(&output).into_iter().any(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75 && tab.contains_rect(image.rect)
+        }),
+        "the official grok mark must drop when grok exits"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "an exited remote grok leaves no stale dots"
+    );
+
+    // A previous-attachment snapshot with a stale identity is discarded and
+    // must not restore activity after the exit.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let mut stale = remote.identity().clone();
+        stale.epoch = 9;
+        assert!(
+            remote
+                .accept_grok_push(WireEnvelope::new(
+                    stale,
+                    1,
+                    Operation::GrokSnapshot {
+                        snapshot: GrokSessionSnapshot {
+                            revision: 4,
+                            running: true,
+                            hooks_ready: false,
+                            sessions: vec![session("a", "/grok-a", 1, GrokActivity::Working)],
+                        },
+                    },
+                ))
+                .is_err(),
+            "a stale-epoch Grok snapshot must be discarded",
+        );
+    }
+    pointer_away(&mut headless);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "stale-epoch Grok state must not repaint dots"
+    );
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "discarded stale state keeps the server-name presentation"
+    );
+
+    // A transport disconnect clears Grok activity without touching the
+    // terminal presentation.
+    push(
+        &mut headless,
+        GrokSessionSnapshot {
+            revision: 5,
+            running: true,
+            hooks_ready: false,
+            sessions: vec![session("a", "/grok-a", 1, GrokActivity::Working)],
+        },
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the fixture is branded again before the transport disconnect"
+    );
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        workbench.remote_workspace_mut().unwrap().disconnect();
+    }
+    pointer_away(&mut headless);
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(remote_id)).rect;
+    assert!(
+        text_rects(&output, name, 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "the disconnect restores the server-name presentation"
+    );
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "the disconnect clears stale Grok dots"
+    );
+}
+
+#[test]
 fn remote_open_prompt_refuses_changed_key_without_a_secret_field() {
     if isolated("remote_open_prompt_refuses_changed_key_without_a_secret_field") {
         return;
@@ -4281,6 +5532,7 @@ fn local_and_remote_headless(temp: &Path, name: &str) -> (Headless, WorkspaceId,
     use made_app::ssh_servers::ServerMetadata;
     use made_remote::protocol::{Identity, RemotePath, TabCapability};
 
+    assert_ssh_fixture_is_isolated("local_and_remote_headless");
     let root = fixture_workspace(temp, name, "main.rs");
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let local_id = open_workspace(&mut model, &root);
@@ -4697,6 +5949,88 @@ fn stage_error_does_not_spawn_the_companion() {
 }
 
 #[test]
+fn same_version_update_card_is_actionable_and_explorer_is_bounded() {
+    if isolated("same_version_update_card_is_actionable_and_explorer_is_bounded") {
+        return;
+    }
+    use made_app::remote_session::SshFailureClass;
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::{AttemptError, ServerMetadata};
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Update".into(),
+            host: "update-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model");
+    let remote_id = model.active_workspace_id().unwrap();
+    let workbench = model.workspace_mut(remote_id).unwrap();
+    workbench.hold_remote_target("x86_64-unknown-linux-gnu");
+    workbench.deliver_stage_result(Err(AttemptError {
+        class: SshFailureClass::UpdateRequired,
+        detail: "the installed companion must be updated with explicit approval".to_owned(),
+        fingerprint: None,
+    }));
+
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    headless.advance(0.2);
+    let text = output_text(&headless.render());
+    assert!(text.contains("Companion update"), "{text}");
+    assert!(
+        text.contains("the installed companion must be updated"),
+        "the terminal card keeps the real reason: {text}"
+    );
+    assert!(text.contains("Update companion"), "{text}");
+    assert!(
+        text.contains(made_app::APP_VERSION),
+        "the update card names the sanitized version: {text}"
+    );
+    assert!(
+        text.contains("x86_64-unknown-linux-gnu"),
+        "the update card names the sanitized target: {text}"
+    );
+    assert!(
+        !text.contains("Approve companion"),
+        "update approval is separate from initial staging consent: {text}"
+    );
+    assert!(
+        !text.contains("Loading folder…"),
+        "a pre-attach failure must not leave a perpetual loading explorer: {text}"
+    );
+    assert!(
+        text.contains("Explorer unavailable"),
+        "the explorer shows the bounded failure: {text}"
+    );
+    assert!(
+        !text.contains("The explorer remains available"),
+        "a failed pre-attach stage must not claim the explorer is usable: {text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("bump"),
+        "no app-version bump advice is allowed: {text}"
+    );
+}
+
+#[test]
 fn header_plus_menu_lists_terminal_before_detected_tuis() {
     if isolated("header_plus_menu_lists_terminal_before_detected_tuis") {
         return;
@@ -5108,7 +6442,7 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     });
     type_terminal_command(
         headless.model.workspace_mut(id).unwrap(),
-        "i=0; while [ $i -lt 250 ]; do echo tick; i=$((i+1)); sleep 0.01; done",
+        "while :; do echo tick; sleep 0.01; done",
     );
     headless.render();
     let file_row = headless
@@ -5162,32 +6496,33 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         before_paints,
         "hidden terminal must not paint its grid"
     );
-    let deadline = Instant::now() + Duration::from_millis(250);
-    while Instant::now() < deadline {
-        headless.model.logic(&headless.ctx);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        headless
-            .model
+    headless.pump_until(|model| {
+        model
             .workspace(id)
-            .unwrap()
-            .terminal()
-            .unwrap()
-            .output_bytes()
-            > before_output,
-        "hidden terminal must keep consuming output"
-    );
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.output_bytes() > before_output)
+    });
 
+    let at_leak = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .terminal()
+        .unwrap()
+        .output_bytes();
     headless.render_events(typed_events(&format!(
         "printf leaked > '{}'\n",
         marker.display()
     )));
-    let deadline = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < deadline {
-        headless.model.logic(&headless.ctx);
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // Pump until the shell has consumed fresh output after the keystrokes:
+    // the same passes that would deliver a leak have run, so the marker's
+    // absence below is proven, not timed.
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.output_bytes() > at_leak)
+    });
     assert!(
         !marker.exists(),
         "preview keystrokes must never reach the hidden shell"
@@ -6808,6 +8143,7 @@ fn file_control_sits_below_session_strip_and_path() {
     let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
     let mut socket = connect(&options);
     send_state(&mut socket, 1, &root);
+    service_bridge_heartbeat(socket);
     headless.pump_until(|model| !model.workspace(id).unwrap().session_map().is_empty());
     headless
         .model
@@ -7637,6 +8973,7 @@ fn optional_session_map_appears_only_after_session_data() {
     let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
     let mut socket = connect(&options);
     send_state(&mut socket, 1, &root);
+    service_bridge_heartbeat(socket);
     headless.pump_until(|model| !model.workspace(id).unwrap().session_map().is_empty());
     headless.render();
     assert!(
@@ -7649,6 +8986,7 @@ fn optional_session_map_appears_only_after_session_data() {
     let sessions = headless
         .response(top_workspace_action_id(id, "sessions"))
         .rect;
+    let ssh = headless.response(top_action_id("ssh-servers")).rect;
     let explorer = headless
         .response(top_workspace_action_id(id, "explorer"))
         .rect;
@@ -7662,6 +9000,14 @@ fn optional_session_map_appears_only_after_session_data() {
     assert!(
         sessions.right() < explorer.left() && explorer.left() > sessions.left(),
         "right icon order must be Sessions then Explorer (Explorer rightmost): sessions {sessions:?}, explorer {explorer:?}"
+    );
+    assert!(
+        sessions.right() <= ssh.left(),
+        "Sessions must not overlap the SSH control: sessions {sessions:?}, ssh {ssh:?}"
+    );
+    assert!(
+        ssh.right() <= explorer.left(),
+        "the SSH control must precede Explorer without overlap: ssh {ssh:?}, explorer {explorer:?}"
     );
     let hovered = output_text(
         &headless.hover_until_text(top_workspace_action_id(id, "sessions"), "Show sessions"),
@@ -8101,6 +9447,672 @@ fn ssh_servers_window_keeps_field_focus_and_has_no_collapse() {
             .unwrap()
             .is_focused(),
         "closing the window must return focus to the terminal"
+    );
+}
+
+fn assert_large_ssh_window_scrolls(width: f32, height: f32) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-large", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let servers = add_ssh_inventory(&mut model, 80);
+    let last = *servers.last().expect("inventory");
+    let first = servers[0];
+    let mut headless = Headless::new(model, width, height);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.render();
+
+    let screen = headless.ctx.content_rect();
+    let window = headless
+        .ctx
+        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
+        .expect("SSH window rect");
+    assert!(
+        screen.contains_rect(window),
+        "{width}x{height}: the SSH window must stay inside the viewport: {window:?} vs {screen:?}"
+    );
+
+    // The bottom actions are reachable by scrolling the bounded body.
+    wheel_over(&mut headless, window.center(), egui::vec2(0.0, -20_000.0));
+    for action in ["ssh-save", "ssh-test", "ssh-remove"] {
+        let rect = headless.response(top_action_id(action)).rect;
+        assert!(
+            window.contains_rect(rect) && screen.contains_rect(rect),
+            "{width}x{height}: {action} must be reachable inside the window: {rect:?} vs {window:?}"
+        );
+    }
+
+    // Keyboard focus on the last row scrolls it into the bounded body.
+    headless.focus(ssh_server_row_id(last));
+    headless.advance(0.6);
+    let last_rect = headless.response(ssh_server_row_id(last)).rect;
+    assert!(
+        window.contains_rect(last_rect),
+        "{width}x{height}: the last server row must scroll into the window: {last_rect:?} vs {window:?}"
+    );
+
+    // Shift+Tab from the first text field enters the inventory at the end;
+    // arrow keys then move between rows without the old focus hold stealing it
+    // back.
+    headless.focus(ssh_field_id("name"));
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(ssh_field_id("name")),
+        "{width}x{height}: the name field must own focus"
+    );
+    headless.press_key_with_modifiers(egui::Key::Tab, egui::Modifiers::SHIFT);
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(ssh_server_row_id(last)),
+        "{width}x{height}: Shift+Tab from the fields must enter the rows"
+    );
+    headless.press_key(egui::Key::ArrowUp);
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(ssh_server_row_id(servers[servers.len() - 2])),
+        "{width}x{height}: ArrowUp must move to the previous server row"
+    );
+
+    // Forward Tab from the action row enters the inventory instead of leaving
+    // the dialog.
+    headless.focus(top_action_id("ssh-remove"));
+    headless.press_key(egui::Key::Tab);
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(ssh_server_row_id(first)),
+        "{width}x{height}: Tab from the actions must enter the first server row"
+    );
+
+    // Escape closes the management window and returns focus to the terminal.
+    headless.press_key(egui::Key::Escape);
+    headless.render();
+    headless.render();
+    assert!(
+        !output_text(&headless.render()).contains("Display name"),
+        "{width}x{height}: Escape must close the SSH management window"
+    );
+    assert!(
+        headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .terminal()
+            .unwrap()
+            .is_focused(),
+        "{width}x{height}: closing the window must return focus to the terminal"
+    );
+
+    // Reopen: the management window starts at the top, so the first server row
+    // is visible instead of inheriting the previous session's scroll offset.
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.render();
+    let reopened = headless
+        .ctx
+        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
+        .expect("reopened SSH window rect");
+    let first_rect = headless.response(ssh_server_row_id(first)).rect;
+    assert!(
+        reopened.contains_rect(first_rect) && first_rect.top() < reopened.top() + 96.0,
+        "{width}x{height}: reopening must show the first server row at the top: {first_rect:?} vs {reopened:?}"
+    );
+}
+
+fn ssh_window_rect(headless: &Headless) -> egui::Rect {
+    headless
+        .ctx
+        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
+        .expect("SSH window rect")
+}
+
+/// Releasing a text-field hold into Save/Test/Remove or a server row must not
+/// forget the window rect, recenter it, or zero its measured body height.
+fn assert_ssh_window_stays_put_on_hold_release(width: f32, height: f32) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-hold-release", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let servers = add_ssh_inventory(&mut model, 6);
+    let first = servers[0];
+    let mut headless = Headless::new(model, width, height);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.render();
+    let before = ssh_window_rect(&headless);
+    assert!(before.height() > 0.0, "{width}x{height}: {before:?}");
+
+    // Click a server row while its field owns focus.
+    let name = ssh_field_id("name");
+    headless.focus(name);
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(name),
+        "{width}x{height}: the name field must own focus"
+    );
+    headless.click(ssh_server_row_id(first));
+    let after_row_click = ssh_window_rect(&headless);
+    assert_eq!(
+        after_row_click, before,
+        "{width}x{height}: clicking a server row must not collapse or recenter the window"
+    );
+
+    // Tab from the field into Save, then Test, Remove, and the inventory row.
+    headless.focus(name);
+    headless.render();
+    let mut reached = Vec::new();
+    for _ in 0..16 {
+        headless.press_key(egui::Key::Tab);
+        headless.render();
+        let focused = headless.ctx.memory(|memory| memory.focused());
+        if let Some(focused) = focused {
+            if focused == top_action_id("ssh-save") {
+                reached.push("save");
+            } else if focused == top_action_id("ssh-test") {
+                reached.push("test");
+            } else if focused == top_action_id("ssh-remove") {
+                reached.push("remove");
+            }
+        }
+        if reached.len() == 3 {
+            break;
+        }
+        assert!(
+            headless
+                .ctx
+                .memory(|memory| memory.area_rect(ssh_servers_window_id()))
+                .is_some_and(|current| current == before),
+            "{width}x{height}: Tab release changed the window rect to {:?} from {before:?}",
+            ssh_window_rect(&headless)
+        );
+    }
+    assert_eq!(
+        reached,
+        vec!["save", "test", "remove"],
+        "{width}x{height}: Tab must reach each action without losing the window"
+    );
+    assert_eq!(
+        ssh_window_rect(&headless),
+        before,
+        "{width}x{height}: tabbing through actions must not collapse or recenter the window"
+    );
+
+    // The next Tab enters the inventory and keeps the same window rect.
+    headless.press_key(egui::Key::Tab);
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(ssh_server_row_id(first)),
+        "{width}x{height}: Tab from Remove must enter the first server row"
+    );
+    assert_eq!(
+        ssh_window_rect(&headless),
+        before,
+        "{width}x{height}: entering a row must not collapse or recenter the window"
+    );
+}
+
+#[test]
+fn ssh_servers_window_keeps_rect_on_field_hold_release_at_1280x800() {
+    if isolated("ssh_servers_window_keeps_rect_on_field_hold_release_at_1280x800") {
+        return;
+    }
+    assert_ssh_window_stays_put_on_hold_release(1280.0, 800.0);
+}
+
+#[test]
+fn ssh_servers_window_keeps_rect_on_field_hold_release_at_720x480() {
+    if isolated("ssh_servers_window_keeps_rect_on_field_hold_release_at_720x480") {
+        return;
+    }
+    assert_ssh_window_stays_put_on_hold_release(720.0, 480.0);
+}
+
+#[test]
+fn ssh_server_rows_expose_accessible_button_label_and_selection() {
+    if isolated("ssh_server_rows_expose_accessible_button_label_and_selection") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+
+    let format_controls = "\u{202e}\u{200b}\u{feff}\u{2066}";
+    let long = format!(
+        "Provisioning {format_controls}{}",
+        "long-server-name-".repeat(6)
+    );
+    assert!(long.chars().count() <= 128);
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-accessible", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let long_id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: long.clone(),
+            host: "long-server.example".to_owned(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("long server saves");
+    let other_id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Short server".to_owned(),
+            host: "short-server.example".to_owned(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("short server saves");
+    model.select_ssh_server(long_id);
+
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.enable_accesskit();
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    let output = headless.render();
+
+    let row_id = ssh_server_row_id(long_id);
+    let row_rect = headless.response(row_id).rect;
+    let painted = text_in_rect(&output, row_rect);
+    let truncated = format!(
+        "{} · not tested",
+        made_app::sanitize::sanitize_display(&long, 48)
+    );
+    assert!(
+        painted.contains(&truncated) && painted.contains('…'),
+        "a long server name must ellipsize in the row: {painted:?}"
+    );
+    assert!(
+        !painted.contains(&long),
+        "the row must not paint the unbounded long name: {painted:?}"
+    );
+
+    let (role, label, selected) = accesskit_row_state(&output, row_id);
+    assert_eq!(
+        role,
+        egui::Role::Button,
+        "custom server rows must expose the Button role"
+    );
+    let expected_label = format!("{} · not tested", made_app::sanitize::sanitize_text(&long));
+    assert_eq!(
+        label.as_deref(),
+        Some(expected_label.as_str()),
+        "the accessible label carries the full untruncated name"
+    );
+    for (surface, text) in [
+        ("visible", painted.as_str()),
+        ("accessible", label.as_deref().expect("accessible label")),
+    ] {
+        // The painted-text collector joins rows with a trailing newline that is
+        // not part of the row's name; every other control is a real failure.
+        let checked = text.strip_suffix('\n').unwrap_or(text);
+        assert_eq!(
+            made_app::sanitize::sanitize_text(checked),
+            checked,
+            "the {surface} server name must not carry control or format characters"
+        );
+        for control in ['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}'] {
+            assert!(
+                !text.contains(control),
+                "the {surface} server name must not carry {control:?}: {text:?}"
+            );
+        }
+    }
+    use egui::accesskit::Toggled;
+
+    assert_eq!(
+        selected,
+        Some(Toggled::True),
+        "the selected server row must expose selected state"
+    );
+
+    let (_, _, other_selected) = accesskit_row_state(&output, ssh_server_row_id(other_id));
+    assert_eq!(
+        other_selected,
+        Some(Toggled::False),
+        "an unselected server row must expose selected = false"
+    );
+
+    headless.model.select_ssh_server(other_id);
+    let output = headless.render();
+    let (_, _, long_selected) = accesskit_row_state(&output, row_id);
+    let (_, _, other_selected) = accesskit_row_state(&output, ssh_server_row_id(other_id));
+    assert_eq!(
+        long_selected,
+        Some(Toggled::False),
+        "selection must move off the long row"
+    );
+    assert_eq!(
+        other_selected,
+        Some(Toggled::True),
+        "selection must move to the chosen row"
+    );
+}
+
+#[test]
+fn ssh_server_rows_activate_with_enter_and_space_and_load_metadata() {
+    if isolated("ssh_server_rows_activate_with_enter_and_space_and_load_metadata") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-activation", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    // Distinct host aliases prove which selected record loaded into the form.
+    let servers = (0..3)
+        .map(|index| {
+            model
+                .add_ssh_metadata(ServerMetadata {
+                    display_name: format!("Plant {index:03}"),
+                    host: format!("plant-{index:03}.example"),
+                    user: None,
+                    port: None,
+                    key_file: None,
+                    initial_directory: None,
+                })
+                .expect("server metadata saves")
+        })
+        .collect::<Vec<_>>();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.render();
+
+    headless.focus(ssh_server_row_id(servers[1]));
+    headless.press_key(egui::Key::Enter);
+    headless.render();
+    let enter_text = output_text(&headless.render());
+    assert!(
+        enter_text.contains("plant-001.example"),
+        "Enter must load the selected server metadata into the form: {enter_text}"
+    );
+
+    headless.focus(ssh_server_row_id(servers[0]));
+    headless.press_key(egui::Key::Space);
+    headless.render();
+    let space_text = output_text(&headless.render());
+    assert!(
+        space_text.contains("plant-000.example"),
+        "Space must load the selected server metadata into the form: {space_text}"
+    );
+    assert!(
+        !space_text.contains("plant-001.example"),
+        "Space must replace the previous selection: {space_text}"
+    );
+}
+
+#[test]
+fn ssh_management_actions_save_test_remove_have_model_effects() {
+    if isolated("ssh_management_actions_save_test_remove_have_model_effects") {
+        return;
+    }
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let capabilities = |opencode| Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: false,
+        python3: true,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "ssh-actions", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let servers = add_ssh_inventory(&mut model, 2);
+    let first = servers[0];
+    let selected = servers[1];
+    model
+        .hold_ssh_probe_result(first, Ok(capabilities(true)))
+        .expect("first probe result records");
+    model
+        .hold_ssh_probe_result(selected, Ok(capabilities(false)))
+        .expect("second probe result records");
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.click(top_action_id("ssh-servers"));
+    headless.render();
+    headless.render();
+
+    // Each server paints its own probe result instead of a global guess.
+    let probe_text = output_text(&headless.render());
+    assert!(
+        probe_text.contains("Plant 000 · OpenCode detected"),
+        "the first server keeps its own probe text: {probe_text}"
+    );
+    assert!(
+        probe_text.contains("Plant 001 · OpenCode not detected"),
+        "the second server keeps its own probe text: {probe_text}"
+    );
+
+    // Save persists the edited draft through the model, not just the widget.
+    headless.model.select_ssh_server(selected);
+    headless.render();
+    let name = ssh_field_id("name");
+    headless.click(name);
+    headless.press_key_with_modifiers(egui::Key::A, egui::Modifiers::COMMAND);
+    headless.render_events(vec![egui::Event::Text("Renamed Plant".to_owned())]);
+    headless.render();
+    headless.click(top_action_id("ssh-save"));
+    assert_eq!(
+        headless.model.ssh_notice(),
+        Some("Saved. Open workspaces keep their original server."),
+        "Save must report the model's edit"
+    );
+    let saved = output_text(&headless.render());
+    assert!(
+        saved.contains("Renamed Plant · not tested"),
+        "Save must persist the edited server record: {saved}"
+    );
+
+    // Test starts the bounded probe through the model and says so.
+    headless.click(top_action_id("ssh-test"));
+    assert_eq!(
+        headless.model.ssh_notice(),
+        Some("Testing the connection. OpenCode will not be started."),
+        "Test must start the selected server's probe"
+    );
+
+    // Remove deletes the selected record and resets the selection.
+    headless.click(top_action_id("ssh-remove"));
+    assert_eq!(
+        headless.model.ssh_notice(),
+        Some("Server removed. Open workspaces were not closed."),
+        "Remove must report the model's deletion"
+    );
+    let removed = output_text(&headless.render());
+    assert!(
+        !removed.contains("Renamed Plant"),
+        "Remove must delete the saved server row: {removed}"
+    );
+    assert!(
+        removed.contains("Plant 000"),
+        "Remove must keep the other server: {removed}"
+    );
+    assert!(
+        !removed.contains("plant-000.example"),
+        "Remove must clear the selected server's draft: {removed}"
+    );
+}
+
+#[test]
+fn ssh_servers_window_scrolls_large_inventory_at_1280x800() {
+    if isolated("ssh_servers_window_scrolls_large_inventory_at_1280x800") {
+        return;
+    }
+    assert_large_ssh_window_scrolls(1280.0, 800.0);
+}
+
+#[test]
+fn ssh_servers_window_scrolls_large_inventory_at_720x480() {
+    if isolated("ssh_servers_window_scrolls_large_inventory_at_720x480") {
+        return;
+    }
+    assert_large_ssh_window_scrolls(720.0, 480.0);
+}
+
+fn assert_large_new_tab_menu_scrolls(width: f32, height: f32) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "menu-large", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let servers = add_ssh_inventory(&mut model, 80);
+    let last = *servers.last().expect("inventory");
+    let last_menu = new_tab_menu_item_id(&format!("ssh-terminal-{}", authority_hex(last)));
+    let mut headless = Headless::new(model, width, height);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(top_action_id("open-folder"));
+    headless.settle_animation();
+    let screen = headless.ctx.content_rect();
+    let popup = headless
+        .ctx
+        .memory(|memory| memory.area_rect(top_action_id("open-folder").with("popup")))
+        .expect("menu area");
+    assert!(
+        screen.contains_rect(popup),
+        "{width}x{height}: the large menu must be capped inside the viewport: {popup:?} vs {screen:?}"
+    );
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    assert!(
+        terminal.top() < opencode.top(),
+        "{width}x{height}: Terminal must stay first"
+    );
+    assert!(
+        (terminal.height() - opencode.height()).abs() < 0.5
+            && (terminal.width() - opencode.width()).abs() < 0.75,
+        "{width}x{height}: Terminal and OpenCode rows must keep their geometry: {terminal:?} {opencode:?}"
+    );
+
+    // A wheel over the menu scrolls every remote row into view.
+    wheel_over(&mut headless, terminal.center(), egui::vec2(0.0, -20_000.0));
+    let last_rect = headless.response(last_menu).rect;
+    assert!(
+        screen.contains_rect(last_rect),
+        "{width}x{height}: the wheel must scroll the last remote row into view: {last_rect:?} vs {screen:?}"
+    );
+
+    // Reopen and walk the menu with the keyboard to the last remote row.
+    headless.press_key(egui::Key::Escape);
+    headless.render();
+    headless.focus(top_action_id("open-folder"));
+    headless.press_key(egui::Key::Enter);
+    headless.render();
+    let reopened_terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let reopened_opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    assert!(
+        screen.contains_rect(reopened_terminal) && screen.contains_rect(reopened_opencode),
+        "{width}x{height}: reopening must show Terminal and OpenCode at the top: {reopened_terminal:?} {reopened_opencode:?} vs {screen:?}"
+    );
+    assert!(
+        reopened_terminal.top() < reopened_opencode.top(),
+        "{width}x{height}: reopening must keep Terminal above OpenCode"
+    );
+    headless.press_key(egui::Key::ArrowDown);
+    headless.render();
+    let mut reached = false;
+    for _ in 0..servers.len() + 3 {
+        if headless.ctx.memory(|memory| memory.focused()) == Some(last_menu) {
+            reached = true;
+            break;
+        }
+        headless.press_key(egui::Key::ArrowDown);
+        headless.render();
+    }
+    assert!(
+        reached,
+        "{width}x{height}: arrow keys must reach the last remote row"
+    );
+    headless.advance(0.6);
+    let last_rect = headless.response(last_menu).rect;
+    assert!(
+        screen.contains_rect(last_rect),
+        "{width}x{height}: keyboard focus must scroll the last remote row into view: {last_rect:?} vs {screen:?}"
+    );
+}
+
+#[test]
+fn new_tab_menu_scrolls_large_inventory_at_1280x800() {
+    if isolated("new_tab_menu_scrolls_large_inventory_at_1280x800") {
+        return;
+    }
+    assert_large_new_tab_menu_scrolls(1280.0, 800.0);
+}
+
+#[test]
+fn new_tab_menu_scrolls_large_inventory_at_720x480() {
+    if isolated("new_tab_menu_scrolls_large_inventory_at_720x480") {
+        return;
+    }
+    assert_large_new_tab_menu_scrolls(720.0, 480.0);
+}
+
+#[test]
+fn new_tab_menu_scrolls_large_inventory_at_short_viewport() {
+    if isolated("new_tab_menu_scrolls_large_inventory_at_short_viewport") {
+        return;
+    }
+    // A shorter supported viewport must bound the menu to the space that is
+    // actually left instead of reserving three rows past the bottom edge.
+    assert_large_new_tab_menu_scrolls(720.0, 360.0);
+}
+
+#[test]
+fn new_tab_menu_short_inventory_stays_compact() {
+    if isolated("new_tab_menu_short_inventory_stays_compact") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "menu-short", "main.rs");
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+    );
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1100.0, 700.0);
+    wait_explorer_ready(&mut headless, id);
+
+    headless.click(top_action_id("open-folder"));
+    headless.settle_animation();
+    let screen = headless.ctx.content_rect();
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    let popup = headless
+        .ctx
+        .memory(|memory| memory.area_rect(top_action_id("open-folder").with("popup")))
+        .expect("menu area");
+    assert!(
+        (terminal.height() - opencode.height()).abs() < 0.5
+            && (terminal.width() - opencode.width()).abs() < 0.75,
+        "the short menu must keep its row geometry: {terminal:?} {opencode:?}"
+    );
+    assert!(
+        popup.height() < terminal.height() * 3.0 + 40.0,
+        "a short menu must not reserve an empty scroll viewport: {popup:?}"
+    );
+    assert!(
+        screen.contains_rect(popup),
+        "a short menu must stay compact inside the viewport: {popup:?} vs {screen:?}"
     );
 }
 
@@ -10197,5 +12209,466 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
         "unsupported",
         "opencode_missing",
         "Grok Build is not on PATH.",
+    );
+}
+
+#[test]
+fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
+    if isolated("remote_grok_diagnostics_follow_the_tab_tier_and_server_state") {
+        return;
+    }
+    use made_app::app::RemoteGrokInstallHold;
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{
+        Capabilities, GrokActivity, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation,
+        RemotePath, RemoteTarget, TabCapability, WireEnvelope,
+    };
+
+    let grok_capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: true,
+        python3: true,
+    };
+    let no_grok_capabilities = Capabilities {
+        grok: false,
+        ..grok_capabilities.clone()
+    };
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "grok-server".into(),
+            host: "grok-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    let other = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "plain-server".into(),
+            host: "plain-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(authority, Ok(grok_capabilities))
+        .expect("the probe result records");
+    model
+        .hold_ssh_probe_result(other, Ok(no_grok_capabilities))
+        .expect("the probe result records");
+    assert!(
+        model.remote_grok_detected_on(authority).unwrap(),
+        "the server's own probe detected grok"
+    );
+    assert!(!model.remote_grok_detected_on(other).unwrap());
+    assert!(
+        !model.remote_grok_consent_granted(authority).unwrap(),
+        "no consent exists before an explicit approval"
+    );
+    // A server without detected grok offers no Grok tier at all.
+    assert!(!model.remote_grok_detected_on(other).unwrap());
+
+    model
+        .attach_remote_grok_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/project".to_vec()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .expect("remote model attaches");
+    let remote_id = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.render();
+
+    let sentence = |headless: &Headless| {
+        headless
+            .model
+            .workspace(remote_id)
+            .unwrap()
+            .diagnostics_snapshot()
+            .grok_sentence
+            .to_owned()
+    };
+    let pill = |headless: &Headless| {
+        headless
+            .model
+            .workspace(remote_id)
+            .unwrap()
+            .diagnostics_snapshot()
+            .grok_pill
+    };
+
+    // Attached, detected, nothing running: the honest row is not running.
+    assert!(
+        sentence(&headless).contains("Grok Build is not running."),
+        "{}",
+        sentence(&headless)
+    );
+
+    // An owned open session without consent: the inventory tier is degraded
+    // and names the missing approval. The host sentence never applies.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot {
+                    snapshot: GrokSessionSnapshot {
+                        revision: 1,
+                        running: false,
+                        hooks_ready: false,
+                        sessions: vec![GrokSessionInfo {
+                            session_id: "a".to_owned(),
+                            cwd: Some(RemotePath::new(b"/grok-a".to_vec()).unwrap()),
+                            opened_at: 1,
+                            activity: GrokActivity::Working,
+                        }],
+                    },
+                },
+            ))
+            .expect("the current-attach Grok snapshot applies");
+    }
+    headless.advance(0.1);
+    assert!(
+        sentence(&headless).contains("hooks are unavailable"),
+        "{}",
+        sentence(&headless)
+    );
+    assert!(
+        sentence(&headless).contains("not approved"),
+        "{}",
+        sentence(&headless)
+    );
+    assert_eq!(
+        pill(&headless),
+        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+    );
+
+    // The bounded attempt is busy while it runs.
+    headless
+        .model
+        .hold_remote_grok_install(authority, RemoteGrokInstallHold::Running);
+    assert!(
+        sentence(&headless).contains("Installing the Grok Build plugin"),
+        "{}",
+        sentence(&headless)
+    );
+
+    // python3 missing is a declared honest failure reason.
+    headless.model.hold_remote_grok_install(
+        authority,
+        RemoteGrokInstallHold::Failed {
+            reason: Some("python3-missing"),
+        },
+    );
+    assert!(
+        sentence(&headless).contains("remote python3 is missing"),
+        "{}",
+        sentence(&headless)
+    );
+
+    // A generic install failure names the failed install.
+    headless
+        .model
+        .hold_remote_grok_install(authority, RemoteGrokInstallHold::Failed { reason: None });
+    assert!(
+        sentence(&headless).contains("the plugin install failed"),
+        "{}",
+        sentence(&headless)
+    );
+
+    // After a successful install the row is ready while the session is open.
+    headless
+        .model
+        .hold_remote_grok_install(authority, RemoteGrokInstallHold::Succeeded);
+    assert_eq!(
+        sentence(&headless),
+        "Grok Build session follow is ready.",
+        "{}",
+        sentence(&headless)
+    );
+
+    // When the session closes the row says not running again.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot {
+                    snapshot: GrokSessionSnapshot {
+                        revision: 2,
+                        running: false,
+                        hooks_ready: false,
+                        sessions: vec![],
+                    },
+                },
+            ))
+            .expect("the exit snapshot applies");
+    }
+    headless.advance(0.1);
+    assert!(
+        sentence(&headless).contains("Grok Build is not running."),
+        "{}",
+        sentence(&headless)
+    );
+
+    // A transport disconnect leaves no stale Grok claim at all.
+    {
+        let workbench = headless.model.workspace_mut(remote_id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot {
+                    snapshot: GrokSessionSnapshot {
+                        revision: 3,
+                        running: true,
+                        hooks_ready: false,
+                        sessions: vec![GrokSessionInfo {
+                            session_id: "b".to_owned(),
+                            cwd: Some(RemotePath::new(b"/grok-b".to_vec()).unwrap()),
+                            opened_at: 1,
+                            activity: GrokActivity::Working,
+                        }],
+                    },
+                },
+            ))
+            .expect("the reconnect snapshot applies");
+        workbench.remote_workspace_mut().unwrap().disconnect();
+    }
+    headless.advance(0.1);
+    let row_sentence = sentence(&headless);
+    assert!(
+        row_sentence.contains("SSH transport is disconnected"),
+        "no stale Grok claim may survive the disconnect: {row_sentence}"
+    );
+    assert!(
+        !row_sentence.contains("ready") && !row_sentence.contains("hooks are unavailable"),
+        "the transport row must not carry pre-disconnect tier claims: {row_sentence}"
+    );
+}
+
+#[test]
+fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
+    if isolated("grok_ssh_menu_row_and_consent_card_follow_per_server_detection") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: true,
+        python3: true,
+    };
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let with_grok = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok server".into(),
+            host: "grok-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    let _without_grok = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Plain server".into(),
+            host: "plain-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(with_grok, Ok(capabilities))
+        .expect("probe result records");
+    // A local workspace tab hosts the header; the servers exist beside it.
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "menu-host", "main.rs");
+    open_workspace(&mut model, &root);
+    let menu_host = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    wait_explorer_ready(&mut headless, menu_host);
+    headless.render();
+
+    // The `+` menu offers `Grok SSH` only for the server whose own probe
+    // detected grok; the other server's choices omit it.
+    headless.click(top_action_id("open-folder"));
+    let menu = output_text(&headless.render());
+    assert!(
+        menu.contains("Grok SSH — Grok server"),
+        "the detected server must offer Grok SSH: {menu}"
+    );
+    assert!(
+        !menu.contains("Grok SSH — Plain server"),
+        "an undetected server must not offer Grok SSH: {menu}"
+    );
+    assert!(
+        menu.contains("Terminal SSH — Plain server"),
+        "the undetected server keeps its terminal choice: {menu}"
+    );
+    headless.press_key(egui::Key::Escape);
+    headless.render();
+
+    // The consent card lives in the server window for the selected server.
+    headless.click(top_action_id("ssh-servers"));
+    let window = output_text(&headless.render());
+    assert!(
+        window.contains("Servidores SSH"),
+        "the SSH window opens: {window}"
+    );
+    assert!(
+        !window.contains("Grok Build plugin install"),
+        "a server whose probe did not detect grok shows no Grok consent card: {window}"
+    );
+
+    // Select the grok-capable server: the card offers approve and refuse with
+    // the honest new-sessions-only disclosure, and nothing has been installed.
+    headless.model.select_ssh_server(with_grok);
+    // The bounded body measures the card, then the window grows to fit it.
+    headless.render();
+    headless.render();
+    let card = output_text(&headless.render());
+    assert!(
+        card.contains("Grok Build plugin install"),
+        "the detected server offers the consent card: {card}"
+    );
+    assert!(
+        card.contains("only to Grok sessions started after the install"),
+        "the card discloses the new-sessions-only limit: {card}"
+    );
+    assert!(
+        card.contains("Approve") && card.contains("Refuse"),
+        "the card presents approve and refuse: {card}"
+    );
+    assert!(
+        !headless
+            .model
+            .remote_grok_consent_granted(with_grok)
+            .unwrap(),
+        "no consent exists before the explicit approval"
+    );
+    assert!(
+        headless
+            .model
+            .remote_grok_install_state(with_grok)
+            .is_none(),
+        "viewing the card must not start any install"
+    );
+
+    // Refusal stores nothing and starts nothing; the terminal choice stays.
+    headless.click(top_action_id("ssh-grok-refuse"));
+    headless.render();
+    let refused = output_text(&headless.render());
+    assert!(
+        refused.contains("Refused. Nothing was installed or written"),
+        "refusal is disclosed honestly: {refused}"
+    );
+    assert!(
+        !headless
+            .model
+            .remote_grok_consent_granted(with_grok)
+            .unwrap(),
+        "refusal never records approval"
+    );
+    assert!(
+        headless
+            .model
+            .remote_grok_install_state(with_grok)
+            .is_none(),
+        "refusal must not start an install attempt"
+    );
+
+    // A fresh server has no staged helper, so the approval stays gated until
+    // this session verifies a provisioned or reused companion.
+    assert!(!headless.model.remote_grok_install_ready(with_grok));
+    headless.click(top_action_id("ssh-grok-approve"));
+    assert!(
+        !headless
+            .model
+            .remote_grok_consent_granted(with_grok)
+            .unwrap(),
+        "a gated approval stores nothing"
+    );
+    assert!(!headless.model.remote_grok_install_running(with_grok));
+
+    headless.model.hold_remote_companion_provisioned(with_grok);
+    headless.render();
+
+    // Approval persists the per-server/version consent and starts the bounded
+    // attempt; without the packaged helper it fails closed and says so.
+    headless.click(top_action_id("ssh-grok-approve"));
+    assert!(
+        headless
+            .model
+            .remote_grok_consent_granted(with_grok)
+            .unwrap(),
+        "approval persists the consent"
+    );
+    headless.pump_until(|model| {
+        !matches!(
+            model.remote_grok_install_state(with_grok),
+            Some(made_app::app::RemoteGrokInstallState::Running)
+        )
+    });
+    assert!(matches!(
+        headless.model.remote_grok_install_state(with_grok),
+        Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+    ));
+    headless.render();
+    let failed = output_text(&headless.render());
+    assert!(
+        failed.contains("install failed"),
+        "the failed attempt is disclosed honestly: {failed}"
+    );
+
+    // Withdrawal clears the consent and the card returns to its offer.
+    headless.click(top_action_id("ssh-grok-withdraw"));
+    assert!(
+        !headless
+            .model
+            .remote_grok_consent_granted(with_grok)
+            .unwrap(),
+        "withdrawal removes the consent"
+    );
+    headless.render();
+    let withdrawn = output_text(&headless.render());
+    assert!(
+        withdrawn.contains("Consent withdrawn"),
+        "withdrawal is disclosed: {withdrawn}"
     );
 }

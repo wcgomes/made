@@ -767,6 +767,8 @@ struct ExplorerCardView<'a> {
     tree: ExplorerTreeBody<'a>,
     git: Option<GitBodyView>,
     scroll_to_selection: bool,
+    /// Only offer Retry when the caller can actually re-request the root.
+    retry_available: bool,
 }
 
 /// Branch and worktree facts the explorer header needs. Made never invents a branch.
@@ -1663,6 +1665,7 @@ impl ExplorerPane {
                 tree,
                 git,
                 scroll_to_selection,
+                retry_available: true,
             };
             explorer_card_ui(
                 ui,
@@ -2024,6 +2027,7 @@ fn explorer_card_ui(
             scope,
             layout,
             view.scroll_to_selection,
+            view.retry_available,
             &mut result,
         );
     }
@@ -2036,6 +2040,7 @@ fn explorer_tree_body_ui(
     scope: egui::Id,
     layout: &theme::Layout,
     scroll_to_selection: bool,
+    retry_available: bool,
     result: &mut ExplorerCardResult,
 ) {
     match body {
@@ -2052,7 +2057,9 @@ fn explorer_tree_body_ui(
                             .color(theme::ERROR),
                     );
                     ui.label(theme::body(sanitize_display(message, 700)));
-                    if theme::secondary_button(ui, "Retry", layout.button_height).clicked() {
+                    if retry_available
+                        && theme::secondary_button(ui, "Retry", layout.button_height).clicked()
+                    {
                         result.retry = true;
                     }
                 });
@@ -3518,6 +3525,15 @@ impl ExplorerRowSource for RemoteRows {
     }
 }
 
+/// Presentation and interaction context for one remote Explorer frame.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteExplorerOptions {
+    pub scope: egui::Id,
+    pub native_backdrop: bool,
+    /// Only a tab with a live remote connection can re-request its root.
+    pub allow_root_retry: bool,
+}
+
 /// Draw a remote explorer from an already-applied projection through the same
 /// card, header, row, and Git renderer used by the local Explorer. This
 /// function does not read the host filesystem and does not start a local
@@ -3527,11 +3543,14 @@ pub fn remote_explorer_ui(
     root: &made_remote::protocol::RemotePath,
     projection: &crate::remote_workspace::WorkspaceProjection,
     layout: &theme::Layout,
-    scope: egui::Id,
-    native_backdrop: bool,
+    options: RemoteExplorerOptions,
     cache: &mut RemoteExplorerCache,
 ) -> Vec<RemoteExplorerAction> {
     use crate::remote_workspace::{ExplorerMode, Freshness};
+
+    let scope = options.scope;
+    let native_backdrop = options.native_backdrop;
+    let allow_root_retry = options.allow_root_retry;
 
     let git_view = projection.git_view.as_ref();
     let show_icon =
@@ -3549,8 +3568,21 @@ pub fn remote_explorer_ui(
     let root_full = sanitize_display(&remote_path_text(header_root), 900);
     let root_name = sanitize_display(&remote_root_name(header_root), 160);
     let mut root_unavailable = None;
+    let root_failed = matches!(projection.root_state, Freshness::Unavailable(_));
     let tree = if git_open {
         ExplorerTreeBody::Empty
+    } else if root_failed {
+        // A failed pre-flight SSH stage or attach never painted data. Show the
+        // bounded failure instead of a spinner or a partial/stale tree.
+        root_unavailable = Some("Remote files unavailable".to_string());
+        ExplorerTreeBody::Error(
+            if allow_root_retry {
+                "The remote folder did not open because the SSH attempt failed. Retry after the companion is available."
+            } else {
+                "The remote folder did not open because the SSH attempt failed. Reconnect after the companion is available."
+            }
+            .to_owned(),
+        )
     } else {
         let directory = projection.directories.get(header_root).or_else(|| {
             projection
@@ -3608,6 +3640,7 @@ pub fn remote_explorer_ui(
         tree,
         git,
         scroll_to_selection: false,
+        retry_available: allow_root_retry,
     };
     let result = explorer_card_ui(ui, &view, scope, native_backdrop, layout);
     let mut actions = Vec::new();
@@ -6941,6 +6974,7 @@ mod tests {
             session_state: Freshness::Stale,
             integration_error: None,
             focus: None,
+            grok: None,
             mode: ExplorerMode::Files,
             cleanup_unconfirmed: false,
         }
@@ -6968,8 +7002,11 @@ mod tests {
                 root,
                 projection,
                 &layout,
-                egui::Id::unique("remote-explorer-test"),
-                false,
+                RemoteExplorerOptions {
+                    scope: egui::Id::unique("remote-explorer-test"),
+                    native_backdrop: false,
+                    allow_root_retry: true,
+                },
                 &mut cache,
             );
         });
@@ -6983,6 +7020,76 @@ mod tests {
     ) -> (egui::FullOutput, Vec<RemoteExplorerAction>) {
         let (_ctx, output, actions) = remote_render_ctx(projection, root);
         (output, actions)
+    }
+
+    fn remote_render_with_retry(
+        projection: &crate::remote_workspace::WorkspaceProjection,
+        root: &made_remote::protocol::RemotePath,
+        allow_retry: bool,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let layout = theme::Layout::for_window(1280.0, 800.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut cache = RemoteExplorerCache::default();
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = remote_explorer_ui(
+                ui,
+                root,
+                projection,
+                &layout,
+                RemoteExplorerOptions {
+                    scope: egui::Id::unique("remote-explorer-retry-test"),
+                    native_backdrop: false,
+                    allow_root_retry: allow_retry,
+                },
+                &mut cache,
+            );
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn disconnected_remote_error_hides_the_inert_retry_action() {
+        use crate::remote_workspace::{ExplorerMode, Freshness, RootSource};
+        use made_remote::protocol::{ErrorCode, RemotePath};
+
+        let root = RemotePath::new(b"/home/vscode".to_vec()).unwrap();
+        let mut projection = remote_projection();
+        projection.source = RootSource::Launch;
+        projection.requested_root = None;
+        projection.root_state = Freshness::Unavailable(ErrorCode::Unavailable);
+        projection.directories.clear();
+        projection.expanded.clear();
+        projection.selected = None;
+        projection.git_selected = None;
+        projection.git_root_known = false;
+        projection.git.clear();
+        projection.git_view = None;
+        projection.mode = ExplorerMode::Files;
+
+        let disconnected = output_text(&remote_render_with_retry(&projection, &root, false));
+        assert!(
+            disconnected.contains("Explorer unavailable"),
+            "{disconnected:?}"
+        );
+        assert!(
+            !disconnected.contains("Retry"),
+            "a pre-attach failure must not offer an inert Retry: {disconnected:?}"
+        );
+
+        let connected = output_text(&remote_render_with_retry(&projection, &root, true));
+        assert!(
+            connected.contains("Retry"),
+            "a connected root failure keeps its retry action: {connected:?}"
+        );
     }
 
     #[test]
@@ -7296,6 +7403,7 @@ mod tests {
             session_state: Freshness::Stale,
             integration_error: None,
             focus: None,
+            grok: None,
             mode: ExplorerMode::Files,
             cleanup_unconfirmed: false,
         };

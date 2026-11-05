@@ -144,41 +144,21 @@ fn status_log() -> Option<PathBuf> {
 
 fn read_open_sessions_at(path: &Path) -> Option<Vec<OpenSession>> {
     let text = std::fs::read_to_string(path).ok()?;
-    let mut rows = Vec::new();
-    for object in text.split("},") {
-        // A repeated field has more than one interpretation, so the row cannot
-        // choose an attachment. Skipping it keeps the explorer where it was.
-        if ["pid", "session_id", "cwd", "opened_at"]
+    // The companion's inventory parser defines completeness, duplicate-key
+    // rejection, and string-aware object bounds identically. A repeated field
+    // or a truncated row has no single interpretation, so it never moves the
+    // explorer.
+    Some(
+        made_remote::grok::parse_inventory(&text)
             .into_iter()
-            .any(|key| key_count(object, key) > 1)
-        {
-            continue;
-        }
-        if let (Some(pid), Some(cwd)) = (json_u32(object, "pid"), json_string(object, "cwd")) {
-            rows.push(OpenSession {
-                pid,
-                session_id: json_string(object, "session_id").unwrap_or_default(),
-                cwd,
-                opened_at: json_string(object, "opened_at").unwrap_or_default(),
-            });
-        }
-    }
-    Some(rows)
-}
-
-fn key_count(object: &str, key: &str) -> usize {
-    let pattern = format!("\"{key}\"");
-    object.matches(pattern.as_str()).count()
-}
-
-fn json_u32(object: &str, key: &str) -> Option<u32> {
-    let rest = after_key(object, key)?;
-    let number: String = rest
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    number.parse().ok()
+            .map(|record| OpenSession {
+                pid: record.pid,
+                session_id: record.session_id,
+                cwd: record.cwd,
+                opened_at: record.opened_at,
+            })
+            .collect(),
+    )
 }
 
 fn json_string(object: &str, key: &str) -> Option<String> {
@@ -310,6 +290,45 @@ mod tests {
             open_sessions_at(unreadable, terminal_pid).is_empty(),
             "a malformed inventory path must not invent a session"
         );
+    }
+
+    #[test]
+    fn truncated_malformed_and_pretty_printed_inventory_never_moves_or_invents() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("active_sessions.json");
+        let pretty_cwd = serde_json::to_string("/pretty").unwrap();
+        let escaped_cwd = serde_json::to_string(r#"/weird,{}[]\"quoted"#).unwrap();
+        let body = format!(
+            r#"[
+  {{
+    "pid": 1,
+    "session_id": "pretty",
+    "cwd": {pretty_cwd},
+    "opened_at": "t2"
+  }},
+  {{"pid":1,"session_id":"broken" "cwd":"/broken","opened_at":"t3"}},
+  {{"pid":1,"session_id":"dup","session_id":"dup2","cwd":"/dup","opened_at":"t4"}},
+  {{"pid":1,"session_id":"escaped","cwd":{escaped_cwd},"opened_at":"t5"}},
+  {{"pid":1,"session_id":"after","cwd":"/after","opened_at":"t6"}},
+  {{"pid":1,"session_id":"truncated","cwd":"/truncated","opened_at":"t9""#
+        );
+        write(&sessions, &body);
+
+        let open = open_sessions_matching(&sessions, 1, |_| None);
+        let ids: Vec<&str> = open.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["pretty", "escaped", "after"],
+            "only complete, well-formed, unambiguous rows may move the explorer"
+        );
+        assert_eq!(open[1].cwd, r#"/weird,{}[]\"quoted"#);
+        for absent in ["broken", "dup", "dup2", "truncated"] {
+            assert_eq!(
+                session_ownership_at(&sessions, 1, absent),
+                SessionOwnership::Unknown,
+                "{absent} must not be invented from an incomplete or malformed row"
+            );
+        }
     }
 
     #[test]

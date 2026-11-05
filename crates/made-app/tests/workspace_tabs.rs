@@ -1,4 +1,5 @@
 //! Real-process ownership and hidden-runtime regression tests.
+mod support;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -10,6 +11,10 @@ use serde_json::{json, Value};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use tungstenite::{Message, WebSocket};
+
+/// Set by the isolated-child helpers so helpers that persist app data can
+/// prove they resolve their app-data directory under the test temp root.
+const ISOLATED_TEST_HOME_ENV: &str = "MADE_WORKSPACE_TEST_HOME";
 
 fn isolated(name: &str) -> bool {
     isolated_with_opencode_launches(name, 0)
@@ -43,6 +48,7 @@ fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize
     command
         .args(["--exact", name, "--nocapture"])
         .env("MADE_WORKSPACE_TEST_CHILD", "1")
+        .env(ISOLATED_TEST_HOME_ENV, home.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -76,6 +82,15 @@ fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize
         command.env("MADE_OPENCODE_CWD_CAPTURE", &cwd_capture);
         command.env("SHELL", "/bin/bash");
     }
+    // Hand the child an explicit fixture plugin package staged inside the
+    // install root, which release builds require the plugin override to
+    // canonicalize into; cargo never packages a plugin beside the test
+    // binary.
+    let plugins = support::StagedPlugins::stage("workspace-tabs");
+    command.env(
+        made_platform::PLUGIN_DIR_ENV,
+        plugins.package("opencode-made"),
+    );
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -151,6 +166,7 @@ fn isolated_menu_launch(name: &str) -> bool {
     command
         .args(["--exact", name, "--nocapture"])
         .env("MADE_WORKSPACE_TEST_CHILD", "1")
+        .env(ISOLATED_TEST_HOME_ENV, home.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -173,6 +189,15 @@ fn isolated_menu_launch(name: &str) -> bool {
         .env("MADE_GROK_BIN", &grok_bin);
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     command.env_remove(made_platform::SHELL_ENV);
+    // Hand the child an explicit fixture plugin package staged inside the
+    // install root, which release builds require the plugin override to
+    // canonicalize into; cargo never packages a plugin beside the test
+    // binary.
+    let plugins = support::StagedPlugins::stage("workspace-menu");
+    command.env(
+        made_platform::PLUGIN_DIR_ENV,
+        plugins.package("opencode-made"),
+    );
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -2230,6 +2255,32 @@ fn tick_until_root(
     }
 }
 
+/// Like [`tick_until_root`], but also returns the instant the returning tick
+/// began. `Workbench::tick` captures `now` as its first statement and passes
+/// it to the Grok inventory pass, so for an adoption this is the instant the
+/// poll's one-second debounce is measured from.
+#[cfg(unix)]
+fn tick_until_root_from(
+    workbench: &mut made_app::Workbench,
+    ctx: &egui::Context,
+    expected: &std::path::Path,
+    timeout: Duration,
+) -> (PathBuf, Instant) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let tick_began = Instant::now();
+        workbench.tick(ctx);
+        let root = workbench
+            .explorer_root()
+            .expect("explorer root")
+            .to_path_buf();
+        if root == expected || Instant::now() >= deadline {
+            return (root, tick_began);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Inventory, hook history, prompt priority, focus, and shell restore.
 ///
 /// The refresh decision lives in the workbench, not `session_follow`: a prompt
@@ -2292,9 +2343,10 @@ fn grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back() {
         row("older", &older, "2024-01-01T00:00:01Z"),
         row("newer", &newer, "2024-01-01T00:00:02Z"),
     ]);
+    let (newer_root, newer_adopted_tick) =
+        tick_until_root_from(&mut workbench, &ctx, &newer, Duration::from_secs(3));
     assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &newer, Duration::from_secs(3)),
-        newer,
+        newer_root, newer,
         "the newest attachment moves the explorer"
     );
 
@@ -2303,19 +2355,22 @@ fn grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back() {
         row("newer", &newer, "2024-01-01T00:00:02Z"),
         row("attached", &attached, "2024-01-01T00:00:03Z"),
     ]);
-    for _ in 0..5 {
-        workbench.tick(&ctx);
-    }
+    let (attached_root, attached_adopted_tick) =
+        tick_until_root_from(&mut workbench, &ctx, &attached, Duration::from_secs(3));
     assert_eq!(
-        workbench.explorer_root(),
-        Some(newer.as_path()),
-        "inventory refresh is about once a second and must not run again immediately"
-    );
-    std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &attached, Duration::from_secs(2)),
-        attached,
+        attached_root, attached,
         "a newly attached session moves the explorer on the next refresh"
+    );
+    // The inventory poll is debounced to once a second, measured from the
+    // adopting tick's own start instant (`tick` captures `now` first and both
+    // passes run inside their tick). Comparing the two adoption instants
+    // asserts the debounce exactly, with no assumption about how long a tick
+    // or the host may stall; counting ticks was not safe — five of them
+    // straddled the one-second boundary under load.
+    assert!(
+        attached_adopted_tick.saturating_duration_since(newer_adopted_tick)
+            >= Duration::from_secs(1),
+        "inventory refresh is about once a second and must not run again immediately"
     );
 
     append_grok_hook(&json!({
@@ -2324,8 +2379,11 @@ fn grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back() {
         "event": "UserPromptSubmit",
         "status": "working"
     }));
+    // A prompt moves the explorer in the very next hook read, without waiting
+    // for the inventory poll; the bound only covers observation, not
+    // scheduling.
     assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &older, Duration::from_secs(2)),
+        tick_until_root(&mut workbench, &ctx, &older, Duration::from_secs(3)),
         older,
         "a prompt moves the explorer without waiting for inventory"
     );
@@ -2350,7 +2408,7 @@ fn grok_follow_moves_on_attach_and_prompt_without_inventory_stealing_back() {
     write_grok_inventory(&[]);
     std::thread::sleep(Duration::from_millis(1100));
     assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &root, Duration::from_secs(2)),
+        tick_until_root(&mut workbench, &ctx, &root, Duration::from_secs(3)),
         root,
         "no remaining Grok session returns the explorer to the shell"
     );
@@ -2400,15 +2458,30 @@ fn grok_session_start_moves_the_explorer_immediately() {
         "event": "SessionStart",
         "status": "idle"
     }));
-    let began = Instant::now();
-    assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &started, Duration::from_secs(1)),
-        started,
-        "session start moves the explorer immediately and shows idle"
-    );
+    // The move happens in the tick that reads the hook line — not on the
+    // one-second inventory cadence. A tick can stall past that debounce under
+    // load, and the same tick's empty-inventory pass would then release the
+    // unconfirmed session back to the shell; a revert is itself a poll, so
+    // re-driving the hook line moves again inside a fresh debounce window.
+    let mut started_immediately = false;
+    for attempt in 0..4 {
+        if attempt > 0 {
+            append_grok_hook(&json!({
+                "sessionId": "live",
+                "cwd": started,
+                "event": "SessionStart",
+                "status": "idle"
+            }));
+        }
+        workbench.tick(&ctx);
+        if workbench.explorer_root() == Some(started.as_path()) {
+            started_immediately = true;
+            break;
+        }
+    }
     assert!(
-        began.elapsed() < Duration::from_millis(900),
-        "session start must not wait for the one-second inventory refresh"
+        started_immediately,
+        "session start moves the explorer immediately and shows idle"
     );
     workbench.shutdown();
 }
@@ -2470,12 +2543,29 @@ fn a_later_owned_prompt_survives_release_of_an_earlier_provisional_move() {
         "event": "SessionStart",
         "status": "idle"
     }));
-    for _ in 0..5 {
+    // The provisional move is observable only while no inventory poll reverts
+    // it, and a tick can outlast the one-second debounce under load — the
+    // same tick's pass then releases the unconfirmed session back to the
+    // adopted root. A revert is itself a poll, so re-driving the hook line
+    // moves again inside a fresh debounce window and the retry converges.
+    let mut provisional = false;
+    for attempt in 0..4 {
+        if attempt > 0 {
+            append_grok_hook(&json!({
+                "sessionId": "foreign-new",
+                "cwd": foreign,
+                "event": "SessionStart",
+                "status": "idle"
+            }));
+        }
         workbench.tick(&ctx);
+        if workbench.explorer_root() == Some(foreign.as_path()) {
+            provisional = true;
+            break;
+        }
     }
-    assert_eq!(
-        workbench.explorer_root(),
-        Some(foreign.as_path()),
+    assert!(
+        provisional,
         "a session not yet in the inventory moves the explorer provisionally"
     );
 
@@ -2485,15 +2575,14 @@ fn a_later_owned_prompt_survives_release_of_an_earlier_provisional_move() {
         "event": "UserPromptSubmit",
         "status": "working"
     }));
-    let began = Instant::now();
+    // One tick reads the appended hook line; the inventory poll cannot have
+    // fired in the same tick's directory pass (its newest row is unchanged),
+    // so this proves the prompt moved without waiting for inventory.
+    workbench.tick(&ctx);
     assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &older, Duration::from_millis(800)),
-        older,
+        workbench.explorer_root(),
+        Some(older.as_path()),
         "a prompt in the older owned session moves the explorer there immediately"
-    );
-    assert!(
-        began.elapsed() < Duration::from_millis(800),
-        "the owned prompt must not wait for inventory"
     );
 
     std::thread::sleep(Duration::from_millis(1100));
@@ -2577,15 +2666,14 @@ fn a_foreign_hook_does_not_keep_or_yank_this_tabs_explorer() {
         "event": "UserPromptSubmit",
         "status": "working"
     }));
-    let began = Instant::now();
+    // One tick reads the appended hook line; the inventory poll cannot have
+    // moved the root in the same tick's directory pass (its newest row is
+    // unchanged), so this proves the prompt moved without waiting for it.
+    workbench.tick(&ctx);
     assert_eq!(
-        tick_until_root(&mut workbench, &ctx, &own, Duration::from_secs(1)),
-        own,
+        workbench.explorer_root(),
+        Some(own.as_path()),
         "a prompt for a session this terminal owns moves immediately"
-    );
-    assert!(
-        began.elapsed() < Duration::from_millis(900),
-        "an owned prompt must not wait for the one-second inventory poll"
     );
 
     append_grok_hook(&json!({
@@ -2808,6 +2896,15 @@ sleep 30\n",
         .env("MADE_GROK_LAUNCH_ARGS", home.path().join("launch-args"));
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     command.env_remove(made_platform::SHELL_ENV);
+    // Hand the child an explicit fixture plugin package staged inside the
+    // install root, which release builds require the plugin override to
+    // canonicalize into; cargo never packages a plugin beside the test
+    // binary.
+    let plugins = support::StagedPlugins::stage("workspace-install");
+    command.env(
+        made_platform::PLUGIN_DIR_ENV,
+        plugins.package("opencode-made"),
+    );
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -2983,4 +3080,846 @@ fn hooks_unavailable(model: &AppModel) -> bool {
                     .contains("session-status hooks are unavailable")
             })
     })
+}
+
+#[test]
+fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
+    if isolated("grok_ssh_requires_detection_and_launches_remote_grok_directly") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, Identity, RemotePath, RemoteTarget, TabCapability};
+
+    let grok_capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: true,
+        python3: true,
+    };
+    let no_grok_capabilities = Capabilities {
+        grok: false,
+        ..grok_capabilities.clone()
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let with_grok = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok server".into(),
+            host: "grok-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    let without_grok = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Plain server".into(),
+            host: "plain-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(with_grok, Ok(grok_capabilities))
+        .expect("probe result records");
+    model
+        .hold_ssh_probe_result(without_grok, Ok(no_grok_capabilities))
+        .expect("probe result records");
+
+    // The row exists only where that server's own probe detected grok.
+    assert!(model.remote_grok_detected_on(with_grok).unwrap());
+    assert!(!model.remote_grok_detected_on(without_grok).unwrap());
+
+    // The current tab keeps running: open a local shell tab first.
+    model.open_plan(LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let local_id = model.active_workspace_id().expect("local tab");
+
+    // The launch is immediate: no folder picker step, no SSH panel draft.
+    model
+        .begin_remote_grok_launch(with_grok)
+        .expect("grok ssh starts");
+    let grok_id = model.active_workspace_id().expect("remote grok tab");
+    assert_ne!(grok_id, local_id, "the launch opens a new tab");
+    assert!(
+        !model.remote_launch_pending(),
+        "a direct Grok SSH launch must not open a folder picker draft"
+    );
+    assert_eq!(
+        model.workspace(grok_id).unwrap().terminal_target(),
+        TerminalTarget::RemoteGrok {
+            authority: with_grok
+        },
+        "the new tab owns the remote Grok target"
+    );
+    assert!(
+        model
+            .workspace(local_id)
+            .and_then(made_app::Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "the current tab keeps running across the Grok SSH launch"
+    );
+
+    // An undetected server never starts a launch, locally or remotely.
+    let before = model.workspace_count();
+    assert!(
+        model.begin_remote_grok_launch(without_grok).is_err(),
+        "Grok SSH must refuse a server whose probe did not detect grok"
+    );
+    assert_eq!(
+        model.workspace_count(),
+        before,
+        "a refused launch must not create a tab"
+    );
+    assert!(
+        model.workspace(grok_id).unwrap().terminal_target()
+            == TerminalTarget::RemoteGrok {
+                authority: with_grok
+            },
+        "the refused attempt must not retarget an existing tab"
+    );
+
+    // The remote model binding path mirrors the launch target for tests.
+    let identity = Identity {
+        authority: with_grok,
+        tab: TabCapability::random().unwrap(),
+        epoch: 1,
+        generation: 1,
+    };
+    let workspace =
+        RemoteWorkspace::new(identity, RemotePath::new(b"/project".to_vec()).unwrap()).unwrap();
+    model
+        .attach_remote_grok_model(with_grok, workspace)
+        .expect("remote model attaches");
+    assert_eq!(
+        model.active_workspace_id(),
+        Some(grok_id.max(model.active_workspace_id().unwrap())),
+        "attaching keeps a live tab selected"
+    );
+}
+
+#[test]
+fn grok_install_consent_is_explicit_bounded_and_withdrawable() {
+    if isolated("grok_install_consent_is_explicit_bounded_and_withdrawable") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: true,
+        python3: true,
+    };
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok server".into(),
+            host: "grok-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(id, Ok(capabilities))
+        .expect("probe result records");
+
+    let ctx = egui::Context::default();
+    let poll_until = |model: &mut AppModel, ready: &dyn Fn(&AppModel) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            model.logic(&ctx);
+            if ready(model) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the model did not reach the expected state");
+    };
+
+    // Before any approval nothing is installed and no attempt is running.
+    assert!(!model.remote_grok_consent_granted(id).unwrap());
+    assert!(model.remote_grok_install_state(id).is_none());
+    assert!(!model.remote_grok_install_running(id));
+
+    // Refusal stores nothing and starts nothing.
+    model.refuse_remote_grok_install(id);
+    assert!(model.remote_grok_install_refused(id));
+    assert!(!model.remote_grok_consent_granted(id).unwrap());
+    assert!(model.remote_grok_install_state(id).is_none());
+
+    // A fresh server has no staged helper, so approval stays gated until this
+    // session verifies a provisioned or reused companion.
+    assert!(!model.remote_grok_install_ready(id));
+    assert!(model.approve_remote_grok_install(id).is_err());
+    assert!(!model.remote_grok_install_running(id));
+    assert!(!model.remote_grok_consent_granted(id).unwrap());
+    model.hold_remote_companion_provisioned(id);
+    assert!(model.remote_grok_install_ready(id));
+
+    // Approval persists the per-server/version consent and starts the bounded
+    // attempt. In this environment the attempt fails closed (no packaged
+    // askpass); the failure is honest and consent stays recorded.
+    model.approve_remote_grok_install(id).expect("approve");
+    assert!(
+        model.remote_grok_consent_granted(id).unwrap(),
+        "approval persists the consent"
+    );
+    assert!(
+        model.remote_grok_install_running(id),
+        "the bounded attempt starts only after approval"
+    );
+    poll_until(&mut model, &|model: &AppModel| {
+        !matches!(
+            model.remote_grok_install_state(id),
+            Some(made_app::app::RemoteGrokInstallState::Running)
+        )
+    });
+    assert!(
+        matches!(
+            model.remote_grok_install_state(id),
+            Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+        ),
+        "the attempt fails closed without the packaged helper: {:?}",
+        model.remote_grok_install_state(id)
+    );
+    assert!(
+        model.remote_grok_consent_granted(id).unwrap(),
+        "a failed install never revokes the recorded approval"
+    );
+    let notice = model.ssh_notice().unwrap_or_default();
+    assert!(
+        notice.contains("install failed"),
+        "the failure is disclosed honestly: {notice}"
+    );
+
+    // Withdrawal removes the consent; no further install may start.
+    model.withdraw_remote_grok_install(id).expect("withdraw");
+    assert!(!model.remote_grok_consent_granted(id).unwrap());
+    assert!(!model.remote_grok_install_refused(id));
+
+    // A server without detected grok refuses approval outright.
+    let other = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Plain server".into(),
+            host: "plain-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    assert!(model.approve_remote_grok_install(other).is_err());
+    assert!(!model.remote_grok_consent_granted(other).unwrap());
+    assert!(model.remote_grok_install_state(other).is_none());
+}
+
+#[test]
+fn grok_install_approval_is_gated_until_the_companion_is_provisioned() {
+    if isolated("grok_install_approval_is_gated_until_the_companion_is_provisioned") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok server".into(),
+            host: "grok-server".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(
+            id,
+            Ok(Capabilities {
+                target: RemoteTarget::LinuxX64,
+                tmux: false,
+                opencode: false,
+                shell_cwd: false,
+                helper_version: "probe".to_owned(),
+                grok: true,
+                python3: true,
+            }),
+        )
+        .expect("probe result records");
+
+    // A fresh server has no helper for `GrokPluginInstall` to exec.
+    assert!(!model.remote_grok_install_ready(id));
+    let error = model
+        .approve_remote_grok_install(id)
+        .expect_err("a missing companion must gate approval");
+    assert!(
+        error.contains("private companion"),
+        "the gate names the missing requirement: {error}"
+    );
+    assert!(!model.remote_grok_consent_granted(id).unwrap());
+    assert!(!model.remote_grok_install_running(id));
+    assert!(model.remote_grok_install_state(id).is_none());
+
+    // A provisioned or reused companion makes this authority independently
+    // approvable and starts the bounded fixed install.
+    model.hold_remote_companion_provisioned(id);
+    assert!(model.remote_grok_install_ready(id));
+    model
+        .approve_remote_grok_install(id)
+        .expect("a provisioned companion allows approval");
+    assert!(model.remote_grok_consent_granted(id).unwrap());
+    assert!(model.remote_grok_install_running(id));
+    assert!(matches!(
+        model.remote_grok_install_state(id),
+        Some(made_app::app::RemoteGrokInstallState::Running)
+    ));
+}
+
+#[test]
+fn grok_install_attempts_stay_independent_across_servers() {
+    if isolated("grok_install_attempts_stay_independent_across_servers") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: true,
+        python3: true,
+    };
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let server_a = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok A".into(),
+            host: "grok-a".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(server_a, Ok(capabilities.clone()))
+        .expect("probe result records");
+    let server_b = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "Grok B".into(),
+            host: "grok-b".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .hold_ssh_probe_result(server_b, Ok(capabilities))
+        .expect("probe result records");
+
+    let ctx = egui::Context::default();
+    let poll_until = |model: &mut AppModel, ready: &dyn Fn(&AppModel) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            model.logic(&ctx);
+            if ready(model) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the model did not reach the expected state");
+    };
+
+    // Approving A starts A's own bounded attempt once its companion is
+    // provisioned or verified in this session.
+    model.hold_remote_companion_provisioned(server_a);
+    model
+        .approve_remote_grok_install(server_a)
+        .expect("approve A");
+    assert!(model.remote_grok_install_running(server_a));
+
+    // Approving B must not cancel or overwrite A's in-flight attempt: SSH
+    // tabs are independent servers.
+    model.hold_remote_companion_provisioned(server_b);
+    model
+        .approve_remote_grok_install(server_b)
+        .expect("approve B");
+    assert!(
+        model.remote_grok_install_running(server_a),
+        "approving B must not cancel A's in-flight attempt"
+    );
+    assert!(model.remote_grok_install_running(server_b));
+    assert!(
+        matches!(
+            model.remote_grok_install_state(server_a),
+            Some(made_app::app::RemoteGrokInstallState::Running)
+        ),
+        "A's record stays honest while B is approved: {:?}",
+        model.remote_grok_install_state(server_a)
+    );
+    assert!(model.remote_grok_consent_granted(server_a).unwrap());
+    assert!(model.remote_grok_consent_granted(server_b).unwrap());
+
+    // Both attempts finish on their own, each result recorded against its
+    // own authority. In this environment both fail closed (no packaged
+    // askpass); the failure is honest and both consents stay recorded.
+    poll_until(&mut model, &|model: &AppModel| {
+        !matches!(
+            model.remote_grok_install_state(server_a),
+            Some(made_app::app::RemoteGrokInstallState::Running)
+        ) && !matches!(
+            model.remote_grok_install_state(server_b),
+            Some(made_app::app::RemoteGrokInstallState::Running)
+        ) && !model.remote_grok_install_running(server_a)
+            && !model.remote_grok_install_running(server_b)
+    });
+    for (server, name) in [(server_a, "A"), (server_b, "B")] {
+        assert!(
+            matches!(
+                model.remote_grok_install_state(server),
+                Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+            ),
+            "{name}'s attempt fails closed without the packaged helper: {:?}",
+            model.remote_grok_install_state(server)
+        );
+        assert!(
+            model.remote_grok_consent_granted(server).unwrap(),
+            "{name}'s failed install never revokes its recorded approval"
+        );
+    }
+
+    // Withdrawing A touches neither B's consent nor B's recorded outcome.
+    model
+        .withdraw_remote_grok_install(server_a)
+        .expect("withdraw A");
+    assert!(!model.remote_grok_consent_granted(server_a).unwrap());
+    assert!(
+        model.remote_grok_consent_granted(server_b).unwrap(),
+        "withdrawing A must not withdraw B"
+    );
+    assert!(matches!(
+        model.remote_grok_install_state(server_b),
+        Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+    ));
+
+    // Re-approving B replaces only B's own attempt; A's outcome stays.
+    model
+        .approve_remote_grok_install(server_b)
+        .expect("re-approve B");
+    assert!(model.remote_grok_install_running(server_b));
+    assert!(
+        !model.remote_grok_install_running(server_a),
+        "A has no attempt after it finished"
+    );
+    assert!(matches!(
+        model.remote_grok_install_state(server_a),
+        Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+    ));
+    poll_until(&mut model, &|model: &AppModel| {
+        !model.remote_grok_install_running(server_b)
+    });
+    assert!(matches!(
+        model.remote_grok_install_state(server_b),
+        Some(made_app::app::RemoteGrokInstallState::Failed { .. })
+    ));
+}
+
+fn remote_update_model(
+    name: &str,
+) -> (
+    AppModel,
+    made_remote::protocol::AuthorityId,
+    made_app::app::WorkspaceId,
+) {
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_platform::Platform;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    // `add_ssh_metadata` persists immediately. Refuse to build this model
+    // unless the resolved app-data directory is provably under the temp root
+    // supplied by an isolated-child helper, so a future direct caller cannot
+    // write the user's real ssh-servers.json.
+    let test_root = std::env::var_os(ISOLATED_TEST_HOME_ENV)
+        .expect("remote_update_model requires an isolated temporary HOME");
+    let app_data = made_platform::host_platform()
+        .app_paths()
+        .expect("test app paths")
+        .data_dir;
+    assert!(
+        app_data.starts_with(&test_root),
+        "remote_update_model would write the host app-data registry at {}",
+        app_data.display()
+    );
+
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: name.into(),
+            host: format!("{name}.example"),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    let workspace = RemoteWorkspace::new(
+        Identity {
+            authority: id,
+            tab: TabCapability::random().unwrap(),
+            epoch: 1,
+            generation: 1,
+        },
+        RemotePath::new(b"/project".to_vec()).unwrap(),
+    )
+    .unwrap();
+    model
+        .attach_remote_model(id, workspace, false)
+        .expect("remote model");
+    let remote_id = model.active_workspace_id().expect("remote tab");
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .hold_remote_target("x86_64-unknown-linux-gnu");
+    (model, id, remote_id)
+}
+
+fn update_required_error() -> made_app::ssh_servers::AttemptError {
+    made_app::ssh_servers::AttemptError {
+        class: made_app::remote_session::SshFailureClass::UpdateRequired,
+        detail: "the installed companion must be updated with explicit approval".to_owned(),
+        fingerprint: None,
+    }
+}
+
+#[test]
+fn same_version_update_waits_for_separate_approval_and_reports_the_real_reason() {
+    if isolated("same_version_update_waits_for_separate_approval_and_reports_the_real_reason") {
+        return;
+    }
+    let (mut model, authority, remote_id) = remote_update_model("update-boundary");
+    // An earlier successful stage is no longer a usable install path once this
+    // attempt reports the same-version mismatch.
+    model.hold_remote_companion_provisioned(authority);
+    assert!(model.remote_grok_install_ready(authority));
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(update_required_error()));
+    let ctx = egui::Context::default();
+    model.logic(&ctx);
+
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.remote_needs_update());
+    assert!(
+        !workbench.companion_spawn_requested(),
+        "a same-version mismatch must not spawn the companion before approval"
+    );
+    assert!(!workbench.remote_update_approved());
+    assert_eq!(
+        workbench.remote_update_target(),
+        Some("x86_64-unknown-linux-gnu")
+    );
+    assert!(
+        workbench
+            .remote_detail()
+            .unwrap()
+            .contains("installed companion must be updated"),
+        "the actual companion update reason must survive: {:?}",
+        workbench.remote_detail()
+    );
+    assert!(!model.remote_grok_install_ready(authority));
+
+    // A pre-attach stage failure has no tree to show and must not spin.
+    let projection = workbench.remote_workspace().unwrap().projection();
+    assert!(matches!(
+        projection.root_state,
+        made_app::remote_workspace::Freshness::Unavailable(_)
+    ));
+    assert!(projection.directories.is_empty());
+
+    // The initial provisioning consent is not granted or implied.
+    assert!(!model
+        .remote_provision_consent_granted(authority)
+        .expect("consent state"));
+
+    // The copied report keeps the actual reason, version and honest failure
+    // classification, with no path/hash/secret.
+    let report = model
+        .workspace(remote_id)
+        .unwrap()
+        .sanitized_diagnostics_text();
+    assert!(
+        report.contains("installed companion must be updated"),
+        "the copied report must preserve the companion update reason: {report}"
+    );
+    assert!(
+        report.contains(&format!("remote version: {}", made_app::APP_VERSION)),
+        "{report}"
+    );
+    assert!(!report.contains("ssh connection failed"), "{report}");
+    assert!(
+        !report
+            .split_whitespace()
+            .any(|word| word.len() >= 32 && word.chars().all(|ch| ch.is_ascii_hexdigit())),
+        "the copied report must not add a hash: {report}"
+    );
+
+    // Approval starts only this attempt's update stage; the companion still
+    // waits for a successful stage result.
+    model
+        .approve_remote_companion_update()
+        .expect("update approval");
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.remote_update_approved());
+    assert!(workbench.remote_update_in_progress());
+    assert!(!workbench.companion_spawn_requested());
+
+    // Approved update success continues the normal companion launch.
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Ok(()));
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.companion_spawn_requested());
+    assert!(!workbench.remote_needs_update());
+    assert!(!workbench.remote_update_approved());
+    model.logic(&ctx);
+    assert!(
+        model.remote_grok_install_ready(authority),
+        "a successful matching update stage makes the current path install-ready"
+    );
+
+    // A later exact staging reuse succeeds without another update prompt.
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Ok(()));
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(!workbench.remote_needs_update());
+    assert!(!workbench.remote_update_approved());
+    assert!(workbench.companion_spawn_requested());
+}
+
+#[test]
+fn update_refusal_writes_nothing_and_failed_update_keeps_retry_actionable() {
+    if isolated("update_refusal_writes_nothing_and_failed_update_keeps_retry_actionable") {
+        return;
+    }
+    let (mut model, authority, remote_id) = remote_update_model("update-refusal");
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(update_required_error()));
+    model.refuse_remote_companion_update();
+
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(!workbench.remote_needs_update());
+    assert!(!workbench.remote_update_approved());
+    assert!(!workbench.companion_spawn_requested());
+    assert!(!model.remote_grok_install_ready(authority));
+    assert!(
+        workbench
+            .remote_detail()
+            .unwrap()
+            .contains("Nothing was written or deleted"),
+        "{:?}",
+        workbench.remote_detail()
+    );
+
+    let (mut model, _authority, remote_id) = remote_update_model("update-retry");
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(update_required_error()));
+    model
+        .approve_remote_companion_update()
+        .expect("update approval");
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(made_app::ssh_servers::AttemptError {
+            class: made_app::remote_session::SshFailureClass::Timeout,
+            detail: "ssh connection timed out".to_owned(),
+            fingerprint: None,
+        }));
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.remote_needs_update());
+    assert!(workbench.remote_update_failed());
+    assert!(
+        !workbench.companion_spawn_requested(),
+        "a failed update stage must not fall through to the companion"
+    );
+    assert!(workbench
+        .remote_detail()
+        .unwrap()
+        .contains("ssh connection timed out"));
+    model.retry_remote_companion_update().expect("update retry");
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.remote_update_approved());
+    assert!(workbench.remote_update_in_progress());
+    assert!(
+        !workbench.remote_update_failed(),
+        "a new retry attempt clears the previous update failure"
+    );
+    assert!(!workbench.companion_spawn_requested());
+}
+
+#[test]
+fn terminal_update_failures_clear_consent_before_a_later_normal_stage() {
+    if isolated("terminal_update_failures_clear_consent_before_a_later_normal_stage") {
+        return;
+    }
+    use made_app::remote_session::SshFailureClass;
+    for class in [
+        SshFailureClass::AuthFailed,
+        SshFailureClass::Cancelled,
+        SshFailureClass::MissingCapability,
+        SshFailureClass::ChangedHostKey,
+    ] {
+        let (mut model, _authority, remote_id) =
+            remote_update_model(&format!("terminal-update-{class:?}"));
+        model
+            .workspace_mut(remote_id)
+            .unwrap()
+            .deliver_stage_result(Err(update_required_error()));
+        model
+            .approve_remote_companion_update()
+            .expect("update approval");
+        assert!(model.workspace(remote_id).unwrap().remote_update_approved());
+
+        model
+            .workspace_mut(remote_id)
+            .unwrap()
+            .deliver_stage_result(Err(made_app::ssh_servers::AttemptError {
+                class,
+                detail: format!("terminal {class:?}"),
+                fingerprint: None,
+            }));
+        let workbench = model.workspace(remote_id).unwrap();
+        assert!(
+            !workbench.remote_update_approved(),
+            "{class:?} must clear this attempt's update consent"
+        );
+        assert!(
+            !workbench.remote_update_failed(),
+            "{class:?} must not leave an update retry card"
+        );
+        assert!(!workbench.remote_needs_update(), "{class:?}");
+        assert!(
+            workbench.remote_update_target().is_none(),
+            "{class:?} must clear the update target"
+        );
+
+        // A later ordinary stage failure must stay an ordinary open failure;
+        // it must not inherit update consent or an update retry state.
+        model
+            .workspace_mut(remote_id)
+            .unwrap()
+            .deliver_stage_result(Err(made_app::ssh_servers::AttemptError {
+                class: SshFailureClass::Timeout,
+                detail: "ssh connection timed out".to_owned(),
+                fingerprint: None,
+            }));
+        let workbench = model.workspace(remote_id).unwrap();
+        assert!(
+            !workbench.remote_needs_update(),
+            "{class:?} let a later stage inherit update consent"
+        );
+        assert!(!workbench.remote_update_failed(), "{class:?}");
+        assert!(!workbench.remote_update_approved(), "{class:?}");
+    }
+}
+
+fn registry_file_exists(root: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name() == Some(std::ffi::OsStr::new(made_app::ssh_servers::REGISTRY_FILE)) {
+            return true;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) && registry_file_exists(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the update tests with an outer temporary HOME/XDG. Each test must
+/// isolate itself in a nested temp HOME, so the outer root never receives the
+/// private SSH registry that `add_ssh_metadata` persists immediately.
+#[test]
+fn update_tests_never_write_the_host_app_data_registry() {
+    if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for name in [
+        "same_version_update_waits_for_separate_approval_and_reports_the_real_reason",
+        "update_refusal_writes_nothing_and_failed_update_keeps_retry_actionable",
+        "terminal_update_failures_clear_consent_before_a_later_normal_stage",
+    ] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--nocapture"])
+            .env_remove("MADE_WORKSPACE_TEST_CHILD")
+            .env(ISOLATED_TEST_HOME_ENV, home.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TMPDIR", &tmp)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("APPDATA", &roaming)
+            .env("LOCALAPPDATA", &local);
+        command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+        command.env_remove(made_platform::SHELL_ENV);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{name} failed in the canary HOME:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !registry_file_exists(home.path()),
+            "{name} wrote {} under the host app-data root",
+            made_app::ssh_servers::REGISTRY_FILE
+        );
+    }
 }

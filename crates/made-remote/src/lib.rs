@@ -5,6 +5,7 @@ pub mod client;
 pub mod clipboard;
 pub mod filesystem;
 pub mod git;
+pub mod grok;
 pub mod integration;
 pub mod protocol;
 pub mod supervisor;

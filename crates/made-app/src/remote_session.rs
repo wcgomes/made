@@ -21,6 +21,9 @@ pub enum SshFailureClass {
     Timeout,
     Cancelled,
     MissingCapability,
+    /// The installed same-version companion differs and needs its own
+    /// per-attempt approval. This is not a generic transport failure.
+    UpdateRequired,
     Other,
 }
 
@@ -38,6 +41,9 @@ impl SshFailureClass {
             Self::Cancelled => "The SSH attempt was cancelled. Other workspaces were not touched.",
             Self::MissingCapability => {
                 "OpenSSH or the packaged askpass helper is unavailable. Made will not fall back to an insecure login."
+            }
+            Self::UpdateRequired => {
+                "The installed companion under this version differs from the packaged files. Approve updating it before the session can open."
             }
             Self::Other => "The SSH attempt failed. No local shell was started.",
         }
@@ -108,6 +114,7 @@ pub fn class_from_kind(kind: made_platform::ssh::SshFailureKind) -> SshFailureCl
         SshFailureKind::Timeout => SshFailureClass::Timeout,
         SshFailureKind::Cancelled => SshFailureClass::Cancelled,
         SshFailureKind::MissingCapability => SshFailureClass::MissingCapability,
+        SshFailureKind::UpdateRequired => SshFailureClass::UpdateRequired,
         SshFailureKind::Io => SshFailureClass::Other,
     }
 }
@@ -250,6 +257,11 @@ pub const STAGE_FILES: &[&str] = &[
     "plugins/opencode-made/index.ts",
     "plugins/opencode-made/src/protocol.ts",
     "plugins/opencode-made/src/integration.ts",
+    "plugins/grok-made/plugin.json",
+    "plugins/grok-made/README.md",
+    "plugins/grok-made/hooks/hooks.json",
+    "plugins/grok-made/hooks/status_test.py",
+    "plugins/grok-made/hooks/bin/status.py",
 ];
 
 /// Build the Stage stdin body. Consent false is a hard refusal from the
@@ -260,11 +272,28 @@ pub fn stage_body(
     target: &str,
     files: &[Vec<u8>],
 ) -> Result<Vec<u8>, String> {
+    let header = made_platform::ssh::staging_header(consent, version, target)
+        .map_err(|_| "staging requires explicit consent and a supported target".to_owned())?;
+    stage_body_with_header(header, files)
+}
+
+/// The approved update payload. Initial staging stays on `consent-v1`; only an
+/// explicit `Update companion` approval builds `consent-v2-update`.
+pub fn update_stage_body(
+    consent: bool,
+    version: &str,
+    target: &str,
+    files: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
+    let header = made_platform::ssh::staging_update_header(consent, version, target)
+        .map_err(|_| "an update requires explicit approval and a supported target".to_owned())?;
+    stage_body_with_header(header, files)
+}
+
+fn stage_body_with_header(mut body: Vec<u8>, files: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     if files.len() != STAGE_FILES.len() {
         return Err("stage payload is missing a packaged companion file".to_owned());
     }
-    let mut body = made_platform::ssh::staging_header(consent, version, target)
-        .map_err(|_| "staging requires explicit consent and a supported target".to_owned())?;
     for bytes in files {
         if bytes.is_empty() || bytes.len() > 128 * 1024 * 1024 {
             return Err("a companion artifact is empty or too large".to_owned());
@@ -401,19 +430,26 @@ mod tests {
 
     #[test]
     fn stage_body_requires_consent_and_embeds_hashes() {
-        let files = vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"c".to_vec(),
-            b"d".to_vec(),
-            b"e".to_vec(),
-            b"f".to_vec(),
-        ];
+        // One entry per STAGE_FILES element: the fixed staging header, the
+        // companion binary, and both complete plugin packages.
+        let files: Vec<Vec<u8>> = STAGE_FILES
+            .iter()
+            .enumerate()
+            .map(|(index, _)| vec![b'a' + index as u8])
+            .collect();
+        assert_eq!(files.len(), 11);
         assert!(stage_body(false, "0.1.0", "x86_64-unknown-linux-gnu", &files).is_err());
         let body = stage_body(true, "0.1.0", "x86_64-unknown-linux-gnu", &files).unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with("consent-v1\n0.1.0\nx86_64-unknown-linux-gnu\n"));
-        assert!(text.contains(&sha256_hex(b"a")));
+        for (index, bytes) in files.iter().enumerate() {
+            let letter = (b'a' + index as u8) as char;
+            let hash = sha256_hex(bytes);
+            assert!(
+                text.contains(&format!("{size}\n{hash}\n", size = bytes.len())),
+                "missing length-delimited hash {letter}"
+            );
+        }
         assert!(!text.contains("password"));
     }
 

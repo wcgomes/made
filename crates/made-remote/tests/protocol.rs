@@ -600,6 +600,305 @@ fn reply_progress_validates_utf8_across_any_multibyte_boundary_and_final_tail() 
         .is_err());
 }
 
+fn grok_session(id: &str) -> GrokSessionInfo {
+    GrokSessionInfo {
+        session_id: id.to_owned(),
+        cwd: None,
+        opened_at: 0,
+        activity: GrokActivity::Idle,
+    }
+}
+
+fn grok_snapshot(revision: u64, sessions: Vec<GrokSessionInfo>) -> GrokSessionSnapshot {
+    GrokSessionSnapshot {
+        revision,
+        running: false,
+        hooks_ready: false,
+        sessions,
+    }
+}
+
+fn grok_event(kind: GrokEventKind, session_id: &str) -> GrokSessionEvent {
+    GrokSessionEvent {
+        kind,
+        session_id: session_id.to_owned(),
+        cwd: None,
+        activity: GrokActivity::Idle,
+    }
+}
+
+#[test]
+fn grok_launch_target_is_additive_and_major_stays_one() {
+    assert_eq!(PROTOCOL_MAJOR, 1);
+    assert_eq!(
+        serde_json::from_str::<LaunchTarget>(r#""Grok""#).unwrap(),
+        LaunchTarget::Grok
+    );
+    assert!(serde_json::from_str::<LaunchTarget>(r#""Codex""#).is_err());
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"Open","data":{"directory":"/project","target":"Codex","rows":24,"cols":80}}"#
+    )
+    .is_err());
+    assert!(frame(Operation::Open {
+        directory: path("/project"),
+        target: LaunchTarget::Grok,
+        rows: 24,
+        cols: 80,
+    })
+    .validate()
+    .is_ok());
+}
+
+#[test]
+fn grok_snapshot_hook_tier_is_additive_with_a_legacy_default() {
+    let legacy = serde_json::from_value::<GrokSessionSnapshot>(serde_json::json!({
+        "revision": 1,
+        "running": true,
+        "sessions": []
+    }))
+    .unwrap();
+    assert!(!legacy.hooks_ready);
+
+    let mut current = grok_snapshot(1, Vec::new());
+    current.hooks_ready = true;
+    let encoded = serde_json::to_value(&current).unwrap();
+    assert_eq!(encoded["hooks_ready"], true);
+    assert_eq!(
+        serde_json::from_value::<GrokSessionSnapshot>(encoded).unwrap(),
+        current
+    );
+}
+
+#[test]
+fn grok_state_reply_pairs_by_full_identity_and_events_stay_outside_replies() {
+    let request = frame(Operation::GrokState);
+    request.validate().unwrap();
+    request.validate_request(&path("/project"), None).unwrap();
+    let snapshot = grok_snapshot(1, Vec::new());
+    let reply = response(&request, Operation::GrokSnapshot { snapshot });
+    reply.validate_reply(&request).unwrap();
+    for field in 0..5 {
+        let mut hostile = response(
+            &request,
+            Operation::GrokSnapshot {
+                snapshot: grok_snapshot(1, Vec::new()),
+            },
+        );
+        match field {
+            0 => hostile.identity.authority = AuthorityId([2; 16]),
+            1 => hostile.identity.tab = TabCapability::random().unwrap(),
+            2 => hostile.identity.epoch += 1,
+            3 => hostile.identity.generation += 1,
+            _ => hostile.request_id += 1,
+        }
+        assert_eq!(
+            hostile.validate_reply(&request),
+            Err(ProtocolError::Identity)
+        );
+    }
+    // Unsolicited Grok events and snapshots are never correlated replies and
+    // never client request verbs; routing stays with the current attach source.
+    let event = response(
+        &request,
+        Operation::GrokEvent {
+            event: grok_event(GrokEventKind::Prompt, "s0"),
+        },
+    );
+    assert_eq!(
+        event.validate_reply(&request),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    assert_eq!(
+        frame(Operation::GrokSnapshot {
+            snapshot: grok_snapshot(1, Vec::new())
+        })
+        .validate_request(&path("/project"), None),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    assert_eq!(
+        frame(Operation::GrokEvent {
+            event: grok_event(GrokEventKind::Prompt, "s0")
+        })
+        .validate_request(&path("/project"), None),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    // Grok state traffic is never interactive terminal traffic.
+    assert!(!event.operation.is_terminal());
+    assert!(!reply.operation.is_terminal());
+    // The correlated snapshot completes the state request exactly once.
+    let mut progress = ReplyProgress::new(request.clone()).unwrap();
+    progress.accept(&reply).unwrap();
+    progress.finish().unwrap();
+    assert!(progress.accept(&reply).is_err());
+    assert!(ReplyProgress::new(event).is_err());
+    assert!(ReplyProgress::new(frame(Operation::GrokSnapshot {
+        snapshot: grok_snapshot(1, Vec::new())
+    }))
+    .is_err());
+}
+
+#[test]
+fn grok_snapshots_are_bounded_unique_and_posix_validated() {
+    let full = frame(Operation::GrokSnapshot {
+        snapshot: grok_snapshot(
+            1,
+            (0..made_bridge::state::MAX_SESSIONS)
+                .map(|i| grok_session(&format!("s{i}")))
+                .collect(),
+        ),
+    });
+    full.validate().unwrap();
+    assert_eq!(
+        frame(Operation::GrokSnapshot {
+            snapshot: grok_snapshot(0, Vec::new())
+        })
+        .validate(),
+        Err(ProtocolError::Malformed)
+    );
+    let sessions = |sessions: Vec<GrokSessionInfo>| {
+        frame(Operation::GrokSnapshot {
+            snapshot: grok_snapshot(1, sessions),
+        })
+    };
+    assert!(sessions(vec![grok_session("a"), grok_session("a")])
+        .validate()
+        .is_err());
+    assert!(sessions(
+        (0..made_bridge::state::MAX_SESSIONS + 1)
+            .map(|i| grok_session(&format!("s{i}")))
+            .collect()
+    )
+    .validate()
+    .is_err());
+    for id in [
+        "",
+        "a\0b",
+        "a\nb",
+        &"x".repeat(made_bridge::state::MAX_SESSION_ID_CHARS + 1),
+    ] {
+        assert!(sessions(vec![grok_session(id)]).validate().is_err());
+    }
+    // Session directories are absolute traversal-free remote POSIX bytes.
+    assert!(
+        serde_json::from_value::<GrokSessionInfo>(serde_json::json!({
+            "session_id": "s0", "opened_at": 0, "activity": "Idle", "cwd": "relative"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<GrokSessionInfo>(serde_json::json!({
+            "session_id": "s0", "opened_at": 0, "activity": "Idle", "cwd": "/a/../b"
+        }))
+        .is_err()
+    );
+    // The whole snapshot stays inside one frame even at the session cap.
+    let heavy = sessions(
+        (0..made_bridge::state::MAX_SESSIONS)
+            .map(|i| GrokSessionInfo {
+                session_id: format!("s{i}"),
+                cwd: Some(path(&format!("/{}", "x".repeat(MAX_PATH_BYTES - 1)))),
+                opened_at: i as u64,
+                activity: GrokActivity::Idle,
+            })
+            .collect(),
+    );
+    assert_eq!(encode(&heavy), Err(ProtocolError::Limit));
+}
+
+#[test]
+fn grok_events_carry_the_local_equivalent_semantics_and_bounds() {
+    for kind in [
+        GrokEventKind::SessionStart,
+        GrokEventKind::Prompt,
+        GrokEventKind::Stop,
+        GrokEventKind::Error,
+        GrokEventKind::Cancel,
+        GrokEventKind::SessionEnd,
+    ] {
+        let event = frame(Operation::GrokEvent {
+            event: grok_event(kind, "s0"),
+        });
+        event.validate().unwrap();
+        let encoded = encode(&event).unwrap();
+        let (_, parsed) = FrameDecoder::new().push(&encoded).unwrap();
+        assert_eq!(
+            parsed.unwrap().operation,
+            Operation::GrokEvent {
+                event: grok_event(kind, "s0")
+            }
+        );
+    }
+    for id in [
+        "",
+        "a\0b",
+        &"x".repeat(made_bridge::state::MAX_SESSION_ID_CHARS + 1),
+    ] {
+        assert!(frame(Operation::GrokEvent {
+            event: grok_event(GrokEventKind::Stop, id)
+        })
+        .validate()
+        .is_err());
+    }
+    // Event directories are validated remote POSIX bytes or absent.
+    assert!(
+        serde_json::from_value::<GrokSessionEvent>(serde_json::json!({
+            "kind": "Prompt", "session_id": "s0", "activity": "Working", "cwd": "/a/./b"
+        }))
+        .is_err()
+    );
+    // Unknown kinds, activities and fields stay malformed; no event metadata
+    // beyond the bounded classification rides the wire.
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"GrokEvent","data":{"event":{"kind":"Exploded","session_id":"s0","activity":"Idle"}}}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"GrokEvent","data":{"event":{"kind":"Prompt","session_id":"s0","activity":"Busy"}}}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"GrokEvent","data":{"event":{"kind":"Prompt","session_id":"s0","activity":"Idle","at":"2026-01-01T00:00:00Z"}}}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"GrokEvent","data":{"event":{"kind":"Prompt","session_id":"s0","activity":"Idle"},"extra":1}}"#
+    )
+    .is_err());
+}
+
+#[test]
+fn grok_capabilities_are_backward_safe_and_session_snapshot_is_not_overloaded() {
+    // An older companion frame without the additive fields stays honest: the
+    // capabilities deserialize as absent, not as a claimed availability.
+    let legacy: Capabilities = serde_json::from_str(
+        r#"{"target":"LinuxX64","tmux":false,"opencode":true,"shell_cwd":false,"helper_version":"1"}"#,
+    )
+    .unwrap();
+    assert!(!legacy.grok);
+    assert!(!legacy.python3);
+    let caps: Capabilities = serde_json::from_str(
+        r#"{"target":"LinuxX64","tmux":false,"opencode":true,"shell_cwd":false,"helper_version":"1","grok":true,"python3":true}"#,
+    )
+    .unwrap();
+    assert!(caps.grok);
+    assert!(caps.python3);
+    assert!(serde_json::from_str::<Capabilities>(
+        r#"{"target":"LinuxX64","tmux":false,"opencode":true,"shell_cwd":false,"helper_version":"1","codex":true}"#
+    )
+    .is_err());
+    // Grok state travels only in its own operation: the OpenCode snapshot
+    // shape cannot carry a Grok payload.
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"SessionSnapshot","data":{"snapshot":{"revision":1,"running":false,"sessions":[]}}}"#
+    )
+    .is_err());
+    let grok = frame(Operation::GrokSnapshot {
+        snapshot: grok_snapshot(1, Vec::new()),
+    });
+    let value = serde_json::to_value(&grok.operation).unwrap();
+    assert_eq!(value["op"], "GrokSnapshot");
+}
+
 #[test]
 fn unary_reply_is_terminal_and_truncation_is_final_only() {
     let request = frame(Operation::Heartbeat);

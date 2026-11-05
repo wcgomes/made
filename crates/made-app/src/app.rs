@@ -215,6 +215,82 @@ fn grok_row_for(
     }
 }
 
+/// The owning remote tab's Grok Build row from resolved per-server state plus
+/// the tab's own remote state. The host detection phase never applies.
+fn remote_grok_row_for(
+    consented: bool,
+    install: Option<crate::diagnostics::RemoteGrokInstallOutcome>,
+    workbench: &Workbench,
+) -> GrokDiagnosticsRow {
+    let report = crate::diagnostics::remote_grok_row(
+        workbench.remote_transport_failed(),
+        workbench.remote_attached(),
+        workbench.remote_failure_detail(),
+        workbench.remote_grok_detected(),
+        install,
+        consented,
+        workbench.remote_grok_running(),
+    );
+    GrokDiagnosticsRow {
+        pill: report.pill,
+        sentence: report.sentence.into(),
+    }
+}
+
+/// Recorded outcome of one server's consented remote Grok plugin install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteGrokInstallState {
+    /// The bounded install attempt is still running.
+    Running,
+    /// The official installer reported installed or already-current.
+    Succeeded,
+    /// The attempt failed with the companion's bounded machine reason.
+    Failed { reason: Option<&'static str> },
+}
+
+/// Test-only hold for one server's remote Grok install outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteGrokInstallHold {
+    /// The bounded attempt is still running.
+    Running,
+    /// The official installer reported installed or already-current.
+    Succeeded,
+    /// The attempt failed; `reason` is the companion's bounded machine reason.
+    Failed { reason: Option<&'static str> },
+}
+
+/// Map the companion's bounded install reasons to the ones diagnostics name.
+/// Unknown or absent reasons degrade to the generic failed row.
+fn known_install_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        "python3-missing" => Some("python3-missing"),
+        "grok-missing" => Some("grok-missing"),
+        "staged-plugin-missing" => Some("staged-plugin-missing"),
+        "install-failed" => Some("install-failed"),
+        "timeout" => Some("timeout"),
+        "lock-unavailable" => Some("lock-unavailable"),
+        "lock-timeout" => Some("lock-timeout"),
+        _ => None,
+    }
+}
+
+impl RemoteGrokInstallState {
+    /// Diagnostics outcome for the owning tab's Grok Build row.
+    pub fn outcome(self) -> crate::diagnostics::RemoteGrokInstallOutcome {
+        match self {
+            RemoteGrokInstallState::Running => {
+                crate::diagnostics::RemoteGrokInstallOutcome::Running
+            }
+            RemoteGrokInstallState::Succeeded => {
+                crate::diagnostics::RemoteGrokInstallOutcome::Succeeded
+            }
+            RemoteGrokInstallState::Failed { reason } => {
+                crate::diagnostics::RemoteGrokInstallOutcome::Failed { reason }
+            }
+        }
+    }
+}
+
 fn initial_grok_phase(
     detecting: bool,
     detection_started: bool,
@@ -336,6 +412,25 @@ pub struct AppModel {
     grok_plugin_receiver: Option<Receiver<EnsureOutcome>>,
     /// Install failed, so Grok session follow has no status hooks.
     grok_hooks_unavailable: bool,
+    /// Per-server remote Grok plugin install outcome, from the bounded
+    /// consented attempt or a test hold.
+    remote_grok_installs: Vec<(made_remote::protocol::AuthorityId, RemoteGrokInstallState)>,
+    /// In-flight remote Grok install SSH attempts, at most one per authority.
+    /// Attempts are independent: approving one server never cancels or
+    /// replaces another server's attempt.
+    remote_grok_install_attempts: Vec<(
+        made_remote::protocol::AuthorityId,
+        crate::ssh_servers::GrokInstallAttempt,
+    )>,
+    /// Authorities whose private companion was staged or verified in this
+    /// session. The Grok plugin installer needs that helper on the server, so
+    /// approval stays unavailable until this set contains the authority.
+    remote_grok_provisioned: Vec<made_remote::protocol::AuthorityId>,
+    /// Authority whose install attempt owns the displayed `ssh_prompt`.
+    remote_grok_prompt_authority: Option<made_remote::protocol::AuthorityId>,
+    /// Servers whose install was refused this session. Refusal is the absence
+    /// of consent and is never persisted as approval.
+    remote_grok_install_refusals: Vec<made_remote::protocol::AuthorityId>,
     /// Row derived from detection and install, unless a test hold is set.
     grok_phase: GrokDiagnosticsPhase,
     /// Set only by [`AppModel::hold_grok_diagnostics`].
@@ -445,6 +540,11 @@ impl AppModel {
             grok_phase,
             grok_hold: None,
             grok_running_hold: Vec::new(),
+            remote_grok_installs: Vec::new(),
+            remote_grok_install_attempts: Vec::new(),
+            remote_grok_provisioned: Vec::new(),
+            remote_grok_prompt_authority: None,
+            remote_grok_install_refusals: Vec::new(),
             opencode_missing,
             terminal_target: TerminalTarget::Shell,
             smoke,
@@ -547,6 +647,328 @@ impl AppModel {
         self.push_grok_diagnostics();
     }
 
+    /// Record a finished probe outcome for one server without an SSH attempt.
+    ///
+    /// Test-only seam: the product flow arrives through [`Self::poll_ssh_probe`]
+    /// with a live attempt.
+    pub fn hold_ssh_probe_result(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        result: Result<made_remote::protocol::Capabilities, made_remote::protocol::ErrorCode>,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        registry
+            .record_probe_result(id, result)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Grant or withdraw the per-server/version Grok plugin install consent.
+    ///
+    /// Test-only seam: the product flow arrives through the consent card
+    /// ([`Self::approve_remote_grok_install`] / [`Self::withdraw_remote_grok_install`]).
+    pub fn hold_grok_install_consent(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        granted: bool,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        let version = granted.then(|| crate::APP_VERSION.to_owned());
+        registry
+            .set_grok_consent(id, version)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Hold the remote Grok plugin install outcome for one server.
+    ///
+    /// Test-only seam: the product flow arrives through
+    /// [`Self::poll_remote_grok_install`]. Holds do not spawn SSH, stage
+    /// files, or invoke any installer.
+    pub fn hold_remote_grok_install(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        hold: RemoteGrokInstallHold,
+    ) {
+        let state = match hold {
+            RemoteGrokInstallHold::Running => RemoteGrokInstallState::Running,
+            RemoteGrokInstallHold::Succeeded => RemoteGrokInstallState::Succeeded,
+            RemoteGrokInstallHold::Failed { reason } => RemoteGrokInstallState::Failed { reason },
+        };
+        if let Some((_, slot)) = self
+            .remote_grok_installs
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            *slot = state;
+        } else {
+            self.remote_grok_installs.push((id, state));
+        }
+        self.push_grok_diagnostics();
+    }
+
+    /// Whether this server's own probe detected remote grok. Absent or failed
+    /// probes never count as detection.
+    pub fn remote_grok_detected_on(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<bool, String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        Ok(registry.can_launch_grok(id))
+    }
+
+    /// Whether the initial per-server/version provisioning consent is granted.
+    pub fn remote_provision_consent_granted(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<bool, String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        Ok(snapshot.server().allows_provision(crate::APP_VERSION))
+    }
+
+    /// Whether the per-server/version Grok install consent is granted.
+    pub fn remote_grok_consent_granted(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<bool, String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        Ok(snapshot.server().allows_grok_install(crate::APP_VERSION))
+    }
+
+    /// Recorded remote Grok install outcome for one server, if any.
+    pub fn remote_grok_install_state(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Option<RemoteGrokInstallState> {
+        self.remote_grok_installs
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, state)| *state)
+    }
+
+    /// Whether this server's own Grok install attempt is still bounded-busy.
+    pub fn remote_grok_install_running(&self, id: made_remote::protocol::AuthorityId) -> bool {
+        self.remote_grok_install_attempts
+            .iter()
+            .any(|(authority, _)| *authority == id)
+    }
+
+    /// Whether this session observed a successfully staged or reused private
+    /// companion for this server. The official installer execs that helper, so
+    /// approval must not start it before the helper exists.
+    pub fn remote_grok_install_ready(&self, id: made_remote::protocol::AuthorityId) -> bool {
+        self.remote_grok_provisioned.contains(&id)
+    }
+
+    /// Test-only seam: record a successfully provisioned/reused companion.
+    /// Production records this from the owning remote tab's completed stage.
+    pub fn hold_remote_companion_provisioned(&mut self, id: made_remote::protocol::AuthorityId) {
+        if !self.remote_grok_provisioned.contains(&id) {
+            self.remote_grok_provisioned.push(id);
+        }
+    }
+
+    /// Whether this server's install was refused in this session. Refusal is
+    /// the absence of consent and is never persisted as approval.
+    pub fn remote_grok_install_refused(&self, id: made_remote::protocol::AuthorityId) -> bool {
+        self.remote_grok_install_refusals.contains(&id)
+    }
+
+    /// Approve the per-server/version Grok plugin install: persist the consent
+    /// and start the bounded official-installer attempt against the server's
+    /// already provisioned or reused private companion. Nothing is staged,
+    /// invoked, or written under this approval, and a server whose companion
+    /// has not been provisioned in this session cannot be approved.
+    pub fn approve_remote_grok_install(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        let target = match registry.probe_state(id) {
+            crate::ssh_servers::ProbeState::Complete(capabilities) if capabilities.grok => {
+                match capabilities.target {
+                    made_remote::protocol::RemoteTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
+                    made_remote::protocol::RemoteTarget::LinuxArm64 => "aarch64-unknown-linux-gnu",
+                    made_remote::protocol::RemoteTarget::MacosX64 => "x86_64-apple-darwin",
+                    made_remote::protocol::RemoteTarget::MacosArm64 => "aarch64-apple-darwin",
+                }
+            }
+            _ => {
+                return Err(
+                    "Grok SSH stays hidden until this server's own detection succeeds.".to_owned(),
+                )
+            }
+        };
+        if !self.remote_grok_provisioned.contains(&id) {
+            return Err(
+                "Open this server's remote workspace first so Made can provision or verify its private companion; the Grok plugin install needs that staged helper."
+                    .to_owned(),
+            );
+        }
+        registry
+            .set_grok_consent(id, Some(crate::APP_VERSION.to_owned()))
+            .map_err(|error| error.to_string())?;
+        self.remote_grok_install_refusals.retain(|key| *key != id);
+        let metadata = snapshot.server().metadata().clone();
+        // Re-approving this server replaces only its own attempt. Another
+        // server's in-flight attempt is never cancelled or overwritten.
+        if let Some((_, previous)) = self
+            .remote_grok_install_attempts
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            previous.cancel();
+        }
+        self.remote_grok_install_attempts
+            .retain(|(key, _)| *key != id);
+        if self
+            .remote_grok_prompt_authority
+            .is_some_and(|owner| owner == id)
+        {
+            self.remote_grok_prompt_authority = None;
+        }
+        self.upsert_remote_grok_install(id, RemoteGrokInstallState::Running);
+        self.remote_grok_install_attempts.push((
+            id,
+            crate::ssh_servers::spawn_grok_install(
+                metadata,
+                crate::APP_VERSION.to_owned(),
+                target.to_owned(),
+            ),
+        ));
+        self.push_grok_diagnostics();
+        self.ssh_notice = Some(
+            "Approved for this server and version. Installing the official Grok Build plugin."
+                .to_owned(),
+        );
+        Ok(())
+    }
+
+    /// Refuse the Grok plugin install for this session: no consent is stored,
+    /// nothing is staged or invoked, and the inventory tier keeps working.
+    pub fn refuse_remote_grok_install(&mut self, id: made_remote::protocol::AuthorityId) {
+        if !self.remote_grok_install_refusals.contains(&id) {
+            self.remote_grok_install_refusals.push(id);
+        }
+        self.ssh_notice = Some(
+            "Refused. Nothing was installed or written; session follow uses the remote inventory."
+                .to_owned(),
+        );
+    }
+
+    /// Withdraw a previously granted per-server/version consent. No further
+    /// install may start; an already-installed plugin is never uninstalled.
+    pub fn withdraw_remote_grok_install(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        registry
+            .set_grok_consent(id, None)
+            .map_err(|error| error.to_string())?;
+        self.ssh_notice = Some(
+            "Consent withdrawn. Nothing was uninstalled; no further install can start.".to_owned(),
+        );
+        Ok(())
+    }
+
+    fn upsert_remote_grok_install(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        state: RemoteGrokInstallState,
+    ) {
+        if let Some((_, slot)) = self
+            .remote_grok_installs
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            *slot = state;
+        } else {
+            self.remote_grok_installs.push((id, state));
+        }
+    }
+
+    /// Poll every bounded remote Grok install attempt without waiting for any.
+    /// Attempts are per-authority and independent: one finishing, prompting,
+    /// or failing never touches another server's attempt or recorded outcome.
+    fn poll_remote_grok_install(&mut self) {
+        if self.ssh_prompt.is_none() {
+            // One auth card slot per frame; other attempts keep their prompts
+            // queued until the slot frees.
+            for (authority, attempt) in &self.remote_grok_install_attempts {
+                if let Some(prompt) = attempt.poll_prompt() {
+                    self.ssh_prompt = Some(prompt);
+                    self.remote_grok_prompt_authority = Some(*authority);
+                    self.show_ssh = true;
+                    break;
+                }
+            }
+        }
+        let mut finished = Vec::new();
+        self.remote_grok_install_attempts
+            .retain(|(authority, attempt)| match attempt.poll() {
+                Some(result) => {
+                    finished.push((*authority, result));
+                    false
+                }
+                None => true,
+            });
+        let any_finished = !finished.is_empty();
+        for (authority, result) in finished {
+            if self
+                .remote_grok_prompt_authority
+                .is_some_and(|owner| owner == authority)
+            {
+                self.remote_grok_prompt_authority = None;
+            }
+            match result {
+                Ok(report) => {
+                    let state = match report.outcome {
+                        crate::ssh_servers::GrokInstallOutcome::Installed
+                        | crate::ssh_servers::GrokInstallOutcome::Skipped => {
+                            RemoteGrokInstallState::Succeeded
+                        }
+                        crate::ssh_servers::GrokInstallOutcome::Failed => {
+                            RemoteGrokInstallState::Failed {
+                                reason: report.reason.as_deref().and_then(known_install_reason),
+                            }
+                        }
+                    };
+                    let reason_text = match (&report.reason, report.outcome) {
+                        (Some(reason), _) => format!(" The server reported: {reason}."),
+                        (None, crate::ssh_servers::GrokInstallOutcome::Failed) => String::new(),
+                        _ => String::new(),
+                    };
+                    let notice = match state {
+                    RemoteGrokInstallState::Succeeded => format!(
+                        "The Grok Build plugin is installed. Plugin hooks apply only to Grok sessions started after the install.{reason_text}"
+                    ),
+                    RemoteGrokInstallState::Failed { .. } => format!(
+                        "The Grok Build plugin install failed. Session follow keeps the remote inventory tier.{reason_text}"
+                    ),
+                    RemoteGrokInstallState::Running => String::new(),
+                };
+                    self.upsert_remote_grok_install(authority, state);
+                    self.ssh_notice = Some(notice);
+                }
+                Err(error) => {
+                    self.upsert_remote_grok_install(
+                        authority,
+                        RemoteGrokInstallState::Failed { reason: None },
+                    );
+                    self.ssh_notice = Some(format!(
+                    "The Grok Build plugin install failed. Session follow keeps the remote inventory tier. {}",
+                    error.detail
+                ));
+                }
+            }
+        }
+        if any_finished {
+            self.push_grok_diagnostics();
+        }
+    }
+
     /// Give this workspace the OpenCode tab label without a bridge.
     ///
     /// The existing terminal process stays the child. This does not spawn
@@ -565,12 +987,55 @@ impl AppModel {
             .unwrap_or(self.grok_phase);
         // Taken so each workspace can be updated while its mark is read.
         let running = std::mem::take(&mut self.grok_running_hold);
+        let mut provisioned = Vec::new();
+        let mut unprovisioned = Vec::new();
         for (id, workbench) in &mut self.workspaces {
             let mark = running
                 .iter()
                 .find(|(key, _)| key == id)
                 .map(|(_, hold)| *hold);
+            if workbench.is_remote() {
+                if let Some(authority) = workbench.remote_authority() {
+                    if workbench.remote_companion_provisioned() {
+                        provisioned.push(authority);
+                    } else {
+                        unprovisioned.push(authority);
+                    }
+                }
+                // A remote tab's Grok Build row is driven by its own server
+                // state: its launch detection, this tab's transport and the
+                // per-server install outcome and consent. The host phase never
+                // applies to it.
+                let consented = workbench
+                    .remote_authority()
+                    .and_then(|authority| {
+                        let snapshot = self.ssh.as_ref().ok()?.snapshot(authority).ok()?;
+                        Some(snapshot.server().allows_grok_install(crate::APP_VERSION))
+                    })
+                    .unwrap_or(false);
+                let install = workbench
+                    .remote_authority()
+                    .and_then(|authority| {
+                        self.remote_grok_installs
+                            .iter()
+                            .find(|(key, _)| *key == authority)
+                            .map(|(_, state)| *state)
+                    })
+                    .map(RemoteGrokInstallState::outcome);
+                workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, workbench));
+                continue;
+            }
             workbench.set_grok_diagnostics(grok_row_for(phase, mark, workbench));
+        }
+        // A failed or update-required transition is not a provisioned path for
+        // the Grok installer, even if an earlier attempt succeeded.
+        self.remote_grok_provisioned.retain(|authority| {
+            !unprovisioned.contains(authority) || provisioned.contains(authority)
+        });
+        for authority in provisioned {
+            if !self.remote_grok_provisioned.contains(&authority) {
+                self.remote_grok_provisioned.push(authority);
+            }
         }
         self.grok_running_hold = running;
     }
@@ -604,7 +1069,7 @@ impl AppModel {
         &mut self.ssh_draft
     }
 
-    pub(crate) fn ssh_notice(&self) -> Option<&str> {
+    pub fn ssh_notice(&self) -> Option<&str> {
         self.ssh_notice.as_deref()
     }
 
@@ -635,6 +1100,40 @@ impl AppModel {
     pub fn deny_remote_provision(&mut self) {
         if let Some(workbench) = self.workbench_mut() {
             workbench.deny_remote_consent();
+        }
+    }
+
+    /// Approve this attempt's same-version companion update. The baseline
+    /// provisioning consent is not touched or granted by this action.
+    pub fn approve_remote_companion_update(&mut self) -> Result<(), String> {
+        let approved = self
+            .workbench_mut()
+            .is_some_and(Workbench::approve_remote_update);
+        if approved {
+            self.ssh_notice = Some(
+                "Companion update approved for this attempt only. Running sessions are not signalled."
+                    .to_owned(),
+            );
+            Ok(())
+        } else {
+            Err("No remote workspace is waiting for a companion update.".to_owned())
+        }
+    }
+
+    pub fn refuse_remote_companion_update(&mut self) {
+        if let Some(workbench) = self.workbench_mut() {
+            workbench.refuse_remote_update();
+        }
+    }
+
+    pub fn retry_remote_companion_update(&mut self) -> Result<(), String> {
+        let retried = self
+            .workbench_mut()
+            .is_some_and(Workbench::retry_remote_update);
+        if retried {
+            Ok(())
+        } else {
+            Err("No failed update is available to retry.".to_owned())
         }
     }
 
@@ -693,7 +1192,7 @@ impl AppModel {
         self.ssh_selected
     }
 
-    pub(crate) fn select_ssh_server(&mut self, id: made_remote::protocol::AuthorityId) {
+    pub fn select_ssh_server(&mut self, id: made_remote::protocol::AuthorityId) {
         let Ok(registry) = self.ssh.as_ref() else {
             return;
         };
@@ -770,8 +1269,49 @@ impl AppModel {
         } else {
             TerminalTarget::RemoteShell { authority: id }
         };
-        let workbench =
+        let mut workbench =
             Workbench::bind_remote_model(snapshot, workspace, target, "Remote model attached");
+        // A bound test model inherits the server's own probe detection; the
+        // real launch path re-probes and records its own result.
+        if let Ok(registry) = self.ssh.as_ref() {
+            if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
+            {
+                workbench.set_remote_grok_detection(capabilities.grok);
+            }
+        }
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
+    /// Attach a remote model as a directly launched `Grok SSH` tab: the target
+    /// is the server's grok process, never a host binary. A missing live SSH
+    /// process is not reported as a successful connection.
+    pub fn attach_remote_grok_model(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        workspace: crate::remote_workspace::RemoteWorkspace,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .ssh
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .snapshot(id)
+            .map_err(|error| error.to_string())?;
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot,
+            workspace,
+            TerminalTarget::RemoteGrok { authority: id },
+            "Remote model attached",
+        );
+        if let Ok(registry) = self.ssh.as_ref() {
+            if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
+            {
+                workbench.set_remote_grok_detection(capabilities.grok);
+            }
+        }
         let source = self.launch.source();
         self.leave_picker_for_remote();
         self.insert_workbench(workbench, source);
@@ -848,6 +1388,46 @@ impl AppModel {
 
     pub(crate) fn cancel_remote_launch(&mut self) {
         self.remote_launch = None;
+    }
+
+    /// Whether a remote launch choice is waiting for folder confirmation.
+    /// A direct `Grok SSH` launch never sets this: it opens its tab at once.
+    pub fn remote_launch_pending(&self) -> bool {
+        self.remote_launch.is_some()
+    }
+
+    /// Start the selected server's detected grok executable with the single
+    /// argument `dashboard` as a new tab, bound to that server and its selected
+    /// remote directory. There is no shell first and no separate folder picker,
+    /// the current tab keeps running, and no plugin configuration is injected.
+    /// Servers whose own probe did not detect grok refuse here.
+    pub fn begin_remote_grok_launch(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        if !registry.can_launch_grok(id) {
+            return Err(
+                "Grok SSH stays hidden until this server's own detection succeeds.".to_owned(),
+            );
+        }
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        let directory = match snapshot.server().metadata().initial_directory.clone() {
+            Some(directory) => directory,
+            None => made_remote::protocol::RemotePath::new(b"/".to_vec())
+                .map_err(|_| "the default remote directory was rejected".to_owned())?,
+        };
+        let workbench = Workbench::start_remote(
+            snapshot,
+            directory,
+            TerminalTarget::RemoteGrok { authority: id },
+            Instant::now(),
+        )?;
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
     }
 
     pub(crate) fn save_ssh_server(&mut self) -> Result<(), String> {
@@ -940,6 +1520,7 @@ impl AppModel {
         }
         self.probe = None;
         self.ssh_prompt = None;
+        self.remote_grok_prompt_authority = None;
         self.prompt_draft.clear();
         self.ssh_notice = Some("Connection test cancelled.".to_owned());
     }
@@ -948,6 +1529,9 @@ impl AppModel {
         let Some(prompt) = self.ssh_prompt.take() else {
             return;
         };
+        // A displayed install prompt belongs to one authority's attempt and is
+        // answered there; a probe prompt routes to the probe.
+        let owner = self.remote_grok_prompt_authority.take();
         match crate::remote_session::classify_prompt(&prompt.text) {
             crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
                 self.prompt_draft.clear();
@@ -971,7 +1555,18 @@ impl AppModel {
                 } else {
                     None
                 };
-                if let Some(probe) = self.probe.as_ref() {
+                if let Some(owner) = owner {
+                    if let Some((_, attempt)) = self
+                        .remote_grok_install_attempts
+                        .iter_mut()
+                        .find(|(key, _)| *key == owner)
+                    {
+                        let _ = attempt.answer(prompt.id, answer);
+                        if !accept {
+                            attempt.cancel();
+                        }
+                    }
+                } else if let Some(probe) = self.probe.as_ref() {
                     let _ = probe.answer(prompt.id, answer);
                     if !accept {
                         probe.cancel();
@@ -1001,6 +1596,14 @@ impl AppModel {
                 };
                 if let Some(probe) = self.probe.as_ref() {
                     let _ = probe.answer(prompt.id, answer);
+                } else if let Some(owner) = owner {
+                    if let Some((_, attempt)) = self
+                        .remote_grok_install_attempts
+                        .iter_mut()
+                        .find(|(key, _)| *key == owner)
+                    {
+                        let _ = attempt.answer(prompt.id, answer);
+                    }
                 }
             }
         }
@@ -1074,6 +1677,7 @@ impl AppModel {
             let ticket = self.probe.as_ref().map(ProbeAttempt::ticket);
             self.probe = None;
             self.ssh_prompt = None;
+            self.remote_grok_prompt_authority = None;
             self.prompt_draft.clear();
             if matches!(
                 &result,
@@ -1136,6 +1740,7 @@ impl AppModel {
         };
         let _ = probe.answer(prompt.id, Some(answer));
         self.ssh_prompt = None;
+        self.remote_grok_prompt_authority = None;
     }
 
     /// Look up a live owner; closed identities never resolve again.
@@ -1313,7 +1918,27 @@ impl AppModel {
             .iter()
             .find(|(key, _)| *key == id)
             .map(|(_, hold)| *hold);
-        workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
+        if workbench.is_remote() {
+            let consented = workbench
+                .remote_authority()
+                .and_then(|authority| {
+                    let snapshot = self.ssh.as_ref().ok()?.snapshot(authority).ok()?;
+                    Some(snapshot.server().allows_grok_install(crate::APP_VERSION))
+                })
+                .unwrap_or(false);
+            let install = workbench
+                .remote_authority()
+                .and_then(|authority| {
+                    self.remote_grok_installs
+                        .iter()
+                        .find(|(key, _)| *key == authority)
+                        .map(|(_, state)| *state)
+                })
+                .map(RemoteGrokInstallState::outcome);
+            workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, &workbench));
+        } else {
+            workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
+        }
         if self.grok_hooks_unavailable {
             workbench.note_grok_session_hooks_unavailable();
         }
@@ -1686,6 +2311,7 @@ impl AppModel {
         self.poll_compatible_tui_detection(ctx);
         self.poll_grok_plugin_ensure(ctx);
         self.poll_ssh_probe();
+        self.poll_remote_grok_install();
         self.poll_remote_closes();
         self.persist_remote_consent();
         self.apply_focus_reset(ctx);

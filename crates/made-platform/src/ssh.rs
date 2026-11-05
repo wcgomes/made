@@ -64,6 +64,7 @@ pub enum SshCommand {
     Probe,
     Companion,
     Stage,
+    GrokPluginInstall,
 }
 impl SshCommand {
     pub fn script(self) -> &'static str {
@@ -71,24 +72,43 @@ impl SshCommand {
             Self::Probe => PROBE,
             Self::Companion => COMPANION,
             Self::Stage => STAGE,
+            Self::GrokPluginInstall => GROK_PLUGIN_INSTALL,
         }
     }
 }
 // Shell receives exactly one constant command string. Never concatenate a path,
 // hostname, user, prompt or server response here.
-const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"'"#;
+// Detection is metadata-only: command -v performs PATH lookups on the
+// sanitized PATH and never executes or version-checks a program. OpenCode is
+// additionally looked up in fixed user-owned install locations; grok and
+// python3 are PATH-only (SSH-09/SSH-10).
+const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); python3=$(command -v python3 || :); printf "%s\n%s\n" "$grok" "$python3"'"#;
 const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --stdio'"#;
+// Consent-gated Grok plugin install: identical version/target/root/stdin
+// discipline, but the staged companion starts in its `--install-grok-plugin`
+// mode. Registering this command never runs it; a caller spawns it only after
+// the separate per-server/version Grok install consent, and the companion owns
+// the official `grok plugin install` invocation. Everything after the two
+// header lines is forwarded to the companion's stdin.
+const GROK_PLUGIN_INSTALL: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; test ${#version} -le 128 || exit 64; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --install-grok-plugin'"#;
 
 // First-install bootstrap does not assume an executable already exists. Exactly
-// six allowlisted files, length-delimited stdin, remote checksum verification,
-// private temporary directory and atomic promotion. Never tar/extract/eval.
-// Header: consent-v1 LF version LF target LF, then for each fixed file in order:
+// eleven allowlisted files, length-delimited stdin, remote checksum
+// verification, private temporary directory and atomic promotion. Never
+// tar/extract/eval.
+// Header: consent-v1 LF version LF target LF for initial staging/exact reuse,
+// or consent-v2-update LF version LF target LF for an already approved
+// same-version replacement. Then for each fixed file in order:
 // decimal-size LF lowercase-sha256 LF raw-exactly-size-bytes.
+// Existing artifacts that differ are never overwritten without the update
+// header: the script prints MADE-STAGE-UPDATE-REQUIRED and exits nonzero
+// without writing or deleting anything.
 const STAGE: &str = r#"sh -c '
 set -eu
 umask 077
 oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH
-IFS= read -r consent; test "$consent" = consent-v1 || exit 64
+IFS= read -r consent
+case "$consent" in consent-v1) update=0;; consent-v2-update) update=1;; *) exit 64;; esac
 IFS= read -r version; IFS= read -r target
 case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac
 test ${#version} -le 128 || exit 64
@@ -121,39 +141,279 @@ private() {
  else mode=$(stat -c %a "$1"); owner=$(stat -c %u "$1"); fi
  test "$mode" = 700 && test "$owner" = "$(id -u)" || exit 73
 }
+mode_of() { if test "$statmode" = bsd; then stat -f %Lp "$1"; else stat -c %a "$1"; fi; }
+update_required() { printf "MADE-STAGE-UPDATE-REQUIRED\n" >&2; exit 74; }
+recovery_required() { printf "MADE-STAGE-RECOVERY-REQUIRED\n" >&2; exit 75; }
 private "$root"; private "$root/remote"; private "$root/remote/$version"
 base="$root/remote/$version"
-mkdir "$base/.stage-lock"
+replace="$base/.replace"
+lock="$base/.stage-lock"
+lock_tmp="$base/.stage-lock.$$"
+reap="$base/.stage-reap.$$"
 stage="$base/.stage-$$"
 stage_owned=0
-cleanup() { if test "$stage_owned" = 1; then rm -rf -- "$stage"; fi; rmdir -- "$base/.stage-lock"; }
+reap_owned=0
+lock_owned=0
+# A lock owner is alive while its PID exists. kill(2) can fail with EPERM for a
+# live process, so ps confirms existence; a zombie is already dead. Missing or
+# malformed tokens are never treated as dead: that would let a creation race
+# steal a live lock.
+owner_alive() {
+ pid=$1
+ case "$pid" in ""|*[!0-9]*) return 0;; esac
+ if kill -0 "$pid" 2>/dev/null; then
+  state=$(ps -p "$pid" -o stat= 2>/dev/null || :)
+  case "$state" in *Z*) return 1;; *) return 0;; esac
+ fi
+ ps -p "$pid" >/dev/null 2>&1 && return 0
+ return 1
+}
+release_lock() {
+ if test "$lock_owned" = 1; then
+  rm -f -- "$lock" 2>/dev/null || :
+  lock_owned=0
+ fi
+}
+cleanup() {
+ if test "$stage_owned" = 1; then rm -rf -- "$stage" 2>/dev/null || :; stage_owned=0; fi
+ if test "$reap_owned" = 1; then rm -rf -- "$reap" 2>/dev/null || :; reap_owned=0; fi
+ rm -f -- "$lock_tmp" 2>/dev/null || :
+ release_lock
+}
+# A stale directory is removable only when it is a real, non-symlink directory
+# directly under the already validated private base with the exact private mode
+# and owner this app creates. Symlinks are never followed or traversed.
+private_stage_dir() {
+ test ! -L "$1" && test -d "$1" || return 1
+ if test "$statmode" = bsd; then dir_mode=$(stat -f %Lp "$1"); dir_owner=$(stat -f %u "$1")
+ else dir_mode=$(stat -c %a "$1"); dir_owner=$(stat -c %u "$1"); fi
+ test "$dir_mode" = 700 && test "$dir_owner" = "$(id -u)"
+}
+# Remove only exact app-owned acquisition temps. The name fixes the owner PID;
+# a live PID, symlink or unreadable replacement is left untouched. This keeps a
+# crash before publication from accumulating files without deleting anything
+# whose ownership is unknown.
+cleanup_stale_temps() {
+ for candidate in "$base"/.stage-lock.*; do
+  test ! -L "$candidate" && test -f "$candidate" || continue
+  name=${candidate##*/}
+  pid=${name#.stage-lock.}
+  case "$pid" in ""|*[!0-9]*) continue;; esac
+  if test "$pid" = "$$"; then
+   rm -f -- "$candidate" 2>/dev/null || :
+   continue
+  fi
+  if owner_alive "$pid"; then continue; fi
+  token=
+  IFS= read -r token < "$candidate" 2>/dev/null || :
+  case "$token" in ""|"$pid") ;; *) continue;; esac
+  again=
+  IFS= read -r again < "$candidate" 2>/dev/null || :
+  test "$again" = "$token" || continue
+  rm -f -- "$candidate" 2>/dev/null || :
+ done
+}
+# A crash while reaping leaves `.stage-reap.<reaper>` plus the dead owner
+# `.stage-<owner>`. The reaper PID is in the artifact name and the moved lock
+# still carries the owner token, so both must be demonstrably dead before
+# either path is touched. Malformed names/tokens, symlinks and live PIDs are
+# never deleted. Only a real private `.stage-<owner>` directory is removed;
+# the reap artifact itself is removed afterwards by its exact name.
+cleanup_stale_reaps() {
+ for candidate in "$base"/.stage-reap.*; do
+  test ! -L "$candidate" || continue
+  test -f "$candidate" || test -d "$candidate" || continue
+  name=${candidate##*/}
+  pid=${name#.stage-reap.}
+  case "$pid" in ""|*[!0-9]*) continue;; esac
+  if test "$pid" != "$$" && owner_alive "$pid"; then continue; fi
+  token=
+  if test -d "$candidate"; then
+   IFS= read -r token < "$candidate/owner" 2>/dev/null || :
+  else
+   IFS= read -r token < "$candidate" 2>/dev/null || :
+  fi
+  case "$token" in ""|*[!0-9]*) continue;; esac
+  test "$token" != "$pid" || continue
+  if owner_alive "$token"; then continue; fi
+  again=
+  if test -d "$candidate"; then
+   IFS= read -r again < "$candidate/owner" 2>/dev/null || :
+  else
+   IFS= read -r again < "$candidate" 2>/dev/null || :
+  fi
+  test "$again" = "$token" || continue
+  dead_stage="$base/.stage-$token"
+  if private_stage_dir "$dead_stage"; then rm -rf -- "$dead_stage" 2>/dev/null || :; fi
+  rm -rf -- "$candidate" 2>/dev/null || :
+ done
+}
+# Serialize the whole attempt, including stale recovery. An owner token is
+# written to a private PID-named file first, then hard-linked to the fixed lock
+# path. `link` publishes or fails atomically, so the fixed lock is never observed
+# without its complete owner token. A live owner is never disturbed. A
+# demonstrably dead owner lock is moved aside atomically, its exact private
+# `.stage-<pid>` is removed, and this attempt retries. The token is re-read
+# after the move; a changed token means another owner appeared and the moved
+# entry is never deleted.
+acquire_lock() {
+ cleanup_stale_reaps
+ cleanup_stale_temps
+ tries=0
+ while test "$tries" -lt 4; do
+  tries=$((tries + 1))
+  acquired=0
+  if test ! -e "$lock_tmp" && test ! -L "$lock_tmp"; then
+   if (set -C; printf "%s\n" "$$" > "$lock_tmp") 2>/dev/null; then
+    token=
+    IFS= read -r token < "$lock_tmp" 2>/dev/null || :
+    if test "$token" = "$$" && link -- "$lock_tmp" "$lock" 2>/dev/null; then
+     lock_owned=1
+     acquired=1
+    fi
+    rm -f -- "$lock_tmp" 2>/dev/null || :
+   fi
+  fi
+  if test "$acquired" = 1; then return 0; fi
+  if test -L "$lock"; then return 1; fi
+  owner=
+  if test -d "$lock"; then
+   IFS= read -r owner < "$lock/owner" 2>/dev/null || :
+  elif test -f "$lock"; then
+   IFS= read -r owner < "$lock" 2>/dev/null || :
+  else
+   return 1
+  fi
+  case "$owner" in ""|*[!0-9]*) return 1;; esac
+  if owner_alive "$owner"; then return 1; fi
+  current=
+  if test -d "$lock"; then
+   IFS= read -r current < "$lock/owner" 2>/dev/null || :
+  else
+   IFS= read -r current < "$lock" 2>/dev/null || :
+  fi
+  test "$current" = "$owner" || return 1
+  reap="$base/.stage-reap.$$"
+  test ! -e "$reap" && test ! -L "$reap" || return 1
+  mv -- "$lock" "$reap" 2>/dev/null || return 1
+  moved=
+  if test -d "$reap"; then
+   IFS= read -r moved < "$reap/owner" 2>/dev/null || :
+  else
+   IFS= read -r moved < "$reap" 2>/dev/null || :
+  fi
+  if test "$moved" != "$owner"; then
+   if test ! -e "$lock" && test ! -L "$lock"; then mv -- "$reap" "$lock" 2>/dev/null || :; fi
+   return 1
+  fi
+  reap_owned=1
+  dead_stage="$base/.stage-$owner"
+  if private_stage_dir "$dead_stage"; then
+   rm -rf -- "$dead_stage" 2>/dev/null || :
+  fi
+  dead_tmp="$base/.stage-lock.$owner"
+  if test ! -L "$dead_tmp" && test -f "$dead_tmp"; then
+   rm -f -- "$dead_tmp" 2>/dev/null || :
+  fi
+  if rm -rf -- "$reap" 2>/dev/null; then reap_owned=0; fi
+ done
+ return 1
+}
+acquire_lock || exit 73
 trap cleanup 0
-reuse=0
-if test -d "$base/$target" && test ! -L "$base/$target"; then private "$base/$target"; reuse=1
-else test ! -e "$base/$target" && test ! -L "$base/$target" || exit 73; fi
-if test "$reuse" = 0; then
-mkdir "$stage"
-stage_owned=1
-mkdir "$stage/plugins" "$stage/plugins/opencode-made" "$stage/plugins/opencode-made/src"
+# Finish an interrupted replacement from an earlier attempt while the lock is
+# held. The path is fixed and app-owned, so no wildcard or process-specific
+# name is ever scanned.
+recover_replace() {
+ st=0
+ if test -L "$replace" || { test -e "$replace" && test ! -d "$replace"; }; then
+  st=73
+ elif test ! -e "$base/$target" && test ! -L "$base/$target"; then
+  mv -- "$replace" "$base/$target" 2>/dev/null || st=73
+ else
+  if test -L "$base/$target" || test ! -d "$base/$target"; then
+   st=73
+  else
+   rm -rf -- "$replace" 2>/dev/null || st=73
+  fi
+ fi
+ return "$st"
+}
+if test -e "$replace" || test -L "$replace"; then
+ recover_replace || exit $?
 fi
-for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts; do
+existing=0
+test ! -L "$base/$target" || exit 73
+if test -e "$base/$target"; then
+ test -d "$base/$target" || exit 73
+ private "$base/$target"
+ existing=1
+fi
+if test "$existing" = 1 && test "$update" = 0; then
+for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/status_test.py plugins/grok-made/hooks/bin/status.py; do
  IFS= read -r size; IFS= read -r hash
  case "$size" in ""|*[!0-9]*) exit 64;; esac
  test ${#size} -le 9 && test "$size" -gt 0 && test "$size" -le 134217728 || exit 64
  case "$hash" in *[!0-9a-f]*) exit 64;; esac
  test ${#hash} -eq 64 || exit 64
- if test "$reuse" = 1; then file="$base/$target/$name"; check_ancestors "$file"; test -f "$file" || exit 73; dd bs=1 count="$size" of=/dev/null 2>/dev/null
- else file="$stage/$name"; dd bs=1 count="$size" of="$file" 2>/dev/null; chmod 600 "$file"; fi
+ file="$base/$target/$name"
+ # Check ancestors only: the leaf itself must reach the explicit
+ # update-required classification below, not a generic security exit.
+ check_ancestors "${file%/*}"
+ if test -L "$file" || test ! -f "$file"; then update_required; fi
+ dd bs=1 count="$size" of=/dev/null 2>/dev/null
+ test "$(wc -c < "$file" | tr -d " ")" = "$size" || update_required
+ if test "$checksum" = sha256sum; then actual=$(sha256sum "$file"); else actual=$(shasum -a 256 "$file"); fi
+ case "$actual" in "$hash "*) ;; *) update_required;; esac
+ case "$name" in
+ made-remote|plugins/grok-made/hooks/bin/status.py) test "$(mode_of "$file")" = 700 || update_required;;
+ *) test "$(mode_of "$file")" = 600 || update_required;;
+ esac
+done
+printf "MADE-STAGED-1\n"
+exit 0
+fi
+mkdir "$stage"
+stage_owned=1
+mkdir "$stage/plugins" "$stage/plugins/opencode-made" "$stage/plugins/opencode-made/src" "$stage/plugins/grok-made" "$stage/plugins/grok-made/hooks" "$stage/plugins/grok-made/hooks/bin"
+for name in made-remote plugins/opencode-made/package.json plugins/opencode-made/tui.ts plugins/opencode-made/index.ts plugins/opencode-made/src/protocol.ts plugins/opencode-made/src/integration.ts plugins/grok-made/plugin.json plugins/grok-made/README.md plugins/grok-made/hooks/hooks.json plugins/grok-made/hooks/status_test.py plugins/grok-made/hooks/bin/status.py; do
+ IFS= read -r size; IFS= read -r hash
+ case "$size" in ""|*[!0-9]*) exit 64;; esac
+ test ${#size} -le 9 && test "$size" -gt 0 && test "$size" -le 134217728 || exit 64
+ case "$hash" in *[!0-9a-f]*) exit 64;; esac
+ test ${#hash} -eq 64 || exit 64
+ file="$stage/$name"
+ dd bs=1 count="$size" of="$file" 2>/dev/null
+ chmod 600 "$file"
  test "$(wc -c < "$file" | tr -d " ")" = "$size" || exit 74
  if test "$checksum" = sha256sum; then actual=$(sha256sum "$file"); else actual=$(shasum -a 256 "$file"); fi
  case "$actual" in "$hash "*) ;; *) exit 74;; esac
+ case "$name" in
+ made-remote|plugins/grok-made/hooks/bin/status.py) chmod 700 "$file"; test "$(mode_of "$file")" = 700 || exit 74;;
+ *) test "$(mode_of "$file")" = 600 || exit 74;;
+ esac
 done
-if test "$reuse" = 0; then
-chmod 700 "$stage/made-remote"
-test ! -e "$base/$target" && test ! -L "$base/$target" || exit 73
-mv "$stage" "$base/$target"
+if test "$existing" = 1; then
+ if mv -- "$base/$target" "$replace" 2>/dev/null; then
+  if mv -- "$stage" "$base/$target" 2>/dev/null; then
+   stage_owned=0
+   rm -rf -- "$replace" 2>/dev/null || exit 73
+  elif mv -- "$replace" "$base/$target" 2>/dev/null; then
+   exit 74
+  else
+   # The original is the only copy and now lives at the fixed `.replace`
+   # path. The next attempt restores it before doing anything else.
+   recovery_required
+  fi
+ else
+  exit 74
+ fi
+else
+ test ! -e "$base/$target" && test ! -L "$base/$target" || exit 73
+ mv "$stage" "$base/$target"
+ stage_owned=0
 fi
-rmdir "$base/.stage-lock"
+release_lock
 trap - 0
 printf "MADE-STAGED-1\n"
 '"#;
@@ -186,6 +446,16 @@ pub fn staging_header(consent: bool, version: &str, target: &str) -> io::Result<
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let mut bytes = b"consent-v1\n".to_vec();
+    bytes.extend(companion_header(version, target)?);
+    Ok(bytes)
+}
+/// Explicit per-attempt approval to replace an existing same-version companion
+/// whose artifacts differ. Nothing is replaced without this header.
+pub fn staging_update_header(consent: bool, version: &str, target: &str) -> io::Result<Vec<u8>> {
+    if !consent {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let mut bytes = b"consent-v2-update\n".to_vec();
     bytes.extend(companion_header(version, target)?);
     Ok(bytes)
 }
@@ -287,6 +557,9 @@ pub enum SshFailureKind {
     Timeout,
     Cancelled,
     MissingCapability,
+    /// The installed same-version companion differs and needs an approved
+    /// replacement. Nothing was written or deleted.
+    UpdateRequired,
     Io,
 }
 
@@ -300,6 +573,7 @@ impl SshFailureKind {
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::MissingCapability => "missing_capability",
+            Self::UpdateRequired => "update_required",
             Self::Io => "io",
         }
     }
@@ -369,6 +643,13 @@ impl SshFailure {
     fn cancelled() -> Self {
         Self::new(SshFailureKind::Cancelled, "ssh connection cancelled")
     }
+
+    fn update_required() -> Self {
+        Self::new(
+            SshFailureKind::UpdateRequired,
+            "the installed companion must be updated with explicit approval",
+        )
+    }
 }
 
 impl fmt::Debug for SshFailure {
@@ -392,6 +673,14 @@ impl fmt::Display for SshFailure {
 
 impl std::error::Error for SshFailure {}
 
+/// Fixed marker emitted by the stage script when artifacts under the same
+/// version differ and no approved update was given. It carries no path or hash.
+const STAGE_UPDATE_REQUIRED_MARKER: &str = "MADE-STAGE-UPDATE-REQUIRED";
+/// Fixed marker emitted when promotion and immediate restoration both failed.
+/// The preserved original stays at the app-owned replacement path for the next
+/// attempt. It carries no path or hash and is classified as update-required.
+const STAGE_RECOVERY_REQUIRED_MARKER: &str = "MADE-STAGE-RECOVERY-REQUIRED";
+
 /// Classify bounded OpenSSH diagnostic text. The returned value does not retain
 /// the input. Callers must drop the original bytes.
 pub fn classify_ssh_stderr(bytes: &[u8]) -> SshFailure {
@@ -405,6 +694,10 @@ pub fn classify_ssh_stderr(bytes: &[u8]) -> SshFailure {
     }
     if is_auth_failed(&lower) {
         return SshFailure::auth_failed();
+    }
+    if text.contains(STAGE_UPDATE_REQUIRED_MARKER) || text.contains(STAGE_RECOVERY_REQUIRED_MARKER)
+    {
+        return SshFailure::update_required();
     }
     if is_timeout_text(&lower) {
         return SshFailure::timeout();
@@ -811,6 +1104,12 @@ impl SshProcess {
             }
             Ok(None) => None,
         }
+    }
+    /// True once `poll` has returned this process's terminal event. Later polls
+    /// report `None`, so callers that keep a non-terminal `Failed(Io)` can stop
+    /// instead of spinning until their own deadline.
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
     /// Drop only the host attachment; never sends remote Close or signals the
     /// detached supervisor.

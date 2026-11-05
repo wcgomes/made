@@ -212,3 +212,125 @@ fn process_session(pid: u32) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
+#[test]
+#[cfg(unix)]
+fn attached_reader_survives_idle_reads_and_close_confirms_over_a_real_socket() {
+    use made_remote::supervisor::{
+        capability_bytes, read_envelope, write_envelope, ChildLaunch, Endpoint, Supervisor,
+    };
+    use std::io::{ErrorKind, Write};
+    use std::net::TcpStream;
+
+    // Regression for two macOS-only stalls that the loopback harness exposed:
+    // BSD accepted sockets inherit the listener's O_NONBLOCK, so an idle
+    // attachment read fails read_exact with EAGAIN and silently kills the
+    // reader (set_read_timeout(None) does not clear the flag); and a session
+    // runtime path past the kernel AF_UNIX budget must not prevent the cwd
+    // sink from binding. Both fixes are exercised through a real socket.
+    let temp = tempfile::tempdir().unwrap();
+    let deep = temp.path().join("h".repeat(72));
+    let runtime = deep.join("remote/runtime/sha256-0123456789abcdef");
+    // The frontend creates the private runtime base before the per-session
+    // leaf; mirror that here.
+    made_platform::ensure_private_directory(&runtime).unwrap();
+    let over_limit = runtime.join("cwd-1-0/report.sock").as_os_str().len();
+    assert!(over_limit > 103, "fixture must exceed the AF_UNIX budget");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let identity = Identity {
+        authority: AuthorityId::random().unwrap(),
+        tab: TabCapability::random().unwrap(),
+        epoch: 1,
+        generation: 1,
+    };
+    let first = WireEnvelope::new(
+        identity.clone(),
+        1,
+        Operation::Open {
+            directory: RemotePath::new(workspace.as_os_str().as_encoded_bytes().to_vec()).unwrap(),
+            target: LaunchTarget::Shell,
+            rows: 24,
+            cols: 80,
+        },
+    );
+    let supervisor = Supervisor::create(
+        &first,
+        runtime.clone(),
+        temp.path(),
+        std::path::Path::new("/bin/sh"),
+        ChildLaunch {
+            program: workspace.clone(),
+            args: Vec::new(),
+            cwd: workspace.clone(),
+            env: Vec::new(),
+        },
+        None,
+    )
+    .expect("supervisor create with a long runtime path");
+    let runner = thread::spawn(move || supervisor.run());
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let endpoint: Endpoint = loop {
+        assert!(
+            Instant::now() < deadline,
+            "endpoint.json was never published"
+        );
+        if let Ok(bytes) = std::fs::read(runtime.join("endpoint.json")) {
+            break serde_json::from_slice(&bytes).expect("endpoint");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stream = TcpStream::connect(endpoint.addr).expect("connect");
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let capability = capability_bytes(&identity).expect("capability");
+    stream.write_all(&capability).unwrap();
+    stream.write_all(&identity.authority.0).unwrap();
+    stream.write_all(&identity.epoch.to_be_bytes()).unwrap();
+    write_envelope(&mut stream, &first).expect("write open");
+    fn read_until(
+        stream: &mut TcpStream,
+        deadline: Instant,
+        want: impl Fn(&Operation) -> bool,
+    ) -> WireEnvelope {
+        loop {
+            assert!(Instant::now() < deadline, "deadline waiting for a frame");
+            match read_envelope(stream) {
+                Ok(frame) if want(&frame.operation) => return frame,
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(error) => panic!("attachment socket failed: {error}"),
+            }
+        }
+    }
+    read_until(&mut stream, deadline, |operation| {
+        matches!(operation, Operation::Attached)
+    });
+    // The idle window: a nonblocking reader dies here before any byte arrives.
+    thread::sleep(Duration::from_millis(400));
+    write_envelope(
+        &mut stream,
+        &WireEnvelope::new(identity.clone(), 2, Operation::Close),
+    )
+    .expect("write close");
+    let closed = read_until(&mut stream, deadline, |operation| {
+        matches!(operation, Operation::Closed { .. })
+    });
+    let Operation::Closed { confirmed } = closed.operation else {
+        panic!("expected Closed")
+    };
+    assert!(confirmed, "close was not confirmed");
+    drop(stream);
+    assert!(runner.join().expect("run thread").is_ok());
+    // The runtime directory is removed by the supervisor after Close.
+    let removed = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < removed && runtime.exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!runtime.exists(), "runtime directory survived Close");
+}

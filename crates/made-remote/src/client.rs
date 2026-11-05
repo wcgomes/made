@@ -156,6 +156,16 @@ impl State {
         {
             return Err(ProtocolError::Limit);
         }
+        // A GrokSnapshot/GrokEvent is a reply only when it completes a pending
+        // GrokState request; every other Grok frame is an unsolicited
+        // session-sink event for the owning tab.
+        let grok_state_reply = matches!(
+            frame.operation,
+            Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. }
+        ) && self
+            .pending
+            .get(&frame.request_id)
+            .is_some_and(|pending| matches!(pending.request.operation, Operation::GrokState));
         match &frame.operation {
             Operation::RootResult {
                 path, generation, ..
@@ -166,6 +176,9 @@ impl State {
                 generation: *generation,
             }),
             Operation::SessionSnapshot { .. } | Operation::FocusResult { .. } => {
+                self.sessions.push_back(frame.clone())
+            }
+            Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. } if !grok_state_reply => {
                 self.sessions.push_back(frame.clone())
             }
             Operation::Error { code } => {
@@ -190,21 +203,29 @@ impl State {
         }
         // Dedicated ports consume their own replies: do not require draining a
         // duplicate generic queue for normal root/session/heartbeat operation.
+        // Unsolicited Grok pushes belong to the session sink only; a Grok
+        // snapshot reply to a pending GrokState request keeps the generic
+        // reply queue for the workspace id map.
         if !matches!(
             frame.operation,
             Operation::RootResult { .. }
                 | Operation::SessionSnapshot { .. }
                 | Operation::FocusResult { .. }
-        ) && !self.pending.get(&frame.request_id).is_some_and(|p| {
-            matches!(
-                p.request.operation,
-                Operation::Heartbeat
-                    | Operation::RootValidate { .. }
-                    | Operation::RootSelect { .. }
-                    | Operation::SessionState
-                    | Operation::Focus { .. }
-            )
-        }) {
+        ) && !(matches!(
+            frame.operation,
+            Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. }
+        ) && !grok_state_reply)
+            && !self.pending.get(&frame.request_id).is_some_and(|p| {
+                matches!(
+                    p.request.operation,
+                    Operation::Heartbeat
+                        | Operation::RootValidate { .. }
+                        | Operation::RootSelect { .. }
+                        | Operation::SessionState
+                        | Operation::Focus { .. }
+                )
+            })
+        {
             self.replies.push_back(frame);
         }
         Ok(())
@@ -255,12 +276,17 @@ impl State {
         // A reset or accepted root transition deliberately abandons old-root
         // work. Late replies for those request ids are drained, not treated as
         // forged replies that would disconnect the new root. Unsolicited
-        // SessionSnapshot events reuse the current Open/Attach request id, so
-        // only that event source survives the discard window; downstream
-        // revision/identity validation still rejects stale or foreign state.
-        let unsolicited_snapshot = matches!(frame.operation, Operation::SessionSnapshot { .. })
-            && self.attach_request == Some(frame.request_id);
-        if !unsolicited_snapshot
+        // SessionSnapshot and Grok push events reuse the current Open/Attach
+        // request id, so only that event source survives the discard window;
+        // downstream revision/identity validation still rejects stale or
+        // foreign state.
+        let unsolicited_plugin = matches!(
+            frame.operation,
+            Operation::SessionSnapshot { .. }
+                | Operation::GrokSnapshot { .. }
+                | Operation::GrokEvent { .. }
+        ) && self.attach_request == Some(frame.request_id);
+        if !unsolicited_plugin
             && !self.pending.contains_key(&frame.request_id)
             && ((frame.request_id != 0 && frame.request_id <= self.discard_through)
                 || (frame.request_id >= (1u64 << 63)
@@ -277,6 +303,17 @@ impl State {
                 return self.deliver(frame);
             }
             Operation::SessionSnapshot { .. } if !self.pending.contains_key(&frame.request_id) => {
+                return self.deliver(frame);
+            }
+            // Genuine Grok pushes are session-sink events, never replies to a
+            // pending workspace request. When the attach is still in flight, a
+            // push riding its id must not consume it; a reply to a pending
+            // GrokState request keeps the normal correlation path below.
+            Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. }
+                if !self.pending.get(&frame.request_id).is_some_and(|pending| {
+                    matches!(pending.request.operation, Operation::GrokState)
+                }) =>
+            {
                 return self.deliver(frame);
             }
             _ => {}

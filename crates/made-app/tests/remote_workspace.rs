@@ -1,8 +1,9 @@
 //! Pure controller/fake-transport evidence; not real SSH/TUI acceptance.
 use made_app::remote_workspace::*;
 use made_remote::protocol::{
-    AuthorityId, Chunk, DirectoryEntry, EntryKind, ErrorCode, GitRead, Identity, Operation,
-    PreviewKind, RemotePath, TabCapability, WireEnvelope, MAX_IN_FLIGHT,
+    AuthorityId, Chunk, DirectoryEntry, EntryKind, ErrorCode, GitRead, GrokActivity, GrokEventKind,
+    GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, PreviewKind,
+    RemotePath, TabCapability, WireEnvelope, MAX_IN_FLIGHT,
 };
 
 fn path(value: &str) -> RemotePath {
@@ -86,6 +87,17 @@ fn settle(
     workspace: &mut RemoteWorkspace,
     snapshot: &made_bridge::state::SessionSnapshot,
 ) -> Vec<WireEnvelope> {
+    settle_with_grok(workspace, Some(snapshot), None)
+}
+
+/// Protocol responder spy with an optional Grok inventory. `None` OpenCode
+/// consumes SessionState requests without replying (integration stays down);
+/// `None` Grok answers GrokState with an honest error.
+fn settle_with_grok(
+    workspace: &mut RemoteWorkspace,
+    snapshot: Option<&made_bridge::state::SessionSnapshot>,
+    grok: Option<&GrokSessionSnapshot>,
+) -> Vec<WireEnvelope> {
     let mut observed = Vec::new();
     for _ in 0..100 {
         let Some(request) = workspace.next_command() else {
@@ -111,8 +123,22 @@ fn settle(
             Operation::GitRead { .. } => Operation::Error {
                 code: ErrorCode::Unavailable,
             },
-            Operation::SessionState => Operation::SessionSnapshot {
-                snapshot: snapshot.clone(),
+            Operation::SessionState => match snapshot {
+                Some(snapshot) => Operation::SessionSnapshot {
+                    snapshot: snapshot.clone(),
+                },
+                None => {
+                    observed.push(request);
+                    continue;
+                }
+            },
+            Operation::GrokState => match grok {
+                Some(snapshot) => Operation::GrokSnapshot {
+                    snapshot: snapshot.clone(),
+                },
+                None => Operation::Error {
+                    code: ErrorCode::Unavailable,
+                },
             },
             Operation::Watch { path } => Operation::Changed { path: path.clone() },
             Operation::Cancel { .. } => {
@@ -125,6 +151,53 @@ fn settle(
         observed.push(request);
     }
     panic!("unbounded command feedback")
+}
+
+fn grok_session(
+    id: &str,
+    cwd: Option<&str>,
+    opened_at: u64,
+    activity: GrokActivity,
+) -> GrokSessionInfo {
+    GrokSessionInfo {
+        session_id: id.to_owned(),
+        cwd: cwd.map(path),
+        opened_at,
+        activity,
+    }
+}
+fn grok_snapshot(
+    revision: u64,
+    running: bool,
+    sessions: Vec<GrokSessionInfo>,
+) -> GrokSessionSnapshot {
+    GrokSessionSnapshot {
+        revision,
+        running,
+        hooks_ready: false,
+        sessions,
+    }
+}
+fn grok_event_envelope(
+    identity: &Identity,
+    request_id: u64,
+    kind: GrokEventKind,
+    session_id: &str,
+    cwd: Option<&str>,
+    activity: GrokActivity,
+) -> WireEnvelope {
+    WireEnvelope::new(
+        identity.clone(),
+        request_id,
+        Operation::GrokEvent {
+            event: GrokSessionEvent {
+                kind,
+                session_id: session_id.to_owned(),
+                cwd: cwd.map(path),
+                activity,
+            },
+        },
+    )
 }
 
 #[test]
@@ -857,4 +930,598 @@ fn full_pending_queue_transition_drops_old_work_without_cancel_frames() {
             .any(|command| matches!(command.operation, Operation::Cancel { .. })),
         "transition must not enqueue one Cancel per old pending request"
     );
+}
+
+#[test]
+fn grok_push_never_consumes_pending_work_even_by_numeric_id() {
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    // One pending List whose request id the push will numerically reuse.
+    let list_id = workspace.load_directory(path("/project")).unwrap();
+    let pending_before = workspace.pending_count();
+
+    let identity = workspace.identity().clone();
+    workspace
+        .accept_grok_push(WireEnvelope::new(
+            identity,
+            list_id,
+            Operation::GrokSnapshot {
+                snapshot: grok_snapshot(1, true, vec![]),
+            },
+        ))
+        .expect("a current-attach Grok push applies without a workspace mapping");
+    assert!(workspace.projection().grok.is_some());
+    assert_eq!(
+        workspace.pending_count(),
+        pending_before,
+        "a Grok push must not consume or poison a numeric-equal pending request"
+    );
+    // The pending List itself is still the queued correlated request.
+    let request = workspace.next_command().expect("the List stays queued");
+    assert_eq!(request.request_id, list_id);
+    assert!(matches!(request.operation, Operation::List { .. }));
+
+    // The correlated reply for that pending request still applies afterwards.
+    let reply = WireEnvelope::new(
+        request.identity.clone(),
+        list_id,
+        Operation::Listed {
+            path: path("/project"),
+            entries: vec![],
+            truncated: false,
+            done: true,
+        },
+    );
+    workspace
+        .accept(reply)
+        .expect("the correlated List reply applies");
+    assert!(
+        workspace.pending_count() < pending_before,
+        "the answered request must complete normally"
+    );
+}
+
+#[test]
+fn grok_hook_tier_comes_only_from_a_current_snapshot_or_hook_event() {
+    let mut workspace = model(1);
+    assert_eq!(workspace.grok_hooks_ready(), None);
+
+    // An authenticated idle event proves the hook tier even before the first
+    // snapshot; no non-idle activity inference is needed.
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            1,
+            GrokEventKind::SessionStart,
+            "idle",
+            None,
+            GrokActivity::Idle,
+        ))
+        .unwrap();
+    assert_eq!(workspace.grok_hooks_ready(), Some(true));
+
+    workspace.begin_resnapshot().unwrap();
+    assert_eq!(workspace.grok_hooks_ready(), None);
+    let identity = workspace.identity().clone();
+    workspace
+        .accept_grok_push(WireEnvelope::new(
+            identity.clone(),
+            2,
+            Operation::GrokSnapshot {
+                snapshot: grok_snapshot(1, true, vec![]),
+            },
+        ))
+        .unwrap();
+    assert_eq!(workspace.grok_hooks_ready(), Some(false));
+
+    // An equal revision cannot replace the already accepted tier.
+    let mut duplicate = grok_snapshot(1, true, vec![]);
+    duplicate.hooks_ready = true;
+    workspace
+        .accept_grok_push(WireEnvelope::new(
+            identity.clone(),
+            3,
+            Operation::GrokSnapshot {
+                snapshot: duplicate,
+            },
+        ))
+        .unwrap();
+    assert_eq!(workspace.grok_hooks_ready(), Some(false));
+
+    let mut ready = grok_snapshot(2, true, vec![]);
+    ready.hooks_ready = true;
+    workspace
+        .accept_grok_push(WireEnvelope::new(
+            identity,
+            4,
+            Operation::GrokSnapshot { snapshot: ready },
+        ))
+        .unwrap();
+    assert_eq!(workspace.grok_hooks_ready(), Some(true));
+    workspace.disconnect();
+    assert_eq!(workspace.grok_hooks_ready(), None);
+}
+
+#[test]
+fn grok_root_sits_below_opencode_and_above_shell_with_honest_lifecycle() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace
+        .report_shell_cwd(&identity, path("/shell-a"))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+
+    // A living sessionless Grok process never moves the root.
+    let sessionless = grok_snapshot(1, true, vec![]);
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&sessionless));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+    let state = workspace.projection().grok.as_ref().unwrap();
+    assert!(state.running && state.sessions.is_empty());
+
+    // The owned session's cwd wins over the validated shell cwd.
+    let inventory = grok_snapshot(
+        2,
+        true,
+        vec![grok_session("a", Some("/grok-a"), 7, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+
+    // A connected OpenCode session stays authoritative above Grok.
+    workspace.refresh_sessions().unwrap();
+    settle_with_grok(
+        &mut workspace,
+        Some(&active_snapshot(2, "/session")),
+        Some(&inventory),
+    );
+    assert_eq!(workspace.root(), &path("/session"));
+    assert_eq!(workspace.projection().source, RootSource::Session);
+
+    // OpenCode yields; the Grok slot retakes the root above the shell.
+    let identity = workspace.identity().clone();
+    workspace
+        .integration_changed(&identity, IntegrationState::Unavailable)
+        .unwrap();
+    settle_with_grok(&mut workspace, None, None);
+    assert_eq!(workspace.root(), &path("/grok-a"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+
+    // The last owned session ends; the shell cwd is restored honestly.
+    workspace.refresh_grok().unwrap();
+    let ended = grok_snapshot(3, false, vec![]);
+    settle_with_grok(&mut workspace, None, Some(&ended));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+    assert_eq!(workspace.projection().source, RootSource::Shell);
+    assert!(workspace
+        .projection()
+        .grok
+        .as_ref()
+        .is_some_and(|state| state.sessions.is_empty()));
+}
+
+#[test]
+fn grok_newest_attachment_wins_prompts_move_and_inventory_does_not_steal_back() {
+    let mut workspace = model(1);
+    let inventory = grok_snapshot(
+        2,
+        true,
+        vec![
+            grok_session("older", Some("/older"), 1, GrokActivity::Idle),
+            grok_session("newer", Some("/newer"), 2, GrokActivity::Idle),
+            grok_session("attached", Some("/attached"), 3, GrokActivity::Idle),
+        ],
+    );
+    // The newest attachment moves the explorer (A).
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/attached"));
+
+    // A prompt in the older owned session moves immediately (B)...
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            9,
+            GrokEventKind::Prompt,
+            "older",
+            Some("/older"),
+            GrokActivity::Working,
+        ))
+        .unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.root(), &path("/older"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+    assert_eq!(
+        workspace.projection().grok.as_ref().unwrap().sessions[0].activity,
+        GrokActivity::Working
+    );
+
+    // ...and the unchanged newest attachment must not steal the root back.
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/older"));
+
+    // A new attachment moves once more (C): repeated A→B→C keeps working.
+    let attached = grok_snapshot(
+        3,
+        true,
+        vec![
+            grok_session("older", Some("/older"), 1, GrokActivity::Idle),
+            grok_session("attached", Some("/attached"), 3, GrokActivity::Idle),
+            grok_session("fresh", Some("/fresh"), 4, GrokActivity::Idle),
+        ],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&attached));
+    assert_eq!(workspace.root(), &path("/fresh"));
+
+    // Ending the followed session keeps the root while others remain.
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            10,
+            GrokEventKind::SessionEnd,
+            "fresh",
+            None,
+            GrokActivity::Idle,
+        ))
+        .unwrap();
+    assert_eq!(workspace.root(), &path("/fresh"));
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            11,
+            GrokEventKind::SessionEnd,
+            "attached",
+            None,
+            GrokActivity::Idle,
+        ))
+        .unwrap();
+    assert_eq!(workspace.root(), &path("/fresh"));
+    // The last owned session ending returns to the launch fallback.
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            12,
+            GrokEventKind::SessionEnd,
+            "older",
+            None,
+            GrokActivity::Idle,
+        ))
+        .unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.root(), &path("/project"));
+    assert_eq!(workspace.projection().source, RootSource::Launch);
+}
+
+#[test]
+fn grok_events_require_current_attachment_and_never_consume_pending_work() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace.begin_resnapshot().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    let inventory = grok_snapshot(
+        1,
+        true,
+        vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+
+    // A disconnected transport cannot mutate Grok state.
+    workspace.disconnect();
+    assert!(workspace
+        .accept_grok_event(grok_event_envelope(
+            &identity,
+            1,
+            GrokEventKind::Prompt,
+            "a",
+            Some("/grok-b"),
+            GrokActivity::Working
+        ))
+        .is_err());
+    assert!(workspace.projection().grok.is_none());
+    workspace.reattach(2).unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    // Neither can a foreign epoch or a non-Grok envelope.
+    let mut foreign = workspace.identity().clone();
+    foreign.epoch = 3;
+    assert!(workspace
+        .accept_grok_event(grok_event_envelope(
+            &foreign,
+            1,
+            GrokEventKind::Prompt,
+            "a",
+            Some("/grok-b"),
+            GrokActivity::Working
+        ))
+        .is_err());
+    assert!(workspace
+        .accept_grok_event(WireEnvelope::new(
+            workspace.identity().clone(),
+            1,
+            Operation::SessionState
+        ))
+        .is_err());
+
+    // Re-establish the projection; an event never consumes pending work.
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+    let list = workspace
+        .request(
+            Operation::List {
+                path: path("/grok-a"),
+            },
+            None,
+        )
+        .unwrap();
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &workspace.identity().clone(),
+            list.request_id,
+            GrokEventKind::Error,
+            "a",
+            None,
+            GrokActivity::Attention,
+        ))
+        .unwrap();
+    assert_eq!(
+        workspace.pending_count(),
+        1,
+        "an event must not consume a numerically equal pending request"
+    );
+    assert_eq!(
+        workspace.projection().grok.as_ref().unwrap().sessions[0].activity,
+        GrokActivity::Attention
+    );
+    workspace
+        .accept(reply(
+            &list,
+            Operation::Listed {
+                path: path("/grok-a"),
+                entries: vec![],
+                truncated: false,
+                done: true,
+            },
+        ))
+        .unwrap();
+    assert_eq!(workspace.pending_count(), 0);
+}
+
+#[test]
+fn grok_state_replies_are_correlated_revision_gated_and_honest_on_error() {
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    let inventory = grok_snapshot(
+        1,
+        true,
+        vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+    );
+
+    // A GrokSnapshot bound to another request id is rejected without state.
+    workspace.refresh_grok().unwrap();
+    let state = workspace.next_command().unwrap();
+    assert!(matches!(state.operation, Operation::GrokState));
+    let mut forged = reply(
+        &state,
+        Operation::GrokSnapshot {
+            snapshot: inventory.clone(),
+        },
+    );
+    forged.request_id = state.request_id + 1;
+    assert!(workspace.accept(forged).is_err());
+    assert_eq!(
+        workspace.pending_count(),
+        1,
+        "a foreign reply id must not consume the pending GrokState"
+    );
+    // The correctly correlated reply owns its pending request and moves the root.
+    workspace
+        .accept(reply(
+            &state,
+            Operation::GrokSnapshot {
+                snapshot: inventory.clone(),
+            },
+        ))
+        .unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.pending_count(), 0);
+    assert_eq!(workspace.root(), &path("/grok-a"));
+
+    // A lower revision cannot overwrite the projection or move the root.
+    let newer = grok_snapshot(
+        2,
+        true,
+        vec![grok_session("b", Some("/grok-b"), 5, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    let state = workspace.next_command().unwrap();
+    workspace
+        .accept(reply(&state, Operation::GrokSnapshot { snapshot: newer }))
+        .unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.root(), &path("/grok-b"));
+    workspace.refresh_grok().unwrap();
+    let state = workspace.next_command().unwrap();
+    assert!(workspace
+        .accept(reply(
+            &state,
+            Operation::GrokSnapshot {
+                snapshot: inventory
+            }
+        ))
+        .is_err());
+    assert_eq!(workspace.projection().grok.as_ref().unwrap().revision, 2);
+
+    // An equal revision is a refresh completion, not a new move.
+    workspace.refresh_grok().unwrap();
+    let state = workspace.next_command().unwrap();
+    workspace
+        .accept(reply(
+            &state,
+            Operation::GrokSnapshot {
+                snapshot: grok_snapshot(
+                    2,
+                    true,
+                    vec![grok_session("b", Some("/grok-b"), 5, GrokActivity::Idle)],
+                ),
+            },
+        ))
+        .unwrap();
+    assert!(workspace.next_command().is_none());
+    assert_eq!(workspace.root(), &path("/grok-b"));
+
+    // A GrokState error clears the projection honestly without touching the
+    // OpenCode integration state, and the root falls back.
+    let integration_before = workspace.integration();
+    workspace.refresh_grok().unwrap();
+    let state = workspace.next_command().unwrap();
+    workspace
+        .accept(reply(
+            &state,
+            Operation::Error {
+                code: ErrorCode::Unavailable,
+            },
+        ))
+        .unwrap();
+    assert!(workspace.projection().grok.is_none());
+    assert_eq!(workspace.integration(), integration_before);
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.root(), &path("/project"));
+    assert_eq!(workspace.projection().source, RootSource::Launch);
+}
+
+#[test]
+fn reconnect_discards_previous_epoch_grok_state_and_resnapshots() {
+    let mut workspace = model(1);
+    let old_identity = workspace.identity().clone();
+    workspace.begin_resnapshot().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    let inventory = grok_snapshot(
+        4,
+        true,
+        vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+
+    // Disconnect clears the projection and the follow state.
+    workspace.disconnect();
+    assert!(workspace.projection().grok.is_none());
+    workspace.reattach(2).unwrap();
+    // A previous-attachment event cannot mutate the fresh epoch.
+    assert!(workspace
+        .accept_grok_event(grok_event_envelope(
+            &old_identity,
+            3,
+            GrokEventKind::Prompt,
+            "a",
+            Some("/grok-a"),
+            GrokActivity::Working
+        ))
+        .is_err());
+    // The fresh-epoch snapshot re-establishes the root from a clean gate.
+    let fresh = grok_snapshot(
+        1,
+        true,
+        vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&fresh));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+    assert_eq!(workspace.projection().grok.as_ref().unwrap().revision, 1);
+}
+
+#[test]
+fn grok_session_start_moves_before_the_first_inventory_snapshot() {
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    let identity = workspace.identity().clone();
+    workspace
+        .accept_grok_event(grok_event_envelope(
+            &identity,
+            5,
+            GrokEventKind::SessionStart,
+            "live",
+            Some("/started"),
+            GrokActivity::Idle,
+        ))
+        .unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    assert_eq!(workspace.root(), &path("/started"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+
+    // The inventory confirms the session afterwards without stealing the root.
+    let inventory = grok_snapshot(
+        1,
+        true,
+        vec![grok_session(
+            "live",
+            Some("/started"),
+            9,
+            GrokActivity::Idle,
+        )],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/started"));
+    assert_eq!(
+        workspace.projection().grok.as_ref().unwrap().sessions[0].opened_at,
+        9
+    );
+}
+
+#[test]
+fn pre_attach_failure_projects_a_bounded_unavailable_tree() {
+    let mut workspace = model(1);
+    workspace.load_directory(path("/project")).unwrap();
+    assert!(!workspace.projection().directories.is_empty());
+    let revision = workspace.projection().revision;
+
+    workspace.project_unavailable(ErrorCode::Unavailable);
+    let projection = workspace.projection();
+    assert!(matches!(
+        projection.root_state,
+        Freshness::Unavailable(ErrorCode::Unavailable)
+    ));
+    assert!(
+        projection.directories.is_empty(),
+        "a failure must not keep a partial tree"
+    );
+    assert!(projection.expanded.is_empty());
+    assert!(projection.preview.is_none());
+    assert_ne!(projection.revision, revision);
+}
+
+#[test]
+fn grok_cwd_is_used_byte_exact_and_granted_like_any_remote_report() {
+    // A cwd outside the launch root is selected exactly as reported; the
+    // server validates the path, never the host filesystem.
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), None);
+    let inventory = grok_snapshot(
+        1,
+        true,
+        vec![grok_session(
+            "a",
+            Some("/srv/odd-name."),
+            1,
+            GrokActivity::Idle,
+        )],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/srv/odd-name."));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
 }

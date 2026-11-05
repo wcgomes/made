@@ -212,6 +212,7 @@ pub enum GitRead {
 pub enum LaunchTarget {
     Shell,
     OpenCode,
+    Grok,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKind {
@@ -265,6 +266,101 @@ pub struct Capabilities {
     pub opencode: bool,
     pub shell_cwd: bool,
     pub helper_version: String,
+    /// Additive within major 1: an older companion frame without these fields
+    /// deserializes as false, so absence stays honest inventory tier. Detection
+    /// is remote-only and never implies launch or install support.
+    #[serde(default)]
+    pub grok: bool,
+    #[serde(default)]
+    pub python3: bool,
+}
+
+/// Bounded Grok activity vocabulary shared by snapshots and events; mirrors the
+/// shipped grok-made hook statuses (`idle`, `working`, `attention`, `error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrokActivity {
+    Idle,
+    Working,
+    Attention,
+    Error,
+}
+
+/// Closed classification of one Grok event, carrying what the local Grok Build
+/// contract needs: which session, what happened, and the resulting activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrokEventKind {
+    SessionStart,
+    Prompt,
+    Stop,
+    Error,
+    Cancel,
+    SessionEnd,
+}
+
+/// One owned remote Grok session in a revisioned snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokSessionInfo {
+    pub session_id: String,
+    /// Absolute remote POSIX directory, byte-validated by `RemotePath`. Never
+    /// canonicalized or opened by either side; root authorization is the
+    /// owning tab's, like any other remote report.
+    #[serde(default)]
+    pub cwd: Option<RemotePath>,
+    /// Companion-assigned attachment-order key. Only relative ordering within
+    /// one snapshot is contractual; never wall-clock or cross-epoch semantics.
+    pub opened_at: u64,
+    pub activity: GrokActivity,
+}
+
+/// Complete revisioned Grok state for one tab: inventory plus activity. Grok
+/// state never rides the OpenCode `SessionSnapshot` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokSessionSnapshot {
+    /// Monotonic revision within the current connection epoch. Must be positive.
+    pub revision: u64,
+    /// Whether the tab's managed child is a living Grok process, even before
+    /// any session exists.
+    pub running: bool,
+    /// Whether the companion armed the installed plugin's status hooks. Older
+    /// companions omit this additive field and retain inventory-only behavior.
+    #[serde(default)]
+    pub hooks_ready: bool,
+    pub sessions: Vec<GrokSessionInfo>,
+}
+impl GrokSessionSnapshot {
+    /// Wire-shape validation only. Envelope authority/tab/epoch/request and
+    /// root-generation binding stay with `WireEnvelope`, and revision
+    /// progression is the client's, never re-checked here.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.revision == 0 || self.sessions.len() > made_bridge::state::MAX_SESSIONS {
+            return Err(ProtocolError::Malformed);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.sessions.len());
+        for session in &self.sessions {
+            if !bounded_session_id(&session.session_id) || !seen.insert(session.session_id.as_str())
+            {
+                return Err(ProtocolError::Malformed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One server-global Grok event the companion has filtered to sessions owned by
+/// this tab's managed child, pushed unsolicited under the current attach id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokSessionEvent {
+    pub kind: GrokEventKind,
+    pub session_id: String,
+    /// Absolute remote POSIX directory for explorer follow, when the event
+    /// carries one. Absent keeps the current root.
+    #[serde(default)]
+    pub cwd: Option<RemotePath>,
+    /// The activity dot implied by this event; `SessionEnd` removes the row.
+    pub activity: GrokActivity,
 }
 
 /// Closed verbs and their replies. Content-bearing Debug is deliberately opaque.
@@ -358,6 +454,13 @@ pub enum Operation {
         session_id: String,
         accepted: bool,
     },
+    GrokState,
+    GrokSnapshot {
+        snapshot: GrokSessionSnapshot,
+    },
+    GrokEvent {
+        event: GrokSessionEvent,
+    },
     ShellCwd {
         path: RemotePath,
     },
@@ -405,6 +508,15 @@ impl fmt::Debug for Operation {
         f.write_str("Operation(<redacted>)")
     }
 }
+
+/// Session-identifier shape shared by OpenCode focus and the Grok surface:
+/// non-empty, bounded in characters, no control bytes (NUL included).
+fn bounded_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.chars().count() <= made_bridge::state::MAX_SESSION_ID_CHARS
+        && !session_id.chars().any(char::is_control)
+}
+
 impl Operation {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
@@ -480,10 +592,15 @@ impl Operation {
                 .validate_with_path_semantics(made_bridge::state::PathSemantics::RemotePosix)
                 .map_err(|_| ProtocolError::Malformed)?,
             Self::Focus { session_id } | Self::FocusResult { session_id, .. } => {
-                if session_id.is_empty()
-                    || session_id.chars().count() > made_bridge::state::MAX_SESSION_ID_CHARS
-                    || session_id.chars().any(char::is_control)
-                {
+                if !bounded_session_id(session_id) {
+                    return Err(ProtocolError::Malformed);
+                }
+            }
+            Self::GrokSnapshot { snapshot } => {
+                snapshot.validate().map_err(|_| ProtocolError::Malformed)?
+            }
+            Self::GrokEvent { event } => {
+                if !bounded_session_id(&event.session_id) {
                     return Err(ProtocolError::Malformed);
                 }
             }
@@ -586,6 +703,7 @@ impl WireEnvelope {
             | GitRead { .. }
             | SessionState
             | Focus { .. }
+            | GrokState
             | TerminalInput { .. }
             | TerminalResize { .. }
             | UploadBegin { .. }
@@ -622,7 +740,8 @@ impl WireEnvelope {
                 | UploadAbort { .. },
                 Ack,
             )
-            | (SessionState, SessionSnapshot { .. }) => true,
+            | (SessionState, SessionSnapshot { .. })
+            | (GrokState, GrokSnapshot { .. }) => true,
             (
                 RootValidate { path: a },
                 RootResult {
@@ -787,6 +906,7 @@ impl ReplyProgress {
                 | GitRead { .. }
                 | SessionState
                 | Focus { .. }
+                | GrokState
                 | TerminalInput { .. }
                 | TerminalResize { .. }
                 | UploadBegin { .. }

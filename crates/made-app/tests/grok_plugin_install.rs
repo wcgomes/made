@@ -4,6 +4,8 @@
 //! The fake `grok` and `GROK_HOME` live under a temporary directory. Nothing
 //! here writes the user's real `~/.grok`.
 
+mod support;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -95,6 +97,15 @@ sleep 30\n",
     command.env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
     command.env_remove(made_platform::SHELL_ENV);
     command.env_remove("MADE_PLUGIN_DIR");
+    // Hand the child an explicit fixture plugin package staged inside the
+    // install root, which release builds require the plugin override to
+    // canonicalize into; cargo never packages a plugin beside the test
+    // binary.
+    let plugins = support::StagedPlugins::stage(&format!("grok-{case}"));
+    command.env(
+        made_platform::PLUGIN_DIR_ENV,
+        plugins.package("opencode-made"),
+    );
     for directory in [
         home.path().join("tmp"),
         home.path().join("runtime"),
@@ -133,15 +144,15 @@ fn run_case() {
     match case.as_str() {
         "missing" => expect_install(None, None),
         "lexical-older" => {
-            let shipped = plant_controlled_shipped("0.10.0");
+            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
             expect_install(Some("0.2.0"), Some(shipped));
         }
         "equal" => {
-            let shipped = plant_controlled_shipped("0.10.0");
+            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
             expect_skip("0.10.0", &shipped);
         }
         "newer" => {
-            let shipped = plant_controlled_shipped("0.10.0");
+            let (shipped, _staged) = plant_controlled_shipped("0.10.0");
             expect_skip("0.10.1", &shipped);
         }
         other => panic!("unknown case {other}"),
@@ -362,19 +373,19 @@ fn plant_installed(version: &str) {
     .unwrap();
 }
 
-fn plant_controlled_shipped(version: &str) -> PathBuf {
-    let root = env_path_var("HOME").join("shipped-plugins");
-    let opencode = root.join("opencode-made");
-    let grok = root.join("grok-made");
-    std::fs::create_dir_all(&opencode).unwrap();
-    std::fs::create_dir_all(&grok).unwrap();
+fn plant_controlled_shipped(version: &str) -> (PathBuf, support::StagedPlugins) {
+    let staged = support::StagedPlugins::stage("grok-controlled");
     std::fs::write(
-        grok.join("plugin.json"),
+        staged.package("grok-made").join("plugin.json"),
         format!("{{\n  \"name\": \"grok-made\",\n  \"version\": \"{version}\"\n}}\n"),
     )
     .unwrap();
-    std::env::set_var("MADE_PLUGIN_DIR", &opencode);
-    std::fs::canonicalize(&grok).unwrap()
+    std::env::set_var(
+        made_platform::PLUGIN_DIR_ENV,
+        staged.package("opencode-made"),
+    );
+    let grok = std::fs::canonicalize(staged.package("grok-made")).unwrap();
+    (grok, staged)
 }
 
 fn resolved_grok_plugin_dir() -> PathBuf {

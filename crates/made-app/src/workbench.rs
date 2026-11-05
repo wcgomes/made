@@ -211,6 +211,9 @@ enum RemotePhase {
     Connecting,
     NeedsConsent,
     NeedsHostApproval,
+    /// Same-version companion bytes differ. Waiting for this attempt's separate
+    /// update approval; nothing has been written or deleted.
+    NeedsUpdate,
     Staging,
     AwaitingAttach,
     Ready,
@@ -222,6 +225,9 @@ enum OpenRetry {
     Probe,
     Stage,
     Companion,
+    /// The approved same-version update stage failed; Retry stays on the
+    /// update card instead of becoming a generic open failure.
+    Update,
 }
 
 struct PendingUpload {
@@ -242,6 +248,19 @@ struct RemoteTab {
     prompt: Option<made_platform::ssh_askpass::PromptRequest>,
     prompt_draft: String,
     opencode: bool,
+    /// Whether the remote launch target is Grok: the first frame opens
+    /// `grok dashboard` through LaunchTarget::Grok.
+    grok: bool,
+    /// Sanitized target triple for the update card. The version is the shipped
+    /// app version; no path or hash is stored here.
+    update_target: Option<String>,
+    /// This attempt's explicit `Update companion` approval. Never persisted.
+    update_approved: bool,
+    /// The approved update attempt itself failed; Retry stays actionable.
+    update_failed: bool,
+    /// What the tab's own launch probe detected. Absence is undetected; the
+    /// host PATH is never consulted for a remote tab.
+    grok_detected: bool,
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
     client_rx: Option<
@@ -261,6 +280,9 @@ struct RemoteTab {
     /// Set when the user approves provisioning for this launch.
     consent_granted: bool,
     consent_persist: bool,
+    /// The private companion was staged/verified successfully in this launch.
+    /// Only then can the consented Grok plugin installer find its helper.
+    companion_provisioned: bool,
     session_open: crate::remote_session::SessionOpen,
     /// Epoch stamped on the next client. The workspace epoch stays put until Attached.
     client_epoch: u64,
@@ -296,6 +318,11 @@ impl RemoteTab {
             prompt: None,
             prompt_draft: String::new(),
             opencode: false,
+            grok: false,
+            update_target: None,
+            update_approved: false,
+            update_failed: false,
+            grok_detected: false,
             probe: None,
             stage: None,
             client_rx: None,
@@ -311,6 +338,7 @@ impl RemoteTab {
             cleanup_unconfirmed: false,
             consent_granted: false,
             consent_persist: false,
+            companion_provisioned: false,
             session_open: crate::remote_session::SessionOpen::New,
             client_epoch: 1,
             attach_request: None,
@@ -619,6 +647,8 @@ impl Workbench {
     ) -> Result<Self, String> {
         let mut remote = RemoteTab::connecting(snapshot.clone(), directory)?;
         remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
+        remote.grok = matches!(target, TerminalTarget::RemoteGrok { .. });
+        remote.grok_detected = false;
         remote.probe = Some(crate::ssh_servers::spawn_probe(
             crate::ssh_servers::ProbeRequest {
                 ticket: crate::ssh_servers::ProbeTicket {
@@ -654,7 +684,12 @@ impl Workbench {
             detail: detail.into(),
             prompt: None,
             prompt_draft: String::new(),
-            opencode: false,
+            opencode: matches!(target, TerminalTarget::RemoteOpenCode { .. }),
+            grok: matches!(target, TerminalTarget::RemoteGrok { .. }),
+            update_target: None,
+            update_approved: false,
+            update_failed: false,
+            grok_detected: false,
             probe: None,
             stage: None,
             client_rx: None,
@@ -670,6 +705,7 @@ impl Workbench {
             cleanup_unconfirmed: false,
             consent_granted: false,
             consent_persist: false,
+            companion_provisioned: false,
             session_open: crate::remote_session::SessionOpen::New,
             client_epoch: 1,
             attach_request: None,
@@ -1075,7 +1111,9 @@ impl Workbench {
             }
             // Remote tabs already return before this function. If it is reached,
             // do not start a host PTY or inject the local OpenCode plugin.
-            TerminalTarget::RemoteShell { .. } | TerminalTarget::RemoteOpenCode { .. } => {
+            TerminalTarget::RemoteShell { .. }
+            | TerminalTarget::RemoteOpenCode { .. }
+            | TerminalTarget::RemoteGrok { .. } => {
                 return;
             }
         };
@@ -1250,12 +1288,22 @@ impl Workbench {
 
     /// Keep the Grok Build diagnostics row for the next snapshot.
     pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
-        self.grok_diagnostics = row;
+        // Consent authorizes Made's installer, not hooks a user installed.
+        // Keep transport, detection, install and not-running rows unchanged.
+        let hooks_ready = self.remote_grok_running()
+            && self.remote_grok_hooks_ready() == Some(true)
+            && (row == GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED
+                || row == GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
+        self.grok_diagnostics = if hooks_ready {
+            GrokDiagnosticsRow::READY
+        } else {
+            row
+        };
     }
 
     /// Grok Build pill and sentence currently shown in About.
     pub(crate) fn grok_diagnostics(&self) -> GrokDiagnosticsRow {
-        self.grok_diagnostics
+        self.grok_diagnostics.clone()
     }
 
     /// Record that Grok session follow has no status hooks.
@@ -1778,6 +1826,40 @@ impl Workbench {
             .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsConsent))
     }
 
+    /// A same-version companion mismatch is waiting for this attempt's own
+    /// approval. Initial staging consent never authorizes changed bytes.
+    pub fn remote_needs_update(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsUpdate))
+    }
+
+    pub fn remote_update_failed(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            remote.update_failed && matches!(remote.phase, RemotePhase::NeedsUpdate)
+        })
+    }
+
+    /// Sanitized target triple for the update card.
+    pub fn remote_update_target(&self) -> Option<&str> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.update_target.as_deref())
+    }
+
+    /// Whether approval of this attempt's update has started the fixed stage.
+    pub fn remote_update_approved(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.update_approved)
+    }
+
+    pub fn remote_update_in_progress(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            remote.update_approved && matches!(remote.phase, RemotePhase::Staging)
+        })
+    }
+
     /// Show a sanitized open failure on this tab. Does not start SSH.
     pub fn present_open_failure(
         &mut self,
@@ -1826,6 +1908,13 @@ impl Workbench {
         match retry {
             Some(OpenRetry::Probe) => self.retry_remote_probe(),
             Some(OpenRetry::Stage) => self.start_remote_stage(),
+            Some(OpenRetry::Update) => {
+                if let Some(remote) = self.remote.as_mut() {
+                    remote.update_approved = true;
+                    remote.update_failed = false;
+                }
+                self.start_remote_stage_with(true);
+            }
             Some(OpenRetry::Companion) => self.spawn_remote_companion(),
             None => {}
         }
@@ -1839,6 +1928,56 @@ impl Workbench {
         self.remote.as_ref().is_some_and(|remote| {
             remote.attached_once && matches!(remote.phase, RemotePhase::Failed)
         })
+    }
+
+    /// Approve only this attempt's same-version companion update. This is
+    /// separate from initial staging consent and is never persisted. Approval
+    /// starts the fixed update-mode stage; the companion still waits for a
+    /// successful stage result.
+    pub fn approve_remote_update(&mut self) -> bool {
+        let approved = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsUpdate));
+        if !approved {
+            return false;
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            remote.update_approved = true;
+            remote.update_failed = false;
+            remote.prompt = None;
+            remote.prompt_draft.clear();
+        }
+        self.start_remote_stage_with(true);
+        true
+    }
+
+    /// Retry a failed approved update. Refusal and cancellation never enter
+    /// update mode.
+    pub fn retry_remote_update(&mut self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.update_failed)
+            && self.approve_remote_update()
+    }
+
+    /// Refuse or cancel the update. No update-mode stage is started, so no
+    /// remote file is written or deleted by this action.
+    pub fn refuse_remote_update(&mut self) {
+        let pending = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| matches!(remote.phase, RemotePhase::NeedsUpdate));
+        if !pending {
+            return;
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            remote.update_approved = false;
+            remote.update_failed = false;
+        }
+        self.cancel_remote_attempt(
+            "The companion update was not approved. Nothing was written or deleted, and no local shell was started.",
+        );
     }
 
     /// Show an authentication card on an existing remote tab. Does not start SSH.
@@ -2063,6 +2202,9 @@ impl Workbench {
         remote.prompt_draft.clear();
         remote.phase = RemotePhase::Failed;
         remote.detail = detail.to_owned();
+        remote.update_approved = false;
+        remote.update_failed = false;
+        remote.update_target = None;
     }
 
     pub fn remote_connection(&self) -> Option<crate::remote_workspace::ConnectionState> {
@@ -2075,6 +2217,127 @@ impl Workbench {
         self.remote
             .as_ref()
             .map(|remote| remote.workspace.integration())
+    }
+
+    /// Whether this remote tab presents OpenCode: the owning remote
+    /// integration is connected through the attached session, or a directly
+    /// launched remote OpenCode process is still alive before its first
+    /// plugin handshake. A reported remote integration exit ends the direct
+    /// launch's branding. Never reads host integration or process state.
+    pub(crate) fn remote_opencode_active(&self) -> bool {
+        let Some(remote) = self.remote.as_ref() else {
+            return false;
+        };
+        if remote.workspace.connection() != crate::remote_workspace::ConnectionState::Connected {
+            return false;
+        }
+        let integration = remote.workspace.integration();
+        integration == crate::remote_workspace::IntegrationState::Connected
+            || (remote.opencode
+                && integration != crate::remote_workspace::IntegrationState::Unavailable)
+    }
+
+    /// Whether the tab's remote Grok state currently justifies Grok Build
+    /// branding: the tab's managed child is a living grok process, or at
+    /// least one open Grok session is owned by this tab's process ancestry.
+    /// OpenCode branding is decided by the caller; this only reports the
+    /// remote Grok projection. Never reads host process state.
+    pub(crate) fn remote_grok_running(&self) -> bool {
+        self.remote_projection()
+            .and_then(|projection| projection.grok.as_ref())
+            .is_some_and(|snapshot| snapshot.running || !snapshot.sessions.is_empty())
+    }
+
+    /// The companion's explicit hook tier, independent of session activity.
+    fn remote_grok_hooks_ready(&self) -> Option<bool> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.workspace.grok_hooks_ready())
+    }
+
+    /// The owning tab's own launch-probe Grok detection. The host PATH is
+    /// never consulted; a tab without a finished probe reports undetected.
+    pub(crate) fn remote_grok_detected(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.grok_detected)
+    }
+
+    /// Record the tab's own remote detection after its launch probe finishes.
+    /// Test-only seam: record the resolved remote target without a live probe.
+    /// Production sets this from the server's own capabilities.
+    pub fn hold_remote_target(&mut self, target: impl Into<String>) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.remote_target = Some(target.into());
+        }
+    }
+
+    pub(crate) fn set_remote_grok_detection(&mut self, detected: bool) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.grok_detected = detected;
+        }
+    }
+
+    /// Whether the tab's SSH transport is down: the attempt failed or the
+    /// attached session is disconnected. Transport failure outranks every
+    /// remote Grok claim in diagnostics.
+    pub(crate) fn remote_transport_failed(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            matches!(remote.phase, RemotePhase::Failed | RemotePhase::NeedsUpdate)
+                || remote.workspace.connection()
+                    == crate::remote_workspace::ConnectionState::Disconnected
+        })
+    }
+
+    /// The owning tab's own bounded failure sentence when opening failed.
+    /// About reports this instead of the generic transport row so a vanished
+    /// grok, stage, companion or launch failure keeps its actual reason.
+    pub(crate) fn remote_failure_detail(&self) -> Option<&str> {
+        self.remote
+            .as_ref()
+            .filter(|remote| matches!(remote.phase, RemotePhase::Failed | RemotePhase::NeedsUpdate))
+            .map(|remote| remote.detail.as_str())
+    }
+
+    /// Whether this tab's private companion was staged or verified in this
+    /// launch. The consented Grok installer needs that helper on the server.
+    pub(crate) fn remote_companion_provisioned(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.companion_provisioned)
+    }
+
+    /// Whether the tab's SSH session is attached and current.
+    pub(crate) fn remote_attached(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            matches!(remote.phase, RemotePhase::Ready)
+                && remote.workspace.connection()
+                    == crate::remote_workspace::ConnectionState::Connected
+        })
+    }
+
+    /// Remote Grok session dots in attachment order, mapped with the local
+    /// idle/working/attention treatment (`error` shows as attention). Empty
+    /// when no owned Grok projection is current for this tab.
+    pub(crate) fn remote_grok_activities(&self) -> Vec<SessionActivity> {
+        let Some(snapshot) = self
+            .remote_projection()
+            .and_then(|projection| projection.grok.as_ref())
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let mut sessions = snapshot.sessions;
+        sessions.sort_by_key(|session| session.opened_at);
+        sessions
+            .into_iter()
+            .map(|session| match session.activity {
+                made_remote::protocol::GrokActivity::Idle => SessionActivity::Idle,
+                made_remote::protocol::GrokActivity::Working => SessionActivity::Busy,
+                made_remote::protocol::GrokActivity::Attention
+                | made_remote::protocol::GrokActivity::Error => SessionActivity::Attention,
+            })
+            .collect()
     }
 
     pub fn remote_projection(&self) -> Option<&crate::remote_workspace::WorkspaceProjection> {
@@ -2099,8 +2362,12 @@ impl Workbench {
             root,
             remote.workspace.projection(),
             layout,
-            scope,
-            native_backdrop,
+            crate::explorer_view::RemoteExplorerOptions {
+                scope,
+                native_backdrop,
+                allow_root_retry: remote.workspace.connection()
+                    == crate::remote_workspace::ConnectionState::Connected,
+            },
             &mut self.remote_explorer_cache,
         )
     }
@@ -2241,6 +2508,10 @@ impl Workbench {
         })
     }
 
+    pub fn remote_workspace(&self) -> Option<&crate::remote_workspace::RemoteWorkspace> {
+        self.remote.as_ref().map(|remote| &remote.workspace)
+    }
+
     pub fn remote_workspace_mut(
         &mut self,
     ) -> Option<&mut crate::remote_workspace::RemoteWorkspace> {
@@ -2347,6 +2618,7 @@ impl Workbench {
             }
         }
         self.pump_remote_client();
+        self.sync_remote_sessions();
         let terminal_changed = self.pump_remote_terminal();
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
@@ -2483,8 +2755,21 @@ impl Workbench {
             remote.phase = RemotePhase::Failed;
             remote.detail =
                 "OpenCode was not detected on this server. Nothing ran locally.".to_owned();
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
+        if remote.grok && !capabilities.grok {
+            remote.phase = RemotePhase::Failed;
+            remote.detail = "Grok was not detected on this server. Nothing ran locally.".to_owned();
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
+            return;
+        }
+        // The owning tab's own detection feeds its Grok Build diagnostics row.
+        remote.grok_detected = capabilities.grok;
         let target = match capabilities.target {
             made_remote::protocol::RemoteTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
             made_remote::protocol::RemoteTarget::LinuxArm64 => "aarch64-unknown-linux-gnu",
@@ -2495,6 +2780,9 @@ impl Workbench {
         if crate::ssh_servers::companion_artifact(target).is_none() {
             remote.phase = RemotePhase::Failed;
             remote.detail = "The remote companion is not packaged with this build. Made did not start a local shell.".to_owned();
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
         let allowed =
@@ -2510,25 +2798,52 @@ impl Workbench {
     }
 
     fn start_remote_stage(&mut self) {
+        self.start_remote_stage_with(false);
+    }
+
+    /// Initial staging stays on `consent-v1`; only an approved update builds
+    /// the platform's `consent-v2-update` payload.
+    fn start_remote_stage_with(&mut self, update: bool) {
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
+        // A new attempt never inherits the previous attempt's update outcome.
+        // Initial/consented staging also never inherits an update approval.
+        remote.update_failed = false;
+        if !update {
+            remote.update_approved = false;
+            remote.update_target = None;
+        }
         let Some(target) = remote.remote_target.clone() else {
             remote.phase = RemotePhase::Failed;
             remote.detail =
                 "The remote target is unknown. Made did not start a local shell.".to_owned();
+            remote.update_approved = false;
+            remote.update_failed = false;
+            remote.update_target = None;
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         };
         let metadata = remote.snapshot.server().metadata().clone();
-        remote.stage = Some(crate::ssh_servers::spawn_consented_stage(
-            metadata,
-            APP_VERSION.to_owned(),
-            target,
-        ));
+        remote.stage = Some(if update {
+            crate::ssh_servers::spawn_approved_update_stage(
+                metadata,
+                APP_VERSION.to_owned(),
+                target,
+            )
+        } else {
+            crate::ssh_servers::spawn_consented_stage(metadata, APP_VERSION.to_owned(), target)
+        });
         remote.phase = RemotePhase::Staging;
-        remote.detail =
+        remote.detail = if update {
+            "Updating the private companion only after your approval. A running session is not signalled."
+                .to_owned()
+        } else {
             "Checking the private companion. Existing matching files are reused; nothing runs locally."
-                .to_owned();
+                .to_owned()
+        };
     }
 
     fn finish_remote_stage(&mut self, result: Result<(), crate::ssh_servers::AttemptError>) {
@@ -2538,11 +2853,43 @@ impl Workbench {
         remote.stage = None;
         remote.prompt = None;
         remote.prompt_draft.clear();
+        let update = remote.update_approved;
         let Err(error) = result else {
+            remote.update_approved = false;
+            remote.update_failed = false;
+            remote.update_target = None;
+            remote.companion_provisioned = true;
             return self.spawn_remote_companion();
         };
+        if error.class == crate::remote_session::SshFailureClass::UpdateRequired {
+            // The platform confirmed a same-version mismatch. Nothing was
+            // written or deleted; keep this attempt's own approval pending.
+            remote.companion_provisioned = false;
+            remote.update_approved = false;
+            remote.update_failed = false;
+            remote.update_target = remote.remote_target.clone();
+            remote.phase = RemotePhase::NeedsUpdate;
+            remote.detail = error.detail.clone();
+            if !remote.attached_once {
+                remote
+                    .workspace
+                    .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
+            }
+            self.diag.log_mut().record(
+                LogLevel::Warn,
+                format!("remote companion update required: {}", error.detail),
+            );
+            return;
+        }
         // A failed stage must not open another SSH session or the companion.
-        self.apply_attempt_error(error, OpenRetry::Stage);
+        self.apply_attempt_error(
+            error,
+            if update {
+                OpenRetry::Update
+            } else {
+                OpenRetry::Stage
+            },
+        );
     }
 
     fn apply_attempt_error(&mut self, error: crate::ssh_servers::AttemptError, retry: OpenRetry) {
@@ -2560,6 +2907,13 @@ impl Workbench {
         };
         remote.prompt = None;
         remote.prompt_draft.clear();
+        // A pre-attach failure cannot supply a tree. Project a bounded
+        // unavailable Explorer state instead of leaving it loading forever.
+        if !remote.attached_once {
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
+        }
         if error.class == crate::remote_session::SshFailureClass::UnknownHost {
             remote.phase = RemotePhase::NeedsHostApproval;
             remote.detail = error.detail;
@@ -2567,10 +2921,38 @@ impl Workbench {
             remote.host_retry = Some(retry);
             return;
         }
+        // Only update-required itself, or a retryable failure of an approved
+        // update attempt, keeps the update card. Changed keys, auth failures,
+        // cancellation and missing packaged capabilities stay terminal.
+        let retryable_update = matches!(retry, OpenRetry::Update)
+            && matches!(
+                error.class,
+                crate::remote_session::SshFailureClass::Timeout
+                    | crate::remote_session::SshFailureClass::Other
+            );
+        if error.class == crate::remote_session::SshFailureClass::UpdateRequired || retryable_update
+        {
+            remote.companion_provisioned = false;
+            remote.update_approved = false;
+            remote.update_target = remote.remote_target.clone();
+            remote.update_failed =
+                error.class != crate::remote_session::SshFailureClass::UpdateRequired;
+            remote.phase = RemotePhase::NeedsUpdate;
+            remote.detail = error.detail;
+            remote.host_fingerprint = None;
+            remote.host_retry = None;
+            return;
+        }
         remote.host_fingerprint = None;
         remote.host_retry = None;
         remote.phase = RemotePhase::Failed;
         remote.detail = error.detail;
+        remote.companion_provisioned = false;
+        // Terminal failures end this update attempt. A later normal stage
+        // must not inherit its consent or its retry card.
+        remote.update_approved = false;
+        remote.update_failed = false;
+        remote.update_target = None;
     }
 
     fn retry_remote_probe(&mut self) {
@@ -2614,6 +2996,7 @@ impl Workbench {
             remote.phase = RemotePhase::Failed;
             remote.detail =
                 "The remote target is unknown. Made did not start a local shell.".to_owned();
+            remote.companion_provisioned = false;
             return;
         };
         let metadata = remote.snapshot.server().metadata().clone();
@@ -2644,6 +3027,8 @@ impl Workbench {
         let directory = remote.workspace.launch_directory().clone();
         let launch = if remote.opencode {
             made_remote::protocol::LaunchTarget::OpenCode
+        } else if remote.grok {
+            made_remote::protocol::LaunchTarget::Grok
         } else {
             made_remote::protocol::LaunchTarget::Shell
         };
@@ -2674,6 +3059,10 @@ impl Workbench {
                 remote.detail =
                     "The remote session rejected the opening frame. No local shell was started."
                         .to_owned();
+                remote.companion_provisioned = false;
+                remote
+                    .workspace
+                    .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             }
         }
     }
@@ -2779,12 +3168,26 @@ impl Workbench {
                         }
                     }
                     let mut sessions = client.session_sink();
-                    while let Some(mut reply) = sessions.poll() {
+                    while let Some(reply) = sessions.poll() {
                         self.diag.log_mut().record(
                             LogLevel::Info,
                             format!("remote session reply: {}", operation_name(&reply.operation)),
                         );
+                        // The client classifies Grok snapshots and events as
+                        // unsolicited pushes riding the current attach id.
+                        // They never consume a pending workspace request
+                        // mapping, even by numeric id equality; a correlated
+                        // GrokState reply arrives on the generic queue above.
+                        if matches!(
+                            reply.operation,
+                            made_remote::protocol::Operation::GrokSnapshot { .. }
+                                | made_remote::protocol::Operation::GrokEvent { .. }
+                        ) {
+                            let _ = remote.workspace.accept_grok_push(reply);
+                            continue;
+                        }
                         if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
+                            let mut reply = reply;
                             reply.request_id = workspace_id;
                             let _ = remote.workspace.accept(reply);
                         } else {
@@ -2803,7 +3206,7 @@ impl Workbench {
         if attach_reply.is_some() || !upload_replies.is_empty() {
             self.finish_remote_replies(attach_reply, upload_replies);
         }
-        let snapshot = {
+        {
             let Some(remote) = self.remote.as_mut() else {
                 return;
             };
@@ -2852,13 +3255,31 @@ impl Workbench {
                     }
                 }
             }
-            let snapshot = remote.workspace.projection().sessions.clone();
             let _ = remote.workspace.expire(Instant::now());
             let _ = remote.workspace.reconcile();
-            snapshot
         };
-        if let Some(snapshot) = snapshot {
-            self.session_map.apply_snapshot(&snapshot);
+        self.sync_remote_sessions();
+    }
+
+    /// Mirror the remote projection's session snapshot into the shared session
+    /// map and drop stale rows once the remote integration no longer carries
+    /// sessions. The projection is the only remote session channel; the
+    /// shared map feeds the sessions panel and the workspace tab dots.
+    fn sync_remote_sessions(&mut self) {
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        match remote.workspace.projection().sessions.clone() {
+            Some(snapshot) => {
+                self.session_map.apply_snapshot(&snapshot);
+            }
+            None => {
+                if remote.workspace.integration()
+                    != crate::remote_workspace::IntegrationState::Connected
+                {
+                    self.session_map.clear();
+                }
+            }
         }
     }
 
@@ -2871,10 +3292,13 @@ impl Workbench {
             remote.phase = RemotePhase::Failed;
             remote.detail =
                 "SSH disconnected. Queued input was discarded and will not be replayed.".to_owned();
+            remote.companion_provisioned = false;
             remote.client = None;
             remote.attach_request = None;
             remote.holding_input = false;
             remote.upload = None;
+            // Stale remote session rows must not outlive the transport.
+            self.session_map.clear();
         }
         if let Some(terminal) = self.terminal.as_mut() {
             terminal.fail_remote_image_paste();
@@ -2958,6 +3382,10 @@ impl Workbench {
                 remote.detail = crate::remote_session::classify_error(code)
                     .detail()
                     .to_owned();
+                remote.companion_provisioned = false;
+                remote
+                    .workspace
+                    .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
                 if let Some(client) = remote.client.take() {
                     client.disconnect();
                 }
@@ -2967,6 +3395,10 @@ impl Workbench {
                 remote.phase = RemotePhase::Failed;
                 remote.detail =
                     "The remote session did not attach. No local shell was started.".to_owned();
+                remote.companion_provisioned = false;
+                remote
+                    .workspace
+                    .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
                 return;
             }
         }
@@ -2986,6 +3418,10 @@ impl Workbench {
             remote.detail =
                 "The remote session attached, but this tab could not accept it. Input was not sent."
                     .to_owned();
+            remote.companion_provisioned = false;
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
         remote.attached_once = true;
@@ -4627,6 +5063,9 @@ impl Workbench {
                 .to_owned()
             }),
             remote_version: self.remote.as_ref().and_then(|remote| {
+                if matches!(remote.phase, RemotePhase::NeedsUpdate) {
+                    return Some(APP_VERSION.to_owned());
+                }
                 remote
                     .workspace
                     .projection()
@@ -4650,8 +5089,30 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
-        snapshot.set_grok_diagnostics(self.grok_diagnostics);
+        if let Some(report) = self.remote_opencode_diagnostics() {
+            snapshot.set_remote_opencode(report);
+        }
+        snapshot.set_grok_diagnostics(self.grok_diagnostics.clone());
         snapshot
+    }
+
+    /// The owning remote tab's OpenCode integration for the diagnostics pill.
+    /// Transport loss and integration loss stay distinguishable; the
+    /// host-local integration state is never claimed for a remote tab.
+    pub(crate) fn remote_opencode_diagnostics(
+        &self,
+    ) -> Option<crate::diagnostics::RemoteOpenCodeReport> {
+        let remote = self.remote.as_ref()?;
+        let attached = matches!(remote.phase, RemotePhase::Ready);
+        let failed = matches!(remote.phase, RemotePhase::Failed | RemotePhase::NeedsUpdate)
+            .then(|| remote.detail.as_str());
+        Some(crate::diagnostics::remote_opencode_report(
+            attached,
+            failed,
+            remote.workspace.connection(),
+            remote.workspace.integration(),
+            remote.workspace.projection().integration_error,
+        ))
     }
 
     /// Sanitized and token-redacted log path for the clipboard.
@@ -6047,8 +6508,11 @@ mod tests {
                 &root,
                 &projection,
                 &layout,
-                scope,
-                false,
+                crate::explorer_view::RemoteExplorerOptions {
+                    scope,
+                    native_backdrop: false,
+                    allow_root_retry: true,
+                },
                 &mut explorer_cache,
             );
         });
@@ -6164,8 +6628,11 @@ mod tests {
                 &plant,
                 &git_projection,
                 &layout,
-                scope,
-                false,
+                crate::explorer_view::RemoteExplorerOptions {
+                    scope,
+                    native_backdrop: false,
+                    allow_root_retry: true,
+                },
                 &mut git_explorer_cache,
             );
         });
@@ -6373,11 +6840,12 @@ mod tests {
     }
     mod unsolicited_remote_snapshots {
         use super::*;
-        use crate::remote_workspace::IntegrationState as RemoteIntegrationState;
+        use crate::remote_workspace::{IntegrationState as RemoteIntegrationState, RootSource};
         use made_platform::ssh::SshEvent;
         use made_remote::protocol::{
-            encode, Chunk, DirectoryEntry, EntryKind, ErrorCode, Identity, LaunchTarget, Operation,
-            RemotePath, WireEnvelope,
+            encode, Chunk, DirectoryEntry, EntryKind, ErrorCode, GrokActivity, GrokEventKind,
+            GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity, LaunchTarget,
+            Operation, RemotePath, WireEnvelope,
         };
         use std::collections::VecDeque;
 
@@ -6600,6 +7068,22 @@ mod tests {
                 path: path.clone(),
                 generation: frame.identity.generation,
             }
+        }
+
+        /// Pump until the attach reply has been processed. Session snapshots
+        /// are sent only after this, matching the companion's post-attach
+        /// ordering. The bench workspace starts pre-connected, so an event
+        /// arriving in the same batch as the attach reply would otherwise be
+        /// wiped by the attach resnapshot; a real tab starts disconnected and
+        /// rejects pre-attach events outright.
+        fn wait_for_attach(bench: &mut RemoteBench) {
+            pump_until(bench, |bench, _| {
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.attach_request.is_none() && remote.attached_once)
+            });
         }
 
         fn assert_terminal_continues(bench: &RemoteBench, output: u64) {
@@ -6960,6 +7444,857 @@ mod tests {
                     .contains_key(&bench.root),
                 "the correlated List reply must still apply"
             );
+        }
+
+        #[test]
+        fn remote_integration_exit_clears_the_shared_session_map() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+            assert!(
+                !bench.workbench.session_map().rows().is_empty(),
+                "the current-attach snapshot populates the shared session map"
+            );
+            assert_eq!(
+                bench.workbench.remote_integration(),
+                Some(RemoteIntegrationState::Connected)
+            );
+            let terminal_output = bench.workbench.terminal.as_ref().unwrap().output_bytes();
+
+            // The remote OpenCode exits: the next session-state poll reports it
+            // unavailable while the SSH transport stays healthy.
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .refresh_sessions()
+                .unwrap();
+            let mut session_poll_sent = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    if matches!(frame.operation, Operation::SessionState) {
+                        session_poll_sent = true;
+                        bench.reply(
+                            &frame,
+                            Operation::Error {
+                                code: ErrorCode::Unavailable,
+                            },
+                        );
+                    }
+                }
+                session_poll_sent
+                    && bench.workbench.remote_integration()
+                        == Some(RemoteIntegrationState::Unavailable)
+            });
+            assert!(
+                bench.workbench.session_map().rows().is_empty(),
+                "stale remote session rows must not outlive the remote integration"
+            );
+            assert!(
+                matches!(
+                    bench.workbench.remote.as_ref().unwrap().phase,
+                    RemotePhase::Ready
+                ),
+                "an integration-only failure must not fail the attached session"
+            );
+            assert_eq!(
+                bench.workbench.terminal.as_ref().unwrap().output_bytes(),
+                terminal_output,
+                "the attached terminal must keep its output state"
+            );
+        }
+
+        #[test]
+        fn remote_transport_loss_clears_the_shared_session_map() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+            assert!(
+                !bench.workbench.session_map().rows().is_empty(),
+                "the current-attach snapshot populates the shared session map"
+            );
+            let terminal_output = bench.workbench.terminal.as_ref().unwrap().output_bytes();
+
+            // The SSH transport drops: the client reports disconnected and the
+            // tab gates its remote session state without touching the terminal.
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            bench.pump();
+            assert_eq!(
+                bench.workbench.remote_connection(),
+                Some(crate::remote_workspace::ConnectionState::Disconnected),
+            );
+            assert!(
+                bench.workbench.session_map().rows().is_empty(),
+                "stale remote session rows must not outlive the SSH transport"
+            );
+            assert!(
+                matches!(
+                    bench.workbench.remote.as_ref().unwrap().phase,
+                    RemotePhase::Failed
+                ),
+                "the tab must report the transport failure"
+            );
+            assert_eq!(
+                bench.workbench.terminal.as_ref().unwrap().output_bytes(),
+                terminal_output,
+                "the attached terminal keeps its output state"
+            );
+        }
+
+        #[test]
+        fn remote_diagnostics_report_the_owning_tab_not_the_host() {
+            let mut bench = remote_bench();
+
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+            let snapshot = bench.workbench.diagnostics_snapshot();
+            assert_eq!(snapshot.status_label, "connected");
+            assert_eq!(snapshot.reason_code, "connected");
+            assert_eq!(snapshot.reason, "OpenCode session follow is ready.");
+            let text = snapshot.to_text();
+            assert!(text.contains("status: connected"), "{text}");
+            assert!(text.contains("ssh integration: connected"), "{text}");
+            assert!(text.contains("ssh transport: connected"), "{text}");
+
+            // Transport loss reports the SSH transport, not an integration
+            // failure and not the host-local inactive state.
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            bench.pump();
+            let snapshot = bench.workbench.diagnostics_snapshot();
+            assert_eq!(snapshot.status_label, "degraded");
+            assert!(
+                snapshot.reason.contains("SSH disconnected"),
+                "the transport reason must stay honest: {}",
+                snapshot.reason
+            );
+            assert!(
+                snapshot.to_text().contains("ssh transport: disconnected"),
+                "{}",
+                snapshot.to_text()
+            );
+        }
+
+        fn grok_session(
+            id: &str,
+            cwd: Option<&str>,
+            opened_at: u64,
+            activity: GrokActivity,
+        ) -> GrokSessionInfo {
+            GrokSessionInfo {
+                session_id: id.to_owned(),
+                cwd: cwd.map(|value| RemotePath::new(value.as_bytes().to_vec()).unwrap()),
+                opened_at,
+                activity,
+            }
+        }
+
+        fn grok_snapshot(
+            revision: u64,
+            running: bool,
+            sessions: Vec<GrokSessionInfo>,
+        ) -> GrokSessionSnapshot {
+            GrokSessionSnapshot {
+                revision,
+                running,
+                hooks_ready: false,
+                sessions,
+            }
+        }
+
+        fn grok_snapshot_envelope(
+            identity: &Identity,
+            request_id: u64,
+            snapshot: GrokSessionSnapshot,
+        ) -> WireEnvelope {
+            WireEnvelope::new(
+                identity.clone(),
+                request_id,
+                Operation::GrokSnapshot { snapshot },
+            )
+        }
+
+        fn grok_event_envelope(
+            identity: &Identity,
+            request_id: u64,
+            kind: GrokEventKind,
+            session: &str,
+            cwd: Option<&str>,
+            activity: GrokActivity,
+        ) -> WireEnvelope {
+            WireEnvelope::new(
+                identity.clone(),
+                request_id,
+                Operation::GrokEvent {
+                    event: GrokSessionEvent {
+                        kind,
+                        session_id: session.to_owned(),
+                        cwd: cwd.map(|value| RemotePath::new(value.as_bytes().to_vec()).unwrap()),
+                        activity,
+                    },
+                },
+            )
+        }
+
+        /// Drive a Grok-established root change to completion: reply RootSelect
+        /// with an advanced generation and then serve the new root's List.
+        fn settle_grok_root(bench: &mut RemoteBench, target: &RemotePath) {
+            let mut selected = false;
+            pump_until(bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootSelect { path } => {
+                            assert_eq!(path, target, "Grok follow must select the session cwd");
+                            selected = true;
+                            let mut result = root_result(&frame, path);
+                            if let Operation::RootResult { generation, .. } = &mut result {
+                                *generation += 1;
+                            }
+                            bench.reply(&frame, result);
+                        }
+                        Operation::List { path } if path == target => {
+                            bench.reply(&frame, listed(path))
+                        }
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                selected && remote.workspace.root() == target
+            });
+        }
+
+        fn current_identity(bench: &RemoteBench) -> Identity {
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .identity()
+        }
+
+        #[test]
+        fn remote_grok_launch_sends_the_grok_dashboard_open() {
+            use made_remote::protocol::LaunchTarget;
+
+            let mut bench = remote_bench();
+            // The Grok SSH launch target routes the first frame through
+            // LaunchTarget::Grok; the companion then starts the detected
+            // absolute grok with the single argument `dashboard`.
+            bench.workbench.remote.as_mut().unwrap().grok = true;
+            bench.workbench.remote.as_mut().unwrap().client = None;
+            bench.workbench.remote.as_mut().unwrap().attach_request = None;
+            let stream = bench.stream.clone();
+            let client = made_remote::client::RemoteClient::new(
+                stream,
+                bench.identity.clone(),
+                bench.root.clone(),
+            )
+            .unwrap();
+            bench.workbench.arm_remote_client(client);
+            let mut open_frame = None;
+            pump_until(&mut bench, |_bench, frame| {
+                if let Some(frame) = frame {
+                    if matches!(frame.operation, Operation::Open { .. }) {
+                        open_frame = Some(frame.operation.clone());
+                    }
+                }
+                open_frame.is_some()
+            });
+            match open_frame.expect("the first authenticated frame") {
+                Operation::Open {
+                    target, directory, ..
+                } => {
+                    assert_eq!(target, LaunchTarget::Grok);
+                    assert_eq!(directory, bench.root);
+                }
+                other => panic!("expected an Open frame, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn remote_grok_state_reply_is_correlated_and_refreshes_after_attach() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+
+            // Completing the resnapshot's RootValidate is what asks the
+            // companion for a fresh Grok snapshot on the attached root.
+            let mut grok_request = None;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::GrokState => grok_request = Some(frame.clone()),
+                        _ => {}
+                    }
+                }
+                grok_request.is_some()
+            });
+            let grok_request = grok_request.unwrap();
+
+            // The correlated reply carries the same client request id and the
+            // current identity; the projection and the root follow from it.
+            let inventory = grok_snapshot(
+                1,
+                true,
+                vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+            );
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                grok_request.request_id,
+                inventory,
+            ));
+            settle_grok_root(&mut bench, &remote_path("/grok-a"));
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            let snapshot = remote.workspace.projection().grok.clone().unwrap();
+            assert_eq!(snapshot.revision, 1);
+            assert!(snapshot.running);
+            assert_eq!(remote.workspace.projection().source, RootSource::Grok);
+        }
+
+        #[test]
+        fn remote_grok_pushes_follow_sessions_and_keep_terminal_identity() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            let output = bench.workbench.terminal.as_ref().unwrap().output_bytes();
+
+            // A genuine current-attach snapshot rides the attach id with no
+            // workspace mapping; it must still apply and move the root.
+            let identity = current_identity(&bench);
+            bench.send(grok_snapshot_envelope(
+                &identity,
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &remote_path("/grok-a"));
+            assert_terminal_continues(&bench, output);
+
+            // A prompt event moves immediately, without waiting for the next
+            // inventory refresh.
+            bench.send(grok_event_envelope(
+                &current_identity(&bench),
+                attach,
+                GrokEventKind::Prompt,
+                "b",
+                Some("/grok-b"),
+                GrokActivity::Working,
+            ));
+            settle_grok_root(&mut bench, &remote_path("/grok-b"));
+            assert_terminal_continues(&bench, output);
+
+            // Repeated A→B→C switches land on the newest owned attachment and
+            // never lose the terminal's accumulated output.
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    2,
+                    true,
+                    vec![
+                        grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle),
+                        grok_session("b", Some("/grok-b"), 2, GrokActivity::Working),
+                        grok_session("c", Some("/grok-c"), 3, GrokActivity::Attention),
+                        grok_session("d", Some("/grok-d"), 4, GrokActivity::Error),
+                    ],
+                ),
+            ));
+            settle_grok_root(&mut bench, &remote_path("/grok-d"));
+            assert_terminal_continues(&bench, output);
+
+            let activities = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .projection()
+                .grok
+                .as_ref()
+                .unwrap()
+                .sessions
+                .iter()
+                .map(|session| session.activity)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                activities,
+                vec![
+                    GrokActivity::Idle,
+                    GrokActivity::Working,
+                    GrokActivity::Attention,
+                    GrokActivity::Error
+                ],
+                "inventory order must stay attachment order"
+            );
+            let dots = bench.workbench.remote_grok_activities();
+            assert_eq!(
+                dots,
+                vec![
+                    SessionActivity::Idle,
+                    SessionActivity::Busy,
+                    SessionActivity::Attention,
+                    SessionActivity::Attention
+                ],
+                "remote dots must map with the local idle/working/attention treatment"
+            );
+
+            // When no owned session remains the shell fallback returns.
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(3, true, vec![]),
+            ));
+            let launch_root = bench.root.clone();
+            settle_grok_root(&mut bench, &launch_root);
+            assert_terminal_continues(&bench, output);
+        }
+
+        #[test]
+        fn idle_remote_hook_marks_diagnostics_ready_without_install_consent() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("idle", None, 1, GrokActivity::Idle)],
+                ),
+            ));
+            pump_until(&mut bench, |bench, _| {
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .grok
+                    .is_some()
+            });
+            let revision = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .projection()
+                .revision;
+            bench.send(grok_event_envelope(
+                &current_identity(&bench),
+                attach,
+                GrokEventKind::SessionStart,
+                "idle",
+                None,
+                GrokActivity::Idle,
+            ));
+            pump_until(&mut bench, |bench, _| {
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .revision
+                    > revision
+            });
+
+            bench
+                .workbench
+                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(
+                bench.workbench.grok_diagnostics(),
+                GrokDiagnosticsRow::READY
+            );
+            assert_eq!(
+                bench.workbench.diagnostics_snapshot().grok_sentence,
+                GrokDiagnosticsRow::READY.sentence
+            );
+        }
+
+        #[test]
+        fn remote_snapshot_hook_tier_drives_sessionless_and_idle_diagnostics() {
+            let mut bench = remote_bench();
+            let push = |bench: &mut RemoteBench, snapshot: GrokSessionSnapshot| {
+                let identity = bench.identity.clone();
+                bench
+                    .workbench
+                    .remote_workspace_mut()
+                    .unwrap()
+                    .accept_grok_push(WireEnvelope::new(
+                        identity,
+                        1,
+                        Operation::GrokSnapshot { snapshot },
+                    ))
+                    .unwrap();
+            };
+
+            // A user-self-installed equal/newer plugin is ready from the first
+            // snapshot, without consent, an install attempt, sessions or dots.
+            let mut ready = grok_snapshot(1, true, vec![]);
+            ready.hooks_ready = true;
+            push(&mut bench, ready);
+            bench
+                .workbench
+                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(
+                bench.workbench.diagnostics_snapshot().grok_sentence,
+                GrokDiagnosticsRow::READY.sentence
+            );
+            bench
+                .workbench
+                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
+            assert_eq!(
+                bench.workbench.grok_diagnostics(),
+                GrokDiagnosticsRow::READY,
+                "a consented install is unnecessary when hooks are already armed"
+            );
+            bench
+                .workbench
+                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
+            assert_eq!(
+                bench.workbench.grok_diagnostics(),
+                GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN
+            );
+
+            // An explicit inventory-only tier keeps refusal and install
+            // failures honest instead of inferring readiness from `running`.
+            push(&mut bench, grok_snapshot(2, true, vec![]));
+            for row in [
+                GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED,
+                GrokDiagnosticsRow::REMOTE_INSTALL_PENDING,
+                GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING,
+                GrokDiagnosticsRow::REMOTE_INSTALL_FAILED,
+            ] {
+                bench.workbench.set_grok_diagnostics(row.clone());
+                assert_eq!(bench.workbench.grok_diagnostics(), row);
+            }
+
+            // Idle inventory is sufficient to report an explicitly ready tier.
+            let mut idle = grok_snapshot(
+                3,
+                false,
+                vec![grok_session("idle", None, 1, GrokActivity::Idle)],
+            );
+            idle.hooks_ready = true;
+            push(&mut bench, idle);
+            bench
+                .workbench
+                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(
+                bench.workbench.grok_diagnostics(),
+                GrokDiagnosticsRow::READY
+            );
+        }
+
+        #[test]
+        fn remote_grok_push_never_consumes_a_numeric_equal_pending_request() {
+            let mut bench = remote_bench();
+            let client = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .clone()
+                .unwrap();
+            // Synthetic id alignment: production's first request is Open/Attach.
+            // Consume client id 1 here so the attach id can collide with the
+            // pending List workspace id in this adversarial test.
+            let _ = client.request(Operation::Capabilities, None).unwrap();
+            let attach = bench.attach();
+            assert_eq!(attach, 2, "attach request id");
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+
+            let mut list_request = None;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::List { .. } if list_request.is_none() => {
+                            list_request = Some(frame.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                list_request.is_some()
+            });
+            let list_request = list_request.unwrap();
+            let pending_before = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .pending_count();
+            assert!(pending_before > 0);
+
+            // The push rides the attach id, whose number equals the pending
+            // List workspace id. It must be applied as an event and must not
+            // complete, poison, or remove that pending request.
+            bench.send(grok_snapshot_envelope(
+                &bench.identity.clone(),
+                attach,
+                grok_snapshot(1, true, vec![]),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                bench.pump();
+                if bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .grok
+                    .is_some()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(
+                remote.workspace.projection().grok.is_some(),
+                "the current-attach Grok snapshot must apply without a workspace mapping"
+            );
+            assert_eq!(
+                remote.workspace.pending_count(),
+                pending_before,
+                "a Grok push must not consume a numeric-equal pending request"
+            );
+
+            // The real correlated reply must still apply afterwards.
+            bench.reply(&list_request, listed(&bench.root));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                bench.pump();
+                if bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .directories
+                    .contains_key(&bench.root)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .directories
+                    .contains_key(&bench.root),
+                "the correlated List reply must still apply"
+            );
+        }
+
+        #[test]
+        fn late_grok_state_reply_after_a_root_transition_is_discarded() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            wait_for_attach(&mut bench);
+
+            // Complete the resnapshot so a correlated GrokState request is in
+            // flight before the transition.
+            let mut grok_request = None;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::GrokState => grok_request = Some(frame.clone()),
+                        _ => {}
+                    }
+                }
+                grok_request.is_some()
+            });
+            let grok_request = grok_request.unwrap();
+
+            // A session-root transition resets the client's bounded queues and
+            // discards every old-root request id.
+            let session_root = remote_path("/session");
+            follow_snapshot(
+                &mut bench,
+                attach,
+                active_snapshot(1, "/session"),
+                &session_root,
+            );
+
+            // The late correlated reply from before the transition arrives on
+            // the old request id. It must stay discarded: no stale Grok state
+            // may repopulate the projection and no forged-reply disconnect.
+            bench.send(grok_snapshot_envelope(
+                &bench.identity.clone(),
+                grok_request.request_id,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                bench.pump();
+                thread::sleep(Duration::from_millis(5));
+            }
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(
+                remote.workspace.projection().grok.is_none(),
+                "a late pre-transition Grok reply must stay discarded"
+            );
+            assert!(
+                remote.client.as_ref().unwrap().is_connected(),
+                "a discarded late reply is not a forged reply"
+            );
+            assert_eq!(remote.workspace.root(), &session_root);
         }
     }
 

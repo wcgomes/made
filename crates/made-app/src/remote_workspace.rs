@@ -8,9 +8,10 @@ use std::{
 };
 
 use made_remote::protocol::{
-    DirectoryEntry, ErrorCode, GitRead, Identity, Operation, PreviewKind, ProtocolError,
-    RemotePath, ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_IN_FLIGHT, MAX_QUEUED_CHUNKS,
-    MAX_TREE_DEPTH, MAX_TREE_ROWS, RPC_TIMEOUT,
+    DirectoryEntry, ErrorCode, GitRead, GrokEventKind, GrokSessionEvent, GrokSessionInfo,
+    GrokSessionSnapshot, Identity, Operation, PreviewKind, ProtocolError, RemotePath,
+    ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_IN_FLIGHT, MAX_QUEUED_CHUNKS, MAX_TREE_DEPTH,
+    MAX_TREE_ROWS, RPC_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub enum RootSource {
     Shell,
     View,
     Session,
+    Grok,
     Selection,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +115,8 @@ pub struct WorkspaceProjection {
     pub session_state: Freshness,
     pub integration_error: Option<ErrorCode>,
     pub focus: Option<(String, bool)>,
+    /// Owned remote Grok sessions, independent of the OpenCode integration.
+    pub grok: Option<GrokSessionSnapshot>,
     pub mode: ExplorerMode,
     pub cleanup_unconfirmed: bool,
 }
@@ -161,6 +165,7 @@ pub enum RemoteResult {
         session_id: String,
         accepted: bool,
     },
+    Grok(GrokSessionSnapshot),
     Changed(RemotePath),
     Error(ErrorCode),
     Closed {
@@ -219,6 +224,14 @@ pub struct RemoteWorkspace {
     close_state: CloseState,
     watch: Option<(Identity, RemotePath)>,
     integration_epoch: u64,
+    /// Monotonic Grok inventory revision within the transport epoch.
+    grok_revision: u64,
+    /// Hook tier from the latest snapshot, or from a hook event that proves it.
+    grok_hooks_ready: Option<bool>,
+    /// Last inventory-observed newest owned session; guards the no-steal-back rule.
+    grok_newest: Option<String>,
+    /// Remote cwd the Grok domain currently establishes for root follow.
+    grok_root: Option<RemotePath>,
 }
 
 impl RemoteWorkspace {
@@ -251,6 +264,7 @@ impl RemoteWorkspace {
                 session_state: Freshness::Stale,
                 integration_error: None,
                 focus: None,
+                grok: None,
                 mode: ExplorerMode::Files,
                 cleanup_unconfirmed: false,
             },
@@ -263,6 +277,10 @@ impl RemoteWorkspace {
             close_state: CloseState::Open,
             watch: None,
             integration_epoch: 0,
+            grok_revision: 0,
+            grok_hooks_ready: None,
+            grok_newest: None,
+            grok_root: None,
         })
     }
     pub fn identity(&self) -> &Identity {
@@ -335,6 +353,7 @@ impl RemoteWorkspace {
                 | Operation::Rescan { .. }
                 | Operation::GitRead { .. }
                 | Operation::SessionState
+                | Operation::GrokState
                 | Operation::Focus { .. }
                 | Operation::Close
         ) {
@@ -508,6 +527,7 @@ impl RemoteWorkspace {
                 })
             }
             Operation::SessionSnapshot { snapshot } => Some(RemoteResult::Session(snapshot)),
+            Operation::GrokSnapshot { snapshot } => Some(RemoteResult::Grok(snapshot)),
             Operation::FocusResult {
                 session_id,
                 accepted,
@@ -555,6 +575,43 @@ impl RemoteWorkspace {
         )
     }
 
+    /// Apply an unsolicited Grok hook event pushed under the current attach
+    /// id. It never consumes pending workspace work, even by numeric request
+    /// id equality; correlated GrokState replies flow through `accept`.
+    pub fn accept_grok_event(&mut self, event: WireEnvelope) -> Result<(), ProtocolError> {
+        if self.connection != ConnectionState::Connected || !event.identity.matches(&self.identity)
+        {
+            return Err(ProtocolError::Identity);
+        }
+        event.validate()?;
+        let Operation::GrokEvent { event } = event.operation else {
+            return Err(ProtocolError::UnexpectedResponse);
+        };
+        self.apply_grok_event(event)
+    }
+
+    /// Apply an unsolicited Grok push delivered under the current attach id:
+    /// either a revisioned snapshot or one companion-filtered hook event.
+    /// Neither consumes pending workspace work, even by numeric request id
+    /// equality; a correlated `GrokState` reply flows through `accept` instead.
+    pub fn accept_grok_push(&mut self, push: WireEnvelope) -> Result<(), ProtocolError> {
+        if self.connection != ConnectionState::Connected || !push.identity.matches(&self.identity) {
+            return Err(ProtocolError::Identity);
+        }
+        push.validate()?;
+        match push.operation {
+            Operation::GrokSnapshot { snapshot } => self
+                .apply(
+                    &RemoteResult::Grok(snapshot),
+                    &Operation::GrokState,
+                    Purpose::User,
+                )
+                .map(|_| ()),
+            Operation::GrokEvent { event } => self.apply_grok_event(event),
+            _ => Err(ProtocolError::UnexpectedResponse),
+        }
+    }
+
     /// Discard all pending requests; no input, focus or upload is replayed.
     pub fn disconnect(&mut self) {
         self.connection = ConnectionState::Disconnected;
@@ -585,6 +642,16 @@ impl RemoteWorkspace {
         self.shell_report = None;
         self.watch = None;
         self.integration_epoch = 0;
+        self.clear_grok();
+    }
+
+    /// Previous-epoch Grok state is never reused; a fresh snapshot re-establishes it.
+    fn clear_grok(&mut self) {
+        self.projection.grok = None;
+        self.grok_revision = 0;
+        self.grok_hooks_ready = None;
+        self.grok_newest = None;
+        self.grok_root = None;
     }
 
     /// Caller must authenticate and revalidate the authority before invoking.
@@ -610,11 +677,42 @@ impl RemoteWorkspace {
         self.identity.epoch = epoch;
         self.connection = ConnectionState::Connected;
         self.integration = IntegrationState::Unknown;
+        // Previous-epoch Grok state is never reused; the post-attach refresh
+        // re-establishes it from a fresh snapshot.
+        self.clear_grok();
         self.begin_resnapshot()
+    }
+
+    /// A pre-attach failure cannot supply a tree. Clear any partial projection
+    /// and publish a bounded unavailable state so the Explorer never spins.
+    /// Post-attach transport loss uses `disconnect` and keeps prior rows.
+    pub fn project_unavailable(&mut self, code: made_remote::protocol::ErrorCode) {
+        self.connection = ConnectionState::Disconnected;
+        self.integration = IntegrationState::Unknown;
+        self.projection.root_state = Freshness::Unavailable(code);
+        self.projection.requested_root = None;
+        self.projection.directories.clear();
+        self.projection.expanded.clear();
+        self.projection.selected = None;
+        self.projection.git_selected = None;
+        self.projection.git_root_known = false;
+        self.projection.git.clear();
+        self.projection.git_view = None;
+        self.projection.preview = None;
+        self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
+        self.projection.sessions = None;
+        self.projection.session_state = Freshness::Stale;
+        self.projection.focus = None;
+        self.session_revision = 0;
+        self.projection.revision = self.projection.revision.wrapping_add(1);
     }
 
     pub fn projection(&self) -> &WorkspaceProjection {
         &self.projection
+    }
+    /// Unknown until a snapshot or hook event establishes the companion tier.
+    pub fn grok_hooks_ready(&self) -> Option<bool> {
+        self.grok_hooks_ready
     }
     pub fn set_mode(&mut self, mode: ExplorerMode) {
         self.projection.mode = mode;
@@ -915,6 +1013,13 @@ impl RemoteWorkspace {
         self.projection.session_state = Freshness::Loading;
         Ok(id)
     }
+
+    /// Refresh the revisioned owned-Grok inventory. The companion answers on
+    /// the same request id with a GrokSnapshot; events are separate.
+    pub fn refresh_grok(&mut self) -> Result<u64, ProtocolError> {
+        self.cancel_where(|p| matches!(p.request.operation, Operation::GrokState))?;
+        self.enqueue(Operation::GrokState, None, Purpose::User)
+    }
     pub fn focus_session(&mut self, session_id: &str) -> Result<u64, ProtocolError> {
         if self.integration != IntegrationState::Connected
             || !self.projection.sessions.as_ref().is_some_and(|s| {
@@ -1043,6 +1148,11 @@ impl RemoteWorkspace {
                 }
             }
         }
+        // Owned Grok sessions outrank the validated shell cwd but never a
+        // connected OpenCode session or view.
+        if let Some(directory) = self.grok_root.as_ref() {
+            return Ok((directory.clone(), RootSource::Grok));
+        }
         Ok((
             self.shell
                 .clone()
@@ -1117,13 +1227,24 @@ impl RemoteWorkspace {
         self.projection.sessions = None;
         self.projection.session_state = Freshness::Stale;
         self.session_revision = 0;
+        self.clear_grok();
         self.resnapshot = true;
         self.projection.root_state = Freshness::Loading;
         let path = self.root.clone();
         self.enqueue(Operation::RootValidate { path }, None, Purpose::Resnapshot)?;
         Ok(())
     }
-    fn snapshot_root(&mut self) -> Result<(), ProtocolError> {
+    fn snapshot_root(&mut self, purpose: Purpose) -> Result<(), ProtocolError> {
+        // The owned Grok inventory is independent of the OpenCode integration.
+        // A fresh attachment discards previous-epoch state, so the resnapshot
+        // asks the companion for a fresh revisioned snapshot first: answering
+        // it before the shell-fallback follow keeps the owned Grok root from
+        // being abandoned mid-batch. Event- and shell-driven root changes keep
+        // the already-current projection; a transient GrokState error must
+        // never wipe it on every root change.
+        if matches!(purpose, Purpose::Resnapshot) {
+            self.refresh_grok()?;
+        }
         self.load_directory(self.root.clone())?;
         self.refresh_git()?;
         self.refresh_sessions()?;
@@ -1281,11 +1402,11 @@ impl RemoteWorkspace {
                         self.selection = Some(path.clone());
                     }
                     self.projection.root_state = Freshness::Current;
-                    self.snapshot_root()?;
+                    self.snapshot_root(purpose)?;
                 }
                 Purpose::Resnapshot => {
                     self.projection.root_state = Freshness::Current;
-                    self.snapshot_root()?;
+                    self.snapshot_root(purpose)?;
                 }
                 Purpose::User => {
                     if matches!(original, Operation::RootSelect { .. }) {
@@ -1293,7 +1414,7 @@ impl RemoteWorkspace {
                         self.selection = Some(path.clone());
                         self.projection.source = RootSource::Selection;
                         self.projection.root_state = Freshness::Current;
-                        self.snapshot_root()?;
+                        self.snapshot_root(purpose)?;
                     }
                 }
             },
@@ -1410,6 +1531,36 @@ impl RemoteWorkspace {
                     self.follow()?;
                 }
             }
+            RemoteResult::Grok(snapshot) => {
+                if snapshot.revision < self.grok_revision {
+                    return Err(ProtocolError::Identity);
+                }
+                if snapshot.revision != self.grok_revision {
+                    self.grok_revision = snapshot.revision;
+                    self.grok_hooks_ready = Some(snapshot.hooks_ready);
+                    self.projection.grok = Some(snapshot.clone());
+                    match grok_newest_session(snapshot) {
+                        Some(session)
+                            if self.grok_newest.as_deref() != Some(session.session_id.as_str()) =>
+                        {
+                            // A newly attached session moves immediately; an
+                            // unchanged newest attachment never steals back.
+                            self.grok_newest = Some(session.session_id.clone());
+                            if let Some(directory) = &session.cwd {
+                                self.grok_root = Some(directory.clone());
+                                self.follow()?;
+                            }
+                        }
+                        None if snapshot.sessions.is_empty() && self.grok_newest.is_some() => {
+                            // No owned session remains; the shell fallback returns.
+                            self.grok_newest = None;
+                            self.grok_root = None;
+                            self.follow()?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             RemoteResult::Focus {
                 session_id,
                 accepted,
@@ -1478,6 +1629,12 @@ impl RemoteWorkspace {
                     self.projection.integration_error = Some(*code);
                     self.follow()?;
                 }
+                Operation::GrokState => {
+                    // A failed Grok read is honest: the projection goes away
+                    // without touching the independent OpenCode integration.
+                    self.clear_grok();
+                    self.follow()?;
+                }
                 Operation::Focus { .. } => {
                     self.projection.focus = None;
                 }
@@ -1508,6 +1665,70 @@ impl RemoteWorkspace {
         {
             self.resnapshot = false;
         }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Apply one companion-filtered hook event to the owned Grok projection.
+    /// `SessionStart`/`Prompt` move the root immediately; `SessionEnd` removes
+    /// the row and releases the root only when no owned session remains.
+    fn apply_grok_event(&mut self, event: GrokSessionEvent) -> Result<(), ProtocolError> {
+        let mut moved = false;
+        match event.kind {
+            GrokEventKind::SessionEnd => {
+                if let Some(snapshot) = &mut self.projection.grok {
+                    snapshot
+                        .sessions
+                        .retain(|session| session.session_id != event.session_id);
+                }
+                if self
+                    .projection
+                    .grok
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.sessions.is_empty())
+                {
+                    self.grok_newest = None;
+                    moved = self.grok_root.take().is_some();
+                }
+            }
+            kind => {
+                if let Some(snapshot) = &mut self.projection.grok {
+                    match snapshot
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.session_id == event.session_id)
+                    {
+                        Some(session) => {
+                            session.activity = event.activity;
+                            if let Some(cwd) = &event.cwd {
+                                session.cwd = Some(cwd.clone());
+                            }
+                        }
+                        None => snapshot.sessions.push(GrokSessionInfo {
+                            session_id: event.session_id.clone(),
+                            cwd: event.cwd.clone(),
+                            // Provisional until the next inventory snapshot
+                            // confirms the attachment order.
+                            opened_at: 0,
+                            activity: event.activity,
+                        }),
+                    }
+                }
+                if matches!(kind, GrokEventKind::SessionStart | GrokEventKind::Prompt) {
+                    if let Some(cwd) = event.cwd {
+                        if self.grok_root.as_ref() != Some(&cwd) {
+                            self.grok_root = Some(cwd);
+                            moved = true;
+                        }
+                    }
+                }
+            }
+        }
+        if moved {
+            self.follow()?;
+        }
+        // Companions emit owned hook events only after arming the hook tier.
+        self.grok_hooks_ready = Some(true);
         self.projection.revision = self.projection.revision.wrapping_add(1);
         Ok(())
     }
@@ -1603,6 +1824,14 @@ impl RemoteWorkspace {
 fn trim_git_line(bytes: &[u8]) -> &[u8] {
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+/// Newest owned attachment; equal keys keep the later snapshot row.
+fn grok_newest_session(snapshot: &GrokSessionSnapshot) -> Option<&GrokSessionInfo> {
+    snapshot
+        .sessions
+        .iter()
+        .max_by_key(|session| session.opened_at)
 }
 
 fn remote_depth(path: &RemotePath, root: &RemotePath) -> usize {

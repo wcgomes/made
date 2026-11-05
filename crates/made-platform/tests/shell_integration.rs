@@ -109,6 +109,74 @@ fn cwd_datagrams_are_bounded_and_lossless_not_host_path_resolution() {
     assert!(emit_cwd_report(sink.path(), &vec![b'/'; 4097]).is_err());
 }
 
+#[test]
+#[cfg(unix)]
+fn long_runtime_paths_bind_a_short_private_temp_root_sink() {
+    use made_platform::shell_integration::{emit_cwd_report, CwdReportSink};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    // Artificial data root: the runtime endpoint path must exceed the kernel
+    // AF_UNIX budget (macOS sockaddr_un holds 104 bytes including the NUL).
+    let data = temp.path().join("h".repeat(72));
+    let runtime = data.join("remote/runtime/sha256-0123456789abcdef");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let over_limit = runtime.join("cwd-1-0/report.sock").as_os_str().len();
+    assert!(over_limit > 103, "fixture must exceed the AF_UNIX budget");
+    let sink = CwdReportSink::new(&runtime).expect("a long data root must not prevent publication");
+    let path = sink.path().to_path_buf();
+    // Path-length control: the bound endpoint fits the strictest budget.
+    assert!(path.as_os_str().len() <= 103);
+    // The endpoint is hosted under a temp root, never under the long runtime.
+    let directory = path.parent().unwrap().to_path_buf();
+    assert!(
+        directory.starts_with(std::env::temp_dir()) || directory.starts_with("/tmp"),
+        "endpoint unexpectedly at {}",
+        path.display()
+    );
+    assert!(!directory.starts_with(&runtime));
+    // Real Unix bind on this host: a datagram roundtrip through the endpoint.
+    emit_cwd_report(&path, b"/real-bind").unwrap();
+    assert_eq!(
+        sink.poll().unwrap().as_deref(),
+        Some(b"/real-bind".as_slice())
+    );
+    // Security controls: real socket inode, owner-only socket and directory.
+    let socket_meta = std::fs::symlink_metadata(&path).unwrap();
+    assert!(socket_meta.file_type().is_socket());
+    assert_eq!(socket_meta.permissions().mode() & 0o777, 0o600);
+    let directory_meta = std::fs::symlink_metadata(&directory).unwrap();
+    assert!(directory_meta.is_dir());
+    assert_eq!(directory_meta.permissions().mode() & 0o777, 0o700);
+    // Per-tab uniqueness: another sink gets its own directory and cleanup.
+    let other = CwdReportSink::new(&runtime).unwrap();
+    let other_directory = other.path().parent().unwrap().to_path_buf();
+    assert_ne!(other_directory, directory);
+    drop(other);
+    assert!(std::fs::symlink_metadata(&other_directory).is_err());
+    // Cleanup on drop: endpoint and directory are gone.
+    drop(sink);
+    assert!(std::fs::symlink_metadata(&path).is_err());
+    assert!(std::fs::symlink_metadata(&directory).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn short_runtime_sink_stays_inside_the_runtime_directory() {
+    use made_platform::shell_integration::CwdReportSink;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let sink = CwdReportSink::new(temp.path()).unwrap();
+    assert!(sink.path().starts_with(temp.path()));
+    assert_eq!(
+        std::fs::symlink_metadata(sink.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 #[cfg(unix)]
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 #[cfg(unix)]

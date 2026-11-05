@@ -1,6 +1,7 @@
 use made_platform::{
-    private_dacl_is_owner_only, private_dacl_refusal, read_private_metadata,
-    write_private_metadata_atomic, PrivateAce, PrivateAceTrustee, PrivateDacl,
+    artifact_permissions_match, private_dacl_is_owner_only, private_dacl_refusal,
+    read_private_metadata, write_private_metadata_atomic, PrivateAce, PrivateAceTrustee,
+    PrivateDacl,
 };
 use std::path::PathBuf;
 
@@ -70,6 +71,33 @@ fn metadata_is_bounded_atomic_and_preserves_original_on_invalid_write() {
     std::fs::create_dir(root.0.join("not-file")).unwrap();
     assert!(read_private_metadata(&root.0, "not-file", 32).is_err());
     assert!(write_private_metadata_atomic(&root.0, "not-file", b"bad", 32).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_permissions_match_requires_exact_remote_stage_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Scratch::new();
+    std::fs::create_dir_all(&root.0).unwrap();
+    let file = root.0.join("artifact");
+    std::fs::write(&file, b"data").unwrap();
+    for (mode, executable, expected) in [
+        (0o600, false, true),
+        (0o700, true, true),
+        (0o600, true, false),
+        (0o700, false, false),
+        (0o644, false, false),
+        (0o755, true, false),
+        (0o400, false, false),
+    ] {
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        let metadata = std::fs::symlink_metadata(&file).unwrap();
+        assert_eq!(
+            artifact_permissions_match(&metadata, executable),
+            expected,
+            "mode {mode:o}, executable {executable}"
+        );
+    }
 }
 
 #[cfg(unix)]

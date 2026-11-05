@@ -9,6 +9,7 @@
 //! token-aware API are redacted before storage; the snapshot text never
 //! contains the bridge secret.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,10 @@ use std::time::{Duration, Instant};
 use made_bridge::security::{redact_secret, Token};
 use made_platform::{previous_private_log_path, Clipboard, PlatformError};
 
-use crate::integration_status::{IntegrationState, IntegrationStatus, StatusChange};
+use crate::integration_status::{IntegrationState, IntegrationStatus, ReasonCode, StatusChange};
+use crate::remote_workspace::{
+    ConnectionState as RemoteConnectionState, IntegrationState as RemoteIntegrationState,
+};
 use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_log_text};
 use crate::session_follow::FollowedSession;
 use crate::worktree::{MetadataStatus, WorktreeMetadata};
@@ -536,7 +540,7 @@ impl Diagnostics {
                 .clone()
                 .map(|value| sanitize_display(&value, 128)),
             grok_pill: GrokDiagnosticsRow::NOT_ON_PATH.pill,
-            grok_sentence: GrokDiagnosticsRow::NOT_ON_PATH.sentence,
+            grok_sentence: GrokDiagnosticsRow::NOT_ON_PATH.sentence.into_owned(),
             entries: self
                 .log
                 .entries()
@@ -622,40 +626,75 @@ impl GrokDiagnosticsPill {
 }
 
 /// Current Grok Build pill and the one sentence shown beside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GrokDiagnosticsRow {
     pub(crate) pill: GrokDiagnosticsPill,
-    pub(crate) sentence: &'static str,
+    /// Fixed product wording, or the owning tab's bounded failure detail.
+    pub(crate) sentence: Cow<'static, str>,
 }
 
 impl GrokDiagnosticsRow {
     pub(crate) const CHECKING: Self = Self {
         pill: GrokDiagnosticsPill::Inactive,
-        sentence: "Checking for Grok Build.",
+        sentence: Cow::Borrowed("Checking for Grok Build."),
     };
     pub(crate) const NOT_ON_PATH: Self = Self {
         pill: GrokDiagnosticsPill::Inactive,
-        sentence: "Grok Build is not on PATH.",
+        sentence: Cow::Borrowed("Grok Build is not on PATH."),
     };
     pub(crate) const INSTALLING: Self = Self {
         pill: GrokDiagnosticsPill::Inactive,
-        sentence: "Installing the Grok Build plugin.",
+        sentence: Cow::Borrowed("Installing the Grok Build plugin."),
     };
     pub(crate) const READY: Self = Self {
         pill: GrokDiagnosticsPill::Ready,
-        sentence: "Grok Build session follow is ready.",
+        sentence: Cow::Borrowed("Grok Build session follow is ready."),
     };
     pub(crate) const NOT_RUNNING: Self = Self {
         pill: GrokDiagnosticsPill::Inactive,
-        sentence: "Grok Build is not running.",
+        sentence: Cow::Borrowed("Grok Build is not running."),
     };
     pub(crate) const HOOKS_UNAVAILABLE: Self = Self {
         pill: GrokDiagnosticsPill::Degraded,
-        sentence: "Grok Build session-status hooks are unavailable.",
+        sentence: Cow::Borrowed("Grok Build session-status hooks are unavailable."),
     };
     pub(crate) const NOT_INSTALLED: Self = Self {
         pill: GrokDiagnosticsPill::Inactive,
-        sentence: "Grok Build plugin was not installed for this launch.",
+        sentence: Cow::Borrowed("Grok Build plugin was not installed for this launch."),
+    };
+    pub(crate) const REMOTE_NOT_DETECTED: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Grok Build is not detected on this server."),
+    };
+    pub(crate) const REMOTE_INSTALLING: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Installing the Grok Build plugin on this server."),
+    };
+    pub(crate) const REMOTE_HOOKS_NOT_APPROVED: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install was not approved."),
+    };
+    pub(crate) const REMOTE_INSTALL_PENDING: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install has not run on this server yet."),
+    };
+    pub(crate) const REMOTE_INSTALL_FAILED: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
+    };
+    pub(crate) const REMOTE_PYTHON3_MISSING: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed(
+            "Remote Grok Build session-status hooks are unavailable: remote python3 is missing.",
+        ),
+    };
+    pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
+        pill: GrokDiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
+    };
+    pub(crate) const REMOTE_UNKNOWN: Self = Self {
+        pill: GrokDiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("The remote Grok Build state is not known yet."),
     };
 }
 
@@ -747,9 +786,194 @@ pub struct DiagnosticsSnapshot {
     /// Grok Build pill label (`inactive`, `ready`, or `degraded`).
     pub grok_pill: GrokDiagnosticsPill,
     /// The one Grok Build sentence shown beside that pill.
-    pub grok_sentence: &'static str,
+    pub grok_sentence: String,
     /// Recent log entries, oldest to newest.
     pub entries: Vec<LogEntry>,
+}
+
+/// The owning remote tab's OpenCode integration, reported by the status pill
+/// and copied report instead of the host-local integration state. Transport
+/// loss and integration loss stay distinguishable and honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOpenCodeReport {
+    /// Pill status derived from the owning remote integration.
+    pub status: IntegrationStatus,
+    /// Stable machine reason code.
+    pub code: &'static str,
+    /// Honest human reason naming the transport or the integration.
+    pub reason: String,
+}
+
+/// Derive the owning tab's Grok Build row.
+///
+/// Every value comes from the owning tab's own remote state: its launch
+/// detection, the per-server install outcome, the per-server/version consent,
+/// the tab's transport attachment and its own failure detail. A failure while
+/// probing, staging, opening the companion or launching outranks the generic
+/// transport row so the row names what actually failed; a later transport loss
+/// while the tab was attached is still reported as transport. When nothing is
+/// running or open, the honest row is `not running` regardless of the
+/// capability tier.
+pub fn remote_grok_row(
+    transport_failed: bool,
+    attached: bool,
+    failed_detail: Option<&str>,
+    detected: bool,
+    install: Option<RemoteGrokInstallOutcome>,
+    consented: bool,
+    running_or_open: bool,
+) -> RemoteGrokReport {
+    if let Some(detail) = failed_detail {
+        return RemoteGrokReport {
+            pill: GrokDiagnosticsPill::Degraded,
+            sentence: format!(
+                "The remote Grok Build session failed: {}",
+                sanitize_display(&redact_hex_secrets(detail), 400)
+            ),
+        };
+    }
+    if transport_failed {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
+    }
+    if !attached {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_UNKNOWN);
+    }
+    if !detected {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_NOT_DETECTED);
+    }
+    if matches!(install, Some(RemoteGrokInstallOutcome::Running)) {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_INSTALLING);
+    }
+    if !running_or_open {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::NOT_RUNNING);
+    }
+    // A successful install stays ready even if consent was later withdrawn:
+    // Made never uninstalls, so the hooks remain in the user's Grok home.
+    if matches!(install, Some(RemoteGrokInstallOutcome::Succeeded)) {
+        return RemoteGrokReport::from(GrokDiagnosticsRow::READY);
+    }
+    match install {
+        Some(RemoteGrokInstallOutcome::Failed {
+            reason: Some("python3-missing"),
+        }) => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING),
+        Some(RemoteGrokInstallOutcome::Failed { .. }) => {
+            RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_INSTALL_FAILED)
+        }
+        _ if consented => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING),
+        _ => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED),
+    }
+}
+
+/// The owning remote tab's Grok Build tier inputs for [`remote_grok_row`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteGrokInstallOutcome {
+    /// The bounded install attempt is still running.
+    Running,
+    /// The official installer reported installed or already-current.
+    Succeeded,
+    /// The attempt failed; `reason` is the companion's bounded machine reason
+    /// when one was reported (for example `python3-missing`).
+    Failed { reason: Option<&'static str> },
+}
+
+/// One remote Grok Build diagnostics row: the pill plus its bounded sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteGrokReport {
+    pub pill: GrokDiagnosticsPill,
+    pub sentence: String,
+}
+
+impl From<GrokDiagnosticsRow> for RemoteGrokReport {
+    fn from(row: GrokDiagnosticsRow) -> Self {
+        Self {
+            pill: row.pill,
+            sentence: row.sentence.into_owned(),
+        }
+    }
+}
+
+/// Stable machine label for a remote protocol error code. These codes name
+/// the remote integration error, never a host-local integration reason.
+fn remote_error_code_label(code: made_remote::protocol::ErrorCode) -> &'static str {
+    use made_remote::protocol::ErrorCode;
+    match code {
+        ErrorCode::Unsupported => "unsupported",
+        ErrorCode::Unavailable => "unavailable",
+        ErrorCode::Unauthorized => "unauthorized",
+        ErrorCode::InvalidRequest => "invalid_request",
+        ErrorCode::Stale => "stale",
+        ErrorCode::Cancelled => "cancelled",
+        ErrorCode::Timeout => "timeout",
+        ErrorCode::Limit => "limit",
+        ErrorCode::SessionLost => "session_lost",
+        ErrorCode::CleanupUnconfirmed => "cleanup_unconfirmed",
+        ErrorCode::Io => "io",
+    }
+}
+
+/// Derive the owning remote tab's OpenCode report for the diagnostics pill.
+///
+/// `attached` reports whether the SSH session is attached, and `failed_detail`
+/// carries the tab's own failure sentence when the tab failed. Transport loss
+/// is reported as transport, integration loss as integration, and the
+/// host-local integration state is never claimed for a remote tab.
+pub fn remote_opencode_report(
+    attached: bool,
+    failed_detail: Option<&str>,
+    transport: RemoteConnectionState,
+    integration: RemoteIntegrationState,
+    integration_error: Option<made_remote::protocol::ErrorCode>,
+) -> RemoteOpenCodeReport {
+    if let Some(detail) = failed_detail {
+        return RemoteOpenCodeReport {
+            status: IntegrationStatus::Degraded,
+            code: ReasonCode::BridgeClosed.code(),
+            reason: detail.to_owned(),
+        };
+    }
+    if !attached {
+        return RemoteOpenCodeReport {
+            status: IntegrationStatus::Inactive,
+            code: ReasonCode::Inactive.code(),
+            reason: "The remote OpenCode integration has not been observed; the SSH session is not attached."
+                .to_owned(),
+        };
+    }
+    match (transport, integration) {
+        (RemoteConnectionState::Disconnected, _) => RemoteOpenCodeReport {
+            status: IntegrationStatus::Degraded,
+            code: ReasonCode::BridgeClosed.code(),
+            reason: "The SSH transport disconnected; the remote OpenCode integration state is unknown until reattach."
+                .to_owned(),
+        },
+        (RemoteConnectionState::Connected, RemoteIntegrationState::Connected) => {
+            RemoteOpenCodeReport {
+                status: IntegrationStatus::Connected,
+                code: ReasonCode::Connected.code(),
+                reason: ReasonCode::Connected.message().to_owned(),
+            }
+        }
+        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable) => {
+            let error = integration_error
+                .map(|code| format!("{code:?}"))
+                .unwrap_or_else(|| "unavailable".to_owned());
+            RemoteOpenCodeReport {
+                status: IntegrationStatus::Degraded,
+                code: integration_error.map_or("unavailable", remote_error_code_label),
+                reason: format!(
+                    "The remote OpenCode integration is unavailable (error: {error}); the remote terminal and files remain usable."
+                ),
+            }
+        }
+        (RemoteConnectionState::Connected, RemoteIntegrationState::Unknown) => {
+            RemoteOpenCodeReport {
+                status: IntegrationStatus::Inactive,
+                code: ReasonCode::Inactive.code(),
+                reason: "The remote OpenCode integration has not been observed on this connection."
+                    .to_owned(),
+            }
+        }
+    }
 }
 
 impl DiagnosticsSnapshot {
@@ -807,10 +1031,27 @@ impl DiagnosticsSnapshot {
         self.cleanup_unconfirmed = workspace.cleanup_unconfirmed;
     }
 
-    /// Record the Grok Build row. The sentence is a fixed product string.
+    /// Record the Grok Build row. Fixed product wording stays fixed; a remote
+    /// failure detail is already bounded and sanitized by its source.
     pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
         self.grok_pill = row.pill;
-        self.grok_sentence = row.sentence;
+        self.grok_sentence = row.sentence.into_owned();
+    }
+
+    /// Report the owning remote tab's Grok Build tier, replacing the host
+    /// row. A failure sentence is bounded and sanitized by `remote_grok_row`.
+    pub fn set_remote_grok(&mut self, report: RemoteGrokReport) {
+        self.grok_pill = report.pill;
+        self.grok_sentence = report.sentence;
+    }
+
+    /// Report the owning remote tab's OpenCode integration, replacing the
+    /// host-local status and reason. The reason is sanitized and redacted.
+    pub fn set_remote_opencode(&mut self, report: RemoteOpenCodeReport) {
+        self.status = report.status;
+        self.status_label = report.status.label().to_owned();
+        self.reason_code = report.code;
+        self.reason = sanitize_log_text(&redact_hex_secrets(&report.reason));
     }
 
     /// Human-readable report suitable for copying into a bug report.
@@ -821,7 +1062,7 @@ impl DiagnosticsSnapshot {
         push_line(&mut text, "reason code", self.reason_code);
         push_line(&mut text, "reason", &self.reason);
         push_line(&mut text, "grok status", self.grok_pill.label());
-        push_line(&mut text, "grok", self.grok_sentence);
+        push_line(&mut text, "grok", &self.grok_sentence);
         if let Some(identity) = &self.workspace_identity {
             push_line(&mut text, "workspace identity", identity);
         }

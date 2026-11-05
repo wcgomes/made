@@ -19,7 +19,11 @@
 //!   module is still private. The import is the expected public path once
 //!   platform registers it (task 3.1). No `cfg(target_os)` is added here.
 use crate::{
-    clipboard::Uploads, filesystem::Filesystem, git::GitRunner, integration::Integration,
+    clipboard::Uploads,
+    filesystem::Filesystem,
+    git::GitRunner,
+    grok::{self, GrokTracker},
+    integration::Integration,
     protocol::*,
 };
 use made_bridge::remote_rpc::{RpcConnection, RpcListener};
@@ -123,6 +127,13 @@ impl NativeSession {
 
     pub fn pid(&self) -> Option<u32> {
         self.process.pid()
+    }
+
+    /// Whether the managed child is still running. Monitor failure reports
+    /// not running: ingestion must not attribute rows to an unobservable
+    /// process.
+    pub fn is_running(&self) -> bool {
+        self.process.try_is_running().unwrap_or(false)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), ErrorCode> {
@@ -477,6 +488,7 @@ pub fn generation_exempt(operation: &Operation) -> bool {
             | Operation::TerminalResize { .. }
             | Operation::SessionState
             | Operation::Focus { .. }
+            | Operation::GrokState
             | Operation::UploadBegin { .. }
             | Operation::UploadChunk { .. }
             | Operation::UploadCommit { .. }
@@ -497,6 +509,9 @@ pub struct Supervisor {
     filesystem: Filesystem,
     uploads: Uploads,
     integration: Option<Integration>,
+    grok: GrokTracker,
+    grok_detected: bool,
+    python3_detected: bool,
     lease: Lease,
     attachment: Option<Attachment>,
     attached_once: bool,
@@ -559,6 +574,30 @@ impl Supervisor {
                 cols: *cols,
             });
         let session = NativeSession::spawn(&made_platform::host_platform(), options)?;
+        // Grok ingestion reads only the two fixed Grok-home files and filters
+        // by live ancestry against this managed PTY child. The staged grok-made
+        // directory sits beside the companion executable.
+        let staged = companion
+            .parent()
+            .map(|directory| directory.join("plugins/grok-made"));
+        let environment = made_platform::Environment::current();
+        let python3_detected = grok::detect_on_path(&environment, "python3").is_some();
+        let grok_tracker = GrokTracker::new(
+            session.pid(),
+            matches!(
+                first.operation,
+                Operation::Open {
+                    target: LaunchTarget::Grok,
+                    ..
+                }
+            ),
+            grok::GrokSources {
+                files: grok::GrokFiles::from_environment(&environment),
+                staged,
+                python3: python3_detected,
+            },
+        );
+        let grok_detected = grok::detect_on_path(&environment, "grok").is_some();
         Ok(Self {
             identity: first.identity.clone(),
             runtime,
@@ -566,6 +605,9 @@ impl Supervisor {
             filesystem,
             uploads,
             integration,
+            grok: grok_tracker,
+            grok_detected,
+            python3_detected,
             lease: Lease::new(Instant::now()),
             attachment: None,
             attached_once: false,
@@ -579,6 +621,12 @@ impl Supervisor {
     fn install_attachment(&mut self, connection: RpcConnection) -> Result<(), ErrorCode> {
         let epoch = connection.epoch();
         let mut stream = connection.into_stream();
+        // BSD/macOS accepted sockets inherit the listener's O_NONBLOCK, and
+        // set_read_timeout(None) does not clear it. The attachment reader
+        // relies on blocking reads: one idle nonblocking read fails
+        // read_exact with EAGAIN and silently kills the attachment. Linux
+        // never inherits the flag, so only macOS hosts exposed this.
+        stream.set_nonblocking(false).map_err(io_error)?;
         stream
             .set_read_timeout(Some(Duration::from_secs(120)))
             .map_err(io_error)?;
@@ -649,6 +697,7 @@ impl Supervisor {
         if let Some(integration) = &mut self.integration {
             integration.reset_attachment();
         }
+        self.grok.reset_attachment();
         self.uploads.pending_abort_all();
         thread::spawn(move || {
             while let Ok(frame) = read_envelope(&mut reader) {
@@ -804,6 +853,9 @@ impl Supervisor {
                         .as_ref()
                         .is_some_and(|plan| plan.capability().is_supported()),
                     helper_version: env!("CARGO_PKG_VERSION").into(),
+                    // Honest runtime detection. tmux stays false on the wire.
+                    grok: self.grok_detected,
+                    python3: self.python3_detected,
                 },
             },
             Heartbeat => {
@@ -851,6 +903,7 @@ impl Supervisor {
                 .as_ref()
                 .ok_or(ErrorCode::Unavailable)?
                 .state()?,
+            GrokState => self.grok.state(),
             Focus { session_id } => {
                 self.integration
                     .as_mut()
@@ -912,6 +965,17 @@ impl Supervisor {
                         self.shell_cwd = crate::filesystem::remote(guard.root()).ok();
                     }
                 }
+            }
+        }
+        // Bounded Grok ingestion runs every pass, attached or not; pushes are
+        // dropped by `enqueue` while detached and rebuilt after re-attach.
+        let child_alive = self.session.is_running();
+        let grok_pushes = self.grok.tick(Instant::now(), child_alive);
+        if let Some(attachment) = &self.attachment {
+            let identity = attachment.identity.clone();
+            let request = attachment.request;
+            for operation in grok_pushes {
+                self.enqueue(WireEnvelope::new(identity.clone(), request, operation));
             }
         }
         self.flush_attachment();
