@@ -17,7 +17,7 @@ Task IDs are stable because `specs/changes/add-release-auto-update/tasks.md` cit
 - [x] 1.2 Create the crate manifest with the `made-grok-status` binary, a library target, workspace version and only `serde_json` plus required platform dependencies (path: crates/made-grok-hook/Cargo.toml)
 - [x] 1.3 Port `status_test.py` 1:1 as process-level tests: one object with stdin left open appends `sessionId`, `cwd`, `event`, `status` and exits 0 with empty stdout/stderr within 3s; the ten event→status cases; logged `pid` equals the test process id; `NotARealHook` appends nothing (path: crates/made-grok-hook/tests/status.rs)
 - [x] 1.4 [P] Port the Windows chunk-reader test 1:1: a chunk source that yields one object and then neither bytes nor EOF returns that object, and `status_of` of `NotARealHook` is none (path: crates/made-grok-hook/src/lib.rs)
-- [ ] 1.5 [P] Port the hooks.json matcher test 1:1 against the repository source and, when 0.1 selected generation, against the generated Windows variant (path: crates/made-grok-hook/tests/hooks_json.rs)
+- [x] 1.5 [P] Port the hooks.json matcher test 1:1 against the repository source and, when 0.1 selected generation, against the generated Windows variant (path: crates/made-grok-hook/tests/hooks_json.rs)
 - [x] 1.6 Add contract tests beyond the port: snake_case field spellings; `stopHookActive` truthiness including `0` and `0.0` as falsy; `-`/case normalization; first-match rule order; exactly seven fields with the `at` format; absent text fields as empty strings; `GROK_HOME` unset and empty both default to `~/.grok`; missing log directory created; non-object, truncated, invalid, empty and never-completing input writes nothing and exits 0 after about 2s; unwritable log exits 0 with empty stdout; invalid UTF-8 decoded as replacement characters while a valid character split across reads stays intact; concurrent runs against one log on a local filesystem produce whole, non-interleaved lines (path: crates/made-grok-hook/tests/contract.rs)
 - [x] 1.7 Run `cargo test -p made-grok-hook` and confirm 1.3 to 1.6 fail for the missing implementation (path: crates/made-grok-hook/tests/status.rs)
 - [x] 1.8 Implement the chunk-fed first-value decoder over the accumulated buffer, field text rules, status rules and line builder (path: crates/made-grok-hook/src/lib.rs)
@@ -28,9 +28,9 @@ Task IDs are stable because `specs/changes/add-release-auto-update/tasks.md` cit
 
 ## 2. Plugin source and staging
 IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
-- [ ] 2.2 [P] Set the source `version` to `0.1.0`, equal to `[workspace.package].version`; 2.6 writes the workspace version into the staged copy, equal to the source under REL-02 (path: plugins/grok-made/plugin.json)
-- [ ] 2.5 Add a Unix-only (`#[cfg(unix)]`) staging-script test that stages a fixture binary and a fixture source tree with its own fixture `hooks.json`, independent of 6.1's source form, and asserts the exact file set (`plugin.json`, `README.md`, `hooks/hooks.json`, `hooks/bin/<hook>`), mode 755, no test or Python file, the staged `plugin.json` version equal to the workspace version, and the Windows `hooks.json` variant when 0.1 selected generation; confirm it fails (path: crates/made-grok-hook/tests/stage_script.rs)
-- [ ] 2.6 Implement `stage-grok-plugin.sh <target> <hook-binary> <out>`: copy the source files and the hook, set mode 755, write the workspace version into the staged `plugin.json` (equal to the source under REL-02), and generate the Windows `hooks.json` when 0.1 selected it (path: .github/scripts/stage-grok-plugin.sh)
+- [x] 2.2 [P] Set the source `version` to `0.1.0`, equal to `[workspace.package].version`; 2.6 writes the workspace version into the staged copy, equal to the source under REL-02 (path: plugins/grok-made/plugin.json)
+- [x] 2.5 Add a Unix-only (`#[cfg(unix)]`) staging-script test that stages a fixture binary and a fixture source tree with its own fixture `hooks.json`, independent of 6.1's source form, and asserts the exact file set (`plugin.json`, `README.md`, `hooks/hooks.json`, `hooks/bin/<hook>`), mode 755, no test or Python file, the staged `plugin.json` version equal to the workspace version, and the Windows `hooks.json` variant when 0.1 selected generation; confirm it fails (path: crates/made-grok-hook/tests/stage_script.rs)
+- [x] 2.6 Implement `stage-grok-plugin.sh <target> <hook-binary> <out>`: copy the source files and the hook, set mode 755, write the workspace version into the staged `plugin.json` (equal to the source under REL-02), and generate the Windows `hooks.json` when 0.1 selected it (path: .github/scripts/stage-grok-plugin.sh)
 
 ## Checkpoint
 - [ ] verify 2.5 passes on Linux and macOS CI
@@ -85,7 +85,7 @@ Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
 - [ ] verify scenarios `Shipped package matches the host` and `No Python on the machine` (packaged hook, pid and no-Python run on all four local targets via 5.10), `Staged hook matches each server's target` (hook built, checked and manifest-recorded per remote target) and SSH-06 `Approved companion update is verified, swapped and reused` (10 artifacts) pass in CI
 
 ## 6. Cutover
-- [ ] 6.1 Point all nine registrations at `bin/made-grok-status`, keeping events, matchers and the 5-second timeout, in the form 0.1 selected (path: plugins/grok-made/hooks/hooks.json)
+- [x] 6.1 Point all nine registrations at `bin/made-grok-status`, keeping events, matchers and the 5-second timeout, in the form 0.1 selected (path: plugins/grok-made/hooks/hooks.json)
 - [ ] 6.2 [P] Delete the Python hook (path: plugins/grok-made/hooks/bin/status.py)
 - [ ] 6.3 [P] Delete the Python test after 1.3 to 1.5 pass (path: plugins/grok-made/hooks/status_test.py)
 
