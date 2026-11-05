@@ -9430,9 +9430,22 @@ fn ssh_servers_window_keeps_field_focus_and_has_no_collapse() {
     headless.render_events(vec![pointer_button(close_at, true)]);
     headless.render_events(vec![pointer_button(close_at, false)]);
     // The close click and the terminal focus handback can settle on different
-    // frames depending on the host. Render one settling frame before checking.
+    // frames depending on the host. Render settling frames, bounded, until the
+    // handback has happened before checking.
     headless.render();
-    let closed = headless.render();
+    let mut closed = headless.render();
+    for _ in 0..30 {
+        let handed_back = headless
+            .model
+            .workspace(id)
+            .and_then(|workbench| workbench.terminal())
+            .is_some_and(|terminal| terminal.is_focused());
+        if handed_back && !output_text(&closed).contains("Display name") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        closed = headless.render();
+    }
     assert!(
         !output_text(&closed).contains("Display name"),
         "the window must still close: {}",
