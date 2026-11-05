@@ -3720,6 +3720,13 @@ impl Workbench {
                                         .unwrap_or_else(|| "none".to_owned()),
                                 ),
                                 ("Made", snapshot.app_version.clone()),
+                                (
+                                    "Last command-line apply",
+                                    snapshot
+                                        .update_apply
+                                        .clone()
+                                        .unwrap_or_else(|| "none".to_owned()),
+                                ),
                             ],
                         );
 
@@ -3925,7 +3932,9 @@ fn updates_section_height(updates: &UpdatePanel) -> f32 {
 fn updates_section(ui: &mut Ui, updates: &mut UpdatePanel, layout: &Layout) {
     ui.horizontal(|ui| {
         ui.label(theme::mono("UPDATES", 10.0, theme::TEXT_TERTIARY));
-        ui.label(theme::micro(&updates.status_line));
+        ui.label(theme::micro(
+            updates.notice.as_deref().unwrap_or(&updates.status_line),
+        ));
     });
     if !updates.controls {
         return;

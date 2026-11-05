@@ -44,7 +44,17 @@ pub trait UpdateCapability: Send + 'static {
     /// relaunch. It runs on the UI thread when the user confirms, so a
     /// background download never delays the restart.
     fn restarter(&self) -> Restarter;
+
+    /// A check run before `Restart now` closes anything: `Err` names why the
+    /// restart must not start (for example another Made window of the same
+    /// install is open). The default never blocks.
+    fn restart_guard(&self) -> RestartGuard {
+        Box::new(|| Ok(()))
+    }
 }
+
+/// See [`UpdateCapability::restart_guard`].
+pub type RestartGuard = Box<dyn Fn() -> Result<(), String> + Send>;
 
 /// Hands a ready version to the updater; see [`UpdateCapability::restarter`].
 pub type Restarter = Box<dyn FnMut(&str) -> Result<(), String> + Send>;
@@ -149,6 +159,7 @@ enum Outcome {
 pub struct UpdateScheduler {
     worker: Option<(Sender<Command>, Receiver<Outcome>)>,
     restarter: Option<Restarter>,
+    restart_guard: Option<RestartGuard>,
     status: UpdateStatus,
     ready: Option<String>,
     automatic: bool,
@@ -170,6 +181,7 @@ impl UpdateScheduler {
         Self {
             worker: None,
             restarter: None,
+            restart_guard: None,
             status: status.clone(),
             ready: None,
             automatic: false,
@@ -184,6 +196,7 @@ impl UpdateScheduler {
     /// (no network), then checks at `now` when automatic checks are on.
     pub fn start(capability: Box<dyn UpdateCapability>, automatic: bool, now: Instant) -> Self {
         let restarter = capability.restarter();
+        let restart_guard = capability.restart_guard();
         let (commands, inbox) = mpsc::channel::<Command>();
         let (outbox, outcomes) = mpsc::channel::<Outcome>();
         let spawned = thread::Builder::new()
@@ -193,6 +206,7 @@ impl UpdateScheduler {
         let mut scheduler = Self {
             worker,
             restarter: Some(restarter),
+            restart_guard: Some(restart_guard),
             status: UpdateStatus::NotChecked,
             ready: None,
             automatic,
@@ -380,6 +394,15 @@ impl UpdateScheduler {
         }
     }
 
+    /// Whether `Restart now` may start: `Err` says why not, before anything
+    /// is closed.
+    pub fn restart_check(&self) -> Result<(), String> {
+        match &self.restart_guard {
+            Some(guard) => guard(),
+            None => Err("updates are unavailable".to_owned()),
+        }
+    }
+
     /// The confirmed restart: hand the ready version to the updater. The
     /// caller has already closed every workspace and exits on `Ok`.
     pub fn restart(&mut self) -> Result<String, String> {
@@ -443,6 +466,8 @@ pub struct UpdatePanel {
     pub ready: Option<String>,
     /// The inline restart confirmation is shown.
     pub confirming: bool,
+    /// Why the last `Restart now` did not start, shown instead of the status.
+    pub notice: Option<String>,
     /// Actions taken this frame, handled by the app after drawing.
     pub actions: Vec<UpdateAction>,
 }
@@ -543,6 +568,21 @@ impl UpdateCapability for PlatformCapability {
         Ok(version)
     }
 
+    fn restart_guard(&self) -> RestartGuard {
+        let updater = self.updater.clone();
+        Box::new(move || {
+            let others = updater.other_instances();
+            if others.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Close the other Made window of this install before restarting to update (process {}).",
+                    others.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                ))
+            }
+        })
+    }
+
     fn restarter(&self) -> Restarter {
         let updater = self.updater.clone();
         let ready = self.ready.clone();
@@ -589,6 +629,14 @@ pub fn command_line_update(
     scheduler.run_until_idle(Instant::now);
     scheduler.check_now();
     let status = scheduler.run_until_idle(Instant::now).clone();
+    let busy = scheduler.take_events().contains(&UpdateEvent::Busy);
+    if busy {
+        let _ = writeln!(
+            out,
+            "Another update operation is in progress for this install."
+        );
+        return 1;
+    }
     let _ = writeln!(out, "{}", status.line(format_check_time));
     let code = match status {
         UpdateStatus::CheckFailed
@@ -601,7 +649,7 @@ pub fn command_line_update(
     };
     let Some(version) = scheduler.ready_version().map(str::to_owned) else {
         let _ = writeln!(out, "No verified update to apply.");
-        return code;
+        return 1;
     };
     match apply(&version) {
         Ok(message) => {

@@ -41,18 +41,20 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         CliAction::Update { apply } => update_entry(apply),
-        CliAction::ApplyHelper { wait_pid, root } => {
-            match platform_update::run_windows_helper(wait_pid, &root) {
-                Ok(version) => {
-                    println!("Made {version} is installed.");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("made: {error}");
-                    ExitCode::FAILURE
-                }
+        CliAction::ApplyHelper {
+            wait_pid,
+            root,
+            lock_handle,
+        } => match platform_update::run_windows_helper(wait_pid, &root, lock_handle) {
+            Ok(version) => {
+                println!("Made {version} is installed.");
+                ExitCode::SUCCESS
             }
-        }
+            Err(error) => {
+                eprintln!("made: {error}");
+                ExitCode::FAILURE
+            }
+        },
         CliAction::Run(args) => run(args),
     }
 }
@@ -61,7 +63,18 @@ fn main() -> ExitCode {
 /// verification as About. Never reads or changes the stored automatic-check
 /// choice and never starts the GUI.
 fn update_entry(apply: bool) -> ExitCode {
+    /// Exit status while another process applies an update (EX_TEMPFAIL).
+    const APPLY_IN_PROGRESS: u8 = 75;
     let updater = Updater::detect().map(Arc::new);
+    if let Some(updater) = &updater {
+        if updater.apply_in_progress() {
+            println!("An update is being applied to this install (apply in progress); run `made --update` again when it finishes.");
+            return ExitCode::from(APPLY_IN_PROGRESS);
+        }
+        if let Some(outcome) = updater.last_cli_apply() {
+            println!("Last command-line apply: {}.", outcome.describe());
+        }
+    }
     let mut scheduler = match &updater {
         Some(updater) => UpdateScheduler::start(
             Box::new(PlatformCapability::new(updater.clone())),
@@ -81,7 +94,7 @@ fn update_entry(apply: bool) -> ExitCode {
         match updater.apply_from_cli(&ready).map_err(|error| error.to_string())? {
             CliApplyOutcome::Applied(version) => Ok(format!("Made {version} is installed.")),
             CliApplyOutcome::HandedOff { pid, version } => Ok(format!(
-                "Installing Made {version} in helper process {pid}; Made will not start until it finishes."
+                "Handed off to helper process {pid}: Made {version} is being installed and the apply is not complete yet. Made will not start until it finishes; run `made --update` to see the result."
             )),
         }
     };
@@ -113,6 +126,9 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
         ..AppOptions::new().with_compatible_tui_detection()
     };
     let mut model = AppModel::new(args, options);
+    if let Some(updater) = &updater {
+        model.set_update_apply_outcome(updater.last_cli_apply().map(|outcome| outcome.describe()));
+    }
     // Smoke runs and non-installed builds make no update request (REL-11).
     match (&updater, smoke) {
         (Some(updater), None) => {

@@ -467,6 +467,10 @@ pub struct AppModel {
     update_restarting: bool,
     /// Recent update log lines, replayed into workspaces opened later.
     update_history: Vec<(crate::diagnostics::LogLevel, String)>,
+    /// Why the last `Restart now` did not start.
+    update_notice: Option<String>,
+    /// The last command-line apply outcome, shown in Diagnostics.
+    update_apply_outcome: Option<String>,
 }
 
 impl std::fmt::Debug for AppModel {
@@ -577,6 +581,8 @@ impl AppModel {
             update_confirming: false,
             update_restarting: false,
             update_history: Vec::new(),
+            update_notice: None,
+            update_apply_outcome: None,
         }
     }
 
@@ -1924,6 +1930,9 @@ impl AppModel {
         for (level, message) in &self.update_history {
             workbench.diag.log_mut().record(*level, message.clone());
         }
+        workbench
+            .diag
+            .set_update_apply_outcome(self.update_apply_outcome.clone());
         let id = WorkspaceId(self.next_workspace);
         self.next_workspace = self
             .next_workspace
@@ -2506,6 +2515,17 @@ impl AppModel {
         self.update_store = store;
     }
 
+    /// The last command-line apply outcome (fixed wording), shown in the
+    /// Diagnostics VERSIONS section and copied report.
+    pub fn set_update_apply_outcome(&mut self, outcome: Option<String>) {
+        self.update_apply_outcome = outcome;
+        for (_, workbench) in &mut self.workspaces {
+            workbench
+                .diag
+                .set_update_apply_outcome(self.update_apply_outcome.clone());
+        }
+    }
+
     /// Record an update-related line in every workspace's diagnostics log,
     /// now and for workspaces opened later (bounded).
     pub fn record_update_note(&mut self, level: crate::diagnostics::LogLevel, message: String) {
@@ -2545,6 +2565,7 @@ impl AppModel {
             automatic: self.updates.automatic(),
             ready: self.updates.ready_version().map(str::to_owned),
             confirming: self.update_confirming && self.updates.ready_version().is_some(),
+            notice: self.update_notice.clone(),
             actions: Vec::new(),
         }
     }
@@ -2580,6 +2601,7 @@ impl AppModel {
                     }
                 }
                 UpdateAction::RequestRestart => {
+                    self.update_notice = None;
                     self.update_confirming = self.updates.ready_version().is_some();
                 }
                 UpdateAction::Dismiss => self.update_confirming = false,
@@ -2595,6 +2617,13 @@ impl AppModel {
         if self.updates.ready_version().is_none() {
             return;
         }
+        // Refuse before anything closes, for example while another window
+        // of this install is open.
+        if let Err(reason) = self.updates.restart_check() {
+            self.update_notice = Some(reason);
+            return;
+        }
+        self.update_notice = None;
         self.show_about = false;
         self.shutdown();
         match self.updates.restart() {

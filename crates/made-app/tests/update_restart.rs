@@ -183,3 +183,59 @@ fn the_smoke_line_reports_layout_and_disabled_updates_for_the_production_reposit
         u8::from(made_platform::update::TEST_SEAM_ENABLED)
     )));
 }
+
+#[derive(Clone, Default)]
+struct BusyFake;
+
+impl UpdateCapability for BusyFake {
+    fn kept(&mut self) -> Option<String> {
+        None
+    }
+    fn check(&mut self) -> Result<Option<String>, UpdateFailure> {
+        Err(UpdateFailure::Busy)
+    }
+    fn download(&mut self, version: &str) -> Result<String, UpdateFailure> {
+        Ok(version.to_owned())
+    }
+    fn restarter(&self) -> Restarter {
+        Box::new(|_: &str| Ok(()))
+    }
+    fn restart_guard(&self) -> made_app::updates::RestartGuard {
+        Box::new(|| {
+            Err("Close the other Made window of this install before restarting to update (process 4242).".to_owned())
+        })
+    }
+}
+
+#[test]
+fn a_busy_install_and_an_apply_with_nothing_ready_exit_non_zero() {
+    let mut scheduler = UpdateScheduler::start(Box::new(BusyFake), false, Instant::now());
+    let mut out = Vec::new();
+    assert_eq!(command_line_update(&mut scheduler, None, &mut out), 1);
+    assert!(String::from_utf8(out)
+        .unwrap()
+        .contains("Another update operation is in progress"));
+
+    let fake = Fake {
+        offer: None,
+        ..Fake::default()
+    };
+    let mut apply = |_: &str| Ok(String::new());
+    let (code, out) = run_entry(&fake, Some(&mut apply));
+    assert_eq!(code, 1, "--apply with no verified update fails: {out}");
+    assert!(out.contains("No verified update to apply."));
+}
+
+#[test]
+fn restart_is_refused_before_anything_closes_while_another_window_runs() {
+    let scheduler = UpdateScheduler::start(Box::new(BusyFake), false, Instant::now());
+    let refusal = scheduler.restart_check().unwrap_err();
+    assert!(refusal.contains("process 4242"), "{refusal}");
+    assert!(UpdateScheduler::unavailable(false).restart_check().is_err());
+    let fake = Fake::default();
+    assert!(
+        UpdateScheduler::start(Box::new(fake), false, Instant::now())
+            .restart_check()
+            .is_ok()
+    );
+}

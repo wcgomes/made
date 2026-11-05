@@ -1262,3 +1262,36 @@ fn update_outcomes_reach_the_bounded_redacted_log() {
         "the log stays bounded"
     );
 }
+
+#[test]
+fn the_last_command_line_apply_is_reported_redacted() {
+    let mut diagnostics = Diagnostics::new("/home/alice/.local/state/made/log/integration.log");
+    let integration = IntegrationState::new(
+        Some(PathBuf::from("/workspace")),
+        PathBuf::from("/workspace"),
+    );
+    let text = diagnostics
+        .snapshot(&integration, None, None, None)
+        .to_text();
+    assert!(text.contains("last command-line apply: none"), "{text}");
+    diagnostics.set_update_apply_outcome(Some("installed Made 0.3.0".to_owned()));
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    assert_eq!(view.update_apply.as_deref(), Some("installed Made 0.3.0"));
+    assert!(view
+        .to_text()
+        .contains("last command-line apply: installed Made 0.3.0"));
+    for hostile in [
+        "installed Made /home/alice/0.3.0".to_owned(),
+        format!("installed {}", "0123456789abcdef".repeat(8)),
+        "installed Made 0.3.0\nforged: line".to_owned(),
+    ] {
+        diagnostics.set_update_apply_outcome(Some(hostile.clone()));
+        let text = diagnostics
+            .snapshot(&integration, None, None, None)
+            .to_text();
+        assert!(
+            text.contains("last command-line apply: none"),
+            "{hostile:?} must be dropped: {text}"
+        );
+    }
+}

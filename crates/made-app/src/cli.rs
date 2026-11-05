@@ -60,6 +60,8 @@ pub enum CliAction {
         wait_pid: u32,
         /// Install root being updated.
         root: PathBuf,
+        /// Inherited install-lock handle value.
+        lock_handle: u64,
     },
 }
 
@@ -141,9 +143,14 @@ where
                 let root = args
                     .next()
                     .ok_or_else(|| CliError::new("the apply helper needs an install root"))?;
+                let lock_handle = args
+                    .next()
+                    .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+                    .ok_or_else(|| CliError::new("the apply helper needs its lock handle"))?;
                 return Ok(CliAction::ApplyHelper {
                     wait_pid: pid,
                     root: PathBuf::from(root),
+                    lock_handle,
                 });
             }
             "--smoke-test" => {

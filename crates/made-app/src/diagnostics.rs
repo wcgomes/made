@@ -377,6 +377,7 @@ pub struct Diagnostics {
     previous_log_location_display: String,
     app_version: String,
     token_fingerprint: Option<String>,
+    update_apply: Option<String>,
 }
 
 impl Diagnostics {
@@ -397,6 +398,7 @@ impl Diagnostics {
             previous_log_location,
             previous_log_location_display,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            update_apply: None,
             token_fingerprint: None,
         }
     }
@@ -415,6 +417,7 @@ impl Diagnostics {
             previous_log_location: PathBuf::new(),
             previous_log_location_display: String::new(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            update_apply: None,
             token_fingerprint: None,
         }
     }
@@ -439,6 +442,19 @@ impl Diagnostics {
     /// Mutable log for integration lifecycle entries.
     pub fn log_mut(&mut self) -> &mut DiagnosticLog {
         &mut self.log
+    }
+
+    /// The last command-line apply outcome. Shown only through fixed wording
+    /// with a validated version; anything else is dropped.
+    pub fn set_update_apply_outcome(&mut self, outcome: Option<String>) {
+        self.update_apply = outcome
+            .filter(|text| {
+                text.len() <= 96
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b" .;-+".contains(&b))
+            })
+            .map(|text| sanitize_display(&text, 96));
     }
 
     /// Record one update outcome (REL-08, REL-09). Only fixed wording and
@@ -598,6 +614,7 @@ impl Diagnostics {
                 .map(|value| sanitize_display(&value, 128)),
             protocol_version: report.protocol_version,
             app_version: self.app_version.clone(),
+            update_apply: self.update_apply.clone(),
             last_revision: report.last_revision,
             last_heartbeat: report
                 .last_heartbeat
@@ -838,6 +855,8 @@ pub struct DiagnosticsSnapshot {
     pub protocol_version: Option<u32>,
     /// App version.
     pub app_version: String,
+    /// The last command-line apply outcome, when one was recorded.
+    pub update_apply: Option<String>,
     /// Last accepted state revision.
     pub last_revision: Option<u64>,
     /// Age of the last heartbeat at snapshot time.
@@ -1261,6 +1280,11 @@ impl DiagnosticsSnapshot {
             self.opencode_version.as_deref().unwrap_or("none"),
         );
         push_line(&mut text, "app version", &self.app_version);
+        push_line(
+            &mut text,
+            "last command-line apply",
+            self.update_apply.as_deref().unwrap_or("none"),
+        );
         push_line(
             &mut text,
             "last revision",

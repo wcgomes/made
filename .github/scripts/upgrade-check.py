@@ -127,16 +127,6 @@ def wait_for_latest(form: str, latest: str, timeout: float = 600) -> None:
     smoke.check(False, f"GitHub's latest feed resolves to v{latest} (last: {location})")
 
 
-def wait_for_exit(pid: int, timeout: float = 600) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        listing = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
-        if str(pid) not in listing:
-            return
-        time.sleep(2)
-    smoke.check(False, f"the apply helper {pid} finished within {timeout:.0f}s")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--form", required=True, choices=["setup", "pkg", "zip", "appimage"])
@@ -160,9 +150,21 @@ def main() -> int:
 
     apply = smoke.run(command + ["--update", "--apply"], timeout=900)
     smoke.check(apply.returncode == 0, "the command-line apply succeeds with no Made window open")
-    helper = re.search(r"helper process (\d+)", apply.stdout)
-    if helper:
-        wait_for_exit(int(helper.group(1)))
+    if re.search(r"helper process \d+", apply.stdout):
+        smoke.check("not complete yet" in apply.stdout, "the hand-off says the apply is not complete yet")
+    # Bounded wait while the apply (or the Windows helper) holds the install
+    # lock: `--update` then reports "apply in progress" with exit status 75.
+    deadline = time.time() + 600
+    status = smoke.run(command + ["--update"], timeout=900)
+    while status.returncode == 75 and time.time() < deadline:
+        smoke.check("apply in progress" in status.stdout, "--update reports apply in progress")
+        time.sleep(5)
+        status = smoke.run(command + ["--update"], timeout=900)
+    smoke.check(status.returncode != 75, "the apply finished within ten minutes")
+    smoke.check(
+        f"Last command-line apply: installed Made {args.latest}." in status.stdout,
+        "the next --update reports the recorded apply outcome",
+    )
 
     updated = smoke.run(command + ["--version"])
     smoke.check(updated.stdout.strip() == f"Made {args.latest}", f"the installed build now reports {args.latest}")

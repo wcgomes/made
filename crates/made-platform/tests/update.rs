@@ -833,6 +833,242 @@ mod seam {
         );
     }
 
+    /// Child half of the lock tests. Modes: `hold` takes the install lock and
+    /// waits; `handoff` (Windows) takes it, passes it to a `adopt` grandchild
+    /// and exits; `adopt` keeps an inherited handle and waits.
+    #[test]
+    fn install_lock_child() {
+        let Ok(spec) = std::env::var("MADE_LOCK_CHILD") else {
+            return;
+        };
+        let mut parts = spec.splitn(3, '|');
+        let mode = parts.next().unwrap().to_owned();
+        let dir = std::path::PathBuf::from(parts.next().unwrap());
+        let ready = dir.join(format!("{mode}-ready"));
+        let wait = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        match mode.as_str() {
+            "hold" => {
+                let _lock = seam::hold_install_lock(&dir).unwrap();
+                std::fs::write(&ready, std::process::id().to_string()).unwrap();
+                wait();
+            }
+            #[cfg(windows)]
+            "handoff" => {
+                let lock = seam::hold_install_lock(&dir).unwrap();
+                let handle = seam::share_install_lock(&lock).unwrap();
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["seam::install_lock_child", "--exact", "--nocapture"])
+                    .env(
+                        "MADE_LOCK_CHILD",
+                        format!("adopt|{}|{handle}", dir.display()),
+                    )
+                    .spawn()
+                    .unwrap();
+                let adopted = dir.join("adopt-ready");
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !adopted.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::fs::write(&ready, child.id().to_string()).unwrap();
+                // Exits here, as the command-line apply does after the hand-off.
+            }
+            #[cfg(windows)]
+            "adopt" => {
+                let handle: u64 = parts.next().unwrap().parse().unwrap();
+                let _lock = seam::adopt_install_lock(handle, &dir).unwrap();
+                std::fs::write(&ready, std::process::id().to_string()).unwrap();
+                wait();
+            }
+            other => panic!("unknown lock child mode {other}"),
+        }
+    }
+
+    fn lock_child(mode: &str, dir: &Path) -> (std::process::Child, u32) {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["seam::install_lock_child", "--exact", "--nocapture"])
+            .env("MADE_LOCK_CHILD", format!("{mode}|{}", dir.display()))
+            .spawn()
+            .unwrap();
+        let ready = dir.join(format!("{mode}-ready"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if let Ok(pid) = std::fs::read_to_string(&ready) {
+                if let Ok(pid) = pid.parse() {
+                    return (child, pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the {mode} lock child never became ready");
+    }
+
+    fn kill_pid(pid: u32) {
+        #[cfg(unix)]
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        #[cfg(windows)]
+        let status = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+        assert!(status.unwrap().success());
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_killed_command_line_apply_releases_the_install_lock() {
+        use made_platform::update::{register_instance, StartupRefused};
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let installation = seam::installation(packages.clone(), dir.path().join("data"), "0.2.0");
+        let (mut child, pid) = lock_child("hold", &packages);
+        assert!(
+            seam::apply_in_progress_at(&packages),
+            "--update reports apply in progress"
+        );
+        assert_eq!(
+            register_instance(&installation).err(),
+            Some(StartupRefused::ApplyInProgress)
+        );
+        kill_pid(pid);
+        let _ = child.wait();
+        wait_until(
+            || !seam::apply_in_progress_at(&packages),
+            "the OS to release the lock",
+        );
+        assert!(
+            register_instance(&installation).is_ok(),
+            "the next GUI start succeeds"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_hand_off_keeps_the_lock_until_the_helper_exits() {
+        use made_platform::update::{register_instance, StartupRefused};
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        let installation = seam::installation(packages.clone(), dir.path().join("data"), "0.2.0");
+        let (mut cli, helper) = lock_child("handoff", &packages);
+        // The command-line process has exited; the helper still holds the lock.
+        assert!(cli.wait().unwrap().success());
+        assert!(
+            seam::apply_in_progress_at(&packages),
+            "the lock is continuous across the hand-off"
+        );
+        assert_eq!(
+            register_instance(&installation).err(),
+            Some(StartupRefused::ApplyInProgress)
+        );
+        kill_pid(helper);
+        wait_until(
+            || !seam::apply_in_progress_at(&packages),
+            "the helper's lock to be released",
+        );
+        assert!(
+            register_instance(&installation).is_ok(),
+            "the next GUI start succeeds after the helper dies"
+        );
+    }
+
+    #[test]
+    fn gui_startup_fails_closed_when_it_cannot_register() {
+        use made_platform::update::{register_instance, StartupRefused};
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("packages");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let installation = seam::installation(blocked, dir.path().join("data"), "0.2.0");
+        assert_eq!(
+            register_instance(&installation).err(),
+            Some(StartupRefused::Unregistered)
+        );
+    }
+
+    #[test]
+    fn the_recorded_apply_outcome_is_validated_before_it_is_shown() {
+        let fixture = Fixture::new();
+        let updater = fixture.updater("0.2.0");
+        assert!(updater.last_cli_apply().is_none());
+        for (document, shown) in [
+            (
+                r#"{"version":"0.3.0","applied":true}"#,
+                Some("installed Made 0.3.0"),
+            ),
+            (
+                r#"{"version":"0.3.0","applied":false}"#,
+                Some("failed to install Made 0.3.0; the previous version was kept"),
+            ),
+            (
+                r#"{"version":"/home/alice/0123456789abcdef","applied":true}"#,
+                None,
+            ),
+            (r#"{"version":"0.3.0-beta.1","applied":true}"#, None),
+            (r#"not json"#, None),
+        ] {
+            made_platform::write_private_metadata_atomic(
+                &fixture.data,
+                "update-apply-outcome.json",
+                document.as_bytes(),
+                4096,
+            )
+            .unwrap();
+            assert_eq!(
+                updater
+                    .last_cli_apply()
+                    .map(|outcome| outcome.describe())
+                    .as_deref(),
+                shown,
+                "{document}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_line_apply_records_its_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let package = nupkg("Made", "0.3.0");
+        let listed = asset("0.3.0", &package);
+        fixture.feed(std::slice::from_ref(&listed));
+        fixture.publish("0.3.0", &package, &listed);
+        let updater = fixture.updater("0.2.0");
+        let ready = updater
+            .download(&updater.check().unwrap().unwrap())
+            .unwrap();
+        let script = fixture.packages.join("Update");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        updater.apply_from_cli(&ready).unwrap();
+        assert_eq!(
+            updater.last_cli_apply().unwrap().describe(),
+            "installed Made 0.3.0"
+        );
+        let record = fixture.data.join("update-apply-outcome.json");
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "private record"
+        );
+    }
+
     #[test]
     fn the_production_transport_refuses_plain_http() {
         let transport = seam::production_transport();

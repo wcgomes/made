@@ -93,6 +93,7 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_FEED_BYTES: u64 = 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const READY_RECORD: &str = "update-ready.json";
+const APPLY_OUTCOME: &str = "update-apply-outcome.json";
 const INSTALL_LOCK: &str = "made-install.lock";
 const DOWNLOAD_LOCK: &str = "made-download.lock";
 const INSTANCE_PREFIX: &str = "made-instance-";
@@ -296,6 +297,28 @@ pub mod seam {
             installation,
             source,
         }
+    }
+
+    /// Take the install lock of `packages_dir`, as a command-line apply does.
+    pub fn hold_install_lock(packages_dir: &Path) -> Result<InstallLock, UpdateError> {
+        InstallLock::acquire(packages_dir)
+    }
+
+    /// Make a held install lock inheritable by the next child; its handle.
+    #[cfg(windows)]
+    pub fn share_install_lock(lock: &InstallLock) -> io::Result<u64> {
+        lock.share_with_child()
+    }
+
+    /// Adopt an inherited install-lock handle, as the Windows helper does.
+    #[cfg(windows)]
+    pub fn adopt_install_lock(handle: u64, packages_dir: &Path) -> io::Result<InstallLock> {
+        InstallLock::adopt(handle, packages_dir)
+    }
+
+    /// Whether the install lock of `packages_dir` is held.
+    pub fn apply_in_progress_at(packages_dir: &Path) -> bool {
+        apply_in_progress(packages_dir)
     }
 
     /// The updater from the running executable with an injected transport.
@@ -661,6 +684,27 @@ impl Installation {
     fn clear_record(&self) {
         let _ = fs::remove_file(self.data_dir.join(READY_RECORD));
     }
+
+    fn write_apply_outcome(&self, version: &str, applied: bool) {
+        let outcome = ApplyOutcome {
+            version: version.to_owned(),
+            applied,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&outcome) {
+            let _ =
+                crate::write_private_metadata_atomic(&self.data_dir, APPLY_OUTCOME, &bytes, 4096);
+        }
+    }
+
+    fn read_apply_outcome(&self) -> Option<ApplyOutcome> {
+        let bytes = crate::read_private_metadata(&self.data_dir, APPLY_OUTCOME, 4096).ok()??;
+        let outcome: ApplyOutcome = serde_json::from_slice(&bytes).ok()?;
+        // Only a plain stable version is ever shown; anything else is dropped.
+        Version::parse(&outcome.version)
+            .ok()
+            .filter(|version| version.pre.is_empty() && version.build.is_empty())
+            .map(|_| outcome)
+    }
 }
 
 fn startup_app(config: Option<VelopackLocatorConfig>) -> VelopackApp<'static> {
@@ -823,6 +867,10 @@ impl Updater {
     /// process to exit, applies it and relaunches Made. The caller must close
     /// every workspace first, then exit promptly when this returns `Ok`.
     pub fn restart_into(&self, ready: &Ready) -> Result<(), UpdateError> {
+        let others = self.other_instances();
+        if !others.is_empty() {
+            return Err(UpdateError::InstanceRunning(others));
+        }
         let package = self.reverify(ready)?;
         let mut args = apply_args(&self.installation, &package, false);
         args.push("--waitPid".into());
@@ -845,8 +893,11 @@ impl Updater {
         #[cfg(target_os = "windows")]
         {
             let _ = &package;
+            // The helper inherits this open lock handle, so the lock stays
+            // held from these checks through the swap even after this
+            // process exits.
+            let pid = spawn_windows_helper(&self.installation, &lock)?;
             drop(lock);
-            let pid = spawn_windows_helper(&self.installation)?;
             Ok(CliApplyOutcome::HandedOff {
                 pid,
                 version: ready.version().to_owned(),
@@ -854,12 +905,61 @@ impl Updater {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            run_updater_to_completion(&self.installation, &package)?;
+            let result = run_updater_to_completion(&self.installation, &package);
+            self.installation
+                .write_apply_outcome(ready.version(), result.is_ok());
             drop(lock);
+            result?;
             self.installation.clear_record();
             Ok(CliApplyOutcome::Applied(ready.version().to_owned()))
         }
     }
+
+    /// Whether a command-line apply holds this install's lock right now.
+    pub fn apply_in_progress(&self) -> bool {
+        apply_in_progress(&self.installation.packages_dir)
+    }
+
+    /// Process ids of other Made windows of this install.
+    pub fn other_instances(&self) -> Vec<u32> {
+        running_instances(&self.installation.packages_dir)
+    }
+
+    /// The outcome the last command-line apply recorded, if any.
+    pub fn last_cli_apply(&self) -> Option<ApplyOutcome> {
+        self.installation.read_apply_outcome()
+    }
+}
+
+/// The recorded result of a command-line apply (written by the apply itself or
+/// the Windows helper), kept in private app data.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ApplyOutcome {
+    /// Version that was applied.
+    pub version: String,
+    /// Whether the updater finished successfully.
+    pub applied: bool,
+}
+
+impl ApplyOutcome {
+    /// One fixed-wording line for terminals and diagnostics.
+    pub fn describe(&self) -> String {
+        if self.applied {
+            format!("installed Made {}", self.version)
+        } else {
+            format!(
+                "failed to install Made {}; the previous version was kept",
+                self.version
+            )
+        }
+    }
+}
+
+fn apply_in_progress(packages_dir: &Path) -> bool {
+    matches!(
+        FileLock::try_lock(&packages_dir.join(INSTALL_LOCK)),
+        Ok(None)
+    )
 }
 
 fn acceptable_file_name(name: &str) -> bool {
@@ -935,42 +1035,94 @@ fn run_updater_to_completion(
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_windows_helper(installation: &Installation) -> Result<u32, UpdateError> {
-    let exe = std::env::current_exe().map_err(|error| UpdateError::Local(error.to_string()))?;
-    let dir = std::env::temp_dir().join(format!("made-update-{}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(|error| UpdateError::Local(error.to_string()))?;
+fn spawn_windows_helper(
+    installation: &Installation,
+    lock: &InstallLock,
+) -> Result<u32, UpdateError> {
+    let local = |error: io::Error| UpdateError::Local(error.to_string());
+    let exe = std::env::current_exe().map_err(local)?;
+    remove_stale_helper_copies();
+    // A fresh directory created by this call only: never an existing one
+    // whose contents (for example a planted DLL) we did not write.
+    let dir = std::env::temp_dir().join(format!(
+        "{HELPER_DIR_PREFIX}{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir(&dir).map_err(local)?;
     let copy = dir.join("made-app.exe");
-    fs::copy(&exe, &copy).map_err(|error| UpdateError::Local(error.to_string()))?;
+    fs::copy(&exe, &copy).map_err(local)?;
+    let handle = lock.share_with_child().map_err(local)?;
     let child = std::process::Command::new(&copy)
         .arg(WINDOWS_HELPER_FLAG)
         .arg(std::process::id().to_string())
         .arg(installation.root())
+        .arg(handle.to_string())
+        .current_dir(&dir)
         .spawn()
         .map_err(|error| UpdateError::Local(format!("cannot start the apply helper: {error}")))?;
     Ok(child.id())
 }
 
+/// Remove helper copies left by earlier hand-offs. A helper still running
+/// keeps its directory, because Windows refuses to delete a running image.
+#[cfg(target_os = "windows")]
+fn remove_stale_helper_copies() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(HELPER_DIR_PREFIX)
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+const HELPER_DIR_PREFIX: &str = "made-update-";
+
 /// Hidden flag that runs the Windows apply helper:
-/// `<flag> <wait-pid> <install-root>`.
+/// `<flag> <wait-pid> <install-root> <inherited-lock-handle>`.
 pub const WINDOWS_HELPER_FLAG: &str = "--update-apply-helper";
 
-/// Windows apply helper: wait for the invoking process to exit, then apply
-/// the kept package under the install lock, without restarting Made.
+/// Windows apply helper: adopt the install lock inherited from the
+/// command-line apply, wait for that process to exit, then verify and apply
+/// the kept package without restarting Made, and record the outcome.
 #[cfg(target_os = "windows")]
-pub fn run_windows_helper(wait_pid: u32, root: &Path) -> Result<String, UpdateError> {
-    let _ = velopack::process::wait_for_pid_to_exit(wait_pid, Some(Duration::from_secs(60)));
+pub fn run_windows_helper(
+    wait_pid: u32,
+    root: &Path,
+    lock_handle: u64,
+) -> Result<String, UpdateError> {
+    restrict_dll_search();
     let installation = Installation::from_windows_root(root)
         .ok_or_else(|| UpdateError::Local("the install root is not a Made installation".into()))?;
+    let lock = InstallLock::adopt(lock_handle, &installation.packages_dir).map_err(|error| {
+        UpdateError::Local(format!("the inherited install lock is invalid: {error}"))
+    })?;
+    let _ = velopack::process::wait_for_pid_to_exit(wait_pid, Some(Duration::from_secs(60)));
     let updater = Updater {
         source: ReleaseSource::production(&installation.current_version()),
         installation,
     };
-    let ready = updater
-        .kept()
-        .ok_or_else(|| UpdateError::Local("no verified update is kept for this install".into()))?;
-    let lock = InstallLock::acquire(&updater.installation.packages_dir)?;
+    let Some(ready) = updater.kept() else {
+        drop(lock);
+        return Err(UpdateError::Local(
+            "no verified update is kept for this install".into(),
+        ));
+    };
     let running = running_instances(&updater.installation.packages_dir);
     if !running.is_empty() {
+        updater
+            .installation
+            .write_apply_outcome(ready.version(), false);
         return Err(UpdateError::InstanceRunning(running));
     }
     let package = updater.reverify(&ready)?;
@@ -979,20 +1131,45 @@ pub fn run_windows_helper(wait_pid: u32, root: &Path) -> Result<String, UpdateEr
         apply_args(&updater.installation, &package, true),
     )?
     .wait()
-    .map_err(|error| UpdateError::Local(error.to_string()))?;
-    drop(lock);
-    if !status.success() {
-        return Err(UpdateError::Local(format!(
-            "the updater exited with {status}"
-        )));
+    .map_err(|error| UpdateError::Local(error.to_string()));
+    let applied = matches!(&status, Ok(status) if status.success());
+    updater
+        .installation
+        .write_apply_outcome(ready.version(), applied);
+    if applied {
+        updater.installation.clear_record();
     }
-    updater.installation.clear_record();
-    Ok(ready.version().to_owned())
+    drop(lock);
+    match status {
+        Ok(status) if status.success() => Ok(ready.version().to_owned()),
+        Ok(status) => Err(UpdateError::Local(format!(
+            "the updater exited with {status}"
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// Load later DLLs only from System32, never from the helper's directory.
+#[cfg(target_os = "windows")]
+fn restrict_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        SetDefaultDllDirectories, SetDllDirectoryW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    let empty: [u16; 1] = [0];
+    // SAFETY: plain Win32 calls with valid arguments.
+    unsafe {
+        SetDllDirectoryW(empty.as_ptr());
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
 }
 
 /// Windows has no apply helper elsewhere.
 #[cfg(not(target_os = "windows"))]
-pub fn run_windows_helper(_wait_pid: u32, _root: &Path) -> Result<String, UpdateError> {
+pub fn run_windows_helper(
+    _wait_pid: u32,
+    _root: &Path,
+    _lock_handle: u64,
+) -> Result<String, UpdateError> {
     Err(UpdateError::Local(
         "the apply helper exists only on Windows".into(),
     ))
@@ -1066,6 +1243,54 @@ impl InstallLock {
             Err(error) => Err(UpdateError::Local(error.to_string())),
         }
     }
+
+    /// Make the lock's open handle inheritable by the next child process and
+    /// return its value. The OS releases the lock once every process holding
+    /// the handle has exited, for any reason.
+    #[cfg(windows)]
+    fn share_with_child(&self) -> io::Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        let handle = self._lock._file.as_raw_handle();
+        // SAFETY: the handle is owned by this lock and stays open.
+        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(handle as usize as u64)
+    }
+
+    /// Take ownership of an inherited lock handle after checking it is the
+    /// lock file of `packages_dir`.
+    #[cfg(windows)]
+    fn adopt(handle: u64, packages_dir: &Path) -> io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+        let raw = handle as usize as *mut std::ffi::c_void;
+        let mut buffer = vec![0u16; 1024];
+        // SAFETY: querying a handle value; failure is reported, not trusted.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(raw as _, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
+        if length == 0 || length as usize >= buffer.len() {
+            return Err(io::Error::last_os_error());
+        }
+        let actual = PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
+        let expected = fs::canonicalize(packages_dir.join(INSTALL_LOCK))?;
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "handle is not this install's lock",
+            ));
+        }
+        // SAFETY: the handle was inherited from the parent for this purpose
+        // and is owned by this process from here on.
+        let file = unsafe { File::from_raw_handle(raw) };
+        Ok(Self {
+            _lock: FileLock { _file: file },
+        })
+    }
 }
 
 /// Registration of one running GUI instance, released on drop.
@@ -1085,13 +1310,24 @@ impl Drop for InstanceGuard {
 
 /// Why GUI startup must not continue.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupRefused;
+pub enum StartupRefused {
+    /// A command-line apply holds the install lock.
+    ApplyInProgress,
+    /// This window could not announce itself, so a command-line apply could
+    /// not see it; starting anyway would let an apply replace files under it.
+    Unregistered,
+}
 
 impl fmt::Display for StartupRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "an update is being applied to this Made install; start Made again when it finishes",
-        )
+        f.write_str(match self {
+            Self::ApplyInProgress => {
+                "an update is being applied to this Made install; start Made again when it finishes"
+            }
+            Self::Unregistered => {
+                "Made could not register this window with its install (the update data folder is not writable); fix the folder permissions and start Made again"
+            }
+        })
     }
 }
 
@@ -1101,20 +1337,20 @@ impl fmt::Display for StartupRefused {
 pub fn register_instance(installation: &Installation) -> Result<InstanceGuard, StartupRefused> {
     let dir = &installation.packages_dir;
     if fs::create_dir_all(dir).is_err() {
-        return Ok(InstanceGuard {
-            _lock: None,
-            path: None,
-        });
+        return Err(StartupRefused::Unregistered);
     }
     let path = dir.join(format!("{INSTANCE_PREFIX}{}.lock", std::process::id()));
-    let lock = FileLock::try_lock(&path).ok().flatten();
+    let Ok(Some(lock)) = FileLock::try_lock(&path) else {
+        return Err(StartupRefused::Unregistered);
+    };
     let guard = InstanceGuard {
-        _lock: lock,
+        _lock: Some(lock),
         path: Some(path),
     };
     match FileLock::try_lock(&dir.join(INSTALL_LOCK)) {
-        Ok(None) => Err(StartupRefused),
-        _ => Ok(guard),
+        Ok(Some(_)) => Ok(guard),
+        Ok(None) => Err(StartupRefused::ApplyInProgress),
+        Err(_) => Err(StartupRefused::Unregistered),
     }
 }
 
@@ -1178,9 +1414,13 @@ mod tests {
         assert!(!other.exists(), "stale registrations are removed");
 
         let guard = register_instance(&installation).unwrap();
-        let lock = InstallLock::acquire(&installation.packages_dir).unwrap();
-        assert_eq!(register_instance(&installation).err(), Some(StartupRefused));
-        drop(lock);
         drop(guard);
+        let lock = InstallLock::acquire(&installation.packages_dir).unwrap();
+        assert_eq!(
+            register_instance(&installation).err(),
+            Some(StartupRefused::ApplyInProgress)
+        );
+        drop(lock);
+        assert!(register_instance(&installation).is_ok());
     }
 }
