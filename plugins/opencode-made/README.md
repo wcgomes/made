@@ -43,7 +43,7 @@ The app appends one plugin entry to the launch config. Options are namespaced un
           "token": "<per-launch secret>",
           "paneId": "pane-1",
           "protocolVersion": 1,
-          "appVersion": "0.1.6"
+          "appVersion": "0.1.7"
         }
       }
     }

@@ -13,7 +13,7 @@
 export const PROTOCOL_VERSION = 1;
 
 /** Kept in sync with package.json. The plugin has no build step and does not read files. */
-export const PLUGIN_VERSION = "0.1.6";
+export const PLUGIN_VERSION = "0.1.7";
 
 export const STATE_DEBOUNCE_MS = 60;
 export const RECONNECT_BASE_MS = 100;
