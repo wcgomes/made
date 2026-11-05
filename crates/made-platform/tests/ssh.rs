@@ -619,7 +619,9 @@ mod fixed_staging {
         // The child was started in a fresh process group whose id is its PID,
         // so the negative target names only this fixture's group.
         let _ = Command::new("/bin/kill")
-            .args(["-9", &format!("-{}", child.id())])
+            // `--` keeps procps kill from reading the negative group id as a
+            // signal name; macOS kill accepts it too.
+            .args(["-9", "--", &format!("-{}", child.id())])
             .status();
         let _ = child.wait();
     }
