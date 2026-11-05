@@ -157,6 +157,8 @@ pub mod linux;
 pub mod macos;
 #[cfg(feature = "desktop")]
 pub mod native_backdrop;
+#[cfg(feature = "desktop")]
+pub mod update;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -2433,6 +2435,13 @@ pub use windows::WindowsPlatform as HostPlatform;
 /// Construct the host backend.
 pub fn host_platform() -> HostPlatform {
     HostPlatform::new()
+}
+
+/// The host per-user data directory, for capabilities resolved outside
+/// [`AppPaths`] consumers.
+#[cfg(feature = "desktop")]
+pub(crate) fn host_platform_data_dir() -> Option<PathBuf> {
+    host_platform().app_paths().ok().map(|paths| paths.data_dir)
 }
 
 /// A compatible TUI that Made can launch directly in a new tab.

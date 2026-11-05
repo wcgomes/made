@@ -53,6 +53,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The update tamper/redirect/allowlist tests compile only with the
+      # non-default test seam; lint them too.
+      - name: Run clippy on the update test seam
+        run: cargo clippy -p made-platform --all-targets --locked --features update-test-seam -- -D warnings
+
   test:
     name: Build and test (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -119,6 +124,9 @@ jobs:
           else
             cargo test --workspace --locked --no-fail-fast --target "${{ matrix.target }}"
           fi
+
+      - name: Test the update capability through its test seam
+        run: cargo test -p made-platform --features update-test-seam --test update --locked --target ${{ matrix.target }}
 
       - name: Stage the development binary
         shell: bash
