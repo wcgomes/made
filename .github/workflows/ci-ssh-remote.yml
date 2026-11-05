@@ -78,7 +78,7 @@ jobs:
             -e CARGO_HOME=/src/.cargo-home \
             -e CARGO_TARGET_DIR=/src/target-glibc231 \
             -e CARGO_TERM_COLOR=always \
-            rust:1-bullseye \
+            rust:1-bullseye@sha256:4730e387a220a08a365c77da3096544dde214f9d796c16284d4be45438cad4a9 \
             bash .github/scripts/build-linux-companion.sh
           sudo chown -R "$(id -u):$(id -g)" dist
           if [ -d target-glibc231 ]; then sudo chown -R "$(id -u):$(id -g)" target-glibc231; fi

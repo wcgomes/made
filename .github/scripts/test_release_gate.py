@@ -109,6 +109,26 @@ class ReleaseGateTest(unittest.TestCase):
         self.assertEqual(github.deleted, [7], "only the draft for this tag is removed")
         self.assertIn("7", text)
 
+    def test_the_publish_time_gate_refuses_after_a_newer_release_appeared(self) -> None:
+        fixtures.write_fixture(self.root, version="0.2.0")
+        github = FakeGitHub([release(1, "v0.1.0")])
+        self.assertEqual(self.run_gate("v0.2.0", github)[0], 0, "the start-of-run gate passes")
+        # Another tag published while this run built and smoke-tested.
+        github._releases.append(release(2, "v0.3.0"))
+        github._releases.append(release(3, "v0.2.0", draft=True))
+        code, text = self.run_gate("v0.2.0", github)
+        self.assertEqual(code, 1, "the gate re-run before publishing refuses")
+        self.assertIn("v0.3.0", text)
+
+    def test_check_newest_after_publishing(self) -> None:
+        github = FakeGitHub([release(1, "v0.1.0"), release(2, "v0.2.0"), release(3, "v0.9.0", prerelease=True)])
+        self.assertEqual(self.run_gate("v0.2.0", github, "--check-newest")[0], 0)
+        github._releases.append(release(4, "v0.3.0"))
+        code, text = self.run_gate("v0.2.0", github, "--check-newest")
+        self.assertEqual(code, 1)
+        self.assertIn("v0.3.0 is newer", text)
+        self.assertEqual(self.run_gate("v0.4.0", github, "--check-newest")[0], 1, "unpublished tag")
+
     def test_published_releases_are_never_deleted(self) -> None:
         github = FakeGitHub([release(1, "v0.2.0")])
         self.run_gate("v0.2.0", github, "--delete-drafts")

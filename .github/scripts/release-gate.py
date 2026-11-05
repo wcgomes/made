@@ -4,13 +4,16 @@
 Usage:
   release-gate.py --tag vX.Y.Z [--repo OWNER/REPO]
   release-gate.py --tag vX.Y.Z [--repo OWNER/REPO] --delete-drafts
+  release-gate.py --tag vX.Y.Z [--repo OWNER/REPO] --check-newest
 
 The gate refuses a tag that is not `v<stable semantic version>` (prerelease
 and build versions included), disagrees with any version site, is already a
 published release, or is not greater than the newest published stable
 release. `--delete-drafts` removes unpublished drafts for the tag left by a
 failed run; it needs a token that can write releases and never touches a
-published release. GitHub is reached through the `gh` CLI.
+published release. The full gate runs again in the publish job right before
+publishing. `--check-newest`, after publishing, fails unless the tag is the
+newest published stable release. GitHub is reached through the `gh` CLI.
 """
 
 from __future__ import annotations
@@ -83,6 +86,23 @@ def evaluate(tag: str, releases: list[dict], root: Path) -> list[str]:
     return problems
 
 
+def newest_problems(tag: str, releases: list[dict]) -> list[str]:
+    """After publishing: `tag` must be published and the newest stable release."""
+    published = [r for r in releases if not r.get("draft") and not r.get("prerelease")]
+    if not any(r.get("tag_name") == tag for r in published):
+        return [f"{tag} is not a published stable release"]
+    mine = parse(tag[1:]) if tag.startswith("v") else None
+    newer = [
+        r["tag_name"]
+        for r in published
+        if r.get("tag_name", "").startswith("v")
+        and (version := parse(r["tag_name"][1:])) is not None
+        and mine is not None
+        and version > mine
+    ]
+    return [f"{name} is newer than {tag}" for name in newer]
+
+
 def delete_drafts(tag: str, github: GitHub) -> list[int]:
     """Delete unpublished drafts for `tag`; returns the deleted ids."""
     deleted = []
@@ -97,7 +117,9 @@ def main(argv: list[str] | None = None, github: GitHub | None = None, root: Path
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tag", required=True)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", "wcgomes/made"))
-    parser.add_argument("--delete-drafts", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--delete-drafts", action="store_true")
+    mode.add_argument("--check-newest", action="store_true")
     args = parser.parse_args(argv)
     github = github or GitHub(args.repo)
     root = root or HERE.parents[1]
@@ -105,7 +127,15 @@ def main(argv: list[str] | None = None, github: GitHub | None = None, root: Path
         for release_id in delete_drafts(args.tag, github):
             print(f"deleted unpublished draft {release_id} for {args.tag}")
         return 0
-    problems = evaluate(args.tag, flatten(github.releases()), root)
+    releases = flatten(github.releases())
+    if args.check_newest:
+        problems = newest_problems(args.tag, releases)
+        for problem in problems:
+            print(f"publish check failed: {problem}", file=sys.stderr)
+        if not problems:
+            print(f"{args.tag} is the newest published stable release")
+        return 1 if problems else 0
+    problems = evaluate(args.tag, releases, root)
     for problem in problems:
         print(f"release refused: {problem}", file=sys.stderr)
     if not problems:

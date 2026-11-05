@@ -94,6 +94,27 @@ class ReleaseWorkflowTest(unittest.TestCase):
                     continue
                 self.assertRegex(uses.split(" ")[0], PINNED)
 
+    def test_publish_rechecks_the_gate_and_serializes_across_tags(self) -> None:
+        publish = self.release["jobs"]["publish"]
+        self.assertEqual(publish["concurrency"], {"group": "release-publish", "cancel-in-progress": False})
+        runs = [step.get("run", "") for step in steps(publish)]
+        create = next(i for i, run in enumerate(runs) if "gh release create" in run)
+        patch = next(i for i, run in enumerate(runs) if "make_latest=true" in run)
+        gates = [
+            i for i, run in enumerate(runs)
+            if "release-gate.py" in run and "--delete-drafts" not in run and "--check-newest" not in run
+        ]
+        self.assertTrue(any(create < i < patch for i in gates), "full gate between draft creation and publish")
+        self.assertTrue(any("--check-newest" in run for run in runs[patch + 1:]), "newest check after publish")
+
+    def test_container_images_are_digest_pinned(self) -> None:
+        image = re.compile(r"\b(?:rust|ubuntu|debian|fedora|alpine|docker\.io/[\w./-]+):[\w.-]+(@sha256:[0-9a-f]{64})?")
+        for name in ("release.yml", "upgrade-check.yml", "ci-ssh-remote.yml"):
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            for match in image.finditer(text):
+                self.assertTrue(match.group(1), f"{name}: container image {match.group(0)} is not digest-pinned")
+        self.assertRegex((WORKFLOWS / "ci-ssh-remote.yml").read_text(), r"rust:1-bullseye@sha256:[0-9a-f]{64}")
+
     def test_the_release_is_marked_latest_explicitly(self) -> None:
         publish = self.release["jobs"]["publish"]
         self.assertTrue(any("make_latest=true" in step.get("run", "") for step in steps(publish)))

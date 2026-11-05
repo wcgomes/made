@@ -274,6 +274,11 @@ jobs:
     environment: release
     permissions:
       contents: write
+    # One publish at a time across every tag, so the publish-time gate below
+    # cannot race another release becoming latest.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
     steps:
       - name: Check out the tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -309,6 +314,11 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "Made $version" --notes-file "$RUNNER_TEMP/notes.md" dist/release/*
 
+      - name: Re-run the version gate immediately before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+
       - name: Publish as the latest release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -320,6 +330,15 @@ jobs:
           gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -F prerelease=false -f make_latest=true
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets \
             --jq '{isDraft, isPrerelease, assets: (.assets | length)}'
+
+      - name: Confirm the published release is the newest and latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          test "$latest" = "$GITHUB_REF_NAME" || { echo "latest release is $latest, not $GITHUB_REF_NAME" >&2; exit 1; }
+          python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --check-newest
 
   upgrade-check:
     name: Post-publish upgrade check
