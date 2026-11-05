@@ -115,7 +115,7 @@ def stage(args: argparse.Namespace, root: Path = ROOT) -> Path:
         shutil.copy2(root / name, out / name)
 
     # Release AppPaths resolves the app-owned plugin at
-    # <install_root>/plugins/opencode-made, never plugin/opencode-made.
+    # <install_root>/plugins/opencode-made, never the obsolete singular directory.
     shutil.copytree(
         root / "plugins/opencode-made",
         out / "plugins/opencode-made",

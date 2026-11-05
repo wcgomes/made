@@ -429,15 +429,22 @@ fn supported_targets_are_documented_and_covered_by_ci() {
 fn development_artifact_uses_the_release_plugin_layout() {
     let root = repo_root();
     let artifacts = read(root.join(".github/workflows/ci-artifacts.yml"));
+    let staging = read(root.join(".github/scripts/stage-desktop-package.py"));
 
     assert!(
-        artifacts.contains("$stage/plugins/opencode-made"),
-        "the artifact root must stage the plugin at <install_root>/plugins/opencode-made"
+        artifacts.contains(".github/scripts/stage-desktop-package.py --profile debug"),
+        "development artifacts must use the staging script shared with releases"
     );
     assert!(
-        !artifacts.contains("$stage/plugin/opencode-made"),
-        "the artifact must not use the obsolete singular plugin directory"
+        staging.contains(r#""plugins/opencode-made""#),
+        "the artifact root must stage the plugin at <install_root>/plugins/opencode-made"
     );
+    for text in [&artifacts, &staging] {
+        assert!(
+            !text.contains("plugin/opencode-made"),
+            "the artifact must not use the obsolete singular plugin directory"
+        );
+    }
 }
 
 #[test]
