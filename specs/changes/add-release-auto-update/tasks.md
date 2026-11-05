@@ -298,20 +298,20 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - the install lock is OS-held and released when its holder exits, or a stale lock with a dead holder is detected and ignored;
   - in the fallback, a stale lock whose process id now belongs to an unrelated live process, detected by a mismatched start time, is still treated as stale;
   - after the helper is killed before, during and after its swap, the next GUI start succeeds on the previous or new version.
-- [ ] 11.2 Implement the gap-free lock hand-off, the hand-off failure path and the helper outcome record; confirm 11.1 passes (path: crates/made-platform/src/update.rs)
-- [ ] 11.3 Write failing tests for the command-line hand-off (path: crates/made-app/tests/update_restart.rs):
+- [x] 11.2 Implement the gap-free lock hand-off, the hand-off failure path and the helper outcome record; confirm 11.1 passes (path: crates/made-platform/src/update.rs)
+- [x] 11.3 Write failing tests for the command-line hand-off (path: crates/made-app/tests/update_restart.rs):
   - output states that the apply was handed off and has not completed, and the exit code is 0 only on a successful hand-off and non-zero with a clear message otherwise;
   - GUI startup is refused while the hand-off lock is held;
   - an `--update` invocation while the helper still runs reports "apply in progress", and the next one after it ends reports the recorded outcome;
   - after the command-line entry is killed during its checks, the next GUI start is not blocked and succeeds on the previous version;
   - on macOS and Linux the entry still exits when the apply is done.
-- [ ] 11.4 Implement the hand-off messages, exit codes, the GUI refusal during the hand-off, and reporting the previous helper outcome; confirm 11.3 passes (path: crates/made-app/src/main.rs)
-- [ ] 11.5 Write failing tests that the last recorded helper outcome is one row inside an existing diagnostics section (no new section), appears in copied diagnostics, and is redacted under the existing rules (path: crates/made-app/tests/diagnostics.rs)
-- [ ] 11.6 Show the recorded helper outcome in the diagnostics detail; confirm 11.5 passes (path: crates/made-app/src/diagnostics.rs)
-- [ ] 11.7 Write failing tests for AppImage extraction privacy: unit cases, plus an AppImage-level runtime test that launches the built AppImage against pre-planted entries (a directory owned by another user, a user-owned directory with any `077` bit set, a symlink). None is executed from and the symlink is not followed; the outcome is a fresh private directory or a clear exit, per the M2 decision. Enforcement may need a wrapper inside the AppImage (path: .github/scripts/test_linux_appimage_runtime.py)
-- [ ] 11.8 Implement the private extract-and-run target per the M2 decision; confirm 11.7 passes (path: .github/scripts/linux-appimage-runtime.py)
-- [ ] 11.9 Fill the M2 AppImage extraction decision and confirm the hand-off record (path: specs/changes/add-release-auto-update/proposal.md)
-- [ ] 11.10 Make the Windows upgrade check poll `--update` until it no longer reports "apply in progress", within a bounded wait that fails the upgrade check on timeout, then assert the recorded helper outcome and the new version (path: .github/workflows/upgrade-check.yml)
+- [x] 11.4 Implement the hand-off messages, exit codes, the GUI refusal during the hand-off, and reporting the previous helper outcome; confirm 11.3 passes (path: crates/made-app/src/main.rs)
+- [x] 11.5 Write failing tests that the last recorded helper outcome is one row inside an existing diagnostics section (no new section), appears in copied diagnostics, and is redacted under the existing rules (path: crates/made-app/tests/diagnostics.rs)
+- [x] 11.6 Show the recorded helper outcome in the diagnostics detail; confirm 11.5 passes (path: crates/made-app/src/diagnostics.rs)
+- [x] 11.7 Write failing tests for AppImage extraction privacy: unit cases, plus an AppImage-level runtime test that launches the built AppImage against pre-planted entries (a directory owned by another user, a user-owned directory with any `077` bit set, a symlink). None is executed from and the symlink is not followed; the outcome is a fresh private directory or a clear exit, per the M2 decision. Enforcement may need a wrapper inside the AppImage (path: .github/scripts/test_linux_appimage_runtime.py)
+- [x] 11.8 Implement the private extract-and-run target per the M2 decision; confirm 11.7 passes (path: .github/scripts/linux-appimage-runtime.py)
+- [x] 11.9 Fill the M2 AppImage extraction decision and confirm the hand-off record (path: specs/changes/add-release-auto-update/proposal.md)
+- [x] 11.10 Make the Windows upgrade check poll `--update` until it no longer reports "apply in progress", within a bounded wait that fails the upgrade check on timeout, then assert the recorded helper outcome and the new version (path: .github/workflows/upgrade-check.yml)
 
 ## Checkpoint
 - [ ] verify REL-12 "Windows command-line apply hand-off", "Windows hand-off failure", "Killed apply never blocks startup", "Command-line upgrade uses the same path" and "GUI startup refused during command-line apply"; REL-04 "AppImage extraction directory is private"; REL-12 "Post-publish upgrade check" on Windows through 11.10
