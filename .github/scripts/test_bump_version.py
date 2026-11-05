@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -44,6 +45,19 @@ def copy_repository(destination: Path) -> None:
                        capture_output=True)
 
 
+def workspace_version() -> str:
+    spec = importlib.util.spec_from_file_location("check_versions", REPO / ".github/scripts/check-versions.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.workspace_version(REPO)
+
+
+CURRENT = workspace_version()
+_major, _minor, _ = (int(part) for part in CURRENT.split("."))
+# The next minor version, so the fixture always moves forward from the repository.
+TARGET = f"{_major}.{_minor + 1}.0"
+
+
 class BumpVersionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -52,7 +66,7 @@ class BumpVersionTest(unittest.TestCase):
         copy_repository(cls.root)
         cls.before = (cls.root / "plugins/opencode-made/tests/lifecycle.test.ts").read_text()
         cls.result = subprocess.run(
-            ["bash", "scripts/bump-version.sh", "0.2.0"], cwd=cls.root, capture_output=True, text=True
+            ["bash", "scripts/bump-version.sh", TARGET], cwd=cls.root, capture_output=True, text=True
         )
 
     @classmethod
@@ -68,14 +82,14 @@ class BumpVersionTest(unittest.TestCase):
             [sys.executable, ".github/scripts/check-versions.py"], cwd=self.root, capture_output=True, text=True
         )
         self.assertEqual(check.returncode, 0, check.stderr)
-        self.assertIn("0.2.0", check.stdout)
+        self.assertIn(TARGET, check.stdout)
 
     def test_rewrites_exactly_the_source_sites(self) -> None:
         self.assertEqual(self.changed(), SOURCE_SITES)
         readme = (self.root / "plugins/opencode-made/README.md").read_text()
-        self.assertIn('"appVersion": "0.2.0"', readme)
+        self.assertIn(f'"appVersion": "{TARGET}"', readme)
         protocol = (self.root / "plugins/opencode-made/src/protocol.ts").read_text()
-        self.assertIn('export const PLUGIN_VERSION = "0.2.0";', protocol)
+        self.assertIn(f'export const PLUGIN_VERSION = "{TARGET}";', protocol)
 
     def test_test_fixtures_are_untouched(self) -> None:
         after = (self.root / "plugins/opencode-made/tests/lifecycle.test.ts").read_text()
@@ -87,12 +101,12 @@ class BumpVersionTest(unittest.TestCase):
         edits = [line for line in diff if line[:1] in "+-" and not line.startswith(("+++", "---"))]
         self.assertTrue(edits)
         for line in edits:
-            self.assertRegex(line, r'^[+-]version = "0\.(1|2)\.0"$')
+            self.assertIn(line, (f'-version = "{CURRENT}"', f'+version = "{TARGET}"'))
 
     def test_npm_lock_changed_through_npm_and_npm_ci_passes(self) -> None:
         diff = git(self.root, "diff", "-U0", "--", "plugins/opencode-made/package-lock.json")
-        self.assertIn('+  "version": "0.2.0"', diff)
-        self.assertIn('+      "version": "0.2.0"', diff)
+        self.assertIn(f'+  "version": "{TARGET}"', diff)
+        self.assertIn(f'+      "version": "{TARGET}"', diff)
         if shutil.which("npm") is None:
             self.skipTest("npm is not installed")
         ci = subprocess.run(

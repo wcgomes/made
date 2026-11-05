@@ -879,6 +879,21 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         open(&mut model, &root);
     }
     let ids: Vec<_> = model.workspace_ids().collect();
+    let ctx = egui::Context::default();
+    // Bounded wait until every shell has drawn its first output (its prompt),
+    // so the commands below are typed into a started shell on slow runners.
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < ready_deadline
+        && !ids.iter().all(|id| {
+            model
+                .workspace(*id)
+                .and_then(|workspace| workspace.terminal())
+                .is_some_and(|terminal| terminal.output_bytes() > 0)
+        })
+    {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     for id in &ids {
         type_command(
             model.workspace_mut(*id).unwrap(),
@@ -889,7 +904,6 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         model.workspace_mut(ids[0]).unwrap(),
         &format!("cd '{}'", target.display()),
     );
-    let ctx = egui::Context::default();
     // Hosted macOS arm64 runners can take longer to drain the 2000-line shell
     // command. The assertion still requires every hidden tab to produce the
     // output; only the observation window grows.
