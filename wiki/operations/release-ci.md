@@ -1,6 +1,6 @@
 # Release and CI
 
-Made produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -11,6 +11,8 @@ Made produces **unsigned development builds**, not a production release. There i
 | [`ci-linux-display.yml`](../../.github/workflows/ci-linux-display.yml) | Push/PR/manual | `made-app --smoke-test` under Xvfb X11 and headless Weston Wayland; uploads logs. |
 | [`ci-macos.yml`](../../.github/workflows/ci-macos.yml) | Push/PR/manual | macOS arm64/x64 build, platform contract tests, app smoke, attempted native OpenCode install; TUI interaction manual. |
 | [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) | Push/PR/manual | Windows build, platform/PTY contract tests, app smoke, attempted native OpenCode install; TUI interaction manual. |
+| [`release.yml`](../../.github/workflows/release.yml) | `v*` tag push | Gate, release build and Velopack pack per target, installed smoke, publish (protected `release` environment), post-publish upgrade check. |
+| [`upgrade-check.yml`](../../.github/workflows/upgrade-check.yml) | Manual, called by `release.yml` | Installs the previous published release per target/form and updates it in place to the latest. |
 
 CI jobs deliberately record “manual validation required” instead of claiming native behavior they cannot exercise.
 
@@ -27,8 +29,8 @@ The development artifact stages the plugin at `<artifact_root>/plugins/opencode-
 
 ## Release limits
 
-- Artifacts are unsigned; a local macOS build may be quarantined by Gatekeeper.
-- No notarization, installer, package repository, or auto-update payload.
+- Artifacts and releases are unsigned (macOS bundles are ad-hoc signed only); Gatekeeper and SmartScreen warn on first run.
+- No notarization or package repository; GitHub Releases is the only channel.
 - The packaged/staged layout has **not been launched end-to-end**.
 - CI is observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; artifacts are assembled but remain unlaunched, and green CI is not native UX evidence.
 - CI does not validate native window managers/compositors, native input/IME/clipboard, native shell hooks, Windows Job Object cleanup, native OpenCode TUI interaction, native macOS/Windows backdrop rendering, or hardware-GPU pacing.
@@ -43,6 +45,31 @@ MADE_NATIVE_BACKDROP=off \
 DISPLAY=127.0.0.1:99 LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
   target/debug/made-app --smoke-test 2500 /path/to/workspace
 ```
+
+## Releases
+
+Releases are produced only by pushing a `v<major>.<minor>.<patch>` tag; branch pushes and pull requests never create or modify a release. `[workspace.package].version` in `Cargo.toml` is the single version source, and `ci.yml` fails on any drift of the other sites.
+
+### Bump and release
+
+1. Run `scripts/bump-version.sh X.Y.Z` (stable versions only). It rewrites the workspace version, `plugins/opencode-made/package.json` and `package-lock.json` (through `npm version`), the plugin's `PLUGIN_VERSION`, `plugins/grok-made/plugin.json` and the README `appVersion` example, refreshes `Cargo.lock` through cargo and runs `.github/scripts/check-versions.py`. Commit the result through a pull request.
+2. After the merge: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. CI then runs, in order: the version gate (`release-gate.py`: refuses prerelease or build tags, a version not greater than the newest published stable release, an already published tag, or any version-site disagreement); the SSH companions and the release build and Velopack pack for Windows x64, macOS arm64, macOS x64 and Linux x64 with the glibc 2.35, `NEEDED`, import and minimum-OS checks; the installed-layout smoke of every target and macOS form; maintainer approval in the protected `release` environment; publish (stale draft removed, draft created with every asset and `SHA256SUMS`, notes from `.github/release-notes.md`, then published with `make_latest=true`); and the post-publish upgrade check from the previous release. A failure before publish leaves at most an unpublished draft.
+4. A failed upgrade check is remedied by publishing a fixed, newer release. The failing release is never modified or replaced.
+
+If the gate refuses the tag, read its message, fix the sites with the bump script or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
+
+### Manual maintainer steps
+
+These are not automated and are not configured by implementers:
+
+- A repository ruleset for `v*` tags restricting creation, update and deletion to a maintainer bypass list. GitHub rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
+- The protected `release` environment with required reviewers (GitHub creates it unprotected on the first release run; add the protection under **Settings › Environments › release**).
+- GitHub immutable releases, enabled only after the final `v0.1.0` re-release, never before.
+
+### One-time rollout cleanup
+
+Iteration releases (`v0.1.0`, `v0.1.1`, …) were cut during implementation and marked as temporary. Once verified: delete every iteration release first, then their tags, then re-release `v0.1.0` from the final commit. On every machine that installed an iteration release: uninstall Made (`0.1.0` is lower than the installed version); run `grok plugin uninstall grok-made --confirm` locally and on each SSH server where Made installed it; and remove Made's staged remote version directories on each SSH server.
 
 ## Release-blocking boundary
 
