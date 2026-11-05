@@ -7300,9 +7300,12 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
 
     headless.render_events(vec![pointer_button(dragged_center, false)]);
     let away = egui::pos2(100.0, 400.0);
-    headless.render_events(vec![egui::Event::PointerMoved(away)]);
+    // Frame-paced clock for the fade-out check: a loaded runner's wall clock
+    // can pass the whole ~140 ms fade between two frames.
+    let left_at = headless.last_time;
+    headless.render_events_at(vec![egui::Event::PointerMoved(away)], left_at + 1.0 / 60.0);
     let leaving_center = headless.response(splitter).rect.center();
-    let leaving = headless.render();
+    let leaving = headless.render_events_at(Vec::new(), left_at + 2.0 / 60.0);
     assert!(
         shape_hits_point(&leaving, leaving_center),
         "leaving the splitter must fade out rather than vanish instantly"
