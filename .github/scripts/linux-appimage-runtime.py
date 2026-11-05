@@ -12,11 +12,23 @@ namespaces. The feed's size, SHA-1 and SHA-256 are rewritten to match.
 Extraction is private to the user (security M2): uruntime's default target is
 a predictable shared `$TMPDIR/appimage_extracted_*` directory that it reuses
 without checking its owner, so another local user could plant code there. The
-embedded `APPIMAGE_TARGET_DIR=${HOME}/.cache/made/appimage-<version>` keeps
-the target inside the user's home, the image root is mode 0700 so a fresh
-extraction is private, and the image's `AppRun` is a guard that refuses to
-start unless the extraction directory is a real directory owned by the user
-with no group or other permission bits, then runs Velopack's `AppRun`.
+embedded `APPIMAGE_TARGET_DIR=${HOME}/.cache/made/appimage-<version>-<hash>`
+keeps the target in a per-user location, named by the image's content hash so
+two builds of one version never share an extraction. The image root is mode
+0700 so a fresh extraction is private. uruntime 0.8.1 expands only plain
+`${NAME}` references in embedded settings, with no default value, so the
+target cannot prefer `$XDG_RUNTIME_DIR` and fall back to `$HOME/.cache`; a
+target under an unset `$XDG_RUNTIME_DIR` would leave Made unable to start, so
+the target is always under `$HOME/.cache`.
+
+The image's `AppRun` is a guard, kept as defence in depth: it refuses to start
+unless the extraction directory is a real directory owned by the user with no
+group or other permission bits and its parent is owned by the user (which it
+then makes 0700). uruntime reuses any non-empty target, so an extraction cut
+short (killed, or a full disk) would otherwise be run as is: the guard checks
+every file against the SHA-256 manifest built into the image, and on a
+mismatch removes the extraction and starts the AppImage once more to extract
+afresh. Then it runs Velopack's `AppRun`.
 """
 
 from __future__ import annotations
@@ -32,23 +44,64 @@ import sys
 import zipfile
 from pathlib import Path
 
+MANIFEST = ".made-manifest.sha256"
+
 GUARD = """#!/bin/sh
-# Made: start only from an extraction directory private to this user.
+# Made: start only from a complete extraction in a directory private to this user.
 dir="${APPDIR:-$(dirname "$0")}"
-owner="$(stat -c %u "$dir" 2>/dev/null)"
+owned() {
+  [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c %u "$1" 2>/dev/null)" = "$(id -u)" ]
+}
 mode="$(stat -c %a "$dir" 2>/dev/null)"
-if [ -L "$dir" ] || [ ! -d "$dir" ] || [ "$owner" != "$(id -u)" ] || [ -z "$mode" ] \\
-  || [ $((0$mode & 077)) -ne 0 ]; then
+if ! owned "$dir" || [ -z "$mode" ] || [ $((0$mode & 077)) -ne 0 ]; then
   echo "made: refusing to start from $dir: it is not a private directory owned by this user" >&2
   exit 1
 fi
-unset APPIMAGE_EXTRACT_AND_RUN
+parent="$(dirname "$dir")"
+if ! owned "$parent"; then
+  echo "made: refusing to start from $dir: its parent $parent is not owned by this user" >&2
+  exit 1
+fi
+chmod 700 "$parent" 2>/dev/null
+if ! (cd "$dir" && sha256sum --quiet --strict -c MANIFEST_NAME >/dev/null 2>&1); then
+  rm -rf "$dir"
+  if [ -n "$MADE_APPIMAGE_REEXTRACTED" ] || [ ! -f "$APPIMAGE" ]; then
+    echo "made: the extracted copy of Made in $dir was incomplete and has been removed; start Made again" >&2
+    exit 1
+  fi
+  export MADE_APPIMAGE_REEXTRACTED=1
+  exec "$APPIMAGE" "$@"
+fi
+unset APPIMAGE_EXTRACT_AND_RUN MADE_APPIMAGE_REEXTRACTED
 exec "$dir/AppRun.velopack" "$@"
-"""
+""".replace("MANIFEST_NAME", MANIFEST)
 
 
-def embedded_envs(version: str) -> str:
-    return f"APPIMAGE_EXTRACT_AND_RUN=1\nAPPIMAGE_TARGET_DIR=${{HOME}}/.cache/made/appimage-{version}"
+def embedded_envs(version: str, content_hash: str) -> str:
+    return (
+        "APPIMAGE_EXTRACT_AND_RUN=1\n"
+        f"APPIMAGE_TARGET_DIR=${{HOME}}/.cache/made/appimage-{version}-{content_hash}"
+    )
+
+
+def write_manifest(root: Path) -> None:
+    """SHA-256 of every file in the image, in `sha256sum -c` format."""
+    lines = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            fail(f"{relative} is not a plain file or directory; the guard checks only those")
+        if "\n" in relative or "\\" in relative:
+            fail(f"{relative!r} cannot be listed in the manifest")
+        if path.is_file():
+            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  ./{relative}\n")
+    if not lines:
+        fail("the image holds no files")
+    (root / MANIFEST).write_text("".join(lines), encoding="utf-8")
+
+
+def content_hash(image: Path) -> str:
+    return hashlib.sha256(image.read_bytes()).hexdigest()[:16]
 
 
 def fail(message: str) -> None:
@@ -75,6 +128,7 @@ def rebuild(appimage: Path, runtime: Path, version: str) -> None:
     guard = root / "AppRun"
     guard.write_text(GUARD, encoding="utf-8")
     guard.chmod(0o755)
+    write_manifest(root)
     root.chmod(0o700)
     rebuilt_image = work / "rebuilt.squashfs"
     env = dict(os.environ)
@@ -87,7 +141,7 @@ def rebuild(appimage: Path, runtime: Path, version: str) -> None:
         with rebuilt_image.open("rb") as source:
             shutil.copyfileobj(source, target)
     rebuilt.chmod(rebuilt.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    envs = embedded_envs(version)
+    envs = embedded_envs(version, content_hash(rebuilt_image))
     subprocess.run([str(rebuilt), "--appimage-addenvs", envs], check=True)
     shown = subprocess.run([str(rebuilt), "--appimage-envs"], check=True, capture_output=True, text=True).stdout
     for line in envs.splitlines():

@@ -151,9 +151,16 @@ def check_extraction_guard(image: Path, version: str) -> None:
     Runs the installed AppImage normally, then with the extraction target
     pre-planted as a directory owned by another user, a directory with group
     and other permission bits, and a symlink; each planted case must refuse.
+    An interrupted extraction (a file cut short, or most files missing) is
+    never run: Made extracts afresh and starts.
     """
-    target = Path.home() / ".cache" / "made" / f"appimage-{version}"
-    real = target.with_name(f"appimage-{version}-real")
+    envs = run([image, "--appimage-envs"]).stdout.splitlines()
+    setting = next((line for line in envs if line.startswith("APPIMAGE_TARGET_DIR=")), "")
+    target = Path(setting.partition("=")[2].replace("${HOME}", str(Path.home())))
+    check(target.parent == Path.home() / ".cache" / "made"
+          and target.name.startswith(f"appimage-{version}-") and len(target.name) == len(f"appimage-{version}-") + 16,
+          f"the extraction target is per user, version and build: {target}")
+    real = target.with_name(f"{target.name}-real")
     for path in (target, real):
         run(["sudo", "rm", "-rf", path])
     keep = dict(os.environ, NO_CLEANUP="1")
@@ -184,6 +191,22 @@ def check_extraction_guard(image: Path, version: str) -> None:
     target.symlink_to(real)
     refused("a symlink")
     target.unlink()
+
+    def recovers(label: str) -> None:
+        result = run([image, "--version"])
+        check(result.returncode == 0 and result.stdout.strip() == f"Made {version}",
+              f"an interrupted extraction ({label}) is replaced and Made starts")
+
+    shutil.copytree(real, target, symlinks=True)
+    largest = max((path for path in target.rglob("*") if path.is_file()), key=lambda path: path.stat().st_size)
+    with largest.open("r+b") as handle:
+        handle.truncate(largest.stat().st_size // 2)
+    recovers("a file cut short")
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(mode=0o700)
+    shutil.copy2(real / "AppRun", target / "AppRun")
+    recovers("most files missing")
+    shutil.rmtree(target, ignore_errors=True)
     shutil.rmtree(real)
     result = run([image, "--version"])
     check(result.returncode == 0 and result.stdout.strip() == f"Made {version}", "the AppImage starts again once the planted target is gone")
