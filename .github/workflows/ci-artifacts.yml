@@ -2,7 +2,7 @@ name: Development artifacts
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.1.0] # TEMP release/v0.1.0
   workflow_dispatch:
 
 permissions:
@@ -73,6 +73,11 @@ jobs:
       - name: Build the workspace
         run: cargo build --workspace --locked --target ${{ matrix.target }}
 
+      # The shipped hook is the release build for the host target, staged
+      # below into plugins/grok-made; no interpreter runs it.
+      - name: Build the native Grok hook
+        run: cargo build -p made-grok-hook --locked --release --target ${{ matrix.target }}
+
       - name: Install Node.js 24
         uses: actions/setup-node@v7
         with:
@@ -102,13 +107,16 @@ jobs:
           test -f "$stage/plugins/opencode-made/package.json"
           # The shipped grok-made package rides in every desktop package so
           # both the local install and the staged remote copy never download.
-          cp -R plugins/grok-made "$stage/plugins/grok-made"
+          # It is the repository source plus the host-target native hook,
+          # staged by the same script that stages the remote copies.
+          bash .github/scripts/stage-grok-plugin.sh "$TARGET" \
+            "target/${TARGET}/release/made-grok-status${EXE}" "$stage/plugins/grok-made"
           test -f "$stage/plugins/grok-made/plugin.json"
           test -f "$stage/plugins/grok-made/hooks/hooks.json"
-          test -f "$stage/plugins/grok-made/hooks/bin/status.py"
-          # The hook runs bin/status.py directly; keep the shipped executable
-          # bit regardless of the runner umask.
-          chmod 755 "$stage/plugins/grok-made/hooks/bin/status.py"
+          test -s "$stage/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          test -x "$stage/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          # Source only: no Python hook or test file ships.
+          test -z "$(find "$stage/plugins/grok-made" -name '*.py')"
           test ! -e "$stage/plugin"
 
           node - "$stage" <<'NODE'
@@ -212,6 +220,38 @@ jobs:
             --askpass-manifest askpass-artifact/manifest.json \
             --desktop-target "$TARGET"
           find "dist/made-development-${TARGET}" -type f -print | sort
+
+      # The packaged-layout test: the staged hook, from the desktop package,
+      # run as Grok runs it (one event, stdin left open) with every PATH entry
+      # that provides python or python3 removed. The test binary is built
+      # first with the full PATH because linking needs the system toolchain.
+      - name: Run the packaged Grok hook with Python removed from PATH
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" --no-run
+          hook="$PWD/dist/made-development-${TARGET}/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          test -x "$hook"
+          clean=""
+          IFS=':' read -r -a entries <<< "$PATH"
+          for entry in "${entries[@]}"; do
+            [ -n "$entry" ] || continue
+            if [ -e "$entry/python" ] || [ -e "$entry/python3" ] \
+              || [ -e "$entry/python.exe" ] || [ -e "$entry/python3.exe" ]; then
+              echo "removing from PATH: $entry"
+              continue
+            fi
+            clean="${clean:+$clean:}$entry"
+          done
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            hook="$(cygpath -w "$hook")"
+          fi
+          PATH="$clean" bash -c 'command -v python python3 >/dev/null 2>&1 && { echo "python is still on PATH" >&2; exit 1; }; exit 0'
+          MADE_PACKAGED_HOOK="$hook" PATH="$clean" \
+            cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" -- --nocapture
 
       - name: Upload the development artifact
         uses: actions/upload-artifact@v7

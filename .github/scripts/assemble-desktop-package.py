@@ -32,8 +32,7 @@ FILES = (
     "plugins/grok-made/plugin.json",
     "plugins/grok-made/README.md",
     "plugins/grok-made/hooks/hooks.json",
-    "plugins/grok-made/hooks/status_test.py",
-    "plugins/grok-made/hooks/bin/status.py",
+    "plugins/grok-made/hooks/bin/made-grok-status",
 )
 MAX_BYTES = 128 * 1024 * 1024
 
@@ -144,10 +143,11 @@ def copy_tree(source: Path, destination: Path) -> None:
     if not made.is_file() or made.stat().st_size <= 0:
         fail(f"copied companion is missing: {made}")
     made.chmod(made.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    hook = destination / "plugins/grok-made/hooks/bin/status.py"
+    hook = destination / "plugins/grok-made/hooks/bin/made-grok-status"
     if not hook.is_file() or hook.stat().st_size <= 0:
-        fail(f"copied hook script is missing: {hook}")
-    hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        fail(f"copied native hook is missing or empty: {hook}")
+    if not hook.stat().st_mode & stat.S_IXUSR:
+        fail(f"copied native hook is not executable: {hook}")
 
 
 def verify_askpass(path: Path, manifest_path: Path, expected_target: str) -> dict:

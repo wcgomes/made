@@ -6,6 +6,8 @@ name: SSH remote companions
 # companion for download at connection time.
 
 on:
+  push:
+    branches: [release/v0.1.0] # TEMP release/v0.1.0
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -233,9 +235,9 @@ jobs:
           cd "$RUNNER_TEMP/ssh-companion"
           sha256sum -c SHA256SUMS
           # Artifact upload/download does not preserve file modes.
-          chmod 755 made-remote plugins/grok-made/hooks/bin/status.py
+          chmod 755 made-remote plugins/grok-made/hooks/bin/made-grok-status
           test -x made-remote
-          test -x plugins/grok-made/hooks/bin/status.py
+          test -x plugins/grok-made/hooks/bin/made-grok-status
           # SHA256SUMS and manifest.json are produced by the same build, so the
           # manifest's target/linkage fields plus the actual ELF identity are
           # what tie the bytes to the expected glibc 2.31 x86_64 companion.
@@ -245,6 +247,17 @@ jobs:
             *"ELF 64-bit LSB"*"x86-64"*) ;;
             *)
               echo "made-remote is not an x86-64 ELF: $file_output" >&2
+              exit 1
+              ;;
+          esac
+          # The staged grok-made hook is a native executable for the same
+          # target, never a script.
+          hook_output="$(file plugins/grok-made/hooks/bin/made-grok-status)"
+          printf '%s\n' "$hook_output"
+          case "$hook_output" in
+            *"ELF 64-bit LSB"*"x86-64"*) ;;
+            *)
+              echo "made-grok-status is not an x86-64 ELF: $hook_output" >&2
               exit 1
               ;;
           esac
@@ -262,6 +275,11 @@ jobs:
           entry = next(item for item in manifest['files']
                        if item['name'] == 'made-remote')
           assert entry['size'] == pathlib.Path('made-remote').stat().st_size, entry
+          hook = next(item for item in manifest['files']
+                      if item['name'] == 'plugins/grok-made/hooks/bin/made-grok-status')
+          hook_path = pathlib.Path('plugins/grok-made/hooks/bin/made-grok-status')
+          assert hook['size'] == hook_path.stat().st_size, hook
+          assert len(manifest['files']) == 10, manifest['files']
           PY
 
       - name: Harness contract tests

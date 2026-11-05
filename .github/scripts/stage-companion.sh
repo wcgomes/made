@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Stage one companion and the allowlisted plugin files the Stage stream sends.
-# Names match made_app::remote_session::STAGE_FILES. Empty files and files
-# over the 128 MiB stage cap fail here, not at connection time.
+# Usage: stage-companion.sh <target> <companion-binary> <hook-binary> <out>.
+# Names match made_app::remote_session::STAGE_FILES (10 artifacts). The
+# grok-made package, including the native session-status hook built for the
+# same target, comes from stage-grok-plugin.sh. Empty files and files over the
+# 128 MiB stage cap fail here, not at connection time.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -10,7 +13,8 @@ source "$root/.github/scripts/hash.sh"
 
 target="${1:?target required}"
 binary="${2:?binary required}"
-out="${3:?output directory required}"
+hook="${3:?hook binary required}"
+out="${4:?output directory required}"
 
 case "$target" in
   x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;;
@@ -30,13 +34,12 @@ files=(
   plugins/grok-made/plugin.json
   plugins/grok-made/README.md
   plugins/grok-made/hooks/hooks.json
-  plugins/grok-made/hooks/status_test.py
-  plugins/grok-made/hooks/bin/status.py
+  plugins/grok-made/hooks/bin/made-grok-status
 )
 
 max_bytes=$((128 * 1024 * 1024))
 rm -rf "$out"
-mkdir -p "$out/plugins/opencode-made/src" "$out/plugins/grok-made/hooks/bin"
+mkdir -p "$out/plugins/opencode-made/src"
 
 cp "$binary" "$out/made-remote"
 chmod 755 "$out/made-remote"
@@ -45,14 +48,10 @@ cp "$root/plugins/opencode-made/tui.ts" "$out/plugins/opencode-made/tui.ts"
 cp "$root/plugins/opencode-made/index.ts" "$out/plugins/opencode-made/index.ts"
 cp "$root/plugins/opencode-made/src/protocol.ts" "$out/plugins/opencode-made/src/protocol.ts"
 cp "$root/plugins/opencode-made/src/integration.ts" "$out/plugins/opencode-made/src/integration.ts"
-cp "$root/plugins/grok-made/plugin.json" "$out/plugins/grok-made/plugin.json"
-cp "$root/plugins/grok-made/README.md" "$out/plugins/grok-made/README.md"
-cp "$root/plugins/grok-made/hooks/hooks.json" "$out/plugins/grok-made/hooks/hooks.json"
-cp "$root/plugins/grok-made/hooks/status_test.py" "$out/plugins/grok-made/hooks/status_test.py"
-cp "$root/plugins/grok-made/hooks/bin/status.py" "$out/plugins/grok-made/hooks/bin/status.py"
-# The hook runs bin/status.py directly; the shipped executable bit must survive
-# packaging exactly like the companion binary's.
-chmod 755 "$out/plugins/grok-made/hooks/bin/status.py"
+# The hook runs directly; the shipped executable bit must survive packaging
+# exactly like the companion binary's, and the hook must be a native binary
+# for this target, never a script.
+bash "$root/.github/scripts/stage-grok-plugin.sh" "$target" "$hook" "$out/plugins/grok-made"
 
 linkage_kind="${LINKAGE_KIND:?LINKAGE_KIND required}"
 case "$linkage_kind" in

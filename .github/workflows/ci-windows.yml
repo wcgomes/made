@@ -2,7 +2,7 @@ name: Windows native smoke
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.1.0] # TEMP release/v0.1.0
   pull_request:
   workflow_dispatch:
 
@@ -42,6 +42,9 @@ jobs:
 
       - name: Run PTY/ConPTY contract tests
         run: cargo test -p made-terminal --test pty --locked
+
+      - name: Run the native Grok hook tests
+        run: cargo test -p made-grok-hook --locked
 
       - name: Install Node.js 24
         uses: actions/setup-node@v7

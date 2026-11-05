@@ -2,7 +2,7 @@ name: macOS smoke
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.1.0] # TEMP release/v0.1.0
   pull_request:
   workflow_dispatch:
 
@@ -53,6 +53,9 @@ jobs:
 
       - name: Run the platform contract tests
         run: cargo test -p made-platform --test contract --locked --target ${{ matrix.target }}
+
+      - name: Run the native Grok hook tests
+        run: cargo test -p made-grok-hook --locked --target ${{ matrix.target }}
 
       - name: Install Node.js 24
         uses: actions/setup-node@v7
