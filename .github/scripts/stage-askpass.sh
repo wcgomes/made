@@ -2,6 +2,8 @@
 # Package the native askpass helper for one desktop host.
 # Default platform features stay off so this helper does not pull the desktop
 # clipboard or backdrop crates. It is not a remote companion.
+# PROFILE=release builds the release profile for installers; the default stays
+# debug so development artifacts and ci-ssh-remote.yml are unchanged.
 set -euo pipefail
 
 target="${TARGET:?TARGET required}"
@@ -9,6 +11,16 @@ case "$target" in
   x86_64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin|x86_64-pc-windows-msvc) ;;
   *)
     echo "no desktop askpass target for $target" >&2
+    exit 1
+    ;;
+esac
+
+profile="${PROFILE:-debug}"
+case "$profile" in
+  debug) profile_args=() ;;
+  release) profile_args=(--release) ;;
+  *)
+    echo "PROFILE must be debug or release, got $profile" >&2
     exit 1
     ;;
 esac
@@ -27,8 +39,9 @@ case "$target" in
     ;;
 esac
 
-cargo build -p made-platform --bin made-askpass --locked --no-default-features --target "$target"
-bin="target/${target}/debug/made-askpass${exe}"
+cargo build -p made-platform --bin made-askpass --locked --no-default-features --target "$target" \
+  ${profile_args[@]+"${profile_args[@]}"}
+bin="target/${target}/${profile}/made-askpass${exe}"
 if [ ! -f "$bin" ] || [ ! -s "$bin" ]; then
   echo "askpass binary missing or empty: $bin" >&2
   exit 1
