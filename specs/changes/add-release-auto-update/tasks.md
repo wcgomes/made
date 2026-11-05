@@ -5,14 +5,14 @@ Readiness: `analyze` must pass before implementation; review runs `verify` again
 Phase 1 probes must finish, and any fallback that changes observable behavior must be routed back into spec.md with `analyze` rerun, before Phases 3 to 7 start. Cross-change ordering with `specs/changes/grok-native-hook/` is listed under Cross-change dependencies. The only wiki edit in scope is 8.2; other descriptive knowledge is updated by a post-implementation ingest.
 
 ## 1. Early verification probes (Velopack and self-containment)
-- [ ] 1.1 Create a standalone probe crate with its own empty `[workspace]` table, not a workspace member, depending only on a pinned `velopack` crate version (path: tests/release-probe/Cargo.toml)
-- [ ] 1.2 Write the probe binary. It runs Velopack's startup hook with auto-apply-on-startup disabled; reports installed vs not-installed detection, channel and installed version; checks a feed for a newer stable version only; downloads, then applies and restarts on a flag; logs every request URL and redirect hop; and reports whether the check request can be observed at the transport layer, and otherwise the full header set it sends, including `User-Agent`. This verifies the Rust SDK API for check, download and apply. Fallbacks, applied in Phase 4:
+- [x] 1.1 Create a standalone probe crate with its own empty `[workspace]` table, not a workspace member, depending only on a pinned `velopack` crate version (path: tests/release-probe/Cargo.toml)
+- [x] 1.2 Write the probe binary. It runs Velopack's startup hook with auto-apply-on-startup disabled; reports installed vs not-installed detection, channel and installed version; checks a feed for a newer stable version only; downloads, then applies and restarts on a flag; logs every request URL and redirect hop; and reports whether the check request can be observed at the transport layer, and otherwise the full header set it sends, including `User-Agent`. This verifies the Rust SDK API for check, download and apply. Fallbacks, applied in Phase 4:
   - no GitHub source: use an HTTPS source at `https://github.com/<owner>/<repo>/releases/latest/download/`, which excludes prereleases;
   - auto-apply on startup cannot be disabled: stop and return to the user (conflicts with REL-07);
   - no way to tell non-installed builds: gate on an installed-layout marker resolved in `made-platform`;
   - hosts or redirects cannot be restricted: implement a custom update source in `made-platform` that enforces the REL-08 allowlist on every hop;
   - no SHA-256 or embedded-version check before apply: `made-platform` performs both before marking an update ready (path: tests/release-probe/src/main.rs)
-- [ ] 1.3 Add a manually triggered macOS probe job on arm64 and x64 runners (path: .github/workflows/release-probe.yml).
+- [x] 1.3 Add a manually triggered macOS probe job on arm64 and x64 runners (path: .github/workflows/release-probe.yml).
   - Pack the probe at two versions as `.pkg` and `.zip`, in a layout mirroring REL-03 (`plugins/`, `remote/<target>/`, askpass).
   - Install the `.pkg` for the current user without admin. Separately, extract the `.zip` into `~/Applications` with the quarantine attribute set.
   - Check that the plugin can be resolved from `Contents/Resources` and that companions and askpass can be resolved next to the executable.
@@ -21,7 +21,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
     - Layout: if Velopack accepts a prebuilt `.app` as pack input, build the bundle with the Resources/MacOS split ourselves. Otherwise, after `grok-native-hook` 3.2, extend `made-platform` release resolution so the plugin also resolves inside the bundle's executable directory (app-owned), and rerun `analyze`.
     - Installer: if the `.pkg` needs admin, the `.zip` into `~/Applications` becomes the documented primary path, and the `.pkg` ships only if it installs per-user. Otherwise return to the user.
     - Signature: if the arm64 signature is invalid after pack or update, ad-hoc sign (`codesign --sign -`, no identity) during packaging.
-- [ ] 1.4 Add a Linux AppImage probe job on `ubuntu-22.04` and `ubuntu-24.04` runners (path: .github/workflows/release-probe.yml).
+- [x] 1.4 Add a Linux AppImage probe job on `ubuntu-22.04` and `ubuntu-24.04` runners (path: .github/workflows/release-probe.yml).
   - Use VMs, not containers, because containers lack `/dev/fuse` and do not model a desktop.
   - Purge libfuse2/libfuse3 and `fusermount`, and assert they are absent.
   - Launch the probe AppImage and perform a v1-to-v2 update with the AppImage stored in a user directory.
@@ -29,12 +29,12 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - Fallback decision:
     - (A) Replace Velopack's AppImage runtime with the static FUSE-less AppImage type-2 runtime in post-processing. Accept it only if a re-run shows launch and update still work.
     - (B) Otherwise stop and return to the user, because the remaining options (a documented FUSE prerequisite, or a non-updating tarball) change REL-04 or REL-01.
-- [ ] 1.5 Add a job that inspects Velopack's own installer and updater binaries against the REL-04 baseline. Fallback: any dependency outside the baseline stops and returns to the user (path: .github/workflows/release-probe.yml)
+- [x] 1.5 Add a job that inspects Velopack's own installer and updater binaries against the REL-04 baseline. Fallback: any dependency outside the baseline stops and returns to the user (path: .github/workflows/release-probe.yml)
   - Windows: imports (`dumpbin /dependents`) and the requested execution level (per-user, `asInvoker`, install under `%LocalAppData%`).
   - macOS: `otool -L` and minos for the update helper.
   - Linux: ELF `NEEDED` entries inside the AppImage.
-- [ ] 1.6 Add a Windows job that builds `made-app.exe`, `made-askpass.exe` and `made-grok-status.exe` with `-C target-feature=+crt-static`, asserts their imports contain no `VCRUNTIME*`, `MSVCP*` or `api-ms-win-crt-*` DLLs, and runs `made-app --smoke-test`. Fallback: app-local deployment of the VC++ runtime DLLs beside those executables, under Microsoft's redistribution terms (path: .github/workflows/release-probe.yml)
-- [ ] 1.7 Add a channels, naming and kill-point job on each OS (path: .github/workflows/release-probe.yml).
+- [x] 1.6 Add a Windows job that builds `made-app.exe`, `made-askpass.exe` and `made-grok-status.exe` with `-C target-feature=+crt-static`, asserts their imports contain no `VCRUNTIME*`, `MSVCP*` or `api-ms-win-crt-*` DLLs, and runs `made-app --smoke-test`. Fallback: app-local deployment of the VC++ runtime DLLs beside those executables, under Microsoft's redistribution terms (path: .github/workflows/release-probe.yml)
+- [x] 1.7 Add a channels, naming and kill-point job on each OS (path: .github/workflows/release-probe.yml).
   - Checks:
     - The four channels (`win-x64`, `osx-arm64`, `osx-x64`, `linux-x64`) produce non-colliding feed files in one release folder.
     - Renaming end-user downloads to versioned names keeps updates working.
@@ -44,57 +44,57 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - Fallbacks:
     - A rename breaks updates: keep Velopack's names only for files the feed references and rename the rest. If an end-user download is feed-referenced, return to the user.
     - Any kill point leaves no launchable version: this is release-blocking and returns to the user.
-- [ ] 1.8 Record each probe outcome (pass or chosen fallback), the confirmed Velopack crate version and API names, the observed request and redirect hosts that form the REL-08 allowlist, whether the request is observable at the transport layer or else the full header set sent, including `User-Agent`, and the per-OS swap atomicity in the Decision index. Route any behavior-changing fallback into spec.md (path: specs/changes/add-release-auto-update/proposal.md)
+- [x] 1.8 Record each probe outcome (pass or chosen fallback), the confirmed Velopack crate version and API names, the observed request and redirect hosts that form the REL-08 allowlist, whether the request is observable at the transport layer or else the full header set sent, including `User-Agent`, and the per-OS swap atomicity in the Decision index. Route any behavior-changing fallback into spec.md (path: specs/changes/add-release-auto-update/proposal.md)
 
 ## Checkpoint
-- [ ] Every probe 1.2 to 1.7 has a recorded outcome; no "return to the user" outcome remains unresolved; `analyze` rerun if any fallback changed behavior
+- [x] Every probe 1.2 to 1.7 has a recorded outcome; no "return to the user" outcome remains unresolved; `analyze` rerun if any fallback changed behavior
 
 ## 2. Single version source, bump action and license metadata
-- [ ] 2.1 Write failing tests for the version checker [P] (path: .github/scripts/test_check_versions.py):
+- [x] 2.1 Write failing tests for the version checker [P] (path: .github/scripts/test_check_versions.py):
   - all sites equal passes: workspace `Cargo.toml`, `plugins/opencode-made/package.json`, both root version fields of `plugins/opencode-made/package-lock.json`, `PLUGIN_VERSION` in `plugins/opencode-made/src/protocol.ts`, `plugins/grok-made/plugin.json`;
   - each site's mismatch fails, naming the site and version;
   - tag mismatch fails;
   - invalid semver fails;
   - a prerelease tag is refused.
-- [ ] 2.2 Implement the version checker for every site listed in 2.1 with an optional `--tag`; confirm 2.1 passes (path: .github/scripts/check-versions.py)
-- [ ] 2.3 Add `license = "MIT"` to `[workspace.package]` [P] (path: Cargo.toml)
-- [ ] 2.4 Write failing tests for the bump action on a fixture copy of the repository [P] (path: .github/scripts/test_bump_version.py):
+- [x] 2.2 Implement the version checker for every site listed in 2.1 with an optional `--tag`; confirm 2.1 passes (path: .github/scripts/check-versions.py)
+- [x] 2.3 Add `license = "MIT"` to `[workspace.package]` [P] (path: Cargo.toml)
+- [x] 2.4 Write failing tests for the bump action on a fixture copy of the repository [P] (path: .github/scripts/test_bump_version.py):
   - `bump-version.sh 0.2.0` rewrites exactly the source sites plus the `appVersion` example in `plugins/opencode-made/README.md`, and leaves test fixtures such as `0.1.0-test` untouched;
   - `Cargo.lock` is refreshed through cargo, and `plugins/opencode-made/package-lock.json` changes through `npm version 0.2.0 --no-git-tag-version` with `npm ci` still passing;
   - invalid and prerelease versions are refused;
   - `check-versions.py` passes afterwards.
-- [ ] 2.5 Implement the single bump action and confirm 2.4 passes (path: scripts/bump-version.sh)
-- [ ] 2.6 Make the plugin lifecycle test compare `hello.pluginVersion` with the `package.json` version instead of a literal; confirm it still passes (path: plugins/opencode-made/tests/lifecycle.test.ts)
-- [ ] 2.7 Run the version checker and the 2.1 and 2.4 tests on every push to main and every pull request; land after `grok-native-hook` 2.2 (path: .github/workflows/ci.yml)
+- [x] 2.5 Implement the single bump action and confirm 2.4 passes (path: scripts/bump-version.sh)
+- [x] 2.6 Make the plugin lifecycle test compare `hello.pluginVersion` with the `package.json` version instead of a literal; confirm it still passes (path: plugins/opencode-made/tests/lifecycle.test.ts)
+- [x] 2.7 Run the version checker and the 2.1 and 2.4 tests on every push to main and every pull request; land after `grok-native-hook` 2.2 (path: .github/workflows/ci.yml)
 
 ## Checkpoint
 - [ ] verify REL-02 "One action bumps every version site" (2.4) and "Plugin manifest drifts in a pull request" (2.1 fixtures plus a CI run failing on a drift branch); `check-versions.py` passes on the repository
 
 ## 3. Shared staging and self-contained builds
-- [ ] 3.1 Write failing tests for shared staging. For debug and release profiles, given fake build outputs, the staged tree has (path: .github/scripts/test_stage_desktop_package.py):
+- [x] 3.1 Write failing tests for shared staging. For debug and release profiles, given fake build outputs, the staged tree has (path: .github/scripts/test_stage_desktop_package.py):
   - made-app;
   - `plugins/opencode-made` without `node_modules`;
   - `<install_root>/plugins/grok-made` produced by `stage-grok-plugin.sh` from a fixture hook, with the exact `grok-native-hook` file set and its stamped version;
   - LICENSE and executable bits on Unix;
   - `version.json` whose release profile reports `profile: release` and does not report `installer: none` or `auto_update: none`.
-- [ ] 3.2 Extract the desktop staging from `ci-artifacts.yml`, after the `grok-native-hook` 2.6–6.3 merge, into a profile-aware script. It stages grok-made only through `.github/scripts/stage-grok-plugin.sh`, adds LICENSE and writes profile-specific metadata. Confirm 3.1 passes (path: .github/scripts/stage-desktop-package.py)
-- [ ] 3.3 Switch development artifacts to the shared script with the debug profile. Preserve the `grok-native-hook` 5.4 hook build and its 5.10 packaged-hook test step, and keep artifact names, retention and contents apart from the added LICENSE (path: .github/workflows/ci-artifacts.yml)
-- [ ] 3.4 Configure the Windows MSVC static CRT for all Windows binaries per the 1.6 outcome (path: .cargo/config.toml)
-- [ ] 3.5 Write failing tests for the Linux ELF `NEEDED` allowlist checker using sample `readelf -d` output: glibc libraries and `libgcc_s.so.1` are allowed, any other library fails [P] (path: .github/scripts/test_check_linux_deps.py)
-- [ ] 3.6 Implement the Linux allowlist checker for the REL-04 baseline, including `libgcc_s.so.1`; the glibc 2.35 floor stays with `check-glibc-max.sh`; runtime-loaded libraries are left to fresh-distribution acceptance; confirm 3.5 passes (path: .github/scripts/check-linux-deps.py)
-- [ ] 3.7 Write failing tests for the Windows import checker using sample `dumpbin /dependents` output for `made-app.exe`, `made-askpass.exe` and `made-grok-status.exe` [P] (path: .github/scripts/test_check_windows_imports.py)
-- [ ] 3.8 Implement the Windows import checker allowing only DLLs that ship with Windows 10 1809; confirm 3.7 passes (path: .github/scripts/check-windows-imports.py)
-- [ ] 3.9 Write failing tests for the macOS minimum-OS checker using sample `otool -l` build-version output: minos 12.0 or lower passes, higher fails [P] (path: .github/scripts/test_check_macos_minos.py)
-- [ ] 3.10 Implement the macOS minimum-OS checker for `made-app`, `made-askpass` and `made-grok-status`; confirm 3.9 passes (path: .github/scripts/check-macos-minos.py)
-- [ ] 3.11 Write failing tests that run `stage-askpass.sh` with a stub `cargo` on PATH: `PROFILE=release` selects `--release` and `target/<target>/release`, and the default stays debug [P] (path: .github/scripts/test_stage_askpass.py)
-- [ ] 3.12 Make askpass staging profile-aware with a debug default, so `ci-ssh-remote.yml` is unchanged; confirm 3.11 passes (path: .github/scripts/stage-askpass.sh)
+- [x] 3.2 Extract the desktop staging from `ci-artifacts.yml`, after the `grok-native-hook` 2.6–6.3 merge, into a profile-aware script. It stages grok-made only through `.github/scripts/stage-grok-plugin.sh`, adds LICENSE and writes profile-specific metadata. Confirm 3.1 passes (path: .github/scripts/stage-desktop-package.py)
+- [x] 3.3 Switch development artifacts to the shared script with the debug profile. Preserve the `grok-native-hook` 5.4 hook build and its 5.10 packaged-hook test step, and keep artifact names, retention and contents apart from the added LICENSE (path: .github/workflows/ci-artifacts.yml)
+- [x] 3.4 Configure the Windows MSVC static CRT for all Windows binaries per the 1.6 outcome (path: .cargo/config.toml)
+- [x] 3.5 Write failing tests for the Linux ELF `NEEDED` allowlist checker using sample `readelf -d` output: glibc libraries and `libgcc_s.so.1` are allowed, any other library fails [P] (path: .github/scripts/test_check_linux_deps.py)
+- [x] 3.6 Implement the Linux allowlist checker for the REL-04 baseline, including `libgcc_s.so.1`; the glibc 2.35 floor stays with `check-glibc-max.sh`; runtime-loaded libraries are left to fresh-distribution acceptance; confirm 3.5 passes (path: .github/scripts/check-linux-deps.py)
+- [x] 3.7 Write failing tests for the Windows import checker using sample `dumpbin /dependents` output for `made-app.exe`, `made-askpass.exe` and `made-grok-status.exe` [P] (path: .github/scripts/test_check_windows_imports.py)
+- [x] 3.8 Implement the Windows import checker allowing only DLLs that ship with Windows 10 1809; confirm 3.7 passes (path: .github/scripts/check-windows-imports.py)
+- [x] 3.9 Write failing tests for the macOS minimum-OS checker using sample `otool -l` build-version output: minos 12.0 or lower passes, higher fails [P] (path: .github/scripts/test_check_macos_minos.py)
+- [x] 3.10 Implement the macOS minimum-OS checker for `made-app`, `made-askpass` and `made-grok-status`; confirm 3.9 passes (path: .github/scripts/check-macos-minos.py)
+- [x] 3.11 Write failing tests that run `stage-askpass.sh` with a stub `cargo` on PATH: `PROFILE=release` selects `--release` and `target/<target>/release`, and the default stays debug [P] (path: .github/scripts/test_stage_askpass.py)
+- [x] 3.12 Make askpass staging profile-aware with a debug default, so `ci-ssh-remote.yml` is unchanged; confirm 3.11 passes (path: .github/scripts/stage-askpass.sh)
 
 ## Checkpoint
 - [ ] verify REL-04 "Dependency inspection" for release binaries of all four targets (Linux `NEEDED` allowlist and glibc 2.35, Windows imports, macOS minos 12.0); development artifacts still build, and the `grok-native-hook` 5.10 step still runs
 
 ## 4. Update capability in made-platform
-- [ ] 4.1 Add the pinned `velopack` dependency confirmed in 1.8 (path: crates/made-platform/Cargo.toml)
-- [ ] 4.2 Write failing tests (path: crates/made-platform/tests/update.rs):
+- [x] 4.1 Add the pinned `velopack` dependency confirmed in 1.8 (path: crates/made-platform/Cargo.toml)
+- [x] 4.2 Write failing tests (path: crates/made-platform/tests/update.rs):
   - non-installed builds report not-applicable and make no request;
   - each target uses its own channel;
   - only strictly newer stable versions are offered;
@@ -105,21 +105,21 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - the update repository is a fixed compile-time constant naming the production repository, with no override;
   - the tamper, redirect and allowlist cases inject their source/transport only through a test-only, non-default cargo feature;
   - the request a check actually sends, asserted at the transport layer (or against the full header set including `User-Agent` that 1.8 recorded as sent), contains only the repository path, platform, architecture and installed version, with no workspace paths, file names, user names, server records, session data or install identifiers (REL-06; chosen over a recording proxy, which would change the client's trust rules). If 1.8 found the built-in source opaque, this test applies to the custom source from the 1.2 fallback.
-- [ ] 4.3 Implement the update capability (startup hook, installed detection, check, background download, verification, apply-and-restart, update-repository report) using the 1.8 outcomes and fallbacks; confirm 4.2 passes (path: crates/made-platform/src/update.rs)
-- [ ] 4.4 Export the update module, after `grok-native-hook` 3.2 lands in the same file (path: crates/made-platform/src/lib.rs)
-- [ ] 4.5 Run the startup hook first in `main`, and pass smoke-test mode so updates are disabled under `--smoke-test` (path: crates/made-app/src/main.rs)
+- [x] 4.3 Implement the update capability (startup hook, installed detection, check, background download, verification, apply-and-restart, update-repository report) using the 1.8 outcomes and fallbacks; confirm 4.2 passes (path: crates/made-platform/src/update.rs)
+- [x] 4.4 Export the update module, after `grok-native-hook` 3.2 lands in the same file (path: crates/made-platform/src/lib.rs)
+- [x] 4.5 Run the startup hook first in `main`, and pass smoke-test mode so updates are disabled under `--smoke-test` (path: crates/made-app/src/main.rs)
 
 ## Checkpoint
 - [ ] verify at the capability level: REL-08 "Tampered package rejected", "Non-GitHub or HTTP source refused" and "Wrong embedded version rejected"; REL-06 "Older or prerelease versions never offered" and "Check reveals no private data" (client-boundary request test); REL-11 "Developer build"
 
 ## 5. Update scheduling, preference and diagnostics in made-app
-- [ ] 5.1 Write failing tests for the update preference (path: crates/made-app/tests/update_preference.rs):
+- [x] 5.1 Write failing tests for the update preference (path: crates/made-app/tests/update_preference.rs):
   - defaults to on;
   - persists across restart and survives replacement of app files;
   - a corrupt file reads as on and reports a diagnostic;
   - private permissions on Unix.
-- [ ] 5.2 Implement the preference store in private app data beside the SSH registry; confirm 5.1 passes (path: crates/made-app/src/preferences.rs)
-- [ ] 5.3 Write failing scheduler tests with a fake capability and clock (path: crates/made-app/tests/updates.rs):
+- [x] 5.2 Implement the preference store in private app data beside the SSH registry; confirm 5.1 passes (path: crates/made-app/src/preferences.rs)
+- [x] 5.3 Write failing scheduler tests with a fake capability and clock (path: crates/made-app/tests/updates.rs):
   - a check at launch, then every 24 h, off the UI thread;
   - a manual check, and an explicit command-line entry check, runs while automatic checks are off without changing the stored choice;
   - no request when checks are disabled, the build is non-installed, or under smoke test;
@@ -127,10 +127,10 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - declining keeps the update ready and never applies it at quit or launch; relaunch re-offers it without re-download; the newest known version supersedes once verified;
   - failures go only to the log, with no indicator;
   - status-line states including failed download and failed verification.
-- [ ] 5.4 Implement the update scheduler and state; confirm 5.3 passes (path: crates/made-app/src/updates.rs)
-- [ ] 5.5 Write failing tests that update outcomes appear in the bounded, redacted diagnostics log with no paths, user names or tokens (path: crates/made-app/tests/diagnostics.rs)
-- [ ] 5.6 Record update outcomes in diagnostics; confirm 5.5 passes (path: crates/made-app/src/diagnostics.rs)
-- [ ] 5.7 Write failing tests (path: crates/made-app/tests/update_restart.rs):
+- [x] 5.4 Implement the update scheduler and state; confirm 5.3 passes (path: crates/made-app/src/updates.rs)
+- [x] 5.5 Write failing tests that update outcomes appear in the bounded, redacted diagnostics log with no paths, user names or tokens (path: crates/made-app/tests/diagnostics.rs)
+- [x] 5.6 Record update outcomes in diagnostics; confirm 5.5 passes (path: crates/made-app/src/diagnostics.rs)
+- [x] 5.7 Write failing tests (path: crates/made-app/tests/update_restart.rs):
   - `Restart now` closes every workspace before apply and restart;
   - `Not now` touches nothing;
   - the smoke line reports OpenCode plugin source, `made-grok-status` presence, companion and askpass resolution, `updates=disabled` and `update_repo=<owner>/<repo>` for the production repository;
@@ -138,9 +138,9 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - with the apply flag while any Made instance of the same install is running, it exits non-zero with a clear message and changes no installed files;
   - during a command-line apply the install lock is held for the whole apply, GUI startup for that install refuses with a clear message while it is held, and the apply exits without starting the GUI;
   - it works while automatic checks are off and leaves the stored choice off.
-- [ ] 5.8 Wire the scheduler into the app tick, the restart sequence and the smoke markers; confirm 5.7 passes (path: crates/made-app/src/app.rs)
-- [ ] 5.9 Register the new modules (path: crates/made-app/src/lib.rs)
-- [ ] 5.10 Add the non-interactive command-line upgrade entry for the REL-12 check; confirm 5.7 passes (path: crates/made-app/src/cli.rs)
+- [x] 5.8 Wire the scheduler into the app tick, the restart sequence and the smoke markers; confirm 5.7 passes (path: crates/made-app/src/app.rs)
+- [x] 5.9 Register the new modules (path: crates/made-app/src/lib.rs)
+- [x] 5.10 Add the non-interactive command-line upgrade entry for the REL-12 check; confirm 5.7 passes (path: crates/made-app/src/cli.rs)
 
 ## Checkpoint
 - [ ] verify:
@@ -151,7 +151,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - REL-11 "Smoke test in CI".
 
 ## 6. Update UI
-- [ ] 6.1 Write failing UI-model tests (path: crates/made-app/tests/ui_model.rs):
+- [x] 6.1 Write failing UI-model tests (path: crates/made-app/tests/ui_model.rs):
   - the wordmark indicator appears only when an update is ready, only on the header wordmark of an active workspace, never on the picker wordmark or in non-installed builds, and returns when a workspace becomes active;
   - the tooltip and accessibility name read `About, update ready` (Keyboard Focus and Accessibility);
   - wordmark target, gaps, reserved width and tab fitting are unchanged at 1280×800 and 720×480;
@@ -161,7 +161,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - the compact height fits;
   - every control has focus and an accessible name;
   - existing About, header and accessibility scenarios still pass.
-- [ ] 6.2 Implement the wordmark indicator, its accessible name and the About Updates section with inline confirmation; confirm 6.1 passes (path: crates/made-app/src/ui.rs)
+- [x] 6.2 Implement the wordmark indicator, its accessible name and the About Updates section with inline confirmation; confirm 6.1 passes (path: crates/made-app/src/ui.rs)
 
 ## Checkpoint
 - [ ] verify:
