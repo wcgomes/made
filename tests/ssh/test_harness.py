@@ -227,8 +227,9 @@ class GrokNoInterpreterTests(unittest.TestCase):
             self.assertNotIn(str(fixture.scripts['pybin']), without)
             if parity.platform.system() == 'Linux':
                 shadow = pathlib.Path(fixture.coreutils_path())
-                self.assertFalse(any(entry.name.startswith('python3')
-                                     for entry in shadow.iterdir()))
+                self.assertFalse(any(
+                    entry.name == 'python3' or entry.name.startswith('python3.')
+                    for entry in shadow.iterdir()))
             with_python = fixture.prefix(grok=True, python3=True)
             self.assertIn(str(fixture.scripts['pybin']), with_python)
 

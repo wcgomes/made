@@ -251,7 +251,7 @@ jobs:
           fi
           PATH="$clean" bash -c 'command -v python python3 >/dev/null 2>&1 && { echo "python is still on PATH" >&2; exit 1; }; exit 0'
           MADE_PACKAGED_HOOK="$hook" PATH="$clean" \
-            cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" -- --nocapture
+            bash .github/scripts/temp-annotate.sh "packaged hook" -- cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" -- --nocapture
 
       - name: Upload the development artifact
         uses: actions/upload-artifact@v7
