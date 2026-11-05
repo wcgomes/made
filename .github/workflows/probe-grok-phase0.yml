@@ -50,13 +50,11 @@ jobs:
             chmod "$m" "$pkg/hooks/bin/m$m"
           done
           grok plugin install "$pkg" --trust
-          echo "--- installed tree"
-          find "$GROK_HOME/installed-plugins" -maxdepth 5 -ls
-          echo "--- symlinks (expect none)"
-          find "$GROK_HOME/installed-plugins" -type l
-          echo "--- registry"
-          cat "$GROK_HOME/installed-plugins/registry.json"
-          echo "--- modes (source / installed)"
+          emit() { printf '::notice title=%s::%s\n' "$1" "$(printf '%s' "$2" | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')"; }
+          emit "tree" "$(find "$GROK_HOME/installed-plugins" -maxdepth 5 -ls)"
+          emit "symlinks" "count=$(find "$GROK_HOME/installed-plugins" -type l | wc -l)"
+          emit "registry" "$(cat "$GROK_HOME/installed-plugins/registry.json")"
+          modes=""
           for m in 700 755 644; do
             if [ "$(uname)" = Darwin ]; then
               src=$(stat -f '%Lp' "$pkg/hooks/bin/m$m")
@@ -65,8 +63,9 @@ jobs:
               src=$(stat -c '%a' "$pkg/hooks/bin/m$m")
               dst=$(stat -c '%a' "$GROK_HOME"/installed-plugins/*/hooks/bin/m$m)
             fi
-            echo "m$m source=$src installed=$dst"
+            modes="$modes m$m source=$src installed=$dst;"
           done
+          emit "modes" "$modes"
 
       - name: Probe plugin install (Windows)
         if: runner.os == 'Windows'
@@ -80,8 +79,8 @@ jobs:
           '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bin/made-grok-status","timeout":5}]}]}}' | Set-Content "$pkg\hooks\hooks.json"
           'x' | Set-Content "$pkg\hooks\bin\made-grok-status.exe"
           grok plugin install $pkg --trust
-          Write-Host '--- installed tree'
-          Get-ChildItem -Recurse "$env:GROK_HOME\installed-plugins" | Format-Table FullName, Attributes, LinkType
-          Get-Content "$env:GROK_HOME\installed-plugins\registry.json"
-          Write-Host '--- inspect'
-          grok inspect
+          function Emit($t, $m) { $m = ($m -replace '%','%25') -replace "`r?`n",'%0A'; Write-Host "::notice title=$t::$m" }
+          Emit 'tree' ((Get-ChildItem -Recurse "$env:GROK_HOME\installed-plugins" | ForEach-Object { "$($_.FullName) attrs=$($_.Attributes) link=$($_.LinkType)" }) -join "`n")
+          Emit 'registry' ((Get-Content "$env:GROK_HOME\installed-plugins\registry.json") -join "`n")
+          Emit 'inspect' ((grok inspect 2>&1) -join "`n")
+          Emit 'details' ((grok plugin details grok-made 2>&1) -join "`n")
