@@ -70,31 +70,31 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 
 ## 5. Packaging and CI
 Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
-- [ ] 5.1 Accept the hook binary as an argument, stage it through `stage-grok-plugin.sh` in the 10-file list, and record it in `manifest.json` and `SHA256SUMS` (path: .github/scripts/stage-companion.sh)
-- [ ] 5.2 [P] Update the 10-file list and check the hook is present, non-empty, executable and hash-matched to the companion manifest (path: .github/scripts/assemble-desktop-package.py)
-- [ ] 5.7 Inside `rust:1-bullseye`, run `cargo test -p made-grok-hook`, build `made-grok-hook` in release profile, apply `check-glibc-max.sh` 2.31 and the musl-interpreter and GUI-link checks to the hook, and pass it to `stage-companion.sh` (path: .github/scripts/build-linux-companion.sh)
-- [ ] 5.8 [P] Run `cargo test -p made-grok-hook`, build the hook in release profile, require minos 12.0 and no GUI framework links, and pass it to `stage-companion.sh` (path: .github/scripts/build-macos-companion.sh)
-- [ ] 5.3 Use the updated build scripts for all four remote targets and replace the `status.py` mode checks with the hook (path: .github/workflows/ci-ssh-remote.yml)
-- [ ] 5.4 Build the host-target hook and stage the desktop `plugins/grok-made` through `stage-grok-plugin.sh`, replacing the `status.py` checks (path: .github/workflows/ci-artifacts.yml)
-- [ ] 5.9 Add an env-gated packaged-layout test: given `MADE_PACKAGED_HOOK` pointing at the staged hook and a PATH with no `python`/`python3`, spawn the hook as a child with one event and stdin left open, and assert one line, `pid` equal to the test process id, exit 0 and empty stdout; skipped when the variable is unset (path: crates/made-grok-hook/tests/packaged.rs)
-- [ ] 5.10 Run 5.9 against the packaged `plugins/grok-made` on every matrix target (macOS arm64, macOS x64, Linux x64, Windows x64) with Python removed from PATH (path: .github/workflows/ci-artifacts.yml)
-- [ ] 5.5 [P] Run `cargo test -p made-grok-hook` on Windows (path: .github/workflows/ci-windows.yml)
-- [ ] 5.6 [P] Run `cargo test -p made-grok-hook` on both macOS targets (path: .github/workflows/ci-macos.yml)
+- [x] 5.1 Accept the hook binary as an argument, stage it through `stage-grok-plugin.sh` in the 10-file list, and record it in `manifest.json` and `SHA256SUMS` (path: .github/scripts/stage-companion.sh)
+- [x] 5.2 [P] Update the 10-file list and check the hook is present, non-empty, executable and hash-matched to the companion manifest (path: .github/scripts/assemble-desktop-package.py)
+- [x] 5.7 Inside `rust:1-bullseye`, run `cargo test -p made-grok-hook`, build `made-grok-hook` in release profile, apply `check-glibc-max.sh` 2.31 and the musl-interpreter and GUI-link checks to the hook, and pass it to `stage-companion.sh` (path: .github/scripts/build-linux-companion.sh)
+- [x] 5.8 [P] Run `cargo test -p made-grok-hook`, build the hook in release profile, require minos 12.0 and no GUI framework links, and pass it to `stage-companion.sh` (path: .github/scripts/build-macos-companion.sh)
+- [x] 5.3 Use the updated build scripts for all four remote targets and replace the `status.py` mode checks with the hook (path: .github/workflows/ci-ssh-remote.yml)
+- [x] 5.4 Build the host-target hook and stage the desktop `plugins/grok-made` through `stage-grok-plugin.sh`, replacing the `status.py` checks (path: .github/workflows/ci-artifacts.yml)
+- [x] 5.9 Add an env-gated packaged-layout test: given `MADE_PACKAGED_HOOK` pointing at the staged hook and a PATH with no `python`/`python3`, spawn the hook as a child with one event and stdin left open, and assert one line, `pid` equal to the test process id, exit 0 and empty stdout; skipped when the variable is unset (path: crates/made-grok-hook/tests/packaged.rs)
+- [x] 5.10 Run 5.9 against the packaged `plugins/grok-made` on every matrix target (macOS arm64, macOS x64, Linux x64, Windows x64) with Python removed from PATH (path: .github/workflows/ci-artifacts.yml)
+- [x] 5.5 [P] Run `cargo test -p made-grok-hook` on Windows (path: .github/workflows/ci-windows.yml)
+- [x] 5.6 [P] Run `cargo test -p made-grok-hook` on both macOS targets (path: .github/workflows/ci-macos.yml)
 
 ## Checkpoint
 - [ ] verify scenarios `Shipped package matches the host` and `No Python on the machine` (packaged hook, pid and no-Python run on all four local targets via 5.10), `Staged hook matches each server's target` (hook built, checked and manifest-recorded per remote target) and SSH-06 `Approved companion update is verified, swapped and reused` (10 artifacts) pass in CI
 
 ## 6. Cutover
 - [x] 6.1 Point all nine registrations at `bin/made-grok-status`, keeping events, matchers and the 5-second timeout, in the form 0.1 selected (path: plugins/grok-made/hooks/hooks.json)
-- [ ] 6.2 [P] Delete the Python hook (path: plugins/grok-made/hooks/bin/status.py)
-- [ ] 6.3 [P] Delete the Python test after 1.3 to 1.5 pass (path: plugins/grok-made/hooks/status_test.py)
+- [x] 6.2 [P] Delete the Python hook (path: plugins/grok-made/hooks/bin/status.py)
+- [x] 6.3 [P] Delete the Python test after 1.3 to 1.5 pass (path: plugins/grok-made/hooks/status_test.py)
 
 ## Checkpoint
 - [ ] verify no file under `plugins/grok-made` is Python, `grep -rn 'status\.py\|status_test' .github crates plugins tests` is empty, and phases 1 to 5 still pass
 
 ## 7. Acceptance
-- [ ] 7.1 Replace `grok_install_python3_missing` with a no-python3 consented install that succeeds, drop the python3 detection variants, and add a scenario that runs the installed native hook on a PATH without python3 and ingests its real line (path: tests/ssh/parity.py)
-- [ ] 7.2 [P] Update harness self-tests for the removed python3 variants (path: tests/ssh/test_harness.py)
+- [x] 7.1 Replace `grok_install_python3_missing` with a no-python3 consented install that succeeds, drop the python3 detection variants, and add a scenario that runs the installed native hook on a PATH without python3 and ingests its real line (path: tests/ssh/parity.py)
+- [x] 7.2 [P] Update harness self-tests for the removed python3 variants (path: tests/ssh/test_harness.py)
 - [ ] 7.3 Run native real-grok acceptance on macOS arm64, macOS x64, Linux x64 and Windows x64 (install from the packaged layout with no Python, start a session, prompt, question, stop, end, and check dots, explorer follow and the logged pid against the Grok process) and on one remote per supported target; record per platform the evidence or an `UNVERIFIED` label per SSH-09 evidence rules, including any 0.3 `UNVERIFIED` result (path: tests/e2e/grok_native_hook_validation.md)
 
 ## Checkpoint

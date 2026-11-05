@@ -1,4 +1,4 @@
-//! Process-level port of the Python hook's `status_test.py` cases.
+//! Process-level port of the removed Python hook's test cases.
 
 mod common;
 

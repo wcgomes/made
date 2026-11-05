@@ -45,8 +45,8 @@ impl Fixture {
         std::fs::write(source.join("README.md"), "# fixture\n").unwrap();
         std::fs::write(source.join("hooks/hooks.json"), FIXTURE_HOOKS).unwrap();
         // Files the staged package must never carry.
-        std::fs::write(source.join("hooks/status_test.py"), "print()\n").unwrap();
-        std::fs::write(source.join("hooks/bin/status.py"), "print()\n").unwrap();
+        std::fs::write(source.join("hooks/test_hook.py"), "print()\n").unwrap();
+        std::fs::write(source.join("hooks/bin/hook.py"), "print()\n").unwrap();
         std::fs::write(root.path().join("hook"), b"\x7fELF fixture hook\n").unwrap();
         std::fs::set_permissions(
             root.path().join("hook"),
