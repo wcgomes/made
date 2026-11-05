@@ -862,7 +862,7 @@ def seed_staged_grok_made(companion_dir, version):
     (staged / 'plugin.json').write_text(
         '{"name":"grok-made","version":"' + version + '"}\n')
     (staged / 'hooks' / 'hooks.json').write_text('{}\n')
-    hook = staged / 'hooks' / 'bin' / 'status.py'
+    hook = staged / 'hooks' / 'bin' / 'made-grok-status'
     hook.write_text('#!/bin/sh\n# Fixture stand-in for the shipped status hook.\nexit 0\n')
     hook.chmod(0o755)
     return staged

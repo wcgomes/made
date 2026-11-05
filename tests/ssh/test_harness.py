@@ -10,6 +10,7 @@ from harness import (
     Harness, PREREQUISITES, cleanup_owned_companions, cross_build_blockage,
     linux_arm64_elf, owned_companion_pids, remote_proof_directory, tools, wipe_secret,
 )
+import parity
 from parity import LIMIT, diagnose_supervisor_failure, encode, envelope, receive
 
 
@@ -204,6 +205,38 @@ class CompanionCleanupTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'still running'):
                 harness.__exit__()
         self.assertTrue(root.exists())
+
+
+class GrokNoInterpreterTests(unittest.TestCase):
+    """No interpreter is a product prerequisite: the python3 scenarios and PATH
+    variants are gone and the fixtures default to a remote PATH without one."""
+
+    def test_scenario_table_has_no_python3_missing_variant(self):
+        names = [name for name, _, _ in parity.GROK_SCENARIOS]
+        self.assertNotIn('install-python3-missing', names)
+        self.assertIn('install-without-python3', names)
+        self.assertIn('native-hook-without-python3', names)
+
+    def test_default_remote_path_holds_no_python3(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            companion = root / 'made-remote'
+            companion.write_text('fixture')
+            fixture = parity.GrokFixture(root, companion)
+            without = fixture.prefix(grok=True)
+            self.assertNotIn(str(fixture.scripts['pybin']), without)
+            if parity.platform.system() == 'Linux':
+                shadow = pathlib.Path(fixture.coreutils_path())
+                self.assertFalse(any(entry.name.startswith('python3')
+                                     for entry in shadow.iterdir()))
+            with_python = fixture.prefix(grok=True, python3=True)
+            self.assertIn(str(fixture.scripts['pybin']), with_python)
+
+    def test_staged_set_names_the_native_hook_not_a_script(self):
+        names = parity.current_stage_artifact_names()
+        self.assertEqual(len(names), 10)
+        self.assertIn(parity.NATIVE_HOOK_ARTIFACT, names)
+        self.assertFalse([name for name in names if name.endswith('.py')])
 
 
 if __name__ == '__main__':

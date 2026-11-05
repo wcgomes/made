@@ -506,6 +506,7 @@ class GrokFixture:
         self.companion_dir = self.root / 'companion'
         self.companion_dir.mkdir(mode=0o700, exist_ok=True)
         self.binary = self.companion_dir / 'made-remote'
+        self.host_companion = pathlib.Path(companion)
         shutil.copyfile(companion, self.binary)
         self.binary.chmod(0o755)
         self.home = grok_home(self.root)
@@ -522,6 +523,12 @@ class GrokFixture:
             stage_shipped_opencode_made(self.companion_dir, source)
             self.opencode_staged = self.companion_dir / 'plugins' / 'opencode-made'
         return self.opencode_staged
+
+    def native_hook(self):
+        """The real native session-status hook for the host target: the one
+        staged beside the host companion (the CI artifact), else a local cargo
+        build. A missing hook is unrun, never a pass."""
+        return native_hook_path(self.host_companion)
 
     def reset_home(self, inventory=None, status_lines=(), installed=None):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -568,11 +575,12 @@ class GrokFixture:
 
     def prefix(self, grok=False, python3=False, opencode=True, extra=None):
         """env -i prefix with absolute PATH entries only (the detection rule).
-        /usr/bin carries the host python3, so it is excluded exactly when a
-        scenario needs python3 to be absent; Ubuntu's usrmerge also makes /bin
-        a symlink to /usr/bin, so Linux uses a private coreutils-only shadow
-        directory instead of /bin in that case. The fake opencode is omitted
-        only when a scenario needs opencode to be absent."""
+        No interpreter is a product prerequisite, so python3 is absent by
+        default: /usr/bin carries the host python3 and Ubuntu's usrmerge makes
+        /bin a symlink to /usr/bin, so Linux uses a private coreutils-only
+        shadow directory instead. `python3=True` puts a fixture python3 on
+        PATH, only for scenarios proving its presence changes nothing. The fake
+        opencode is omitted only when a scenario needs opencode to be absent."""
         home = str(self.root / 'home')
         entries = []
         if grok:
@@ -603,8 +611,8 @@ class GrokFixture:
     def coreutils_path(self):
         """A PATH entry with the host's coreutils and no python3 executable.
 
-        The product detects python3 with `command -v`, so a merged /bin must be
-        shadowed rather than merely omitted. Symlinks stay inside this
+        A merged /bin must be shadowed rather than merely omitted, so no
+        python3 resolves on the remote PATH. Symlinks stay inside this
         disposable root and never modify the host."""
         shadow = self.root / 'corebin'
         if shadow.is_dir():
@@ -641,7 +649,7 @@ class GrokTab:
     GrokSnapshot pushes collected instead of discarded. A failed connect is
     kept in `error` so callers can assert on rejections and still clean up."""
 
-    def __init__(self, h, fx, workspace, target='Grok', grok=True, python3=True,
+    def __init__(self, h, fx, workspace, target='Grok', grok=True, python3=False,
                  opencode=True, extra=None, identity=None, epoch=None, mode='Open',
                  attach_timeout=15):
         self.h = h
@@ -905,7 +913,7 @@ def close_quietly(tab):
             tab.process.wait(timeout=5)
 
 
-def run_install(h, fx, python3=True, fail=False):
+def run_install(h, fx, python3=False, fail=False):
     """Run the real --install-grok-plugin entry point and return (report, exit)."""
     extra = {'MADE_FIXTURE_INSTALL_FAIL': '1'} if fail else None
     command = fx.frontend_command(fx.prefix(grok=True, python3=python3, extra=extra),
@@ -1000,11 +1008,12 @@ def diagnose_supervisor_failure(h, identity, error, stderr=''):
 
 
 def grok_detection_probe(h, fx, workspace, mutation=False):
-    """PATH variants decide grok/python3 detection; detection never spawns."""
-    cases = [(True, True), (True, False), (False, True), (False, False)]
-    for grok, python3 in cases:
-        prefix = fx.prefix(grok=(False if mutation else grok),
-                           python3=(False if mutation else python3))
+    """PATH variants decide grok detection; detection never spawns and never
+    looks up python3, even when a python3 sits on the remote PATH. Mutation:
+    grok is removed from every variant."""
+    cases = [(True, False), (True, True), (False, False), (False, True)]
+    for grok, python3_on_path in cases:
+        prefix = fx.prefix(grok=(False if mutation else grok), python3=python3_on_path)
         process = h.ssh_process(fx.frontend_command(prefix, '--probe'))
         try:
             identity = fresh_identity()
@@ -1016,10 +1025,13 @@ def grok_detection_probe(h, fx, workspace, mutation=False):
                 raise AssertionError('probe failed with '
                                      + str((operation.get('data') or {}).get('code')))
             capabilities = operation['data']['capabilities']
-            if capabilities['grok'] is not grok or capabilities['python3'] is not python3:
+            if capabilities['grok'] is not grok:
                 raise AssertionError(
-                    f'PATH grok={grok} python3={python3} detected '
-                    f'grok={capabilities["grok"]} python3={capabilities["python3"]}')
+                    f'PATH grok={grok} detected grok={capabilities["grok"]}')
+            if capabilities['python3'] is not False:
+                raise AssertionError(
+                    f'python3 on PATH={python3_on_path} changed the frozen python3 field: '
+                    f'{capabilities["python3"]}')
             if capabilities['tmux'] is not False:
                 raise AssertionError('Capabilities.tmux must stay false')
         finally:
@@ -1028,8 +1040,10 @@ def grok_detection_probe(h, fx, workspace, mutation=False):
                 process.wait(timeout=5)
     if fx.argv():
         raise AssertionError(f'detection spawned an executable: {fx.argv()}')
-    return ('real --probe entry point over loopback SSH: grok/python3 follow the PATH '
-            'variants exactly, tmux stays false, and no executable is spawned; ' + GROK_BOUNDARY)
+    return ('real --probe entry point over loopback SSH: grok follows the PATH variants '
+            'exactly, python3 present or absent never changes a capability (the frozen '
+            'field stays false), tmux stays false, and no executable is spawned; '
+            + GROK_BOUNDARY)
 
 
 def grok_direct_launch(h, fx, workspace, mutation=False):
@@ -1037,7 +1051,7 @@ def grok_direct_launch(h, fx, workspace, mutation=False):
     dashboard, sessionless running indication, no plugin environment, and no
     OpenCode integration on the tab. Mutation: grok absent from PATH."""
     require_supervisor(fx, h, workspace)
-    tab = GrokTab(h, fx, workspace, target='Grok', grok=not mutation, python3=True)
+    tab = GrokTab(h, fx, workspace, target='Grok', grok=not mutation)
     try:
         tab.collect_terminal()
         pid = tab.wait_pid()
@@ -1247,7 +1261,7 @@ def grok_consent_refused(h, fx, workspace, mutation=False):
     fx.reset_home(status_lines=[hook_line('old', '/old', 'SessionStart', 'idle')])
     fx.reset_stage(GROK_VERSION)
     if mutation:
-        run_install(h, fx, python3=True)
+        run_install(h, fx)
     config_before = remote_read(h, fx.config_file)
     extra = {'MADE_FIXTURE_SESSION': '1', 'MADE_FIXTURE_SESSION_ID': 'ref-1',
              'MADE_FIXTURE_CWD': '/ref'}
@@ -1278,48 +1292,100 @@ def grok_consent_refused(h, fx, workspace, mutation=False):
         close_quietly(tab)
 
 
-def grok_install_python3_missing(h, fx, workspace, mutation=False):
-    """Missing remote python3 is a declared failure that runs nothing and
-    leaves the inventory tier working. Mutation: python3 present."""
+def grok_install_without_python3(h, fx, workspace, mutation=False):
+    """A server with no python3 on its PATH gets the same consented install:
+    the official installer runs once with the staged native hook, config is
+    untouched, and the result is no different from a server with python3.
+    Mutation: the official installer fails."""
     fx.reset_stage(GROK_VERSION)
-    report, code = run_install(h, fx, python3=bool(mutation))
-    if report.get('outcome') != 'failed' or report.get('reason') != 'python3-missing':
-        raise AssertionError(f'python3-missing must be a declared failure: {report}')
-    if code == 0:
-        raise AssertionError('a declared failure must exit non-zero')
-    if fx.argv():
-        raise AssertionError('the installer ran despite the missing prerequisite')
-    if remote_exists(h, fx.installed_manifest):
-        raise AssertionError('python3-missing installed a plugin copy')
+    report, code = run_install(h, fx, fail=bool(mutation))
+    if report.get('outcome') != 'installed' or code != 0:
+        raise AssertionError(f'an install without python3 must succeed: {report} exit={code}')
+    if report.get('new_sessions_only') is not True:
+        raise AssertionError('the new-sessions-only limit must be disclosed')
+    if 'reason' in report:
+        raise AssertionError(f'a successful install carries no failure reason: {report}')
+    if fx.argv() != ['plugin install ' + str(fx.staged_dir) + ' --trust']:
+        raise AssertionError(f'official installer argv mismatch: {fx.argv()}')
+    if fx.env_lines() != ['GROK_HOME=']:
+        raise AssertionError('the installer child must not see a redirected GROK_HOME')
+    if manifest_version(remote_read(h, fx.installed_manifest)) != GROK_VERSION:
+        raise AssertionError('the consented install did not leave the staged copy installed')
     if remote_read(h, fx.config_file) != GROK_CONFIG_SENTINEL.encode():
-        raise AssertionError('the failed install edited Grok configuration')
-    tier_note = supervisor_unavailable(h, fx, workspace)
-    if tier_note is None:
-        extra = {'MADE_FIXTURE_SESSION': '1', 'MADE_FIXTURE_SESSION_ID': 'py-1',
-                 'MADE_FIXTURE_CWD': '/py'}
-        tab = GrokTab(h, fx, workspace, target='Grok', python3=False, extra=extra)
-        try:
-            tab.collect_terminal()
-            snapshot, _ = tab.wait_state(lambda s: 'py-1' in session_ids(s), timeout=10)
-            if not snapshot['running']:
-                raise AssertionError('the inventory tier must keep working after the failure')
-            if not tab.close():
-                raise AssertionError('remote cleanup unconfirmed')
-            tier_note = 'the inventory tier kept following afterwards'
-        finally:
-            close_quietly(tab)
-    else:
-        tier_note = ('UNVERIFIED post-failure inventory tier — '
-                     + tier_note.splitlines()[0])
-    return (f'report {report} with non-zero exit, no installer run, no writes; {tier_note}; '
+        raise AssertionError('the install edited Grok configuration')
+    # Presence of python3 changes nothing: an equal version still skips.
+    rerun, _ = run_install(h, fx, python3=True)
+    if rerun.get('outcome') != 'skipped' or len(fx.argv()) != 1:
+        raise AssertionError(f'python3 presence changed the install outcome: {rerun}')
+    return (f'report {report} with exit 0 and no python3 on the remote PATH: the official '
+            'installer ran once on the staged package, config.toml is byte-identical, the '
+            'child GROK_HOME stayed empty, and python3 presence changes nothing; '
             + GROK_BOUNDARY)
+
+
+def grok_native_hook_without_python3(h, fx, workspace, mutation=False):
+    """The installed native hook runs on a PATH without python3 and its real
+    line drives the tab: a Prompt event with the typed cwd, owned through the
+    hook's parent pid. Mutation: the consented install never runs, so hooks
+    are never ready and the real line is ignored."""
+    hook_source = fx.native_hook()
+    fx.reset_stage(GROK_VERSION)
+    staged_hook = fx.staged_dir / 'hooks' / 'bin' / 'made-grok-status'
+    shutil.copyfile(hook_source, staged_hook)
+    staged_hook.chmod(0o755)
+    if not mutation:
+        report, code = run_install(h, fx)
+        if report.get('outcome') != 'installed' or code != 0:
+            raise AssertionError(f'the install without python3 must succeed: {report} exit={code}')
+    installed_hook = (fx.home / 'installed-plugins' / 'grok-made' / 'hooks' / 'bin'
+                      / 'made-grok-status')
+    if not mutation and not remote_exists(h, installed_hook):
+        raise AssertionError('the installed copy carries no native hook')
+    require_supervisor(fx, h, workspace)
+    tab = GrokTab(h, fx, workspace, target='Shell')
+    try:
+        tab.collect_terminal()
+        tab.type("printf '\\nSHELL_PID:%s\\n' \"$$\"\n")
+        shell_pid = int(tab.wait_terminal(r'SHELL_PID:([0-9]+)').group(1))
+        # Neither interpreter resolves on this remote PATH (command -v fails).
+        for interpreter in ('python', 'python3'):
+            tab.type(f"command -v {interpreter} >/dev/null 2>&1; "
+                     f"printf '\\nNO_{interpreter}_STATUS:%s\\n' \"$?\"\n")
+            tab.wait_terminal(rf'NO_{interpreter}_STATUS:1')
+        tab.arm()
+        event = ('{"hookEventName":"UserPromptSubmit","sessionId":"native-1",'
+                 '"cwd":"/native"}')
+        tab.type(f"printf '%s' '{event}' | {shlex.quote(str(installed_hook))}; "
+                 "printf '\\nHOOK_EXIT:%s\\n' \"$?\"\n")
+        tab.wait_terminal(r'HOOK_EXIT:0')
+        line = None
+        for candidate in (remote_read(h, fx.status_file) or b'').decode().splitlines():
+            line = json.loads(candidate)
+        if line is None:
+            raise AssertionError('the installed native hook appended no line')
+        expected = {'sessionId': 'native-1', 'cwd': '/native', 'event': 'UserPromptSubmit',
+                    'notification': '', 'status': 'working', 'pid': shell_pid}
+        if {key: line.get(key) for key in expected} != expected or set(line) != {
+                'at', *expected}:
+            raise AssertionError(f'the native hook line is wrong: {line}')
+        got = tab.wait_event(lambda e: e['kind'] == 'Prompt', timeout=8)
+        if got['activity'] != 'Working' or decode_cwd(got['cwd']) != '/native':
+            raise AssertionError(f'the native hook line produced the wrong event: {got}')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return (f'the staged native hook, installed by the consented install on a PATH with no '
+                f'python or python3, appended its real line (pid {shell_pid} = the owning '
+                'process) and the companion ingested it as a Working prompt with the typed cwd; '
+                + GROK_BOUNDARY)
+    finally:
+        close_quietly(tab)
 
 
 def grok_install_failed(h, fx, workspace, mutation=False):
     """A failing official installer reports install-failed, writes nothing, and
     the inventory tier keeps working. Mutation: the fixture installer succeeds."""
     fx.reset_stage(GROK_VERSION)
-    report, code = run_install(h, fx, python3=True, fail=not mutation)
+    report, code = run_install(h, fx, fail=not mutation)
     if report.get('outcome') != 'failed' or report.get('reason') != 'install-failed':
         raise AssertionError(f'a failing installer must report install-failed: {report}')
     if code == 0:
@@ -1357,7 +1423,7 @@ def grok_consented_install_hooks(h, fx, workspace, mutation=False):
     server-side. Mutation: the consented install never runs."""
     fx.reset_stage(GROK_VERSION)
     if not mutation:
-        report, code = run_install(h, fx, python3=True)
+        report, code = run_install(h, fx)
         if report.get('outcome') != 'installed' or code != 0:
             raise AssertionError(f'the first install must run: {report} exit={code}')
         if report.get('new_sessions_only') is not True:
@@ -1372,19 +1438,19 @@ def grok_consented_install_hooks(h, fx, workspace, mutation=False):
             raise AssertionError(f'the installed copy version is {version}')
         if remote_read(h, fx.config_file) != GROK_CONFIG_SENTINEL.encode():
             raise AssertionError('the consented install edited Grok configuration')
-        report, _ = run_install(h, fx, python3=True)
+        report, _ = run_install(h, fx)
         if report.get('outcome') != 'skipped' or len(fx.argv()) != 1:
             raise AssertionError(f'an equal version must skip: {report} argv={fx.argv()}')
         remote_write(h, fx.installed_manifest,
                      '{"name":"grok-made","version":"9.9.9"}\n')
-        report, _ = run_install(h, fx, python3=True)
+        report, _ = run_install(h, fx)
         if report.get('outcome') != 'skipped':
             raise AssertionError(f'a newer installed copy must skip: {report}')
         if manifest_version(remote_read(h, fx.installed_manifest)) != '9.9.9':
             raise AssertionError('the newer installed copy was overwritten')
         remote_write(h, fx.installed_manifest,
                      '{"name":"grok-made","version":"0.0.1"}\n')
-        report, _ = run_install(h, fx, python3=True)
+        report, _ = run_install(h, fx)
         if report.get('outcome') != 'installed' or len(fx.argv()) != 2:
             raise AssertionError(f'an older version must run exactly once more: '
                                  f'{report} argv={fx.argv()}')
@@ -1778,11 +1844,35 @@ def host_data_root(h):
     return host_data_root_for(h.root)
 
 
+NATIVE_HOOK_ARTIFACT = 'plugins/grok-made/hooks/bin/made-grok-status'
+
+
+def native_hook_path(companion):
+    """The native hook the host target ships, found beside the companion's own
+    staged package (the CI artifact) or in a local cargo build. The repository
+    `plugins/grok-made` is source only and never holds it."""
+    companion = pathlib.Path(companion)
+    candidates = [companion.parent / NATIVE_HOOK_ARTIFACT]
+    candidates += [REPO_ROOT / 'target' / profile / 'made-grok-status'
+                   for profile in ('release', 'debug')]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.R_OK) and candidate.stat().st_size > 0:
+            return candidate
+    raise PrerequisiteError(
+        'no native made-grok-status hook beside the companion or in target/; build one '
+        'with `cargo build -p made-grok-hook`. A missing hook is unrun, not a pass')
+
+
 def staged_artifact_bytes(companion):
     """The current real packaged artifact set, one byte map keyed by STAGE_FILES."""
     files = {}
     for name in current_stage_artifact_names():
-        source = pathlib.Path(companion) if name == 'made-remote' else REPO_ROOT / name
+        if name == 'made-remote':
+            source = pathlib.Path(companion)
+        elif name == NATIVE_HOOK_ARTIFACT:
+            source = native_hook_path(companion)
+        else:
+            source = REPO_ROOT / name
         files[name] = source.read_bytes()
     return files
 
@@ -1939,9 +2029,7 @@ def grok_update_in_place(h, fx, workspace, mutation=False):
             path = destination / name
             if not path.is_file() or path.read_bytes() != files_b[name]:
                 raise AssertionError(f'the approved update left the wrong bytes for {name}')
-            expected_mode = (0o700 if name in ('made-remote',
-                                               'plugins/grok-made/hooks/bin/status.py')
-                             else 0o600)
+            expected_mode = 0o700 if name in ('made-remote', NATIVE_HOOK_ARTIFACT) else 0o600
             if path.stat().st_mode & 0o777 != expected_mode:
                 raise AssertionError(
                     f'{name} has mode {path.stat().st_mode & 0o777:o}, not '
@@ -2029,9 +2117,10 @@ GROK_SCENARIOS = (
     ('inventory-follow', grok_inventory_follow, True),
     ('open-close-lifecycle', grok_open_close_lifecycle, True),
     ('consent-refused', grok_consent_refused, True),
-    ('install-python3-missing', grok_install_python3_missing, False),
+    ('install-without-python3', grok_install_without_python3, False),
     ('install-failed', grok_install_failed, False),
     ('consented-install-hooks', grok_consented_install_hooks, True),
+    ('native-hook-without-python3', grok_native_hook_without_python3, True),
     ('opencode-precedence', grok_opencode_precedence, True),
     ('repeated-switches-attach-filtering', grok_repeated_switches, True),
     ('two-tab-isolation', grok_two_tab_isolation, True),
