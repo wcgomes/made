@@ -24,7 +24,7 @@ Task IDs are stable because `specs/changes/add-release-auto-update/tasks.md` cit
 - [x] 1.9 Implement the reader-thread stdin read with the ~2s deadline, parent pid per platform, a single-write append to the log path, empty stdout and exit 0 on every path (path: crates/made-grok-hook/src/main.rs)
 
 ## Checkpoint
-- [ ] verify scenarios `Every registered event maps to its status`, `Line carries exactly the seven fields`, `Standard input left open`, `Malformed, empty or late input writes nothing`, `Failures never deny` and `Concurrent hook runs append whole lines` map to passing tests in `crates/made-grok-hook` on Linux, macOS and Windows CI
+- [x] verify scenarios `Every registered event maps to its status`, `Line carries exactly the seven fields`, `Standard input left open`, `Malformed, empty or late input writes nothing`, `Failures never deny` and `Concurrent hook runs append whole lines` map to passing tests in `crates/made-grok-hook` on Linux, macOS and Windows CI
 
 ## 2. Plugin source and staging
 IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
@@ -33,7 +33,7 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 - [x] 2.6 Implement `stage-grok-plugin.sh <target> <hook-binary> <out>`: copy the source files and the hook, set mode 755, write the workspace version into the staged `plugin.json` (equal to the source under REL-02), and generate the Windows `hooks.json` when 0.1 selected it (path: .github/scripts/stage-grok-plugin.sh)
 
 ## Checkpoint
-- [ ] verify 2.5 passes on Linux and macOS CI
+- [x] verify 2.5 passes on Linux and macOS CI
 
 ## 3. Local install and development resolution
 - [x] 3.1 Add tests: development and release builds both resolve `<install_root>/plugins/grok-made`; a development build never falls back to the repository source, which is never passed to `grok plugin install`; a missing staged copy runs no install and records hooks unavailable; and, only when 0.2 selected the fallback, the installed hook mode is restored after install; confirm they fail (path: crates/made-app/tests/grok_plugin_install.rs)
@@ -43,7 +43,7 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 - [x] 3.5 [P] Point the manual install at the staged `<install_root>/plugins/grok-made` path and describe the native hook (path: plugins/grok-made/README.md)
 
 ## Checkpoint
-- [ ] verify scenarios `Missing or older plugin is installed`, `Same version skips install`, `Newer installed copy stays`, `Development run installs only the staged copy` and `Install failure leaves hooks unavailable` map to passing tests
+- [x] verify scenarios `Missing or older plugin is installed`, `Same version skips install`, `Newer installed copy stays`, `Development run installs only the staged copy` and `Install failure leaves hooks unavailable` map to passing tests
 
 ## 4. Remote python3 removal and stage set
 - [x] 4.1 Update tests: the probe no longer looks up python3; the staged grok-made set is the 10-artifact list with the hook at mode 700; no `status.py` or `status_test.py`; confirm failure (path: crates/made-platform/tests/ssh.rs)
@@ -66,7 +66,7 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 - [x] 4.18 [P] Update python3 references in UI-model tests (path: crates/made-app/tests/ui_model.rs)
 
 ## Checkpoint
-- [ ] verify scenarios `Install idempotence, refusal and failure keep honest tiers`, `Remote Grok diagnostics stay honest and hidden until revealed` and `Consented install enables hook activity` (no-python3 variant) map to passing tests, and `grep -rn python3 crates --include=*.rs` shows only the frozen field, its tests and `crates/made-platform/tests/detach.rs`
+- [x] verify scenarios `Install idempotence, refusal and failure keep honest tiers`, `Remote Grok diagnostics stay honest and hidden until revealed` and `Consented install enables hook activity` (no-python3 variant) map to passing tests, and `grep -rn python3 crates --include=*.rs` shows only the frozen field, its tests and `crates/made-platform/tests/detach.rs`
 
 ## 5. Packaging and CI
 Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
@@ -82,7 +82,7 @@ Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
 - [x] 5.6 [P] Run `cargo test -p made-grok-hook` on both macOS targets (path: .github/workflows/ci-macos.yml)
 
 ## Checkpoint
-- [ ] verify scenarios `Shipped package matches the host` and `No Python on the machine` (packaged hook, pid and no-Python run on all four local targets via 5.10), `Staged hook matches each server's target` (hook built, checked and manifest-recorded per remote target) and SSH-06 `Approved companion update is verified, swapped and reused` (10 artifacts) pass in CI
+- [x] verify scenarios `Shipped package matches the host` and `No Python on the machine` (packaged hook, pid and no-Python run on all four local targets via 5.10), `Staged hook matches each server's target` (hook built, checked and manifest-recorded per remote target) and SSH-06 `Approved companion update is verified, swapped and reused` (10 artifacts) pass in CI
 
 ## 6. Cutover
 - [x] 6.1 Point all nine registrations at `bin/made-grok-status`, keeping events, matchers and the 5-second timeout, in the form 0.1 selected (path: plugins/grok-made/hooks/hooks.json)
@@ -90,16 +90,16 @@ Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
 - [x] 6.3 [P] Delete the Python test after 1.3 to 1.5 pass (path: plugins/grok-made/hooks/status_test.py)
 
 ## Checkpoint
-- [ ] verify no file under `plugins/grok-made` is Python, `grep -rn 'status\.py\|status_test' .github crates plugins tests` is empty, and phases 1 to 5 still pass
+- [x] verify no file under `plugins/grok-made` is Python, `grep -rn 'status\.py\|status_test' .github crates plugins tests` is empty, and phases 1 to 5 still pass
 
 ## 7. Acceptance
 - [x] 7.1 Replace `grok_install_python3_missing` with a no-python3 consented install that succeeds, drop the python3 detection variants, and add a scenario that runs the installed native hook on a PATH without python3 and ingests its real line (path: tests/ssh/parity.py)
 - [x] 7.2 [P] Update harness self-tests for the removed python3 variants (path: tests/ssh/test_harness.py)
-- [ ] 7.3 Run native real-grok acceptance on macOS arm64, macOS x64, Linux x64 and Windows x64 (install from the packaged layout with no Python, start a session, prompt, question, stop, end, and check dots, explorer follow and the logged pid against the Grok process) and on one remote per supported target; record per platform the evidence or an `UNVERIFIED` label per SSH-09 evidence rules, including any 0.3 `UNVERIFIED` result (path: tests/e2e/grok_native_hook_validation.md)
+- [x] 7.3 Run native real-grok acceptance on macOS arm64, macOS x64, Linux x64 and Windows x64 (install from the packaged layout with no Python, start a session, prompt, question, stop, end, and check dots, explorer follow and the logged pid against the Grok process) and on one remote per supported target; record per platform the evidence or an `UNVERIFIED` label per SSH-09 evidence rules, including any 0.3 `UNVERIFIED` result (path: tests/e2e/grok_native_hook_validation.md)
 
 ## Checkpoint
-- [ ] verify scenarios `No Python on the machine`, `Session start and prompt move the explorer immediately`, `Question and permission show attention`, `Turn end and session end`, `Parallel sessions stay distinct`, `Consented install enables hook activity`, `Staged hook matches each server's target`, `Two tabs on one server do not leak Grok sessions` and `Disconnect, reconnect and stale Grok state` pass in the loopback grok-parity job or 7.3, with `UNVERIFIED` labels kept for combinations not executed
-- [ ] verify `cargo test --workspace --locked` passes and every spec scenario maps to a passing test or a labeled `UNVERIFIED` combination
+- [x] verify scenarios `No Python on the machine`, `Session start and prompt move the explorer immediately`, `Question and permission show attention`, `Turn end and session end`, `Parallel sessions stay distinct`, `Consented install enables hook activity`, `Staged hook matches each server's target`, `Two tabs on one server do not leak Grok sessions` and `Disconnect, reconnect and stale Grok state` pass in the loopback grok-parity job or 7.3, with `UNVERIFIED` labels kept for combinations not executed
+- [x] verify `cargo test --workspace --locked` passes and every spec scenario maps to a passing test or a labeled `UNVERIFIED` combination
 
 ## Coverage map
 - `Grok status hook`: 0.1, 0.3, 1.1 to 1.9, 5.9, 5.10, 6.1 to 6.3, 7.1, 7.3
