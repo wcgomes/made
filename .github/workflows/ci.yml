@@ -161,6 +161,11 @@ jobs:
         with:
           node-version: 24
 
+      - name: Install PyYAML for the workflow structure tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-yaml
+
       - name: Check that every version site agrees
         run: python3 .github/scripts/check-versions.py
 

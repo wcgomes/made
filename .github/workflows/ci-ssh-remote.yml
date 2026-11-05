@@ -11,6 +11,11 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      release:
+        description: Release build (release.yml); restores no cache.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,10 +47,11 @@ jobs:
             askpass: false
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Cache the glibc 2.31 build
-        uses: actions/cache@v4
+        if: ${{ !inputs.release }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .cargo-home
@@ -77,7 +83,7 @@ jobs:
           if [ -d .cargo-home ]; then sudo chown -R "$(id -u):$(id -g)" .cargo-home; fi
 
       - name: Upload the Linux companion
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ssh-companion-${{ matrix.target }}
           path: dist/ssh-companion-${{ matrix.target }}/
@@ -88,13 +94,14 @@ jobs:
       # glibc 2.31 companion. There is no aarch64 Linux desktop package.
       - name: Install Rust stable
         if: matrix.askpass
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        if: matrix.askpass
-        uses: Swatinem/rust-cache@v2
+        if: matrix.askpass && !inputs.release
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: askpass-${{ matrix.target }}
 
@@ -106,7 +113,7 @@ jobs:
 
       - name: Upload the native Linux askpass
         if: matrix.askpass
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ssh-askpass-${{ matrix.target }}
           path: dist/ssh-askpass-${{ matrix.target }}/
@@ -129,15 +136,17 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        if: ${{ !inputs.release }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: companion-${{ matrix.target }}
 
@@ -147,7 +156,7 @@ jobs:
         run: bash .github/scripts/build-macos-companion.sh
 
       - name: Upload the macOS companion
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ssh-companion-${{ matrix.target }}
           path: dist/ssh-companion-${{ matrix.target }}/
@@ -155,7 +164,7 @@ jobs:
           retention-days: 14
 
       - name: Upload the native macOS askpass
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ssh-askpass-${{ matrix.target }}
           path: dist/ssh-askpass-${{ matrix.target }}/
@@ -168,15 +177,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        if: ${{ !inputs.release }}
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: askpass-x86_64-pc-windows-msvc
 
@@ -187,7 +198,7 @@ jobs:
         run: bash .github/scripts/stage-askpass.sh
 
       - name: Upload the native Windows askpass
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ssh-askpass-x86_64-pc-windows-msvc
           path: dist/ssh-askpass-x86_64-pc-windows-msvc/
@@ -204,7 +215,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Prepare isolated sshd
         run: |
@@ -220,7 +231,7 @@ jobs:
           sshd -V 2>&1 | sed -n '1p' || true
 
       - name: Download the staged x86_64 Linux companion
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: ssh-companion-x86_64-unknown-linux-gnu
           path: ${{ runner.temp }}/ssh-companion
