@@ -6017,6 +6017,9 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
         ];
         let _env = EnvGuard(
             keys.iter()
@@ -6024,6 +6027,9 @@ mod tests {
                 .collect(),
         );
         std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
+        std::env::set_var("LOCALAPPDATA", home.join("AppData").join("Local"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
