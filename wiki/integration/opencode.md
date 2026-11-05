@@ -23,7 +23,7 @@ Made workspace tab
 
 Each workspace tab owns its listener, pane id, and 256-bit token. There is no shared multiplexed bridge. A second authenticated connection for the same pane replaces the first with close code `4409`; a cross-pane hello is rejected before replacement or state disclosure.
 
-In an SSH workspace the same bridge runs inside the server-side companion, and normalized state reaches the client only over the SSH transport; the tab's `OpenCode` label, icon, dots, and diagnostics come from that tab's remote integration and session state, never from the host. See the active [SSH remote workspaces contract](../../specs/changes/ssh-remote-workspaces/spec.md).
+In an SSH workspace the same bridge runs inside the server-side companion, and normalized state reaches the client only over the SSH transport; the tab's `OpenCode` label, icon, dots, and diagnostics come from that tab's remote integration and session state, never from the host. See the archived [SSH remote workspaces contract](../../specs/changes/archive/20261105-ssh-remote-workspaces/spec.md).
 
 OpenCode v2 is not a single process. Default `opencode` uses a managed background service, while `opencode --standalone` still starts a private `serve --stdio --port 0`. Made does not own either service lifecycle and does not attach to the user's service. The Phase 0 full session-follow harness used `--standalone`; managed mode was load-tested only.
 
@@ -31,7 +31,7 @@ OpenCode v2 is not a single process. Default `opencode` uses a managed backgroun
 
 The server-side companion ships under one app-owned version path. A missing version target is staged once after the per-server/version consent, and an existing same-version set that verifies exactly is reused without rewriting. A same-version target with missing, corrupt or different artifacts is never repaired silently: Made writes and deletes nothing, reports a sanitized update-required state naming the version and target, and waits for an explicit `Update companion` approval for the current attempt. An approved update writes all 11 shipped artifacts into a private temporary sibling, verifies every size, hash and required executable mode there, replaces the current version path through a rollback-safe swap, and removes the temporary and replaced app-owned directories, so per-build copies do not accumulate. A failure before the swap leaves the original byte-for-byte intact. A running companion, supervisor or terminal is never signaled and keeps its own OS process lifecycle, while later companion and Grok-install launches resolve the updated path and the next attempt verifies and reuses the updated set exactly.
 
-A crashed or concurrent attempt is serialized by an owner-token lock, and the fixed `.replace` path preserves the original across a swap; the next attempt restores it before any other work and cleans only demonstrably dead-owned temporary state. Full requirements and scenarios stay in the active [SSH remote workspaces contract](../../specs/changes/ssh-remote-workspaces/spec.md).
+A crashed or concurrent attempt is serialized by an owner-token lock, and the fixed `.replace` path preserves the original across a swap; the next attempt restores it before any other work and cleans only demonstrably dead-owned temporary state. Full requirements and scenarios stay in the archived [SSH remote workspaces contract](../../specs/changes/archive/20261105-ssh-remote-workspaces/spec.md).
 
 ## Plugin package
 
@@ -135,6 +135,6 @@ The plugin is pinned to this observed surface. Bridge protocol version gates maj
 - App-level live session switching on the revised terminal-first build is still pending; the current evidence for bridge/config/root precedence is test-level plus historical real-OpenCode runs.
 - Connected view-directory follow is TUI-only; a folder selected in the OpenCode desktop app's own picker is not observable.
 - WSL-hosted OpenCode, ACP, and other agents are out of scope.
-- SSH remote workspaces are covered by the active [contract](../../specs/changes/ssh-remote-workspaces/spec.md). Made does not depend on tmux; the native supervisor is the chosen mechanism. Remote tab presentation and diagnostics consume that tab's remote integration and session state, never the host's. Host-companion tests run over a real loopback `sshd` with the release companion; the live plantsuite/native GUI matrix remains pending, and no external-server validation is claimed.
+- SSH remote workspaces are covered by the archived [contract](../../specs/changes/archive/20261105-ssh-remote-workspaces/spec.md). Made does not depend on tmux; the native supervisor is the chosen mechanism. Remote tab presentation and diagnostics consume that tab's remote integration and session state, never the host's. Host-companion tests run over a real loopback `sshd` with the release companion; the live plantsuite/native GUI matrix remains pending, and no external-server validation is claimed.
 
 Related: [Security](../security.md), [Runtime terminal-first](../runtime/terminal-first.md), [Phase 0 record](../records/20261025-phase-0-gate.md).

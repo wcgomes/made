@@ -596,7 +596,7 @@ Made MUST build from one source tree for macOS arm64, macOS x64, Linux x64 on X1
 
 ### Requirement: Security and Local-Only Integration
 
-Made MUST accept integration connections only over the loopback interface, on a randomly assigned port, authenticated by a per-workspace-instance secret. Credentials and routing MUST isolate workspace tabs: a valid client for one tab MUST NOT mutate, focus, replace the connection of, or disclose state from another tab. Made MUST reject unauthenticated or unauthorized clients before disclosing state. Made MUST NOT persistently modify user shell or OpenCode configuration files. Made MUST load integration code from an app-owned location. Made MUST restrict workspace-content reads to the owning tab's current root and paths the user explicitly selects, and MUST reject path traversal outside those roots. Explicit folder selection, the default home workspace, and validated local cwd, session, or view-directory reports authorize root changes only for their owning tab; they MUST NOT authorize arbitrary file reads in other tabs. Read-only user configuration composition and app-owned resources remain separate from workspace-content reads. The integration bridge MUST NOT be reachable from non-loopback interfaces.
+For local workspaces, Made MUST accept integration connections only over the loopback interface, on a randomly assigned port, authenticated by a per-workspace-instance secret. Credentials and routing MUST isolate workspace tabs: a valid client for one tab MUST NOT mutate, focus, replace the connection of, or disclose state from another tab. Made MUST reject unauthenticated or unauthorized clients before disclosing state. Made MUST NOT persistently modify user shell or OpenCode configuration files. Made MUST load integration code from an app-owned location. Made MUST restrict workspace-content reads to the owning tab's current root and paths the user explicitly selects, and MUST reject path traversal outside those roots. Explicit folder selection, the default home workspace, and validated local cwd, session, or view-directory reports authorize root changes only for their owning local tab; they MUST NOT authorize arbitrary file reads in other tabs. Read-only user configuration composition and app-owned resources remain separate from workspace-content reads. The integration bridge MUST NOT be reachable from non-loopback interfaces. SSH workspaces extend this local-only scope exclusively through the selected authenticated SSH authority as defined by SSH-02 and SSH-08; they MUST NOT require a publicly reachable bridge, accept remote reports as host paths or weaken local authentication/containment. Remote integration provisioning requires the consent and app-owned scope of SSH-06, with the trusted-helper and compromised-server limits of SSH-08.
 
 #### Scenario: Unauthorized bridge client rejected
 
@@ -606,25 +606,25 @@ Made MUST accept integration connections only over the loopback interface, on a 
 
 #### Scenario: Non-loopback bind
 
-- Given the integration bridge is listening
-- When the user inspects its listening sockets
-- Then it is bound only to a loopback address and not to a wildcard or external interface
+- Given the integration bridge is listening for a local or SSH workspace
+- When listening sockets on both machines are inspected
+- Then integration endpoints are bound only to loopback and never a wildcard or external interface
 
 #### Scenario: User config unchanged
 
-- Given the user has an OpenCode configuration file
+- Given the user has an OpenCode configuration file on the selected machine
 - When the user runs OpenCode in Made and the session ends
 - Then the file's content is byte-for-byte unchanged and no Made-managed content was persisted into it
 
 #### Scenario: Path traversal blocked
 
-- Given a path outside the active root
+- Given a path outside the active root on the selected local authority or a trusted remote server/helper
 - When a file request attempts traversal or a symlink escape
-- Then Made rejects the request and shows no content from outside the root
+- Then the owning filesystem guard rejects the request and shows no content from outside the root; client-generated remote operations and response validation also enforce SSH-08, without claiming filesystem attestation for a compromised server/helper
 
 #### Scenario: Plugin from app-owned path
 
-- Given Made loads its integration code
+- Given Made loads its integration code on the selected authority under an authorized provisioning workflow
 - When the loaded location is inspected
 - Then it resolves inside the app-owned installation or resource area and not inside the user's configuration directory
 
