@@ -43,7 +43,7 @@ Releases are not signed, so Windows SmartScreen and macOS Gatekeeper warn on fir
 
 ### Updates
 
-Made checks GitHub Releases at launch and once a day, downloads a newer release in the background and verifies it, then shows a small dot on the MADE wordmark. Open **About** and choose **Restart to update** when convenient; restarting closes every open workspace. To stop automatic checks, turn off **Check for updates automatically** in About; **Check for updates** still checks once when you ask. Builds run from source (`cargo run`) or development artifacts never update themselves.
+Made checks GitHub Releases at launch and once a day, downloads a newer release in the background and verifies it, then shows a small dot on the MADE wordmark. Open **About** and choose **Restart to update** when convenient; restarting closes every open workspace. To stop automatic checks, turn off **Check for updates automatically** in About; **Check for updates** still checks once when you ask. Builds run from source (`cargo run`) or development artifacts never update themselves. Because macOS builds are only ad-hoc signed, macOS may ask again for privacy permissions you granted Made (for example Files and Folders access) after an update; grant them again the same way.
 
 Each release lists the SHA-256 of every file in `SHA256SUMS`. A matching digest shows a download is not corrupted; it does not prove who published it.
 

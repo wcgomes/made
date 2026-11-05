@@ -29,7 +29,7 @@ The development artifact stages the plugin at `<artifact_root>/plugins/opencode-
 
 ## Release limits
 
-- Artifacts and releases are unsigned (macOS bundles are ad-hoc signed only); Gatekeeper and SmartScreen warn on first run.
+- Artifacts and releases are unsigned (macOS bundles are ad-hoc signed only); Gatekeeper and SmartScreen warn on first run. Because the ad-hoc signature changes with every build, macOS may re-request privacy permissions (TCC) after an update.
 - No notarization or package repository; GitHub Releases is the only channel.
 - The packaged/staged layout has **not been launched end-to-end**.
 - CI is observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; artifacts are assembled but remain unlaunched, and green CI is not native UX evidence.

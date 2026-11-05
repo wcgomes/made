@@ -268,7 +268,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - apply kill points on real machines, with power loss marked unverified on any OS whose swap atomicity 1.7 did not establish;
   - About/indicator behavior;
   - installed-layout launch with components resolved.
-- [ ] 9.2 After user approval, push iteration tags `v0.1.0`, `v0.1.1`, ... in the production repository as implementation needs, with notes labelled as temporary test releases, and record each release URL and per-target evidence. After verification, follow the rollout plan: delete all iteration releases, then their tags, re-release `v0.1.0` from the final commit, and record its evidence (path: tests/e2e/release_validation.md)
+- [ ] 9.2 After user approval, push iteration tags `v0.1.0`, `v0.1.1`, ... in the production repository as implementation needs, with notes labelled as temporary test releases, and record each release URL and per-target evidence. After verification, and only once the Phase 11 checkpoint passes and the REL-01 approval gate is configured, follow the rollout plan: delete all iteration releases, then their tags, re-release `v0.1.0` from the final commit, and record its evidence (path: tests/e2e/release_validation.md)
 - [ ] 9.3 At the second published release counted from the final `v0.1.0`, confirm the 7.12 upgrade check passed and verify the in-app upgrade from the first on every target with SSH records and settings preserved (path: tests/e2e/release_validation.md)
 
 ## Checkpoint
@@ -288,6 +288,33 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 
 ## Checkpoint
 - [ ] No probe files, dead references or new warnings remain; `cargo clippy --workspace` and all CI workflows are green
+
+## 11. Security-review fixes
+- [ ] 11.1 Write failing tests for the Windows hand-off (path: crates/made-platform/tests/update.rs):
+  - the install lock passes from the command-line entry to the helper with no gap;
+  - the helper holds the lock until its swap ends;
+  - a failed helper start releases the lock and changes no installed files;
+  - the helper records its final outcome in private app data where the next invocation and diagnostics can read it;
+  - the install lock is OS-held and released when its holder exits, or a stale lock with a dead holder is detected and ignored;
+  - in the fallback, a stale lock whose process id now belongs to an unrelated live process, detected by a mismatched start time, is still treated as stale;
+  - after the helper is killed before, during and after its swap, the next GUI start succeeds on the previous or new version.
+- [ ] 11.2 Implement the gap-free lock hand-off, the hand-off failure path and the helper outcome record; confirm 11.1 passes (path: crates/made-platform/src/update.rs)
+- [ ] 11.3 Write failing tests for the command-line hand-off (path: crates/made-app/tests/update_restart.rs):
+  - output states that the apply was handed off and has not completed, and the exit code is 0 only on a successful hand-off and non-zero with a clear message otherwise;
+  - GUI startup is refused while the hand-off lock is held;
+  - an `--update` invocation while the helper still runs reports "apply in progress", and the next one after it ends reports the recorded outcome;
+  - after the command-line entry is killed during its checks, the next GUI start is not blocked and succeeds on the previous version;
+  - on macOS and Linux the entry still exits when the apply is done.
+- [ ] 11.4 Implement the hand-off messages, exit codes, the GUI refusal during the hand-off, and reporting the previous helper outcome; confirm 11.3 passes (path: crates/made-app/src/main.rs)
+- [ ] 11.5 Write failing tests that the last recorded helper outcome is one row inside an existing diagnostics section (no new section), appears in copied diagnostics, and is redacted under the existing rules (path: crates/made-app/tests/diagnostics.rs)
+- [ ] 11.6 Show the recorded helper outcome in the diagnostics detail; confirm 11.5 passes (path: crates/made-app/src/diagnostics.rs)
+- [ ] 11.7 Write failing tests for AppImage extraction privacy: unit cases, plus an AppImage-level runtime test that launches the built AppImage against pre-planted entries (a directory owned by another user, a user-owned directory with any `077` bit set, a symlink). None is executed from and the symlink is not followed; the outcome is a fresh private directory or a clear exit, per the M2 decision. Enforcement may need a wrapper inside the AppImage (path: .github/scripts/test_linux_appimage_runtime.py)
+- [ ] 11.8 Implement the private extract-and-run target per the M2 decision; confirm 11.7 passes (path: .github/scripts/linux-appimage-runtime.py)
+- [ ] 11.9 Fill the M2 AppImage extraction decision and confirm the hand-off record (path: specs/changes/add-release-auto-update/proposal.md)
+- [ ] 11.10 Make the Windows upgrade check poll `--update` until it no longer reports "apply in progress", within a bounded wait that fails the upgrade check on timeout, then assert the recorded helper outcome and the new version (path: .github/workflows/upgrade-check.yml)
+
+## Checkpoint
+- [ ] verify REL-12 "Windows command-line apply hand-off", "Windows hand-off failure", "Killed apply never blocks startup", "Command-line upgrade uses the same path" and "GUI startup refused during command-line apply"; REL-04 "AppImage extraction directory is private"; REL-12 "Post-publish upgrade check" on Windows through 11.10
 
 ## Cross-change dependencies
 `specs/changes/grok-native-hook/` lands its tasks 2.6 through 6.3 in one merge to main. This change archives before or together with it, because it cites REL-02.
@@ -321,7 +348,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - REL-01: 1.7, 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.8, 7.9, 7.13, 8.2, 9.2
 - REL-02: 2.1, 2.2, 2.4, 2.5, 2.6, 2.7, 3.1, 3.2, 7.4, 7.5, 8.2, 9.2
 - REL-03: 1.3, 3.1, 3.2, 5.7, 5.8, 7.7, 7.9, 7.10, 9.1
-- REL-04: 1.4, 1.5, 1.6, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 7.9, 9.1
+- REL-04: 1.4, 1.5, 1.6, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 7.9, 9.1, 11.7, 11.8, 11.9
 - REL-05: 1.3, 1.5, 7.3, 8.1, 9.1
 - REL-06: 1.2, 1.7, 1.8, 4.2, 4.3, 5.3, 5.4, 6.1, 6.2
 - REL-07: 1.2, 4.2, 4.3, 5.3, 5.4, 5.7, 5.8, 5.10, 6.1, 6.2
@@ -329,7 +356,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - REL-09: 1.7, 4.3, 5.3, 5.4, 5.5, 5.6, 9.1
 - REL-10: 5.1, 5.2, 5.3, 5.4, 5.7, 5.10, 6.1, 6.2, 7.11
 - REL-11: 1.2, 3.3, 4.2, 4.3, 4.5, 5.3, 5.7, 5.8, 5.10, 7.7
-- REL-12: 4.2, 5.7, 5.10, 7.6, 7.7, 7.11, 7.12, 8.2, 9.2, 9.3
+- REL-12: 4.2, 5.7, 5.10, 7.6, 7.7, 7.11, 7.12, 8.2, 9.2, 9.3, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.10
 - MODIFIED Minimal Workspace Layout: 6.1, 6.2
 - MODIFIED About Presentation: 5.3, 6.1, 6.2
 - MODIFIED Keyboard Focus and Accessibility: 6.1, 6.2
