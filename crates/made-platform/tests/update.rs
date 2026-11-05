@@ -881,6 +881,21 @@ mod seam {
             "adopt" => {
                 let handle: u64 = parts.next().unwrap().parse().unwrap();
                 let _lock = seam::adopt_install_lock(handle, &dir).unwrap();
+                // The adopted lock is never inherited by the updater.
+                let mut flags = 0u32;
+                // SAFETY: querying the handle this process now owns.
+                let queried = unsafe {
+                    windows_sys::Win32::Foundation::GetHandleInformation(
+                        handle as usize as *mut std::ffi::c_void,
+                        &mut flags,
+                    )
+                };
+                assert!(queried != 0, "the adopted handle can be queried");
+                assert_eq!(
+                    flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+                    0,
+                    "the adopted lock is not inheritable"
+                );
                 std::fs::write(&ready, std::process::id().to_string()).unwrap();
                 wait();
             }
@@ -991,16 +1006,42 @@ mod seam {
     }
 
     #[test]
-    fn gui_startup_fails_closed_when_it_cannot_register() {
-        use made_platform::update::{register_instance, StartupRefused};
+    fn gui_startup_continues_with_updates_disabled_when_it_cannot_register() {
+        use made_platform::update::{register_instance, Registration};
         let dir = tempfile::tempdir().unwrap();
         let blocked = dir.path().join("packages");
         std::fs::write(&blocked, b"not a directory").unwrap();
         let installation = seam::installation(blocked, dir.path().join("data"), "0.2.0");
-        assert_eq!(
-            register_instance(&installation).err(),
-            Some(StartupRefused::Unregistered)
-        );
+        match register_instance(&installation) {
+            Ok(Registration::UpdatesUnavailable(detail)) => assert!(!detail.is_empty()),
+            Ok(Registration::Registered(_)) => panic!("registered without a writable folder"),
+            Err(refused) => panic!("startup refused: {refused}"),
+        }
+    }
+
+    #[test]
+    fn simultaneous_window_starts_do_not_refuse_each_other() {
+        use made_platform::update::{register_instance, Registration};
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(packages.join("made-install.lock"), b"").unwrap();
+        let installation = seam::installation(packages.clone(), dir.path().join("data"), "0.2.0");
+        // Many windows start at once; each probes the install lock while the
+        // others probe it too. No probe reads another probe as an apply.
+        let starts: Vec<_> = (0..8)
+            .map(|_| {
+                let packages = packages.clone();
+                std::thread::spawn(move || (0..200).any(|_| seam::apply_in_progress_at(&packages)))
+            })
+            .collect();
+        for start in starts {
+            assert!(!start.join().unwrap(), "a concurrent probe was refused");
+        }
+        assert!(matches!(
+            register_instance(&installation),
+            Ok(Registration::Registered(_))
+        ));
     }
 
     #[test]
@@ -1068,6 +1109,59 @@ mod seam {
             std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
             0o600,
             "private record"
+        );
+    }
+
+    /// A helper (Windows) or updater (macOS, Linux) that cannot start leaves
+    /// the install lock free and the installed files untouched.
+    #[test]
+    fn a_failed_helper_start_releases_the_lock() {
+        use made_platform::update::{register_instance, Registration};
+        let fixture = Fixture::new();
+        let package = nupkg("Made", "0.3.0");
+        let listed = asset("0.3.0", &package);
+        fixture.feed(std::slice::from_ref(&listed));
+        fixture.publish("0.3.0", &package, &listed);
+        let updater = fixture.updater("0.2.0");
+        let ready = updater
+            .download(&updater.check().unwrap().unwrap())
+            .unwrap();
+        let listing = |dir: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        // No `Update` binary exists, and the helper root is a plain file, so
+        // neither a helper copy nor the updater can start.
+        let helper_root = fixture.data.join("not-a-directory");
+        std::fs::write(&helper_root, b"").unwrap();
+        let before = listing(&fixture.packages);
+        let error = seam::apply_from_cli_with_helper_root(&updater, &ready, &helper_root)
+            .expect_err("the start fails");
+        assert!(!error.to_string().is_empty());
+        // A child whose exec failed (or any child forked meanwhile by another
+        // test) holds a copy of the lock descriptor until it has fully exited.
+        wait_until(
+            || !seam::apply_in_progress_at(&fixture.packages),
+            "the install lock to be released",
+        );
+        assert!(matches!(
+            register_instance(updater.installation()),
+            Ok(Registration::Registered(_))
+        ));
+        let mut after = listing(&fixture.packages);
+        // Only lock and registration files may appear; no package or app file.
+        after.retain(|name| {
+            let name = name.to_string_lossy();
+            !name.starts_with("made-instance-") && name != "made-install.lock"
+        });
+        assert_eq!(before, after, "no installed file changed");
+        assert!(
+            updater.kept().is_some(),
+            "the verified package is still kept"
         );
     }
 

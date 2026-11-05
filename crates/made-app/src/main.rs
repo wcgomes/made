@@ -104,21 +104,54 @@ fn update_entry(apply: bool) -> ExitCode {
     ExitCode::from(code as u8)
 }
 
+/// A small native window that says why Made did not start, for launches with
+/// no terminal attached. Closes on its button, Enter or Escape.
+fn show_startup_refusal(message: String) {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Made")
+            .with_inner_size([460.0, 150.0])
+            .with_resizable(false),
+        ..Default::default()
+    };
+    let _ = eframe::run_ui_native("Made", options, move |ui, _frame| {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Made cannot start right now").strong());
+            ui.add_space(6.0);
+            ui.label(message.as_str());
+            ui.add_space(14.0);
+            let close = ui.button("Close").clicked()
+                || ui.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
+                });
+            if close {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+    });
+}
+
 fn run(args: cli::LaunchArgs) -> ExitCode {
     let smoke = args.smoke_test;
     let started_at = Instant::now();
     let updater = Updater::detect().map(Arc::new);
-    // Announce this GUI instance; refuse while a command-line apply holds the
-    // install lock (REL-12).
-    let _instance = match &updater {
+    // Announce this GUI instance; refuse only while a command-line apply holds
+    // the install lock (REL-12). A window that cannot register still starts,
+    // with updates off for this run.
+    let (_instance, unregistered) = match &updater {
         Some(updater) => match platform_update::register_instance(updater.installation()) {
-            Ok(guard) => Some(guard),
+            Ok(platform_update::Registration::Registered(guard)) => (Some(guard), None),
+            Ok(platform_update::Registration::UpdatesUnavailable(detail)) => (None, Some(detail)),
             Err(refused) => {
                 eprintln!("made: {refused}");
+                if smoke.is_none() {
+                    show_startup_refusal(refused.to_string());
+                }
                 return ExitCode::FAILURE;
             }
         },
-        None => None,
+        None => (None, None),
     };
     let options = AppOptions {
         smoke_test: smoke,
@@ -129,8 +162,16 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
     if let Some(updater) = &updater {
         model.set_update_apply_outcome(updater.last_cli_apply().map(|outcome| outcome.describe()));
     }
+    if let Some(detail) = &unregistered {
+        let note = format!("Updates are off for this run: {detail}.");
+        eprintln!("made: {note}");
+        model.record_update_note(made_app::diagnostics::LogLevel::Warn, note);
+    }
     // Smoke runs and non-installed builds make no update request (REL-11).
     match (&updater, smoke) {
+        (Some(_), None) if unregistered.is_some() => {
+            model.set_updates(UpdateScheduler::unavailable(true), None);
+        }
         (Some(updater), None) => {
             let store = PreferenceStore::from_app_paths();
             let preference = store.as_ref().map(PreferenceStore::load).unwrap_or(
