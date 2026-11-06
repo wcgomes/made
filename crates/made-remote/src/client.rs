@@ -82,9 +82,14 @@ struct State {
     status: TransportStatus,
     prompt: Option<PromptRequest>,
     answer: Option<(u64, Option<PromptAnswer>)>,
+    /// Called after terminal output arrives or the transport drops, so the UI
+    /// can paint without waiting for its next idle poll.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    wake_pending: bool,
 }
 impl State {
     fn disconnect(&mut self) {
+        self.wake_pending = true;
         self.connected = false;
         self.status = TransportStatus::Disconnected;
         self.control.clear();
@@ -251,6 +256,7 @@ impl State {
                 if *done {
                     self.resnapshot_done = true;
                 }
+                self.wake_pending = true;
                 self.terminal
                     .push_back(QueuedTerminal::Output(TerminalFrame {
                         bytes: data.as_bytes().to_vec(),
@@ -435,10 +441,20 @@ impl RemoteClient {
             status: TransportStatus::Connected,
             prompt: None,
             answer: None,
+            wake: None,
+            wake_pending: false,
         }));
         let weak = Arc::downgrade(&state);
         std::thread::spawn(move || run(stream, weak));
         Ok(Self { state })
+    }
+    /// Register a callback run on the transport thread, outside the state lock,
+    /// after terminal output arrives or the transport drops. It must be cheap
+    /// and must not call back into this client.
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut state) = self.state.lock() {
+            state.wake = Some(Arc::new(wake));
+        }
     }
     pub fn identity(&self) -> Identity {
         self.state
@@ -720,13 +736,27 @@ fn run(mut stream: impl ClientStream, weak: Weak<Mutex<State>>) {
             }
             inbound.drain(..offset);
         }
+        let wake = if std::mem::take(&mut state.wake_pending) {
+            state.wake.clone()
+        } else {
+            None
+        };
         drop(state);
         drop(shared);
+        if let Some(wake) = wake {
+            wake();
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     // Discard partially sent frames and all uncertain input. There is no retry
     // or replay path; a new epoch requires a new transport/client instance.
     stream.detach();
+    let wake = weak
+        .upgrade()
+        .and_then(|shared| shared.lock().ok().and_then(|state| state.wake.clone()));
+    if let Some(wake) = wake {
+        wake();
+    }
 }
 
 pub struct RemoteRootResolver(RemoteClient);
