@@ -38,7 +38,10 @@ use crate::integration_status::{
     claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
     ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus,
 };
-use crate::integrations::{CLAUDE_CODE, GROK};
+use crate::integrations::{
+    EnvContribution, FollowKind, IntegrationList, LaunchCtx, Slots, TabInit, TabIo, TabState,
+    CLAUDE_CODE, GROK, PRODUCT,
+};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFocusController};
@@ -608,6 +611,10 @@ pub struct Workbench {
     claude_plugin: Option<PathBuf>,
     /// App-wide Claude Code detection state for the diagnostics row.
     claude_phase: ClaudeDiagnosticsPhase,
+    /// The integrations this tab was built with, in catalog order.
+    integrations: IntegrationList,
+    /// Per-tab integration state, parallel to `integrations`.
+    tab_states: Slots<Box<dyn TabState>>,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -675,7 +682,28 @@ impl Workbench {
         terminal_target: TerminalTarget,
         started_at: Instant,
     ) -> Self {
+        Self::start_in(
+            PRODUCT,
+            plan,
+            workspace_error,
+            terminal_cwd,
+            terminal_target,
+            started_at,
+        )
+    }
+
+    /// [`Self::start`] over a given integration list instead of the product's.
+    #[doc(hidden)]
+    pub fn start_in(
+        integrations: IntegrationList,
+        plan: Option<LaunchPlan>,
+        workspace_error: Option<WorkspaceError>,
+        terminal_cwd: PathBuf,
+        terminal_target: TerminalTarget,
+        started_at: Instant,
+    ) -> Self {
         Self::start_with(
+            integrations,
             plan,
             workspace_error,
             terminal_cwd,
@@ -689,6 +717,19 @@ impl Workbench {
     ///
     /// Connection continues on a worker. Failure stays on this tab.
     pub fn start_remote(
+        snapshot: crate::ssh_servers::ServerSnapshot,
+        directory: made_remote::protocol::RemotePath,
+        target: TerminalTarget,
+        started_at: Instant,
+    ) -> Result<Self, String> {
+        Self::start_remote_in(PRODUCT, snapshot, directory, target, started_at)
+    }
+
+    /// [`Self::start_remote`] over a given integration list instead of the
+    /// product's.
+    #[doc(hidden)]
+    pub fn start_remote_in(
+        integrations: IntegrationList,
         snapshot: crate::ssh_servers::ServerSnapshot,
         directory: made_remote::protocol::RemotePath,
         target: TerminalTarget,
@@ -709,6 +750,7 @@ impl Workbench {
             },
         ));
         Ok(Self::start_with(
+            integrations,
             None,
             None,
             PathBuf::new(),
@@ -770,6 +812,7 @@ impl Workbench {
             next_upload: 1,
         };
         Self::start_with(
+            PRODUCT,
             None,
             None,
             PathBuf::new(),
@@ -780,6 +823,7 @@ impl Workbench {
     }
 
     fn start_with(
+        integrations: IntegrationList,
         plan: Option<LaunchPlan>,
         mut workspace_error: Option<WorkspaceError>,
         terminal_cwd: PathBuf,
@@ -804,6 +848,15 @@ impl Workbench {
         }
         let claude_plugin = app_paths.as_ref().and_then(|paths| {
             ready_claude_plugin_dir(paths.shipped_claude_plugin_dir().as_deref())
+        });
+        let tab_states = Slots::from_list(integrations, |entry| {
+            entry.new_tab_state(
+                terminal_target,
+                &TabInit {
+                    paths: app_paths.as_ref(),
+                    remote: remote.is_some(),
+                },
+            )
         });
         let log_path = diagnostics_log_path(app_paths.as_ref());
         #[cfg(test)]
@@ -881,6 +934,8 @@ impl Workbench {
             claude: None,
             claude_plugin,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
+            integrations,
+            tab_states,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -1193,6 +1248,7 @@ impl Workbench {
         // Local shell and direct Claude Code tabs load Made's session-only
         // plugin and report to this tab's own spool.
         let (mut claude_spool, claude_launch) = self.prepare_claude_launch();
+        let contributions = self.prepare_launches();
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1206,6 +1262,9 @@ impl Workbench {
             .without_env("BASH_ENV")
             .without_env("ENV");
         options = with_claude_launch_env(options, self.terminal_target, &claude_launch);
+        for contribution in &contributions {
+            options = contribution.apply(options);
+        }
 
         if let Some(content) = &composed_content {
             options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
@@ -1224,6 +1283,7 @@ impl Workbench {
                     );
                 }
                 self.install_claude(pane.pid(), claude_spool.take());
+                self.notify_spawned(pane.pid());
                 self.terminal = Some(pane);
                 self.terminal_error = None;
                 if composed_content.is_none() {
@@ -1249,6 +1309,9 @@ impl Workbench {
                             .without_env("BASH_ENV")
                             .without_env("ENV");
                         retry = with_claude_launch_env(retry, self.terminal_target, &claude_launch);
+                        for contribution in &contributions {
+                            retry = contribution.apply(retry);
+                        }
                         if let Some(content) = &composed_content {
                             retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }
@@ -1267,6 +1330,7 @@ impl Workbench {
                                 follow.set_terminal_cwd(&self.terminal_cwd);
                             }
                             self.install_claude(pane.pid(), claude_spool.take());
+                            self.notify_spawned(pane.pid());
                             self.terminal = Some(pane);
                             self.terminal_error = None;
                             return;
@@ -1279,6 +1343,85 @@ impl Workbench {
                 );
                 self.diag.log_mut().record(LogLevel::Error, detail.clone());
                 self.terminal_error = Some(detail);
+                for state in self.tab_states.iter_mut() {
+                    state.on_launch_failed();
+                }
+            }
+        }
+    }
+
+    /// Ask every integration state to prepare this tab's launch, in list
+    /// order.
+    fn prepare_launches(&mut self) -> Vec<EnvContribution> {
+        let target = self.terminal_target;
+        let mut ctx = LaunchCtx {
+            paths: self.paths.as_ref(),
+            pane_id: &self.pane_id,
+            log: self.diag.log_mut(),
+        };
+        self.tab_states
+            .iter_mut()
+            .map(|state| state.prepare_launch(target, &mut ctx))
+            .collect()
+    }
+
+    /// Tell every integration state that the terminal child started.
+    fn notify_spawned(&mut self, pid: Option<u32>) {
+        for state in self.tab_states.iter_mut() {
+            state.on_spawned(pid);
+        }
+    }
+
+    /// Tell every integration state that its terminal is gone.
+    fn teardown_tab_states(&mut self) {
+        for state in self.tab_states.iter_mut() {
+            state.teardown();
+        }
+    }
+
+    /// Poll every integration state whose turn it is: all of them but the
+    /// session-channel owner on a local tab, those that declare it on a remote
+    /// tab. A directory report goes to the follow coordinator and its outcome
+    /// back to the state that reported it.
+    fn poll_integrations(&mut self, now: Instant) {
+        let remote = self.remote.is_some();
+        for index in 0..self.integrations.len() {
+            let entry = self.integrations[index];
+            let polled = if remote {
+                entry.polls_remote_tabs()
+            } else {
+                entry.follow() != FollowKind::SessionChannel
+            };
+            if !polled {
+                continue;
+            }
+            let Some(state) = self.tab_states.get_mut(index) else {
+                continue;
+            };
+            let mut io = TabIo {
+                terminal: self.terminal.as_mut(),
+                target: self.terminal_target,
+                remote,
+            };
+            let report = state.poll(now, &mut io);
+            let Some(directory) = report.directory else {
+                continue;
+            };
+            let outcome = self
+                .follow
+                .as_mut()
+                .map(|follow| follow.follow_directory(entry, directory.as_deref()));
+            if let Some(outcome) = outcome.as_ref() {
+                if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+                    self.switch_root(
+                        outcome.root.clone(),
+                        outcome.generation,
+                        RootSwitchOrigin::Session,
+                    );
+                }
+            }
+            if let Some(state) = self.tab_states.get_mut(index) {
+                state.on_follow_outcome(outcome.as_ref());
             }
         }
     }
@@ -2813,6 +2956,7 @@ impl Workbench {
         self.sync_remote_sessions();
         let terminal_changed = self.pump_remote_terminal();
         self.poll_claude(Instant::now());
+        self.poll_integrations(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
         // must not drive an immediate repaint of the active local tab: that
@@ -3548,6 +3692,7 @@ impl Workbench {
             .record(LogLevel::Error, "remote transport disconnected");
         // Remote Claude Code status and title do not outlive the transport.
         self.claude = None;
+        self.teardown_tab_states();
         if let Some(remote) = self.remote.as_mut() {
             remote.workspace.disconnect();
             remote.phase = RemotePhase::Failed;
@@ -3703,6 +3848,7 @@ impl Workbench {
         self.terminal = Some(pane);
         // A new remote terminal waits for its own fresh emission.
         self.claude = None;
+        self.teardown_tab_states();
         self.terminal_error = None;
         if let Some(remote) = self.remote.as_mut() {
             remote.snapshot_gate = crate::remote_session::SnapshotGate::default();
@@ -4040,6 +4186,7 @@ impl Workbench {
         self.poll_grok_hooks(now);
         self.poll_grok_directory(now);
         self.poll_claude(now);
+        self.poll_integrations(now);
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -5260,6 +5407,7 @@ impl Workbench {
         }
         // Closing the tab deletes its spool.
         self.claude = None;
+        self.teardown_tab_states();
         if let Some(bridge) = self.bridge.take() {
             if let Err(error) = bridge.shutdown() {
                 self.diag
@@ -6272,6 +6420,16 @@ mod tests {
             claude: None,
             claude_plugin: None,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
+            integrations: PRODUCT,
+            tab_states: Slots::from_list(PRODUCT, |entry| {
+                entry.new_tab_state(
+                    target,
+                    &TabInit {
+                        paths: None,
+                        remote: false,
+                    },
+                )
+            }),
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),
             visible: false,

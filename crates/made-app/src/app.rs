@@ -19,7 +19,10 @@ use crate::cli::LaunchArgs;
 use crate::diagnostics::GrokDiagnosticsRow;
 use crate::grok_plugin::{self, EnsureOutcome};
 use crate::integration_status::ClaudeDiagnosticsPhase;
-use crate::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE, PRODUCT};
+use crate::integrations::{
+    AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, CLAUDE_CODE, GROK, OPENCODE,
+    PRODUCT,
+};
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
@@ -499,6 +502,10 @@ pub struct AppModel {
     grok_phase: GrokDiagnosticsPhase,
     /// Claude Code PATH detection state for every workspace's diagnostics row.
     claude_phase: ClaudeDiagnosticsPhase,
+    /// The integrations this model was built with, in catalog order.
+    integrations: IntegrationList,
+    /// App-wide integration state, parallel to `integrations`.
+    app_states: Slots<Box<dyn AppState>>,
     /// Set only by [`AppModel::hold_grok_diagnostics`].
     grok_hold: Option<GrokDiagnosticsHold>,
     /// Per-workspace running marks set only by [`AppModel::hold_workspace_grok_running`].
@@ -596,6 +603,13 @@ impl AppModel {
             compatible_tui_receiver.is_some(),
             options.compatible_tuis.contains(&CLAUDE_CODE),
         );
+        let app_states = Slots::from_list(PRODUCT, |entry| {
+            entry.new_app_state(&AppInit {
+                detecting: options.detect_compatible_tuis,
+                detection_started: compatible_tui_receiver.is_some(),
+                catalog: &options.compatible_tuis,
+            })
+        });
         // A live worker has not answered yet. A thread that never started is
         // the same as detection finishing without OpenCode.
         let opencode_missing = if options.detect_compatible_tuis {
@@ -626,6 +640,8 @@ impl AppModel {
             grok_hooks_unavailable: false,
             grok_phase,
             claude_phase,
+            integrations: PRODUCT,
+            app_states,
             grok_hold: None,
             grok_running_hold: Vec::new(),
             remote_grok_installs: Vec::new(),
@@ -656,6 +672,25 @@ impl AppModel {
             update_notice: None,
             update_apply_outcome: None,
         }
+    }
+
+    /// Build over a given integration list instead of the product's. Call it
+    /// before the model runs: it replaces the app-wide integration state and
+    /// every workspace started afterwards is built over `list`.
+    #[doc(hidden)]
+    pub fn with_integrations(mut self, list: IntegrationList) -> Self {
+        // A live worker has not answered yet; a model without one is not
+        // detecting.
+        let detecting = self.compatible_tui_receiver.is_some();
+        self.app_states = Slots::from_list(list, |entry| {
+            entry.new_app_state(&AppInit {
+                detecting,
+                detection_started: detecting,
+                catalog: &self.compatible_tuis,
+            })
+        });
+        self.integrations = list;
+        self
     }
 
     /// Launch state.
@@ -1528,7 +1563,13 @@ impl AppModel {
                 authority: draft.authority,
             }
         };
-        let workbench = Workbench::start_remote(snapshot, directory, target, Instant::now())?;
+        let workbench = Workbench::start_remote_in(
+            self.integrations,
+            snapshot,
+            directory,
+            target,
+            Instant::now(),
+        )?;
         let source = self.launch.source();
         self.leave_picker_for_remote();
         self.insert_workbench(workbench, source);
@@ -1569,7 +1610,8 @@ impl AppModel {
             None => made_remote::protocol::RemotePath::new(b"/".to_vec())
                 .map_err(|_| "the default remote directory was rejected".to_owned())?,
         };
-        let workbench = Workbench::start_remote(
+        let workbench = Workbench::start_remote_in(
+            self.integrations,
             snapshot,
             directory,
             TerminalTarget::RemoteGrok { authority: id },
@@ -1604,7 +1646,8 @@ impl AppModel {
             None => made_remote::protocol::RemotePath::new(b"/".to_vec())
                 .map_err(|_| "the default remote directory was rejected".to_owned())?,
         };
-        let workbench = Workbench::start_remote(
+        let workbench = Workbench::start_remote_in(
+            self.integrations,
             snapshot,
             directory,
             TerminalTarget::RemoteClaude { authority: id },
@@ -2270,7 +2313,8 @@ impl AppModel {
         match &self.launch {
             WorkspaceLaunch::Ready(plan) => {
                 let cwd = plan.terminal_cwd().to_path_buf();
-                let workbench = Workbench::start(
+                let workbench = Workbench::start_in(
+                    self.integrations,
                     Some(plan.clone()),
                     None,
                     cwd,
@@ -2280,7 +2324,8 @@ impl AppModel {
                 self.insert_workbench(workbench, source);
             }
             WorkspaceLaunch::TerminalFallback { error, cwd, .. } => {
-                let workbench = Workbench::start(
+                let workbench = Workbench::start_in(
+                    self.integrations,
                     None,
                     Some(error.clone()),
                     cwd.clone(),
@@ -2321,6 +2366,7 @@ impl AppModel {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let terminal_target = self.terminal_target;
+        let integrations = self.integrations;
         let prepared_at = Instant::now();
         let (sender, receiver) = mpsc::sync_channel(1);
         let spawn = thread::Builder::new()
@@ -2329,8 +2375,14 @@ impl AppModel {
                 if worker_cancel.load(Ordering::Acquire) {
                     return;
                 }
-                let mut workbench =
-                    Workbench::start(plan, launch_error, cwd, terminal_target, prepared_at);
+                let mut workbench = Workbench::start_in(
+                    integrations,
+                    plan,
+                    launch_error,
+                    cwd,
+                    terminal_target,
+                    prepared_at,
+                );
                 if worker_cancel.load(Ordering::Acquire) {
                     workbench.shutdown();
                     return;
@@ -2425,6 +2477,7 @@ impl AppModel {
                 } else {
                     ClaudeDiagnosticsPhase::NotOnPath
                 };
+                self.notify_detection(&tuis);
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
                 if !detected_opencode {
@@ -2453,6 +2506,9 @@ impl AppModel {
                     self.claude_phase = ClaudeDiagnosticsPhase::NotOnPath;
                     self.push_grok_diagnostics();
                 }
+                if self.notify_detection_failed().diagnostics_changed() {
+                    self.push_grok_diagnostics();
+                }
                 if self.grok_phase == GrokDiagnosticsPhase::Detecting {
                     self.grok_phase = GrokDiagnosticsPhase::NotOnPath;
                     self.push_grok_diagnostics();
@@ -2460,6 +2516,36 @@ impl AppModel {
                 self.remember_opencode_missing();
             }
         }
+    }
+
+    /// Tell every integration's app-wide state what PATH detection found.
+    fn notify_detection(&mut self, found: &[IntegrationRef]) -> AppCtx {
+        let mut ctx = AppCtx::default();
+        for (index, entry) in self.integrations.iter().enumerate() {
+            if let Some(state) = self.app_states.get_mut(index) {
+                state.on_detection(found.contains(entry), &mut ctx);
+            }
+        }
+        ctx
+    }
+
+    /// Tell every integration's app-wide state that PATH detection ended
+    /// without a result.
+    fn notify_detection_failed(&mut self) -> AppCtx {
+        let mut ctx = AppCtx::default();
+        for state in self.app_states.iter_mut() {
+            state.on_detection_failed(&mut ctx);
+        }
+        ctx
+    }
+
+    /// Apply every integration's app-wide background work.
+    fn poll_app_states(&mut self) -> AppCtx {
+        let mut ctx = AppCtx::default();
+        for state in self.app_states.iter_mut() {
+            state.poll(&mut ctx);
+        }
+        ctx
     }
 
     /// Record that OpenCode is not on PATH for every current workspace.
@@ -2516,6 +2602,9 @@ impl AppModel {
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.poll_compatible_tui_detection(ctx);
         self.poll_grok_plugin_ensure(ctx);
+        if self.poll_app_states().diagnostics_changed() {
+            self.push_grok_diagnostics();
+        }
         self.poll_ssh_probe();
         self.poll_remote_grok_install();
         self.poll_remote_closes();

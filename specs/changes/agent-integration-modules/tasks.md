@@ -89,13 +89,13 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] verify: Branch table preserved; Precedence by rank; Rank is independent of catalog order; Claude Code rejects an unusable directory; Grok ignores an unusable directory silently; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Grok retains under Claude Code
 
 ### 1a-G3a State skeleton (additive, each task green)
-- [ ] 1.37 `AppState`, `TabState`, `Slots<T>`, `EnvPolicy`, `EnvContribution`, `TabReport`, `AppInit`, `TabInit`, `TabIo`, `LaunchCtx`, `AppCtx`; `Integration::{env_policy, new_app_state, new_tab_state, polls_remote_tabs}` with defaults returning `None` or empty, so every integration still has no slot state (path: crates/made-app/src/integrations/mod.rs)
-- [ ] 1.38 Workbench gains `Slots<Box<dyn TabState>>` and its list, filled from `new_tab_state` (all `None` for now), and the generic loops at today's positions: `prepare_launch` and `on_spawned` in `start_terminal` and the retry, `poll` with report application and `on_follow_outcome` where `poll_grok_hooks`/`poll_grok_directory`/`poll_claude` run, the remote-tab poll in `tick_remote`, and teardown; all explicit integration code unchanged, so behavior is identical (path: crates/made-app/src/workbench.rs)
-- [ ] 1.39 App model gains `Slots<Box<dyn AppState>>` and its list, the `on_detection` and `poll` loops (no-ops for now), and `#[doc(hidden)] AppModel::with_integrations(list)` passing the list to every `Workbench`; explicit integration code unchanged (path: crates/made-app/src/app.rs)
+- [x] 1.37 `AppState`, `TabState`, `Slots<T>`, `EnvPolicy`, `EnvContribution`, `TabReport`, `AppInit`, `TabInit`, `TabIo`, `LaunchCtx`, `AppCtx`; `Integration::{env_policy, new_app_state, new_tab_state, polls_remote_tabs}` with defaults returning `None` or empty, so every integration still has no slot state (path: crates/made-app/src/integrations/mod.rs)
+- [x] 1.38 Workbench gains `Slots<Box<dyn TabState>>` and its list, filled from `new_tab_state` (all `None` for now), and the generic loops at today's positions: `prepare_launch` and `on_spawned` in `start_terminal` and the retry, `poll` with report application and `on_follow_outcome` where `poll_grok_hooks`/`poll_grok_directory`/`poll_claude` run, the remote-tab poll in `tick_remote`, and teardown; all explicit integration code unchanged, so behavior is identical (path: crates/made-app/src/workbench.rs)
+- [x] 1.39 App model gains `Slots<Box<dyn AppState>>` and its list, the `on_detection` and `poll` loops (no-ops for now), and `#[doc(hidden)] AppModel::with_integrations(list)` passing the list to every `Workbench`; explicit integration code unchanged (path: crates/made-app/src/app.rs)
 
 #### Checkpoint G3a
-- [ ] gates pass; phase 0 tests unchanged
-- [ ] verify: Existing suites stay the acceptance gate; Launch environment matrix
+- [x] gates pass; phase 0 tests unchanged
+- [x] verify: Existing suites stay the acceptance gate; Launch environment matrix
 
 ### 1a-G3b Claude Code state (ATOMIC: not compile-green until 1.46)
 - [ ] 1.40 Inventory (re-run and update this line if the rebased tree differs). At `0b57210`: Workbench fields `claude`, `claude_plugin`, `claude_phase`; methods `poll_claude`, `prepare_claude_launch`, `open_claude_spool`, `install_claude`, `follow_claude_path`; public accessors and their readers in `src`: `claude_tab` (ui.rs), `claude_diagnostics` (ui.rs), `set_claude_phase` (app.rs), `set_remote_claude_detection` (app.rs, remote path); AppModel field `claude_phase` and `initial_claude_phase` (app.rs only); test readers of `claude_tab`: claude_live.rs, claude_privacy.rs, grok_plugin_install.rs, launch_workspace.rs, ui_model.rs (path: specs/changes/agent-integration-modules/tasks.md)
