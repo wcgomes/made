@@ -38,11 +38,11 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 | Native IME/clipboard/mouse/paste | Not native (Xvfb) | Not yet tested | **Clipboard image paste user-confirmed 2026-11-01**; IME/mouse/full clipboard not yet tested | Not yet tested |
 | Hardware-GPU frame pacing | Software only | Pending | Pending | Pending |
 | Job Object descendant cleanup | N/A | N/A | N/A | Implemented/cross-compiled; native pending |
-| Packaged artifact launch | Not launched | Not launched | Not launched | Not launched |
+| Packaged artifact launch | Installed smoke on hosted runner only | Installed smoke on hosted runner only | Installed smoke on hosted runner only | Installed smoke on hosted runner only |
 
 ## CI coverage and observed status
 
-Workflows cover Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
+Release workflows (`release.yml`, `upgrade-check.yml`) are summarized in [Release and CI](../operations/release-ci.md). Development workflows cover Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
 
 At the 2026-10-28 snapshot, all five workflows were observed green for the CI-stabilization commit: CI (all six jobs), macOS smoke x64/arm64, Windows native smoke, Linux display smoke, and Development artifacts. Green CI proves compilation, contract/PTY tests, window/PTY smoke markers, and artifact assembly; it does not prove the native UX list above, and the packaged layout has not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
 
@@ -55,9 +55,9 @@ At the 2026-10-28 snapshot, all five workflows were observed green for the CI-st
 - Live real-OpenCode switching, worktree removal/indicator, and native session-map focus.
 - Native IME/clipboard/mouse/paste/title/focus (macOS clipboard image paste user-confirmed 2026-11-01; Linux and Windows not yet tested; no known defect).
 - Hardware-GPU pacing/reference input latency.
-- Packaged artifact launch (CI assembles artifacts but does not launch the staged layout).
+- Packaged artifact launch on real machines: release CI launches the installed layout only through `--smoke-test` on hosted runners; fresh-machine installs, Fedora, Wayland and click-through remain `UNVERIFIED` per the [release record](../records/20261106-v0-1-0-release.md).
 - Cross-user bridge DoS acceptance or reserved slot.
 
-Accepted residuals such as read-only preview, optional OpenCode only, no worktree lifecycle management, no installers/signing/auto-update, and same-user token exposure are documented in the [v1 evidence record](../records/20261026-v1-evidence.md) and [Security](../security.md).
+Accepted residuals such as read-only preview, optional OpenCode only, no worktree lifecycle management, no code signing or notarization (installers and auto-update now exist; see the [release record](../records/20261106-v0-1-0-release.md)), and same-user token exposure are documented in the [v1 evidence record](../records/20261026-v1-evidence.md) and [Security](../security.md).
 
 Related: [Test strategy](strategy.md), [CI platform quirks](ci-platform-quirks.md), [Performance](../performance.md), [v1 evidence](../records/20261026-v1-evidence.md).

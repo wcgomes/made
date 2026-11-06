@@ -1,6 +1,6 @@
 # Release and CI
 
-Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. The five CI workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; `release.yml` and `upgrade-check.yml` are covered by the [release record](../records/20261106-v0-1-0-release.md); see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -65,14 +65,17 @@ If the gate refuses the tag, read its message, fix the sites with the bump scrip
 
 ### Repository settings
 
-- The `release` environment requires approval by the maintainer (`wcgomes`) and accepts deployments only from `v*` tags. It is configured before the `v0.1.0` release.
-- Configured at rollout end, after `v0.1.0` is published: a ruleset on `main` allowing changes only through pull requests, and a ruleset on `v*` tags restricting creating, updating and deleting them to a maintainer bypass list. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
+All three are configured (done after `v0.1.0` was published):
 
-Optional, manual: GitHub immutable releases (**Settings › General › Releases**). Enable it only after the `v0.1.0` release is published.
+- The `release` environment requires approval by the maintainer (`wcgomes`) as required reviewer and accepts deployments only from `v*` tags.
+- Ruleset "main: PR only" (id 26664378): a pull request is required with 0 approvals, and force-push and deletion are blocked.
+- Ruleset "release tags" (id 26664379): creating, updating and deleting `v*` tags is restricted; repository admins bypass. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
+
+Optional, manual, not enabled: GitHub immutable releases (**Settings › General › Releases**). It may be enabled now that `v0.1.0` is published.
 
 ### Rollout cleanup (done)
 
-The temporary iteration releases cut during implementation (`v0.1.0` to `v0.1.9`) and their tags were deleted, and `v0.1.0` was released again from the final `main`. Machines that installed an iteration release need Made uninstalled first (`0.1.0` is lower than the installed version), `grok plugin uninstall grok-made --confirm` run locally and on each SSH server where Made installed it, and Made's staged remote version directories removed on each SSH server.
+The outcome is in the [2026-11-06 release record](../records/20261106-v0-1-0-release.md). The temporary iteration releases cut during implementation (`v0.1.0` to `v0.1.9`) and their tags were deleted, and `v0.1.0` was released again from the final `main`. Machines that installed an iteration release need Made uninstalled first (`0.1.0` is lower than the installed version), `grok plugin uninstall grok-made --confirm` run locally and on each SSH server where Made installed it, and Made's staged remote version directories removed on each SSH server.
 
 ## Release-blocking boundary
 

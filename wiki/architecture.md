@@ -10,6 +10,7 @@ Made is a native Rust desktop application built on eframe/egui with one window a
 | [`made-terminal`](../crates/made-terminal/src/lib.rs) | library | `TerminalCore` boundary, VT screen state, PTY adapter, input encoding, render model. | `made-platform` |
 | [`made-platform`](../crates/made-platform/src/lib.rs) | library | Only OS-specific crate: PTY/ConPTY, shell launch and cwd hooks, process lifecycle, app paths, clipboard, IME, native backdrop, home resolution. | none |
 | [`made-explorer`](../crates/made-explorer/src/lib.rs) | library | Lazy tree, watcher, canonical path guard, read-only preview, highlighting, root generations. | none |
+| [`made-grok-hook`](../crates/made-grok-hook/src/lib.rs) | library + binary `made-grok-status` | Native Grok session-status hook: reads one hook event from stdin within a ~2 s deadline, appends one JSONL line to `made-grok-status.jsonl`, always exits 0 with empty stdout. Replaced the Python `status.py`; see [ADR 0006](decisions/0006-native-grok-hook.md). | none (`serde_json` only) |
 | [`made-bridge`](../crates/made-bridge/src/lib.rs) | library | Loopback WebSocket server, protocol state machine, session snapshots, config composition and immutability guard, token helpers. | none |
 
 The OpenCode plugin is TypeScript outside the Cargo workspace at [`plugins/opencode-made`](../plugins/opencode-made/README.md). The Phase 0 gate harness was removed after the gate; its outcomes are preserved in the [Phase 0 gate record](records/20261025-phase-0-gate.md), with integration details in [OpenCode bridge](integration/opencode.md).
@@ -34,6 +35,8 @@ Rules enforced across the workspace:
 6. Only the plugin calls OpenCode APIs. `made-app` consumes normalized snapshots and never parses terminal output or talks to OpenCode.
 7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata and closed-allowlist status are resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config. Git observation is read-only.
 8. Owned values and events cross crate boundaries; the app event loop owns UI state and no cross-crate mutable singleton exists.
+
+`made-remote` is the SSH server-side companion and `made-askpass` the SSH password helper; both ship in the release layout (`made-app`, `plugins/`, `remote/<target>/made-remote`, `made-askpass`, `LICENSE`). Release packaging and updates are described in [Release and CI](operations/release-ci.md) and [ADR 0007](decisions/0007-github-releases-velopack-unsigned.md).
 
 Heavy UI/GPU dependencies are confined to `made-app`: eframe 0.37 brings egui, winit, and wgpu. Domain crates stay UI-free. `made-terminal` uses alacritty_terminal 0.26 behind `TerminalCore`; `made-explorer` uses notify and syntect; `made-bridge` uses tungstenite, serde, sha2, getrandom, and thiserror.
 
