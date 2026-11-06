@@ -633,6 +633,8 @@ impl Diagnostics {
                 .map(|value| sanitize_display(&value, 128)),
             grok_pill: GrokDiagnosticsRow::NOT_ON_PATH.pill,
             grok_sentence: GrokDiagnosticsRow::NOT_ON_PATH.sentence.into_owned(),
+            claude_pill: ClaudeDiagnosticsPill::Inactive,
+            claude_sentence: "Claude Code is not on PATH.".to_owned(),
             entries: self
                 .log
                 .entries()
@@ -713,6 +715,29 @@ impl GrokDiagnosticsPill {
             Self::Inactive => "inactive",
             Self::Ready => "ready",
             Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// Pill on the revealed Claude Code diagnostics row. It uses the same
+/// inactive, degraded and ready treatments as the Grok Build row.
+pub type ClaudeDiagnosticsPill = GrokDiagnosticsPill;
+
+/// The Claude Code pill plus its one fixed sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeDiagnosticsReport {
+    /// Pill beside the sentence.
+    pub pill: ClaudeDiagnosticsPill,
+    /// The one Claude Code sentence. Fixed product wording; it never carries
+    /// prompt, message or title content.
+    pub sentence: String,
+}
+
+impl ClaudeDiagnosticsReport {
+    pub(crate) fn new(pill: ClaudeDiagnosticsPill, sentence: &str) -> Self {
+        Self {
+            pill,
+            sentence: sentence.to_owned(),
         }
     }
 }
@@ -875,6 +900,10 @@ pub struct DiagnosticsSnapshot {
     pub grok_pill: GrokDiagnosticsPill,
     /// The one Grok Build sentence shown beside that pill.
     pub grok_sentence: String,
+    /// Claude Code pill label (`inactive`, `ready`, or `degraded`).
+    pub claude_pill: ClaudeDiagnosticsPill,
+    /// The one Claude Code sentence shown beside that pill.
+    pub claude_sentence: String,
     /// Recent log entries, oldest to newest.
     pub entries: Vec<LogEntry>,
 }
@@ -1123,6 +1152,12 @@ impl DiagnosticsSnapshot {
         self.grok_sentence = row.sentence.into_owned();
     }
 
+    /// Record the Claude Code row for the next render and copied report.
+    pub fn set_claude_diagnostics(&mut self, report: ClaudeDiagnosticsReport) {
+        self.claude_pill = report.pill;
+        self.claude_sentence = report.sentence;
+    }
+
     /// Report the owning remote tab's Grok Build tier, replacing the host
     /// row. A failure sentence is bounded and sanitized by `remote_grok_row`.
     pub fn set_remote_grok(&mut self, report: RemoteGrokReport) {
@@ -1148,6 +1183,8 @@ impl DiagnosticsSnapshot {
         push_line(&mut text, "reason", &self.reason);
         push_line(&mut text, "grok status", self.grok_pill.label());
         push_line(&mut text, "grok", &self.grok_sentence);
+        push_line(&mut text, "claude status", self.claude_pill.label());
+        push_line(&mut text, "claude", &self.claude_sentence);
         if let Some(identity) = &self.workspace_identity {
             push_line(&mut text, "workspace identity", identity);
         }

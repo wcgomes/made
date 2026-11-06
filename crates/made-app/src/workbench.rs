@@ -35,7 +35,10 @@ use crate::diagnostics::{
 use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
-use crate::integration_status::{IntegrationState, IntegrationStatus};
+use crate::integration_status::{
+    claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, IntegrationState,
+    IntegrationStatus,
+};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFocusController};
@@ -78,6 +81,8 @@ struct ClaudeRuntime {
     /// `None` when the spool could not be created; hooks are then unavailable.
     spool: Option<TabSpool>,
     liveness_checked_at: Instant,
+    /// When Claude Code last became present in this tab.
+    present_since: Option<Instant>,
     /// Directory last handed to the follow coordinator.
     applied_directory: Option<PathBuf>,
 }
@@ -579,6 +584,8 @@ pub struct Workbench {
     /// Session-status hooks cannot report for this tab: the shipped plugin is
     /// missing or unreadable, or the tab's spool could not be created.
     claude_hooks_unavailable: bool,
+    /// App-wide Claude Code detection state for the diagnostics row.
+    claude_phase: ClaudeDiagnosticsPhase,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -843,6 +850,7 @@ impl Workbench {
             grok_file_newest_id: None,
             claude: None,
             claude_hooks_unavailable: false,
+            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -1305,6 +1313,7 @@ impl Workbench {
             tab,
             spool,
             liveness_checked_at: Instant::now(),
+            present_since: None,
             applied_directory: None,
         });
     }
@@ -1313,6 +1322,32 @@ impl Workbench {
     /// for tabs that do not load Made's Claude Code plugin.
     pub fn claude_tab(&self) -> Option<&ClaudeTab> {
         self.claude.as_ref().map(|runtime| &runtime.tab)
+    }
+
+    /// Record the app-wide Claude Code detection state for the diagnostics row.
+    pub(crate) fn set_claude_phase(&mut self, phase: ClaudeDiagnosticsPhase) {
+        self.claude_phase = phase;
+    }
+
+    /// The Claude Code diagnostics row for this workspace.
+    pub(crate) fn claude_diagnostics(&self) -> crate::diagnostics::ClaudeDiagnosticsReport {
+        let runtime = self.claude.as_ref();
+        let present = runtime.is_some_and(|runtime| runtime.tab.present());
+        claude_diagnostics_row(&ClaudeDiagnosticsInputs {
+            phase: self.claude_phase,
+            plugin_missing: self
+                .paths
+                .as_ref()
+                .is_none_or(|paths| paths.shipped_claude_plugin_dir().is_none()),
+            present,
+            present_for: runtime
+                .and_then(|runtime| runtime.present_since)
+                .map_or(Duration::ZERO, |since| {
+                    Instant::now().saturating_duration_since(since)
+                }),
+            live_session: runtime.is_some_and(|runtime| runtime.tab.session_count() > 0),
+            protocol_observed: runtime.is_some_and(|runtime| runtime.tab.protocol_status_seen()),
+        })
     }
 
     /// Whether session-status hooks cannot report for this tab because the
@@ -4268,6 +4303,11 @@ impl Workbench {
             runtime.liveness_checked_at = now;
             runtime.tab.check_liveness(made_platform::process_parent);
         }
+        if runtime.tab.present() {
+            runtime.present_since.get_or_insert(now);
+        } else if runtime.present_since.take().is_some() {
+            runtime.tab.reset_observations();
+        }
         let directory = runtime.tab.directory().map(PathBuf::from);
         if directory == runtime.applied_directory {
             return;
@@ -5256,6 +5296,7 @@ impl Workbench {
             snapshot.set_remote_opencode(report);
         }
         snapshot.set_grok_diagnostics(self.grok_diagnostics.clone());
+        snapshot.set_claude_diagnostics(self.claude_diagnostics());
         snapshot
     }
 
@@ -6017,6 +6058,7 @@ mod tests {
             grok_file_newest_id: None,
             claude: None,
             claude_hooks_unavailable: false,
+            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),
             visible: false,

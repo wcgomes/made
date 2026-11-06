@@ -773,6 +773,13 @@ impl ClaudeTab {
         (self.direct && self.child_running) || !self.sessions.is_empty() || self.protocol.is_some()
     }
 
+    /// Forget which channels were observed. Called when Claude Code is no
+    /// longer present, so the next Claude Code in this tab starts clean.
+    pub fn reset_observations(&mut self) {
+        self.probe_seen = false;
+        self.status_seen = false;
+    }
+
     /// Whether a session-level protocol status is live.
     pub fn protocol_live(&self) -> bool {
         self.protocol.is_some()
@@ -846,5 +853,15 @@ impl ClaudeTab {
             .map(|index| self.sessions[index].title.as_str())
             .filter(|title| !title.is_empty())
             .map_or_else(|| DEFAULT_TITLE.to_owned(), str::to_owned)
+    }
+}
+
+impl From<ClaudeActivity> for crate::session_map::SessionActivity {
+    fn from(activity: ClaudeActivity) -> Self {
+        match activity {
+            ClaudeActivity::Idle => Self::Idle,
+            ClaudeActivity::Busy => Self::Busy,
+            ClaudeActivity::Attention => Self::Attention,
+        }
     }
 }

@@ -1295,3 +1295,268 @@ fn the_last_command_line_apply_is_reported_redacted() {
         );
     }
 }
+
+// ---- Claude Code diagnostics row ------------------------------------------------
+
+mod claude_row {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use made_app::diagnostics::{ClaudeDiagnosticsPill, Diagnostics};
+    use made_app::integration_status::{
+        claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, IntegrationState,
+        CLAUDE_GRACE,
+    };
+
+    /// A present Claude Code with a plugin, a live session, an observed
+    /// protocol, and the grace elapsed: the ready state.
+    fn ready() -> ClaudeDiagnosticsInputs {
+        ClaudeDiagnosticsInputs {
+            phase: ClaudeDiagnosticsPhase::Available,
+            plugin_missing: false,
+            present: true,
+            present_for: CLAUDE_GRACE + Duration::from_secs(1),
+            live_session: true,
+            protocol_observed: true,
+        }
+    }
+
+    fn row(inputs: ClaudeDiagnosticsInputs) -> (ClaudeDiagnosticsPill, String) {
+        let report = claude_diagnostics_row(&inputs);
+        (report.pill, report.sentence)
+    }
+
+    #[test]
+    fn grace_is_about_ten_seconds() {
+        assert_eq!(CLAUDE_GRACE, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn checking_is_not_shown_as_not_on_path() {
+        let inputs = ClaudeDiagnosticsInputs {
+            phase: ClaudeDiagnosticsPhase::Checking,
+            ..ready()
+        };
+        assert_eq!(
+            row(inputs),
+            (
+                ClaudeDiagnosticsPill::Inactive,
+                "Checking for Claude Code.".to_owned()
+            )
+        );
+        let inputs = ClaudeDiagnosticsInputs {
+            phase: ClaudeDiagnosticsPhase::NotOnPath,
+            ..ready()
+        };
+        assert_eq!(
+            row(inputs),
+            (
+                ClaudeDiagnosticsPill::Inactive,
+                "Claude Code is not on PATH.".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_missing_plugin_is_degraded_before_presence_is_considered() {
+        for present in [false, true] {
+            let inputs = ClaudeDiagnosticsInputs {
+                plugin_missing: true,
+                present,
+                ..ready()
+            };
+            assert_eq!(
+                row(inputs),
+                (
+                    ClaudeDiagnosticsPill::Degraded,
+                    "Claude Code session-status hooks are unavailable.".to_owned()
+                )
+            );
+        }
+        // Detection states outrank a missing plugin.
+        let inputs = ClaudeDiagnosticsInputs {
+            phase: ClaudeDiagnosticsPhase::NotOnPath,
+            plugin_missing: true,
+            ..ready()
+        };
+        assert_eq!(row(inputs).1, "Claude Code is not on PATH.");
+    }
+
+    #[test]
+    fn not_running_covers_another_workspace_and_opencode_owning_the_label() {
+        // Presence is evaluated for this workspace only: another workspace's
+        // Claude Code arrives here as `present: false`.
+        let inputs = ClaudeDiagnosticsInputs {
+            present: false,
+            live_session: false,
+            protocol_observed: false,
+            ..ready()
+        };
+        assert_eq!(
+            row(inputs),
+            (
+                ClaudeDiagnosticsPill::Inactive,
+                "Claude Code is not running.".to_owned()
+            )
+        );
+        // Presence alone decides; nothing about the tab label is an input, so
+        // OpenCode owning it cannot hide a present Claude Code.
+        assert_eq!(row(ready()).1, "Claude Code session follow is ready.");
+    }
+
+    #[test]
+    fn starting_within_the_grace_without_a_session_or_an_observed_protocol() {
+        for (live_session, protocol_observed) in [(false, false), (false, true), (true, false)] {
+            let inputs = ClaudeDiagnosticsInputs {
+                present_for: Duration::from_secs(3),
+                live_session,
+                protocol_observed,
+                ..ready()
+            };
+            assert_eq!(
+                row(inputs),
+                (
+                    ClaudeDiagnosticsPill::Inactive,
+                    "Claude Code is starting.".to_owned()
+                ),
+                "session {live_session}, observed {protocol_observed}"
+            );
+        }
+        // Both channels already working inside the grace is ready, not starting.
+        let inputs = ClaudeDiagnosticsInputs {
+            present_for: Duration::from_secs(3),
+            ..ready()
+        };
+        assert_eq!(row(inputs).1, "Claude Code session follow is ready.");
+    }
+
+    #[test]
+    fn hooks_unavailable_after_the_grace_without_a_live_session() {
+        for protocol_observed in [false, true] {
+            let inputs = ClaudeDiagnosticsInputs {
+                live_session: false,
+                protocol_observed,
+                ..ready()
+            };
+            assert_eq!(
+                row(inputs),
+                (
+                    ClaudeDiagnosticsPill::Degraded,
+                    "Claude Code session-status hooks are unavailable.".to_owned()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_alone_is_not_observed_so_the_protocol_is_unavailable_after_the_grace() {
+        // `protocol_observed` is true only for a session-level app=claude-code
+        // emission; the ClaudeTab tests cover that the probe does not set it.
+        let inputs = ClaudeDiagnosticsInputs {
+            protocol_observed: false,
+            ..ready()
+        };
+        assert_eq!(
+            row(inputs),
+            (
+                ClaudeDiagnosticsPill::Degraded,
+                "Claude Code status protocol is unavailable.".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn ready_needs_a_live_session_and_an_observed_protocol() {
+        assert_eq!(
+            row(ready()),
+            (
+                ClaudeDiagnosticsPill::Ready,
+                "Claude Code session follow is ready.".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn an_explicit_catalog_without_detection_uses_the_plugin_and_running_states() {
+        // `Available` is what an explicit catalog that lists Claude Code uses
+        // without running detection.
+        let inputs = ClaudeDiagnosticsInputs {
+            present: false,
+            ..ready()
+        };
+        assert_eq!(row(inputs).1, "Claude Code is not running.");
+        let inputs = ClaudeDiagnosticsInputs {
+            plugin_missing: true,
+            ..ready()
+        };
+        assert_eq!(
+            row(inputs).1,
+            "Claude Code session-status hooks are unavailable."
+        );
+        let inputs = ClaudeDiagnosticsInputs {
+            present_for: Duration::from_secs(1),
+            live_session: false,
+            ..ready()
+        };
+        assert_eq!(row(inputs).1, "Claude Code is starting.");
+        assert_eq!(
+            row(ClaudeDiagnosticsInputs {
+                live_session: true,
+                protocol_observed: false,
+                ..ready()
+            })
+            .1,
+            "Claude Code status protocol is unavailable."
+        );
+    }
+
+    #[test]
+    fn the_snapshot_and_copied_report_include_the_claude_sentence_in_every_state() {
+        let diagnostics = Diagnostics::new("/home/user/.local/state/made/log/integration.log")
+            .with_app_version("9.9.9");
+        let mut view = diagnostics.snapshot(
+            &IntegrationState::new(None, PathBuf::from("/workspace")),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            view.claude_sentence, "Claude Code is not on PATH.",
+            "the default is the not-on-PATH row"
+        );
+        for inputs in [
+            ready(),
+            ClaudeDiagnosticsInputs {
+                phase: ClaudeDiagnosticsPhase::Checking,
+                ..ready()
+            },
+            ClaudeDiagnosticsInputs {
+                plugin_missing: true,
+                ..ready()
+            },
+            ClaudeDiagnosticsInputs {
+                present: false,
+                ..ready()
+            },
+        ] {
+            let report = claude_diagnostics_row(&inputs);
+            view.set_claude_diagnostics(report.clone());
+            assert_eq!(view.claude_pill, report.pill);
+            assert_eq!(view.claude_sentence, report.sentence);
+            let text = view.to_text();
+            assert!(
+                text.contains(&format!("claude status: {}", report.pill.label())),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("claude: {}", report.sentence)),
+                "{text}"
+            );
+            assert!(text.contains("grok: Grok Build is not on PATH."), "{text}");
+            assert!(
+                text.contains("reason: "),
+                "the OpenCode sentence stays: {text}"
+            );
+        }
+    }
+}

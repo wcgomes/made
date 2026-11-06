@@ -84,6 +84,8 @@ fn diagnostics_snapshot_and_copy_path_are_sanitized() {
         token_fingerprint: Some("sha256:0123456789abcdef".to_owned()),
         grok_pill: made_app::diagnostics::GrokDiagnosticsPill::Inactive,
         grok_sentence: "Grok Build is not on PATH.".to_owned(),
+        claude_pill: made_app::diagnostics::ClaudeDiagnosticsPill::Inactive,
+        claude_sentence: "Claude Code is not on PATH.".to_owned(),
         entries: vec![LogEntry::new(
             LogLevel::Warn,
             sanitize_log_text(&format!("closed: {HOSTILE}")),

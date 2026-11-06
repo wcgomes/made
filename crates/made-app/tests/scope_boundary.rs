@@ -50,7 +50,8 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
         integration.contains("grok build"),
         "Grok Build is an offered integration, not a forbidden mention"
     );
-    for forbidden in ["claude", "codex", "acp", "chat ui"] {
+    // The Claude Code diagnostics row lives here; task 8.2 finishes this test.
+    for forbidden in ["codex", "acp", "chat ui"] {
         assert!(
             !integration.contains(forbidden),
             "integration status mentions forbidden surface {forbidden:?}"

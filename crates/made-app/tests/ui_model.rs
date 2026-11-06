@@ -1300,7 +1300,10 @@ fn isolated(name: &str) -> bool {
         std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+        // A host `claude` must not leak into detection: drop host PATH entries
+        // that hold one. Tests that need claude put a fake in the isolated bin.
+        let host = std::env::split_paths(&path).filter(|dir| !dir.join("claude").exists());
+        let paths = std::iter::once(bin).chain(host);
         command.env("PATH", std::env::join_paths(paths).unwrap());
     }
     if std::path::Path::new("/bin/bash").exists() {
@@ -13055,4 +13058,702 @@ fn restart_confirmation_lives_inside_about_and_not_now_touches_nothing() {
             "workspace {id:?} must be closed before the update applies"
         );
     }
+}
+
+// ---- Claude Code menu row and tab presentation ------------------------------
+
+const CLAUDE_ESC_WORKING: &[u8] = b"\x1b]7501;state=working:app=claude-code\x07";
+const CLAUDE_ESC_IDLE: &[u8] = b"\x1b]7501;state=idle:app=claude-code\x07";
+const CLAUDE_ESC_CLEAR: &[u8] = b"\x1b]7501;state=clear:app=claude-code\x07";
+
+/// Assert the 16px official Claude mark is painted inside `area`, left of
+/// `left_of`, with its shipped colors.
+fn assert_claude_mark(
+    headless: &Headless,
+    output: &egui::FullOutput,
+    area: egui::Rect,
+    left_of: f32,
+    what: &str,
+) {
+    let image = painted_images(output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && area.contains_rect(image.rect)
+                && image.rect.right() <= left_of - 1.0
+        })
+        .unwrap_or_else(|| panic!("{what}: no 16px image in the leading slot"));
+    let px = (output.pixels_per_point * image.rect.size()).round();
+    assert_eq!(
+        image.texture,
+        embedded_svg_texture(
+            &headless.ctx,
+            "bytes://claude-code.svg",
+            include_bytes!("../assets/claude-code.svg"),
+            px.x as u32,
+            px.y as u32,
+        ),
+        "{what}: the 16px image must match claude-code.svg"
+    );
+    assert_eq!(
+        image.tint,
+        egui::Color32::WHITE,
+        "{what}: the mark keeps its colors"
+    );
+}
+
+/// Whether a 16px image is painted in `area` left of `left_of`.
+fn has_leading_image(output: &egui::FullOutput, area: egui::Rect, left_of: f32) -> bool {
+    painted_images(output).into_iter().any(|image| {
+        (image.rect.width() - 16.0).abs() < 0.75
+            && (image.rect.height() - 16.0).abs() < 0.75
+            && area.contains_rect(image.rect)
+            && image.rect.right() <= left_of - 1.0
+    })
+}
+
+#[test]
+fn catalog_menu_lists_claude_code_after_grok() {
+    if isolated("catalog_menu_lists_claude_code_after_grok") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "all-three", "main.rs");
+    let (mut headless, _) = menu_model(
+        &root,
+        &[
+            CompatibleTui::OpenCode,
+            CompatibleTui::Grok,
+            CompatibleTui::ClaudeCode,
+        ],
+    );
+    let hovered =
+        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
+    assert!(
+        hovered.contains("Open folder"),
+        "the + tooltip stays Open folder: {hovered}"
+    );
+    headless.click(top_action_id("open-folder"));
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
+    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    let claude = headless.response(new_tab_menu_item_id("claude")).rect;
+    assert!(
+        terminal.top() < opencode.top() && opencode.top() < grok.top() && grok.top() < claude.top(),
+        "menu order must be Terminal, OpenCode, Grok Build, Claude Code"
+    );
+    assert!(!headless.model.is_picker());
+    assert!(headless
+        .ctx
+        .read_response(new_tab_menu_item_id("codex"))
+        .is_none());
+}
+
+#[test]
+fn only_claude_code_shows_terminal_then_claude_code_with_its_mark() {
+    if isolated("only_claude_code_shows_terminal_then_claude_code_with_its_mark") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "claude-only", "main.rs");
+    let (mut headless, _) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    headless.ctx.set_pixels_per_point(2.0);
+    headless.click(top_action_id("open-folder"));
+    headless.advance(0.3);
+    let output = headless.render();
+    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
+    let claude = headless.response(new_tab_menu_item_id("claude")).rect;
+    assert!(terminal.top() < claude.top());
+    for absent in ["opencode", "grok"] {
+        assert!(headless
+            .ctx
+            .read_response(new_tab_menu_item_id(absent))
+            .is_none());
+    }
+    let label = painted_menu_label(&output, "Claude Code", claude);
+    assert_claude_mark(
+        &headless,
+        &output,
+        claude,
+        label.line.left(),
+        "the Claude Code menu row",
+    );
+}
+
+#[test]
+fn choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker() {
+    if isolated("choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker") {
+        return;
+    }
+    use made_platform::Platform;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "current", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    let home = made_platform::host_platform()
+        .home_dir()
+        .expect("test home")
+        .canonicalize()
+        .expect("canonical test home");
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("claude"));
+    assert!(!headless.model.is_picker());
+    assert_eq!(headless.model.active_workspace_id(), Some(id));
+    assert!(headless.model.start_pending());
+    assert_eq!(
+        headless.model.terminal_target(),
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+    );
+    assert_eq!(
+        headless.model.launch().source(),
+        WorkspaceSource::DefaultHome
+    );
+    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
+    assert!(headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .is_some_and(made_app::TerminalPane::is_running));
+}
+
+#[cfg(target_os = "linux")]
+struct ClaudeFixture {
+    headless: Headless,
+    id: WorkspaceId,
+    root: PathBuf,
+    emit: PathBuf,
+    spool: PathBuf,
+    claude_pid: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl ClaudeFixture {
+    fn new(temp: &Path) -> Self {
+        // The shipped plugin directory the tab needs to get a spool.
+        std::fs::create_dir_all(
+            made_platform::install_root_from_current_executable(
+                made_platform::PlatformFamily::current(),
+            )
+            .expect("install root")
+            .join("plugins")
+            .join("claude-code-made"),
+        )
+        .unwrap();
+        let root = fixture_workspace(temp, "project-alpha", "main.rs");
+        let mut model = AppModel::from_launch(
+            WorkspaceLaunch::waiting_for_picker(),
+            AppOptions::new().with_compatible_tuis([CompatibleTui::ClaudeCode]),
+        );
+        let id = open_workspace(&mut model, &root);
+        let mut headless = Headless::new(model, 1280.0, 800.0);
+        headless.ctx.enable_accesskit();
+        wait_explorer_ready(&mut headless, id);
+        headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+            style.interaction.tooltip_delay = 0.0
+        });
+        let emit = temp.join("emit.bin");
+        std::fs::write(&emit, b"").unwrap();
+        let workbench = headless.model.workspace_mut(id).unwrap();
+        let spool = PathBuf::from(
+            workbench
+                .terminal()
+                .unwrap()
+                .options()
+                .env
+                .iter()
+                .find(|(key, _)| key == "MADE_CLAUDE_SPOOL")
+                .expect("the shell tab has a spool")
+                .1
+                .clone(),
+        );
+        let shell = workbench.terminal().and_then(made_app::TerminalPane::pid);
+        // A foreground child of the shell stands in for Claude Code: it keeps
+        // the shell off its prompt and relays whatever the test appends.
+        type_terminal_command(workbench, &format!("tail -n0 -f '{}'", emit.display()));
+        let shell = shell.expect("shell pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let claude_pid = loop {
+            headless.render();
+            let found = std::process::Command::new("pgrep")
+                .args(["-P", &shell.to_string(), "tail"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .ok()
+                });
+            if let Some(pid) = found {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "tail did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        Self {
+            headless,
+            id,
+            root,
+            emit,
+            spool,
+            claude_pid,
+        }
+    }
+
+    fn emit(&self, bytes: &[u8]) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.emit)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    fn hook(&self, cwd: &Path, event: &str, status: &str, title: &str) {
+        use std::io::Write;
+        let line = json!({
+            "at": "t", "sessionId": "s1", "cwd": cwd, "event": event, "notification": "",
+            "status": status, "title": title, "pids": [4_000_000u32, self.claude_pid],
+        });
+        let shell = self
+            .headless
+            .model
+            .workspace(self.id)
+            .and_then(Workbench::terminal)
+            .and_then(made_app::TerminalPane::pid)
+            .unwrap();
+        let mut line = line;
+        line["pids"] = json!([4_000_000u32, self.claude_pid, shell]);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.spool)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn tab(&mut self) -> egui::Rect {
+        self.headless.render();
+        self.headless.response(workspace_tab_id(self.id)).rect
+    }
+
+    /// Render until `ready` accepts the tab's painted output.
+    fn until(
+        &mut self,
+        mut ready: impl FnMut(&egui::FullOutput, egui::Rect) -> bool,
+    ) -> egui::FullOutput {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = self.headless.render();
+            let tab = self.headless.response(workspace_tab_id(self.id)).rect;
+            if ready(&output, tab) || Instant::now() >= deadline {
+                return output;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn labeled(&mut self, label: &str) -> egui::FullOutput {
+        let label = label.to_owned();
+        self.until(move |output, tab| {
+            text_rects(output, &label, 55.0)
+                .iter()
+                .any(|rect| tab.contains_rect(*rect))
+        })
+    }
+
+    fn hover_tab(&mut self, needle: &str) -> String {
+        let id = workspace_tab_id(self.id);
+        output_text(&self.headless.hover_until_text(id, needle))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tab_has_label(fixture: &mut ClaudeFixture, output: &egui::FullOutput, label: &str) -> bool {
+    let tab = fixture.tab();
+    text_rects(output, label, 55.0)
+        .iter()
+        .any(|rect| tab.contains_rect(*rect))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
+    if isolated("protocol_status_paints_one_busy_dot_with_the_window_title_tooltip") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let output = fixture.headless.render();
+    assert!(
+        !tab_has_label(&mut fixture, &output, "Claude Code"),
+        "a plain shell is not branded"
+    );
+
+    // Protocol only: no hook record, so no live owned session.
+    fixture.emit(b"\x1b]0;Refactor parser\x07");
+    fixture.emit(CLAUDE_ESC_WORKING);
+    let output = fixture.labeled("Claude Code");
+    let tab = fixture.tab();
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(
+        dots.len(),
+        1,
+        "one protocol-only dot without a live session"
+    );
+    assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the busy dot");
+    let label = text_rects(&output, "Claude Code", 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .unwrap();
+    assert_claude_mark(&fixture.headless, &output, tab, label.left(), "the tab");
+    assert!(
+        text_rects(&output, "project-alpha", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the folder label is replaced"
+    );
+    let hovered = fixture.hover_tab("Refactor parser");
+    assert!(
+        hovered.contains("Refactor parser — Sessions: 1 running"),
+        "tooltip is the window title and the summary: {hovered}"
+    );
+    assert!(
+        !hovered.contains(&fixture.root.display().to_string()),
+        "the tooltip omits the workspace path: {hovered}"
+    );
+    let output = fixture.headless.render();
+    let (role, name, _) = accesskit_row_state(&output, workspace_tab_id(fixture.id));
+    assert_eq!(role, egui::Role::Tab);
+    assert_eq!(name.as_deref(), Some("Claude Code — Sessions: 1 running"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hook_only_dots_go_busy_then_attention_and_ignore_the_glyph_title() {
+    if isolated("hook_only_dots_go_busy_then_attention_and_ignore_the_glyph_title") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let cwd = fixture.root.clone();
+    // No protocol status: the glyph title must not be read.
+    fixture.emit("\u{1b}]0;◐ Refactor parser\u{7}".as_bytes());
+    fixture.hook(&cwd, "SessionStart", "idle", "");
+    let output = fixture.labeled("Claude Code");
+    let tab = fixture.tab();
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(dots.len(), 1);
+    assert_session_dot_color(&dots[0], made_app::theme::TEXT_TERTIARY, "the idle dot");
+
+    fixture.hook(&cwd, "UserPromptSubmit", "working", "");
+    let output = fixture.until(|output, tab| {
+        tab_session_dots(output, tab)
+            .first()
+            .is_some_and(|dot| dot.fill == made_app::theme::ACCENT)
+    });
+    let tab = fixture.tab();
+    assert_session_dot_color(
+        &tab_session_dots(&output, tab)[0],
+        made_app::theme::ACCENT,
+        "busy",
+    );
+    fixture.hook(&cwd, "PermissionRequest", "attention", "");
+    let output = fixture.until(|output, tab| {
+        tab_session_dots(output, tab)
+            .first()
+            .is_some_and(|dot| dot.fill == made_app::theme::WARNING)
+    });
+    let tab = fixture.tab();
+    assert_session_dot_color(
+        &tab_session_dots(&output, tab)[0],
+        made_app::theme::WARNING,
+        "attention",
+    );
+    let hovered = fixture.hover_tab("Claude Code");
+    assert!(
+        hovered.contains("Claude Code — Sessions: 1 needs attention"),
+        "the window title is ignored without a protocol status: {hovered}"
+    );
+    assert!(!hovered.contains("Refactor parser"), "{hovered}");
+
+    // A renamed session title arrives with the next prompt.
+    fixture.hook(&cwd, "UserPromptSubmit", "working", "foo");
+    let hovered = fixture.hover_tab("foo — Sessions");
+    assert!(hovered.contains("foo — Sessions: 1 running"), "{hovered}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_and_hostile_window_titles_fall_back_or_are_sanitized() {
+    if isolated("empty_and_hostile_window_titles_fall_back_or_are_sanitized") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    fixture.emit(b"\x1b]0;\x07");
+    fixture.emit(CLAUDE_ESC_WORKING);
+    fixture.labeled("Claude Code");
+    let hovered = fixture.hover_tab("Sessions: 1 running");
+    assert!(
+        hovered.contains("Claude Code — Sessions: 1 running"),
+        "an empty window title falls back: {hovered}"
+    );
+
+    let hostile = format!("a\u{202e}b\tc{}", "x".repeat(300));
+    fixture.emit(format!("\u{1b}]0;{hostile}\u{7}").as_bytes());
+    let hovered = fixture.hover_tab("abc");
+    assert!(!hovered.contains('\u{202e}'), "{hovered:?}");
+    assert!(
+        hovered.contains("abc"),
+        "bidi controls are removed: {hovered:?}"
+    );
+    assert!(
+        !hovered.contains(&"x".repeat(130)),
+        "capped at 120: {hovered:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn clearing_returns_the_folder_label_path_tooltip_and_terminal_glyph() {
+    if isolated("clearing_returns_the_folder_label_path_tooltip_and_terminal_glyph") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    fixture.emit(CLAUDE_ESC_IDLE);
+    fixture.labeled("Claude Code");
+    fixture.emit(CLAUDE_ESC_CLEAR);
+    let output = fixture.labeled("project-alpha");
+    let tab = fixture.tab();
+    assert!(
+        text_rects(&output, "Claude Code", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "the Claude Code label is gone"
+    );
+    assert!(tab_session_dots(&output, tab).is_empty());
+    assert!(
+        !has_leading_image(&output, tab, tab.right()),
+        "the terminal glyph returns instead of an image"
+    );
+    let hovered = fixture.hover_tab(&fixture.root.display().to_string());
+    assert!(
+        hovered.contains(&fixture.root.display().to_string()),
+        "the full-path tooltip returns: {hovered}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_code_takes_over_a_grok_tab_and_hands_it_back() {
+    if isolated("claude_code_takes_over_a_grok_tab_and_hands_it_back") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let shell = fixture
+        .headless
+        .model
+        .workspace(fixture.id)
+        .and_then(Workbench::terminal)
+        .and_then(made_app::TerminalPane::pid)
+        .unwrap();
+    write_grok_inventory(&[
+        json!({"pid": shell, "session_id": "g1", "cwd": "/tmp/made-grok-missing", "opened_at": "2024-01-01T00:00:01Z"}),
+        json!({"pid": shell, "session_id": "g2", "cwd": "/tmp/made-grok-missing", "opened_at": "2024-01-01T00:00:02Z"}),
+    ]);
+    let output = fixture.labeled("Grok Build");
+    let tab = fixture.tab();
+    assert_eq!(tab_session_dots(&output, tab).len(), 2, "two Grok dots");
+
+    fixture.emit(CLAUDE_ESC_WORKING);
+    let output = fixture.labeled("Claude Code");
+    let tab = fixture.tab();
+    assert_eq!(
+        tab_session_dots(&output, tab).len(),
+        1,
+        "only Claude Code dots while it is present"
+    );
+    assert!(
+        text_rects(&output, "Grok Build", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "Grok Build yields to Claude Code"
+    );
+
+    fixture.emit(CLAUDE_ESC_CLEAR);
+    let output = fixture.labeled("Grok Build");
+    let tab = fixture.tab();
+    assert_eq!(
+        tab_session_dots(&output, tab).len(),
+        2,
+        "the Grok dots return after Claude Code ends"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_direct_claude_code_tab_is_branded_before_any_status() {
+    if isolated("a_direct_claude_code_tab_is_branded_before_any_status") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .next()
+        .expect("isolated bin");
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "current", "main.rs");
+    let (mut headless, first) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    headless.ctx.enable_accesskit();
+    headless.click(top_action_id("open-folder"));
+    headless.click(new_tab_menu_item_id("claude"));
+    let mut direct = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while direct.is_none() && Instant::now() < deadline {
+        headless.render();
+        direct = headless.model.workspace_ids().find(|id| *id != first);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let direct = direct.expect("the Claude Code tab opened");
+    headless.pump_until(|model| {
+        model
+            .workspace(direct)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
+    assert!(
+        headless
+            .model
+            .workspace(first)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "the current tab keeps running"
+    );
+    headless.render();
+    let output = headless.render();
+    let tab = headless.response(workspace_tab_id(direct)).rect;
+    let label = text_rects(&output, "Claude Code", 55.0)
+        .into_iter()
+        .find(|rect| tab.contains_rect(*rect))
+        .expect("a direct launch is labeled Claude Code before any status");
+    assert_claude_mark(&headless, &output, tab, label.left(), "the direct tab");
+    assert!(
+        tab_session_dots(&output, tab).is_empty(),
+        "no dot before any status or record"
+    );
+    let id = workspace_tab_id(direct);
+    let hovered = output_text(&headless.hover_until_text(id, "Claude Code"));
+    assert!(
+        !hovered.contains(&root.display().to_string()),
+        "the tooltip is Claude Code without a path: {hovered}"
+    );
+    let output = headless.render();
+    let (_, name, _) = accesskit_row_state(&output, id);
+    assert_eq!(name.as_deref(), Some("Claude Code"));
+}
+
+#[test]
+fn claude_code_diagnostics_row_stays_hidden_until_revealed() {
+    if isolated("claude_code_diagnostics_row_stays_hidden_until_revealed") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "hidden-row", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    headless.click(made_app::theme::wordmark_id());
+    let before = output_text(&headless.render());
+    assert!(
+        !before.contains("Claude Code is not running.")
+            && !before.contains("Claude Code is not on PATH."),
+        "the row is hidden until Show diagnostics is activated: {before}"
+    );
+    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
+    headless.click(about_diagnostics_toggle_id(&pane_id));
+    settle_about_animation(&mut headless);
+    let after = output_text(&headless.render());
+    assert!(
+        after.contains("Claude Code is not running."),
+        "an explicit catalog without detection uses the running state: {after}"
+    );
+    let grok = after.find("Grok Build is not on PATH.").expect("grok row");
+    let claude = after.find("Claude Code is not running.").unwrap();
+    assert!(
+        grok < claude,
+        "the Claude Code row follows the Grok Build row"
+    );
+}
+
+#[test]
+fn claude_code_row_is_not_on_path_without_a_catalog_entry() {
+    if isolated("claude_code_row_is_not_on_path_without_a_catalog_entry") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "no-claude", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[CompatibleTui::OpenCode]);
+    open_about_diagnostics(&mut headless, id);
+    let text = output_text(&headless.render());
+    assert!(text.contains("Claude Code is not on PATH."), "{text}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_code_row_walks_not_running_starting_and_ready() {
+    if isolated("claude_code_row_walks_not_running_starting_and_ready") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let id = fixture.id;
+    open_about_diagnostics(&mut fixture.headless, id);
+    let text = output_text(&fixture.headless.render());
+    assert!(text.contains("Claude Code is not running."), "{text}");
+
+    // The capability probe alone is not presence.
+    fixture.emit(b"\x1b]7501;?\x07");
+    std::thread::sleep(Duration::from_millis(200));
+    let text = output_text(&fixture.headless.render());
+    assert!(text.contains("Claude Code is not running."), "{text}");
+
+    // A status emission with no hook record: present, still starting.
+    fixture.emit(CLAUDE_ESC_WORKING);
+    let starting = |text: &str| text.contains("Claude Code is starting.");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    while !starting(&text) && Instant::now() < deadline {
+        text = output_text(&fixture.headless.render());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(starting(&text), "{text}");
+
+    // A live owned session plus the observed protocol is ready, with no wait.
+    let cwd = fixture.root.clone();
+    fixture.hook(&cwd, "SessionStart", "idle", "");
+    let ready = |text: &str| text.contains("Claude Code session follow is ready.");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready(&text) && Instant::now() < deadline {
+        text = output_text(&fixture.headless.render());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready(&text), "{text}");
+
+    // The copied report carries the same sentence and no title or message.
+    let report = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .sanitized_diagnostics_text();
+    assert!(
+        report.contains("claude: Claude Code session follow is ready."),
+        "{report}"
+    );
+    assert!(report.contains("claude status: ready"), "{report}");
 }

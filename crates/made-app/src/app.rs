@@ -18,6 +18,7 @@ use made_platform::{CompatibleTui, Platform};
 use crate::cli::LaunchArgs;
 use crate::diagnostics::GrokDiagnosticsRow;
 use crate::grok_plugin::{self, EnsureOutcome};
+use crate::integration_status::ClaudeDiagnosticsPhase;
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
@@ -291,6 +292,25 @@ impl RemoteGrokInstallState {
     }
 }
 
+fn initial_claude_phase(
+    detecting: bool,
+    detection_started: bool,
+    catalog_has_claude: bool,
+) -> ClaudeDiagnosticsPhase {
+    if detecting {
+        if detection_started {
+            ClaudeDiagnosticsPhase::Checking
+        } else {
+            ClaudeDiagnosticsPhase::NotOnPath
+        }
+    } else if catalog_has_claude {
+        // Plugin loading does not depend on detection.
+        ClaudeDiagnosticsPhase::Available
+    } else {
+        ClaudeDiagnosticsPhase::NotOnPath
+    }
+}
+
 fn initial_grok_phase(
     detecting: bool,
     detection_started: bool,
@@ -433,6 +453,8 @@ pub struct AppModel {
     remote_grok_install_refusals: Vec<made_remote::protocol::AuthorityId>,
     /// Row derived from detection and install, unless a test hold is set.
     grok_phase: GrokDiagnosticsPhase,
+    /// Claude Code PATH detection state for every workspace's diagnostics row.
+    claude_phase: ClaudeDiagnosticsPhase,
     /// Set only by [`AppModel::hold_grok_diagnostics`].
     grok_hold: Option<GrokDiagnosticsHold>,
     /// Per-workspace running marks set only by [`AppModel::hold_workspace_grok_running`].
@@ -525,6 +547,11 @@ impl AppModel {
             compatible_tui_receiver.is_some(),
             catalog_has_grok,
         );
+        let claude_phase = initial_claude_phase(
+            options.detect_compatible_tuis,
+            compatible_tui_receiver.is_some(),
+            options.compatible_tuis.contains(&CompatibleTui::ClaudeCode),
+        );
         // A live worker has not answered yet. A thread that never started is
         // the same as detection finishing without OpenCode.
         let opencode_missing = if options.detect_compatible_tuis {
@@ -554,6 +581,7 @@ impl AppModel {
             grok_plugin_receiver: None,
             grok_hooks_unavailable: false,
             grok_phase,
+            claude_phase,
             grok_hold: None,
             grok_running_hold: Vec::new(),
             remote_grok_installs: Vec::new(),
@@ -1008,6 +1036,7 @@ impl AppModel {
             .grok_hold
             .map(GrokDiagnosticsHold::phase)
             .unwrap_or(self.grok_phase);
+        let claude_phase = self.claude_phase;
         // Taken so each workspace can be updated while its mark is read.
         let running = std::mem::take(&mut self.grok_running_hold);
         let mut provisioned = Vec::new();
@@ -1049,6 +1078,7 @@ impl AppModel {
                 continue;
             }
             workbench.set_grok_diagnostics(grok_row_for(phase, mark, workbench));
+            workbench.set_claude_phase(claude_phase);
         }
         // A failed or update-required transition is not a provisioned path for
         // the Grok installer, even if an earlier attempt succeeded.
@@ -1967,6 +1997,7 @@ impl AppModel {
             workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, &workbench));
         } else {
             workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
+            workbench.set_claude_phase(self.claude_phase);
         }
         if self.grok_hooks_unavailable {
             workbench.note_grok_session_hooks_unavailable();
@@ -2252,6 +2283,11 @@ impl AppModel {
             Ok(tuis) => {
                 let detected_opencode = tuis.contains(&CompatibleTui::OpenCode);
                 let detected_grok = tuis.contains(&CompatibleTui::Grok);
+                self.claude_phase = if tuis.contains(&CompatibleTui::ClaudeCode) {
+                    ClaudeDiagnosticsPhase::Available
+                } else {
+                    ClaudeDiagnosticsPhase::NotOnPath
+                };
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
                 if !detected_opencode {
@@ -2276,6 +2312,10 @@ impl AppModel {
             }
             Err(TryRecvError::Disconnected) => {
                 self.compatible_tui_receiver = None;
+                if self.claude_phase == ClaudeDiagnosticsPhase::Checking {
+                    self.claude_phase = ClaudeDiagnosticsPhase::NotOnPath;
+                    self.push_grok_diagnostics();
+                }
                 if self.grok_phase == GrokDiagnosticsPhase::Detecting {
                     self.grok_phase = GrokDiagnosticsPhase::NotOnPath;
                     self.push_grok_diagnostics();
