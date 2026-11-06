@@ -13230,16 +13230,21 @@ struct ClaudeFixture {
 #[cfg(target_os = "linux")]
 impl ClaudeFixture {
     fn new(temp: &Path) -> Self {
-        // The shipped plugin directory the tab needs to get a spool.
-        std::fs::create_dir_all(
-            made_platform::install_root_from_current_executable(
+        // The shipped plugin the tab needs to get a spool: its directory and an
+        // executable hook binary.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let plugin = made_platform::install_root_from_current_executable(
                 made_platform::PlatformFamily::current(),
             )
             .expect("install root")
             .join("plugins")
-            .join("claude-code-made"),
-        )
-        .unwrap();
+            .join("claude-code-made");
+            std::fs::create_dir_all(plugin.join("bin")).unwrap();
+            let hook = plugin.join("bin").join("made-claude-status");
+            std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let root = fixture_workspace(temp, "project-alpha", "main.rs");
         let mut model = AppModel::from_launch(
             WorkspaceLaunch::waiting_for_picker(),
@@ -13427,6 +13432,35 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
     let (role, name, _) = accesskit_row_state(&output, workspace_tab_id(fixture.id));
     assert_eq!(role, egui::Role::Tab);
     assert_eq!(name.as_deref(), Some("Claude Code — Sessions: 1 running"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_window_title_never_reaches_the_copied_report_or_the_log() {
+    if isolated("the_window_title_never_reaches_the_copied_report_or_the_log") {
+        return;
+    }
+    const MARKER: &str = "TITLE-MARKER-7f3a9c";
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let id = fixture.id;
+    fixture.emit(format!("\u{1b}]0;{MARKER}\u{7}").as_bytes());
+    fixture.emit(CLAUDE_ESC_WORKING);
+    fixture.labeled("Claude Code");
+    // The title is read, for the tooltip only.
+    let hovered = fixture.hover_tab(MARKER);
+    assert!(hovered.contains(MARKER), "{hovered}");
+
+    // Open the diagnostics with the title live so every report path runs.
+    open_about_diagnostics(&mut fixture.headless, id);
+    let shown = output_text(&fixture.headless.render());
+    assert!(!shown.contains(MARKER), "the About panel: {shown}");
+    let workbench = fixture.headless.model.workspace(id).unwrap();
+    let report = workbench.sanitized_diagnostics_text();
+    assert!(report.contains("claude status:"), "{report}");
+    assert!(!report.contains(MARKER), "the copied report: {report}");
+    let log = std::fs::read_to_string(isolated_log_path()).unwrap_or_default();
+    assert!(!log.contains(MARKER), "the log: {log}");
 }
 
 #[cfg(target_os = "linux")]

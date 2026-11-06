@@ -399,6 +399,28 @@ fn other_launches_get_no_claude_environment() {
 }
 
 #[test]
+fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
+    let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
+    for target in [
+        TerminalTarget::Shell,
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+    ] {
+        for shipped in [
+            "/opt/a:b/claude-code-made",
+            "/opt/a\"b/claude-code-made",
+            "relative/claude-code-made",
+        ] {
+            let launch = target.claude_launch_env(Some(Path::new(shipped)), None, Some(spool));
+            assert!(
+                env_of(&launch.env, PLUGIN_DIRS).is_none() && launch.env.is_empty(),
+                "{target:?} {shipped}: no empty or partial list, no spool binding: {launch:?}"
+            );
+            assert!(launch.hooks_unavailable, "{target:?} {shipped}");
+        }
+    }
+}
+
+#[test]
 fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
     for target in [
@@ -486,7 +508,11 @@ fn isolated_claude_launch(name: &str) -> bool {
         .expect("test executable install root")
         .join("plugins")
         .join("claude-code-made");
-    fs::create_dir_all(&shipped).unwrap();
+    // The plugin counts as present only with its hook binary in place.
+    fs::create_dir_all(shipped.join("bin")).unwrap();
+    let hook = shipped.join("bin").join("made-claude-status");
+    fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
     let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -505,7 +531,7 @@ fn isolated_claude_launch(name: &str) -> bool {
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("SHELL", "/bin/bash")
         .env(PLUGIN_DIRS, "/user/one:/user/two")
-        .env_remove(SPOOL)
+        .env(SPOOL, "/inherited/other-tab/claude/1-x/tab.jsonl")
         .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
         .env_remove(made_platform::SHELL_ENV)
         .output()
@@ -577,6 +603,10 @@ fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code(
         Some(OsString::from(&expected))
     );
     let shell_spool = PathBuf::from(env_of(&shell_options.env, SPOOL).unwrap());
+    assert!(
+        !shell_spool.starts_with("/inherited"),
+        "the tab binds its own spool over an inherited one"
+    );
     assert_ne!(shell_spool, spool, "each tab has its own spool");
 
     for target in [
@@ -587,6 +617,10 @@ fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code(
         let options = other.terminal().expect("child").options().clone();
         assert!(env_of(&options.env, PLUGIN_DIRS).is_none(), "{target:?}");
         assert!(env_of(&options.env, SPOOL).is_none(), "{target:?}");
+        assert!(
+            options.env_remove.iter().any(|key| key == SPOOL),
+            "an inherited spool binding is stripped from {target:?}"
+        );
         if target == TerminalTarget::Tui(CompatibleTui::Grok) {
             assert_eq!(options.args, vec![OsString::from("dashboard")]);
             assert!(env_of(&options.env, made_bridge::config::CONFIG_CONTENT_ENV).is_none());

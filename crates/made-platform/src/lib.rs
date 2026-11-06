@@ -2675,6 +2675,50 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
+/// Whether `path` is a regular file the current user can execute.
+///
+/// Metadata only: the file is never run. Windows has no execute bit, so any
+/// regular file counts there.
+pub fn is_executable_file(path: &Path) -> bool {
+    is_executable(path)
+}
+
+/// Open an existing regular file for reading, or for writing without
+/// truncation, and refuse anything else.
+///
+/// The final path component is never followed when it is a symlink, a FIFO or
+/// device cannot block the open, and the file type is checked on the opened
+/// handle, so a path swapped after an earlier check is still refused.
+pub fn open_regular_file_nofollow(path: &Path, write: bool) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    if write {
+        options.write(true);
+    } else {
+        options.read(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is a symlink",
+        ));
+    }
+    let file = options.open(path)?;
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ))
+    }
+}
+
 /// Shell resolution shared by the POSIX and Windows backends.
 pub(crate) fn resolve_shell_for(
     family: PlatformFamily,

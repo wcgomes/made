@@ -33,7 +33,8 @@ use crate::sanitize::sanitize_display;
 /// Most parent hops from a Claude Code process to its tab's terminal process.
 pub const MAX_HOPS: usize = 32;
 
-/// Spool size at which a fully consumed spool is truncated.
+/// Size the hook never lets a spool exceed. A fully consumed spool with less
+/// than [`MAX_RECORD_BYTES`] of room below it is truncated.
 pub const SPOOL_BOUND: u64 = 1024 * 1024;
 
 /// Largest record, newline included, that is applied.
@@ -51,8 +52,27 @@ pub const DEFAULT_TITLE: &str = "Claude Code";
 /// File name of the lock a running Made instance holds in its spool directory.
 const OWNER_LOCK: &str = "owner.lock";
 
+/// Name the lock file has until it is held.
+const OWNER_LOCK_PENDING: &str = "owner.lock.pending";
+
 /// Directory under the private per-user temp directory that holds spools.
 const SPOOL_ROOT: &str = "claude";
+
+/// The shipped plugin directory when its hook is really there.
+///
+/// `shipped` is the readable, separator-safe directory the platform layer
+/// found. The plugin counts as present only when its `bin/made-claude-status`
+/// is an executable regular file, because a plugin whose hook cannot run
+/// reports nothing. This reads the filesystem: call it at launch, not per
+/// frame.
+pub fn ready_claude_plugin_dir(shipped: Option<&Path>) -> Option<PathBuf> {
+    let dir = shipped?;
+    let hook = dir.join("bin").join(format!(
+        "made-claude-status{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    made_platform::is_executable_file(&hook).then(|| dir.to_path_buf())
+}
 
 // ---- records ---------------------------------------------------------------
 
@@ -152,11 +172,17 @@ impl SpoolReader {
     /// Apply the records appended since the last poll.
     ///
     /// Malformed, oversized and incomplete lines are skipped, and an
-    /// incomplete trailing line waits for its newline. A spool over
-    /// [`SPOOL_BOUND`] that has been fully consumed is truncated under the
-    /// advisory lock the hook also takes.
+    /// incomplete trailing line waits for its newline. The hook drops a record
+    /// that would take the spool past [`SPOOL_BOUND`], so a fully consumed
+    /// spool that has less than one maximum record of room left is truncated
+    /// under the advisory lock the hook also takes.
     pub fn poll(&mut self) -> Vec<Record> {
-        let Some(len) = regular_file_len(&self.path) else {
+        // One handle for the whole poll: the length, the bytes and the file type
+        // all come from the file that was opened without following a symlink.
+        let Ok(mut file) = made_platform::open_regular_file_nofollow(&self.path, false) else {
+            return Vec::new();
+        };
+        let Ok(len) = file.metadata().map(|meta| meta.len()) else {
             return Vec::new();
         };
         if len < self.offset {
@@ -165,18 +191,18 @@ impl SpoolReader {
         }
         let mut records = Vec::new();
         if len > self.offset {
-            if let Some(bytes) = self.read_from_offset(len) {
+            if let Some(bytes) = self.read_from_offset(&mut file, len) {
                 self.consume(&bytes, &mut records);
             }
         }
-        if self.offset == len && len > SPOOL_BOUND {
+        drop(file);
+        if self.offset == len && len + MAX_RECORD_BYTES as u64 > SPOOL_BOUND {
             self.truncate_consumed();
         }
         records
     }
 
-    fn read_from_offset(&self, len: u64) -> Option<Vec<u8>> {
-        let mut file = File::open(&self.path).ok()?;
+    fn read_from_offset(&self, file: &mut File, len: u64) -> Option<Vec<u8>> {
         file.seek(SeekFrom::Start(self.offset)).ok()?;
         let mut bytes = Vec::new();
         file.take(len - self.offset).read_to_end(&mut bytes).ok()?;
@@ -207,7 +233,7 @@ impl SpoolReader {
     }
 
     fn truncate_consumed(&mut self) {
-        let Ok(file) = OpenOptions::new().write(true).open(&self.path) else {
+        let Ok(file) = made_platform::open_regular_file_nofollow(&self.path, true) else {
             return;
         };
         // The hook holds this lock while it appends, so under it the length is
@@ -222,8 +248,11 @@ impl SpoolReader {
 }
 
 fn regular_file_len(path: &Path) -> Option<u64> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    meta.is_file().then_some(meta.len())
+    made_platform::open_regular_file_nofollow(path, false)
+        .ok()?
+        .metadata()
+        .ok()
+        .map(|meta| meta.len())
 }
 
 /// A [`SpoolReader`] polled on its own thread.
@@ -328,8 +357,13 @@ impl SpoolInstance {
         }
         let dir = root.join(format!("{owner_pid}-{id}"));
         create_private_directory(&dir)?;
-        let owner = create_private_file(&dir.join(OWNER_LOCK))?;
+        // The lock is taken before the file has its final name, so a concurrent
+        // start never sees an `owner.lock` that nobody holds yet. The lock
+        // belongs to the open file and survives the rename.
+        let pending = dir.join(OWNER_LOCK_PENDING);
+        let owner = create_private_file(&pending)?;
         owner.lock()?;
+        fs::rename(&pending, dir.join(OWNER_LOCK))?;
         Ok(Self {
             root,
             dir,
@@ -548,13 +582,20 @@ impl Drop for TabSpool {
 /// The liveness anchor of a record's Claude Code process, when this tab owns
 /// it.
 ///
-/// `chain` is the hook's ancestry, nearest first. The tab's terminal process
-/// `root` must appear in it, and the anchor must still descend from `root`
-/// within [`MAX_HOPS`] live parent hops, which rejects another tab, a process
-/// reparented away from the tab (as under a tmux server) and an exited one.
-/// The anchor is the hook's grandparent when the hook ran through a shell
-/// (Claude Code is then two hops up), the parent when the root is the
-/// grandparent, and the terminal child itself in a directly launched tab.
+/// `chain` is the hook's ancestry, nearest first. The anchor is the nearest
+/// pid in it that is still alive when the record is read and that is the
+/// tab's terminal process `root` or descends from it within [`MAX_HOPS`] live
+/// parent hops. The hook's own shell is transient and has exited by then, so
+/// the anchor is the process that ran the hook: Claude Code itself, whether it
+/// sits under nested shells, replaced the shell with `exec`, or is a
+/// `claude -p` run by another Claude Code.
+///
+/// The nearest live pid decides. A live process that does not descend from
+/// `root` (another tab, or one reparented away such as under a tmux server)
+/// rejects the record rather than letting it fall through to the root. A live
+/// `root` is the anchor only when it is the terminal child of a directly
+/// launched tab, or when it is at most one hop (the hook shell) from the hook:
+/// a shell whose Claude Code has already exited is not Claude Code.
 pub fn resolve_anchor(
     root: u32,
     direct: bool,
@@ -562,22 +603,16 @@ pub fn resolve_anchor(
     mut parent_of: impl FnMut(u32) -> Option<u32>,
 ) -> Option<u32> {
     let chain = &chain[..chain.len().min(MAX_HOPS)];
-    let position = chain.iter().position(|pid| *pid == root)?;
-    let anchor = if direct {
-        root
-    } else {
-        match position {
-            0 => return None,
-            1 => chain[0],
-            _ => chain[1],
+    for (position, pid) in chain.iter().copied().enumerate() {
+        if parent_of(pid).is_none() {
+            continue;
         }
-    };
-    let owned = if anchor == root {
-        parent_of(root).is_some()
-    } else {
-        process_belongs_to_with(anchor, root, &mut parent_of)
-    };
-    owned.then_some(anchor)
+        if pid == root {
+            return (direct || position <= 1).then_some(pid);
+        }
+        return process_belongs_to_with(pid, root, &mut parent_of).then_some(pid);
+    }
+    None
 }
 
 // ---- per-tab state ------------------------------------------------------------
@@ -614,6 +649,8 @@ impl From<ProtocolState> for ClaudeActivity {
 #[derive(Debug, Clone)]
 struct Session {
     anchor: u32,
+    /// The hook's ancestry as of this session's latest record, nearest first.
+    chain: Vec<u32>,
     id: String,
     cwd: String,
     hook: ClaudeActivity,
@@ -665,7 +702,29 @@ impl ClaudeTab {
             else {
                 continue;
             };
+            self.reanchor(anchor, &record.session_id, &mut parent_of);
             self.apply(anchor, record);
+        }
+    }
+
+    /// A record read while its transient hook shell was still running anchors
+    /// on that shell. The session's next record resolves to the real process:
+    /// move the session there instead of starting a second one.
+    fn reanchor(
+        &mut self,
+        anchor: u32,
+        session_id: &str,
+        parent_of: &mut impl FnMut(u32) -> Option<u32>,
+    ) {
+        if self.sessions.iter().any(|s| s.anchor == anchor) {
+            return;
+        }
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_id && parent_of(s.anchor).is_none())
+        {
+            session.anchor = anchor;
         }
     }
 
@@ -690,6 +749,7 @@ impl ClaudeTab {
                 }
                 self.sessions.push(Session {
                     anchor,
+                    chain: Vec::new(),
                     id: record.session_id.clone(),
                     cwd: String::new(),
                     hook: ClaudeActivity::Idle,
@@ -706,6 +766,7 @@ impl ClaudeTab {
             "SessionStart" | "UserPromptSubmit" | "CwdChanged"
         );
         let session = &mut self.sessions[index];
+        session.chain.clone_from(&record.pids);
         if moved {
             session.cwd = record.cwd;
         }
@@ -768,6 +829,23 @@ impl ClaudeTab {
         self.protocol = None;
     }
 
+    /// Apply one frame's terminal reports: the protocol events first, then the
+    /// shell-prompt report. The prompt is drawn after Claude Code exits, so
+    /// when both arrive in one frame it is the later fact; applying it first
+    /// would let a status emitted before the exit outlive it.
+    pub fn apply_terminal_reports(
+        &mut self,
+        events: impl IntoIterator<Item = ProtocolEvent>,
+        prompt_reported: bool,
+    ) {
+        for event in events {
+            self.note_protocol(event);
+        }
+        if prompt_reported {
+            self.note_shell_prompt();
+        }
+    }
+
     /// Whether Claude Code is present in this tab.
     pub fn present(&self) -> bool {
         (self.direct && self.child_running) || !self.sessions.is_empty() || self.protocol.is_some()
@@ -800,12 +878,31 @@ impl ClaudeTab {
         self.sessions.len()
     }
 
+    /// Whether `session` runs under another live session of this tab, as a
+    /// `claude -p` started by Claude Code does.
+    fn is_nested(&self, session: &Session) -> bool {
+        let Some(position) = session.chain.iter().position(|pid| *pid == session.anchor) else {
+            return false;
+        };
+        session.chain[position + 1..].iter().any(|pid| {
+            self.sessions
+                .iter()
+                .any(|other| other.anchor == *pid && other.anchor != session.anchor)
+        })
+    }
+
+    /// The tab's current session: the most recent one that does not run under
+    /// another session, so a nested `claude -p` never takes the tab over.
     fn latest(&self) -> Option<usize> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, session)| session.recency)
-            .map(|(index, _)| index)
+        let pick = |nested: bool| {
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(_, session)| self.is_nested(session) == nested)
+                .max_by_key(|(_, session)| session.recency)
+                .map(|(index, _)| index)
+        };
+        pick(false).or_else(|| pick(true))
     }
 
     /// The working directory of the most recent live owned session, exactly as

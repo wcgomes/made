@@ -27,7 +27,7 @@ use made_platform::{
     PtySize,
 };
 
-use crate::claude_follow::{shared_instance, ClaudeTab, TabSpool};
+use crate::claude_follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
     DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
@@ -592,6 +592,9 @@ pub struct Workbench {
     /// Session-status hooks cannot report for this tab: the shipped plugin is
     /// missing or unreadable, or the tab's spool could not be created.
     claude_hooks_unavailable: bool,
+    /// The shipped Claude Code plugin when it is usable, looked up once per
+    /// launch so the per-frame diagnostics row never touches the filesystem.
+    claude_plugin: Option<PathBuf>,
     /// App-wide Claude Code detection state for the diagnostics row.
     claude_phase: ClaudeDiagnosticsPhase,
     instrumentation: RuntimeInstrumentation,
@@ -786,6 +789,9 @@ impl Workbench {
             }
             Err(error) => path_error = Some(format!("app paths: {error}")),
         }
+        let claude_plugin = app_paths
+            .as_ref()
+            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
         let log_path = diagnostics_log_path(app_paths.as_ref());
         #[cfg(test)]
         if let Some(path) = &log_path {
@@ -861,6 +867,7 @@ impl Workbench {
             grok_file_newest_id: None,
             claude: None,
             claude_hooks_unavailable: false,
+            claude_plugin,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
@@ -1272,11 +1279,11 @@ impl Workbench {
         if !self.terminal_target.loads_claude_plugin() {
             return (None, ClaudeLaunchEnv::default());
         }
-        let shipped = self
+        self.claude_plugin = self
             .paths
             .as_ref()
-            .and_then(|paths| paths.shipped_claude_plugin_dir())
-            .map(Path::to_path_buf);
+            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
+        let shipped = self.claude_plugin.clone();
         let spool = if shipped.is_some() {
             self.open_claude_spool()
         } else {
@@ -1376,10 +1383,7 @@ impl Workbench {
         }
         claude_diagnostics_row(&ClaudeDiagnosticsInputs {
             phase: self.claude_phase,
-            plugin_missing: self
-                .paths
-                .as_ref()
-                .is_none_or(|paths| paths.shipped_claude_plugin_dir().is_none()),
+            plugin_missing: self.claude_plugin.is_none(),
             present,
             present_for: runtime
                 .and_then(|runtime| runtime.present_since)
@@ -4353,14 +4357,10 @@ impl Workbench {
         if let Some(pid) = terminal.pid() {
             runtime.tab.set_root(pid);
         }
-        // A prompt report from before a status emission must not end it, so it
-        // is applied first.
-        if terminal.take_cwd_report() {
-            runtime.tab.note_shell_prompt();
-        }
-        for event in terminal.take_protocol_events() {
-            runtime.tab.note_protocol(event);
-        }
+        let prompt_reported = terminal.take_cwd_report();
+        runtime
+            .tab
+            .apply_terminal_reports(terminal.take_protocol_events(), prompt_reported);
         runtime.tab.set_child_running(terminal.is_running());
         let records = runtime
             .spool
@@ -5728,15 +5728,16 @@ impl Drop for ShellRootWorker {
 }
 
 /// Add a tab's Claude Code environment to its PTY options. A launch with no
-/// spool binding also removes an inherited one, so a copied variable can never
-/// point a tab at another tab's spool.
+/// spool binding, including every target that does not load the plugin, also
+/// removes an inherited one, so a copied variable can never point a tab at
+/// another tab's spool.
 fn with_claude_launch_env(
     mut options: made_terminal::PtyOptions,
     target: TerminalTarget,
     launch: &ClaudeLaunchEnv,
 ) -> made_terminal::PtyOptions {
     if !target.loads_claude_plugin() {
-        return options;
+        return options.without_env(CLAUDE_SPOOL_ENV);
     }
     let binds_spool = launch.env.iter().any(|(key, _)| key == CLAUDE_SPOOL_ENV);
     for (key, value) in &launch.env {
@@ -5872,6 +5873,52 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
+        let authority = made_remote::protocol::AuthorityId([3; 16]);
+        let launch = ClaudeLaunchEnv::default();
+        for target in [
+            TerminalTarget::Tui(CompatibleTui::OpenCode),
+            TerminalTarget::Tui(CompatibleTui::Grok),
+            TerminalTarget::RemoteShell { authority },
+            TerminalTarget::RemoteOpenCode { authority },
+            TerminalTarget::RemoteGrok { authority },
+            TerminalTarget::RemoteClaude { authority },
+        ] {
+            let options = with_claude_launch_env(
+                made_terminal::PtyOptions::new(std::env::temp_dir()),
+                target,
+                &launch,
+            );
+            assert!(
+                options.env_remove.iter().any(|key| key == CLAUDE_SPOOL_ENV),
+                "{target:?} must not inherit another tab's spool"
+            );
+            assert!(
+                options.env.iter().all(|(key, _)| key != CLAUDE_SPOOL_ENV
+                    && key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV),
+                "{target:?} receives neither a spool nor the composed plugin list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_diagnostics_row_reads_the_cached_plugin_state_not_the_filesystem() {
+        let mut workbench = idle_workbench(TerminalTarget::Shell, None);
+        workbench.set_claude_phase(ClaudeDiagnosticsPhase::Available);
+        let sentence = |workbench: &Workbench| workbench.claude_diagnostics().sentence;
+
+        assert_eq!(
+            sentence(&workbench),
+            "Claude Code session-status hooks are unavailable."
+        );
+        // A path that exists nowhere: only the cached value can say "present".
+        workbench.claude_plugin = Some(PathBuf::from("/nonexistent/made/claude-code-made"));
+        for _ in 0..3 {
+            assert_eq!(sentence(&workbench), "Claude Code is not running.");
+        }
+    }
 
     #[test]
     fn shell_root_availability_transitions_once_and_recovers() {
@@ -6129,6 +6176,7 @@ mod tests {
             grok_file_newest_id: None,
             claude: None,
             claude_hooks_unavailable: false,
+            claude_plugin: None,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),

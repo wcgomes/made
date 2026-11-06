@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use made_app::claude_follow::{
-    parse_record, resolve_anchor, ClaudeActivity, ClaudeTab, HookStatus, Record, SpoolReader,
-    SpoolWatcher, MAX_HOPS,
+    parse_record, ready_claude_plugin_dir, resolve_anchor, ClaudeActivity, ClaudeTab, HookStatus,
+    Record, SpoolReader, SpoolWatcher, MAX_HOPS,
 };
 use made_terminal::{ProtocolEvent, ProtocolState};
 
@@ -206,11 +206,12 @@ fn polling_reads_new_records_off_the_calling_thread_within_the_interval() {
 
 // ---- ownership ------------------------------------------------------------
 
+/// The hook shell (300) is transient: it is in the chain but already gone.
 #[test]
-fn anchor_is_the_grandparent_through_the_hook_shell_else_the_parent() {
+fn anchor_is_the_nearest_live_pid_below_the_root() {
     let tree = shell_tree();
     let mut parent = tree.parent();
-    // hook shell -> claude -> root: the anchor is claude.
+    // hook shell (exited) -> claude -> root: the anchor is claude.
     assert_eq!(
         resolve_anchor(ROOT, false, &[HOOK_SHELL, CLAUDE, ROOT, 50], &mut parent),
         Some(CLAUDE)
@@ -220,7 +221,7 @@ fn anchor_is_the_grandparent_through_the_hook_shell_else_the_parent() {
         resolve_anchor(ROOT, false, &[CLAUDE, ROOT, 50], &mut parent),
         Some(CLAUDE)
     );
-    // A nested wrapper between claude and the root: still the grandparent.
+    // A wrapper between claude and the root: still claude.
     let nested = Tree::new(&[(ROOT, 50), (150, ROOT), (CLAUDE, 150)]);
     assert_eq!(
         resolve_anchor(
@@ -234,6 +235,51 @@ fn anchor_is_the_grandparent_through_the_hook_shell_else_the_parent() {
 }
 
 #[test]
+fn a_nested_shell_does_not_move_the_anchor_to_the_inner_shell() {
+    // root shell -> bash -> claude, and the hook ran without a hook shell.
+    let tree = Tree::new(&[(ROOT, 50), (150, ROOT), (CLAUDE, 150)]);
+    assert_eq!(
+        resolve_anchor(ROOT, false, &[CLAUDE, 150, ROOT, 50], &mut tree.parent()),
+        Some(CLAUDE),
+        "the process that ran the hook, not the shell above it"
+    );
+}
+
+#[test]
+fn exec_claude_anchors_on_the_root_itself() {
+    // `exec claude` replaced the shell: claude is the tab's root process.
+    let tree = Tree::new(&[(ROOT, 50), (50, 1)]);
+    let mut parent = tree.parent();
+    assert_eq!(
+        resolve_anchor(ROOT, false, &[HOOK_SHELL, ROOT, 50], &mut parent),
+        Some(ROOT)
+    );
+    assert_eq!(
+        resolve_anchor(ROOT, false, &[ROOT, 50], &mut parent),
+        Some(ROOT)
+    );
+}
+
+#[test]
+fn a_dead_claude_under_a_live_shell_does_not_anchor_on_the_shell() {
+    // claude exited before its last record was read; the shell it ran from is
+    // alive but is not claude.
+    let tree = Tree::new(&[(ROOT, 50), (50, 1)]);
+    assert_eq!(
+        resolve_anchor(
+            ROOT,
+            false,
+            &[HOOK_SHELL, CLAUDE, ROOT, 50],
+            &mut tree.parent()
+        ),
+        None
+    );
+}
+
+const SUB: u32 = 500;
+const TOOL_SHELL: u32 = 400;
+
+#[test]
 fn a_directly_launched_tab_anchors_on_the_terminal_child() {
     let tree = Tree::new(&[(ROOT, 50), (50, 1)]);
     let mut parent = tree.parent();
@@ -245,6 +291,22 @@ fn a_directly_launched_tab_anchors_on_the_terminal_child() {
         resolve_anchor(ROOT, true, &[ROOT, 50], &mut parent),
         Some(ROOT),
         "without a hook shell the terminal child is the parent"
+    );
+}
+
+#[test]
+fn a_descendant_claude_in_a_direct_tab_anchors_on_itself() {
+    // `claude -p` run by the main claude's Bash tool.
+    let tree = Tree::new(&[(ROOT, 50), (TOOL_SHELL, ROOT), (SUB, TOOL_SHELL)]);
+    assert_eq!(
+        resolve_anchor(
+            ROOT,
+            true,
+            &[HOOK_SHELL, SUB, TOOL_SHELL, ROOT, 50],
+            &mut tree.parent()
+        ),
+        Some(SUB),
+        "the nearest live claude-side pid, not the root"
     );
 }
 
@@ -281,6 +343,13 @@ fn ownership_rejects_other_tabs_reparented_processes_and_exited_anchors() {
         ),
         None
     );
+    // A direct tab whose claude exited owns nothing.
+    let mut gone = Tree::new(&[(50, 1)]);
+    assert_eq!(
+        resolve_anchor(ROOT, true, &[HOOK_SHELL, ROOT, 50], &mut gone.parent()),
+        None
+    );
+    gone.kill(50);
     // An empty or unresolved chain is ignored.
     assert_eq!(resolve_anchor(ROOT, false, &[], &mut parent), None);
 }
@@ -326,6 +395,111 @@ fn foreign_and_unresolvable_records_do_not_create_a_session() {
     assert!(!tab.present());
     assert_eq!(tab.directory(), None);
     assert!(tab.dots().is_empty());
+}
+
+#[test]
+fn a_record_caught_while_the_hook_shell_lives_is_re_anchored_on_the_next_one() {
+    let mut tree = Tree::new(&[(ROOT, 50), (CLAUDE, ROOT), (HOOK_SHELL, CLAUDE)]);
+    let mut tab = ClaudeTab::new(ROOT, false);
+    tab.ingest(
+        vec![record("s", "/w", "SessionStart", Some(HookStatus::Working))],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 1);
+    tree.kill(HOOK_SHELL);
+    tab.ingest(
+        vec![record("s", "/w", "Stop", Some(HookStatus::Idle))],
+        tree.parent(),
+    );
+    assert_eq!(
+        tab.session_count(),
+        1,
+        "still one session after the shell exits"
+    );
+    assert_eq!(tab.dots(), vec![ClaudeActivity::Idle]);
+    tab.check_liveness(tree.parent());
+    assert!(tab.present(), "anchored on the live claude process");
+}
+
+#[test]
+fn a_descendant_claude_p_is_a_separate_session_that_never_replaces_the_main_one() {
+    let tree = Tree::new(&[(ROOT, 50), (TOOL_SHELL, ROOT), (SUB, TOOL_SHELL)]);
+    let mut tab = ClaudeTab::new(ROOT, true);
+    let mut main = record(
+        "main",
+        "/main",
+        "UserPromptSubmit",
+        Some(HookStatus::Working),
+    );
+    main.title = "main title".to_owned();
+    main.pids = vec![HOOK_SHELL, ROOT, 50];
+    tab.ingest(vec![main], tree.parent());
+    let mut sub = record("sub", "/sub", "UserPromptSubmit", Some(HookStatus::Working));
+    sub.title = "sub title".to_owned();
+    sub.pids = vec![HOOK_SHELL, SUB, TOOL_SHELL, ROOT, 50];
+    tab.ingest(vec![sub], tree.parent());
+
+    assert_eq!(tab.session_count(), 2, "the main session was not replaced");
+    assert_eq!(
+        tab.directory().as_deref(),
+        Some("/main"),
+        "the tab follows the main session although the nested one is newer"
+    );
+    assert_eq!(tab.tooltip_title(None), "main title");
+
+    // Records of the main session keep applying to it.
+    let mut stop = record("main", "/main", "Stop", Some(HookStatus::Idle));
+    stop.pids = vec![HOOK_SHELL, ROOT, 50];
+    tab.ingest(vec![stop], tree.parent());
+    assert_eq!(tab.session_count(), 2);
+
+    // The nested process exits; the main session is untouched.
+    let mut tree = tree;
+    tree.kill(SUB);
+    assert!(tab.check_liveness(tree.parent()));
+    assert_eq!(tab.session_count(), 1);
+    assert_eq!(tab.directory().as_deref(), Some("/main"));
+}
+
+#[test]
+fn a_nested_shell_session_is_attributed_to_claude_and_a_foreign_one_is_not() {
+    // root shell -> bash -> claude; records without a hook shell.
+    let tree = Tree::new(&[(ROOT, 50), (150, ROOT), (CLAUDE, 150), (900, 1)]);
+    let mut tab = ClaudeTab::new(ROOT, false);
+    let mut own = record("own", "/own", "SessionStart", Some(HookStatus::Idle));
+    own.pids = vec![CLAUDE, 150, ROOT, 50];
+    let mut foreign = record(
+        "foreign",
+        "/foreign",
+        "SessionStart",
+        Some(HookStatus::Idle),
+    );
+    foreign.pids = vec![900, 1];
+    tab.ingest(vec![own, foreign], tree.parent());
+    assert_eq!(tab.session_count(), 1);
+    assert_eq!(tab.directory().as_deref(), Some("/own"));
+}
+
+// ---- terminal reports ---------------------------------------------------------
+
+#[test]
+fn protocol_events_apply_before_the_prompt_report_of_the_same_frame() {
+    // claude's last emission and the shell prompt that followed its exit arrive
+    // in one frame: the prompt is the later fact and must win.
+    let mut tab = ClaudeTab::new(ROOT, false);
+    tab.apply_terminal_reports(vec![status(ProtocolState::Working)], true);
+    assert!(
+        !tab.present(),
+        "the prompt ends the status that preceded it"
+    );
+    assert!(tab.dots().is_empty());
+
+    // Without a prompt the status stands.
+    tab.apply_terminal_reports(vec![status(ProtocolState::Working)], false);
+    assert_eq!(tab.dots(), vec![ClaudeActivity::Busy]);
+    // A prompt alone ends it too.
+    tab.apply_terminal_reports(Vec::new(), true);
+    assert!(!tab.present());
 }
 
 // ---- sessions, liveness and the directory ----------------------------------
@@ -768,4 +942,34 @@ fn presence_does_not_cross_tabs() {
         !b.present(),
         "tab B's root is not in the record's live ancestry"
     );
+}
+
+// ---- the shipped plugin ----------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn the_plugin_is_present_only_with_an_executable_hook_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let plugin = temp.path().join("claude-code-made");
+    fs::create_dir_all(plugin.join("hooks")).unwrap();
+    assert_eq!(ready_claude_plugin_dir(None), None);
+    assert_eq!(
+        ready_claude_plugin_dir(Some(&plugin)),
+        None,
+        "no hook binary"
+    );
+
+    let hook = plugin.join("bin").join("made-claude-status");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(&hook, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        ready_claude_plugin_dir(Some(&plugin)),
+        None,
+        "a hook that cannot execute reports nothing"
+    );
+
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(ready_claude_plugin_dir(Some(&plugin)), Some(plugin.clone()));
 }

@@ -12,7 +12,7 @@ Active change `claude-code-integration`, user-requested. It adds a new domain an
 - `specs/ssh-remote-workspaces.md`: MODIFIED `SSH server entry and launch choices (SSH-01)` (remote `claude` detection and a `Claude Code SSH` row) and ADDED `Remote Claude Code launch and status (SSH-11)` (direct remote launch and OSC 7501 status through the remote terminal; no remote plugin, hook, staging or write).
 
 ## Non-goals
-- Remote Claude Code hooks, remote plugin staging, remote companion work, remote session follow or remote explorer follow for Claude Code; deferred to a follow-up change.
+- Remote companion work for Claude Code beyond the additive `LaunchTarget::Claude` launch target, such as hooks, plugin staging or follow, and remote session follow or remote explorer follow for Claude Code; deferred to a follow-up change.
 - Editing any user Claude Code file (settings, `~/.claude.json`, plugin registry, marketplaces, hooks, statusline), running `claude plugin install` or any other `claude` subcommand, or passing Claude Code command-line arguments.
 - HTTP hooks to the bridge, a statusline command, the IDE lockfile/MCP channel, reading transcripts or session files, scraping screen content, and reading the window title outside the bounded tooltip case.
 - Using `claude agents --json` (or any other spawned `claude` command) as an inventory fallback, even though the spike showed it works (see Clarifications).

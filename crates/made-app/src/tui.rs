@@ -91,9 +91,10 @@ impl TerminalTarget {
     /// `existing` is the inherited `CLAUDE_CODE_PLUGIN_DIRS` value; its entries
     /// keep their order and Made's `shipped` entry is appended once. Targets
     /// that do not load the plugin get an empty result. With no `shipped`
-    /// directory no entry or spool binding is added and hooks are reported
-    /// unavailable. Without a `spool` the entry is still added, but no spool
-    /// binding is set and hooks are reported unavailable.
+    /// directory, or one whose path cannot be written into the list safely, no
+    /// entry or spool binding is added and hooks are reported unavailable.
+    /// Without a `spool` the entry is still added, but no spool binding is set
+    /// and hooks are reported unavailable.
     pub fn claude_launch_env(
         self,
         shipped: Option<&Path>,
@@ -110,10 +111,16 @@ impl TerminalTarget {
             };
         };
         let separator = claude_plugin_dirs_separator(PlatformFamily::current());
-        let mut env = vec![(
-            OsString::from(CLAUDE_CODE_PLUGIN_DIRS_ENV),
-            compose_claude_plugin_dirs(existing, shipped, separator),
-        )];
+        let composed = compose_claude_plugin_dirs(existing, shipped, separator);
+        // An unsafe shipped path composes to nothing. An empty plugin list is
+        // never set: it would only hide the user's own.
+        if composed.is_empty() {
+            return ClaudeLaunchEnv {
+                env: Vec::new(),
+                hooks_unavailable: true,
+            };
+        }
+        let mut env = vec![(OsString::from(CLAUDE_CODE_PLUGIN_DIRS_ENV), composed)];
         if let Some(spool) = spool {
             env.push((
                 OsString::from(CLAUDE_SPOOL_ENV),

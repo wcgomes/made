@@ -15,14 +15,15 @@ use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
     append_private_log_rotated_with_timeout, claude_plugin_dirs_separator,
     compose_claude_plugin_dirs, detect_compatible_tuis_in_path, find_executable_on_path,
-    host_platform, install_root_for_executable, is_sensitive_env_key, open_private_log,
-    previous_private_log_path, private_log_lock_path, prune_clipboard_images,
-    repository_plugin_dir, repository_root, resolve_user_home, save_clipboard_image_png,
-    validate_user_home, AppPaths, Clipboard, ClipboardImage, CompatibleTui, Environment,
-    HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard, LogAppendOutcome,
-    LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest,
-    PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES,
-    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
+    host_platform, install_root_for_executable, is_executable_file, is_sensitive_env_key,
+    open_private_log, open_regular_file_nofollow, previous_private_log_path, private_log_lock_path,
+    prune_clipboard_images, repository_plugin_dir, repository_root, resolve_user_home,
+    save_clipboard_image_png, validate_user_home, AppPaths, Clipboard, ClipboardImage,
+    CompatibleTui, Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent,
+    InMemoryClipboard, LogAppendOutcome, LogIssue, LogIssueSeverity, PathsInputs, Platform,
+    PlatformFamily, PluginDirSource, PtyRequest, PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV,
+    CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES, MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
 };
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -3098,4 +3099,60 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
         let _ = reader_thread.join();
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_file_open_refuses_symlinks_and_special_files() {
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+    let root = unique_temp("nofollow");
+    let real = root.join("real");
+    std::fs::write(&real, b"payload").unwrap();
+
+    let mut text = String::new();
+    open_regular_file_nofollow(&real, false)
+        .expect("a regular file opens")
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "payload");
+    assert!(open_regular_file_nofollow(&real, true).is_ok());
+
+    let link = root.join("link");
+    symlink(&real, &link).unwrap();
+    assert!(open_regular_file_nofollow(&link, false).is_err(), "symlink");
+    assert!(open_regular_file_nofollow(&link, true).is_err(), "symlink");
+    assert!(
+        open_regular_file_nofollow(&root, false).is_err(),
+        "directory"
+    );
+    assert!(open_regular_file_nofollow(&root.join("missing"), false).is_err());
+
+    let fifo = root.join("fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        open_regular_file_nofollow(&fifo, false).is_err(),
+        "a FIFO is refused without blocking"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_file_needs_a_regular_file_with_an_execute_bit() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_temp("exec-bit");
+    let file = root.join("tool");
+    std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!is_executable_file(&file));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(is_executable_file(&file));
+    assert!(!is_executable_file(&root), "a directory is not a program");
+    assert!(!is_executable_file(&root.join("missing")));
+    let _ = std::fs::remove_dir_all(&root);
 }
