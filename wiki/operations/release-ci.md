@@ -65,11 +65,8 @@ If the gate refuses the tag, read its message, fix the sites with the bump scrip
 
 ### Repository settings
 
-Configured for the release flow:
-
-- The `release` environment requires approval by the maintainer (`wcgomes`) and accepts deployments only from `v*` tags.
-- A ruleset on `main` allows changes only through pull requests.
-- A ruleset on `v*` tags restricts creating, updating and deleting them to a maintainer bypass list. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
+- The `release` environment requires approval by the maintainer (`wcgomes`) and accepts deployments only from `v*` tags. It is configured before the `v0.1.0` release.
+- Configured at rollout end, after `v0.1.0` is published: a ruleset on `main` allowing changes only through pull requests, and a ruleset on `v*` tags restricting creating, updating and deleting them to a maintainer bypass list. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
 
 Optional, manual: GitHub immutable releases (**Settings › General › Releases**). Enable it only after the `v0.1.0` release is published.
 
