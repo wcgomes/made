@@ -5,3 +5,5 @@
 - [0003: In-App Glass and Native Backdrop](0003-in-app-glass-native-backdrop.md) — glass, vibrancy, Mica — Portable glass fallback with optional macOS/Windows materials.
 - [0004: Alacritty Terminal Fallback](0004-alacritty-terminal-fallback.md) — VT, alacritty, TerminalCore — Terminal core substitution due to missing Zig toolchain.
 - [0005: Home-Default Startup](0005-home-default-startup.md) — home, picker, precedence — Default home workspace with explicit picker and fallback.
+- [0006: Native Grok Status Hook](0006-native-grok-hook.md) — hook, Rust, python3 — Interpreter-free Grok status hook replacing the Python script.
+- [0007: GitHub Releases and Velopack](0007-github-releases-velopack-unsigned.md) — releases, auto-update, unsigned — Release channel, updater, unsigned builds, single version source.
