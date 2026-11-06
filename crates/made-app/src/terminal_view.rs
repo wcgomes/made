@@ -2663,14 +2663,31 @@ mod tests {
     fn typing_clears_an_existing_terminal_selection() {
         let temp = tempfile::tempdir().unwrap();
         let platform = made_platform::host_platform();
-        let mut pane = TerminalPane::spawn(
-            &platform,
-            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
-        )
-        .unwrap();
+        // A real shell keeps drawing its prompt and echoing input on its own
+        // schedule, and that output lands in the same grid the test selects
+        // from. On a slow runner it can arrive between `mark` and the copy and
+        // overwrite or clear the marked cells. A silent child removes the race.
+        let mut options =
+            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 });
+        if cfg!(unix) {
+            options = options
+                .with_shell("/bin/sh")
+                .with_args(["-c", "stty -echo; printf ready; exec sleep 30"]);
+        }
+        let mut pane = TerminalPane::spawn(&platform, options).unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
         let ctx = egui::Context::default();
+        if cfg!(unix) {
+            // The child has disabled echo once its marker reaches the pane, so
+            // nothing else will ever be written to the grid.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.output_bytes() == 0 {
+                assert!(Instant::now() < deadline, "the quiet child never started");
+                let _ = pane.pump(&mut log);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
         let _ = run_terminal_frame(
             &ctx,
             &mut pane,
