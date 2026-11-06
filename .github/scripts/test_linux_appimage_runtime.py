@@ -29,12 +29,14 @@ class ExtractionGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
         self.base = Path(self._dir.name)
+        self.cache = self.base / ".cache" / "made"
+        self.cache.mkdir(parents=True, mode=0o700)
 
     def tearDown(self) -> None:
         self._dir.cleanup()
 
-    def appdir(self, name: str, mode: int) -> Path:
-        root = self.base / name
+    def appdir(self, name: str, mode: int, parent: Path | None = None) -> Path:
+        root = (parent or self.cache) / f"appimage-{name}"
         root.mkdir()
         (root / "AppRun").write_text(runtime.GUARD)
         (root / "AppRun").chmod(0o755)
@@ -47,7 +49,7 @@ class ExtractionGuardTest(unittest.TestCase):
         return root
 
     def launch(self, appdir: Path, **extra: str) -> subprocess.CompletedProcess:
-        env = dict(os.environ, APPDIR=str(appdir), APPIMAGE_EXTRACT_AND_RUN="1")
+        env = dict(os.environ, APPDIR=str(appdir), APPIMAGE_EXTRACT_AND_RUN="1", HOME=str(self.base))
         env.pop("APPIMAGE", None)
         env.pop("MADE_APPIMAGE_REEXTRACTED", None)
         env.update(extra)
@@ -92,8 +94,7 @@ class ExtractionGuardTest(unittest.TestCase):
         self.assertNotIn("STARTED", result.stdout)
 
     def test_the_parent_directory_is_made_private(self) -> None:
-        parent = self.base / "made"
-        parent.mkdir()
+        parent = self.cache
         parent.chmod(0o775)
         root = parent / "appimage"
         root.mkdir()
@@ -123,17 +124,51 @@ class ExtractionGuardTest(unittest.TestCase):
         real = self.appdir("real", 0o700)
         link = self.base / "link"
         link.symlink_to(real)
-        env = dict(os.environ, APPDIR=str(link))
+        env = dict(os.environ, APPDIR=str(link), HOME=str(self.base))
         result = subprocess.run(["sh", str(link / "AppRun")], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("STARTED", result.stdout)
 
     def test_a_missing_directory_is_refused(self) -> None:
         real = self.appdir("gone", 0o700)
-        env = dict(os.environ, APPDIR=str(self.base / "absent"))
+        env = dict(os.environ, APPDIR=str(self.base / "absent"), HOME=str(self.base))
         result = subprocess.run(["sh", str(real / "AppRun")], env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
 
+
+    def test_appdir_naming_another_directory_is_refused_and_nothing_is_deleted(self) -> None:
+        victim = self.appdir("victim", 0o700)
+        (victim / "usr" / "made-app").unlink()
+        own = self.appdir("own", 0o700)
+        env = dict(os.environ, APPDIR=str(victim), HOME=str(self.base), APPIMAGE=str(self.fake_appimage()))
+        result = subprocess.run(["sh", str(own / "AppRun")], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not this AppImage's extraction directory", result.stderr)
+        self.assertTrue(victim.exists(), "a directory named only by APPDIR is never deleted")
+        self.assertTrue(own.exists())
+
+    def test_an_incomplete_directory_outside_the_cache_is_never_deleted(self) -> None:
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        root = self.appdir("outside", 0o700, parent=elsewhere)
+        (root / "usr" / "made-app").unlink()
+        result = self.launch(root, APPIMAGE=str(self.fake_appimage()))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("remove it and start Made again", result.stderr)
+        self.assertTrue(root.exists())
+        self.assertNotIn("REEXTRACT", result.stdout)
+
+    def test_an_incomplete_cache_directory_not_named_appimage_is_never_deleted(self) -> None:
+        root = self.cache / "other"
+        root.mkdir()
+        (root / "AppRun").write_text(runtime.GUARD)
+        (root / "AppRun.velopack").write_text("#!/bin/sh\necho STARTED\n")
+        runtime.write_manifest(root)
+        (root / "AppRun.velopack").write_text("changed")
+        root.chmod(0o700)
+        result = self.launch(root, APPIMAGE=str(self.fake_appimage()))
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(root.exists())
 
 class EmbeddedSettingsTest(unittest.TestCase):
     def test_the_extraction_target_is_per_user_per_version_and_per_build(self) -> None:

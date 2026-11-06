@@ -28,7 +28,9 @@ then makes 0700). uruntime reuses any non-empty target, so an extraction cut
 short (killed, or a full disk) would otherwise be run as is: the guard checks
 every file against the SHA-256 manifest built into the image, and on a
 mismatch removes the extraction and starts the AppImage once more to extract
-afresh. Then it runs Velopack's `AppRun`.
+afresh. It trusts only its own resolved directory, never `APPDIR`, and deletes
+only a directory named `appimage-*` directly under `$HOME/.cache/made`.
+Then it runs Velopack's `AppRun`.
 """
 
 from __future__ import annotations
@@ -48,7 +50,14 @@ MANIFEST = ".made-manifest.sha256"
 
 GUARD = """#!/bin/sh
 # Made: start only from a complete extraction in a directory private to this user.
-dir="${APPDIR:-$(dirname "$0")}"
+# The directory is this script's own; APPDIR, when set, must name that same
+# directory and must not be a symlink.
+self="$(readlink -f "$0" 2>/dev/null)"
+dir="$(dirname "$self")"
+if [ -z "$self" ] || { [ -n "$APPDIR" ] && { [ -L "$APPDIR" ] || [ "$(readlink -f "$APPDIR" 2>/dev/null)" != "$dir" ]; }; }; then
+  echo "made: refusing to start from ${APPDIR:-$0}: it is not this AppImage's extraction directory" >&2
+  exit 1
+fi
 owned() {
   [ ! -L "$1" ] && [ -d "$1" ] && [ "$(stat -c %u "$1" 2>/dev/null)" = "$(id -u)" ]
 }
@@ -64,6 +73,15 @@ if ! owned "$parent"; then
 fi
 chmod 700 "$parent" 2>/dev/null
 if ! (cd "$dir" && sha256sum --quiet --strict -c MANIFEST_NAME >/dev/null 2>&1); then
+  cache="$(readlink -f "${HOME:-/nonexistent}/.cache/made" 2>/dev/null)"
+  case "$(basename "$dir")" in
+    appimage-*) removable=1 ;;
+    *) removable= ;;
+  esac
+  if [ -z "$removable" ] || [ -z "$cache" ] || [ "$parent" != "$cache" ]; then
+    echo "made: the extracted copy of Made in $dir is incomplete; remove it and start Made again" >&2
+    exit 1
+  fi
   rm -rf "$dir"
   if [ -n "$MADE_APPIMAGE_REEXTRACTED" ] || [ ! -f "$APPIMAGE" ]; then
     echo "made: the extracted copy of Made in $dir was incomplete and has been removed; start Made again" >&2
