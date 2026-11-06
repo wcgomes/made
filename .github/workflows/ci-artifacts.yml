@@ -226,5 +226,6 @@ jobs:
         with:
           name: made-development-${{ matrix.target }}
           path: dist/made-development-${{ matrix.target }}/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
