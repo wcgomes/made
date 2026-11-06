@@ -196,8 +196,9 @@ mod running_tab {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use made_app::integrations::CLAUDE_CODE;
     use made_app::workspace::{LaunchPlan, WorkspaceSource};
-    use made_app::{CompatibleTui, TerminalTarget, Workbench};
+    use made_app::{TerminalTarget, Workbench};
     use made_platform::{Platform, PlatformFamily};
 
     use super::{assert_no_markers, record_with_markers};
@@ -370,7 +371,7 @@ mod running_tab {
             Some(plan),
             None,
             root.clone(),
-            TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+            TerminalTarget::Tui(CLAUDE_CODE),
             Instant::now(),
         );
         let pane_pid = workbench

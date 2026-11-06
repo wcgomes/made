@@ -25,18 +25,16 @@ use made_platform::Platform;
 use made_remote::protocol::AuthorityId;
 
 // BEGIN characterization adapter
-use made_app::{CompatibleTui, TerminalTarget};
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
+use made_app::TerminalTarget;
 
 /// Local targets in the order they are exercised.
 fn local_targets() -> Vec<(&'static str, TerminalTarget)> {
     vec![
         ("shell", TerminalTarget::Shell),
-        ("opencode", TerminalTarget::Tui(CompatibleTui::OpenCode)),
-        ("grok", TerminalTarget::Tui(CompatibleTui::Grok)),
-        (
-            "claude-code",
-            TerminalTarget::Tui(CompatibleTui::ClaudeCode),
-        ),
+        ("opencode", TerminalTarget::Tui(OPENCODE)),
+        ("grok", TerminalTarget::Tui(GROK)),
+        ("claude-code", TerminalTarget::Tui(CLAUDE_CODE)),
     ]
 }
 
@@ -55,7 +53,7 @@ fn remote_targets(authority: AuthorityId) -> Vec<(&'static str, TerminalTarget)>
 
 /// The target a `+` menu launch of the Grok integration starts.
 fn grok_target() -> TerminalTarget {
-    TerminalTarget::Tui(CompatibleTui::Grok)
+    TerminalTarget::Tui(GROK)
 }
 
 fn shell_target() -> TerminalTarget {

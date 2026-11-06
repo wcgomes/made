@@ -20,6 +20,7 @@ pub mod explorer_view;
 mod grok_follow;
 mod grok_plugin;
 pub mod integration_status;
+pub mod integrations;
 pub mod metrics;
 pub mod preferences;
 pub mod remote_session;
@@ -51,10 +52,9 @@ pub use explorer_view::{
     PreviewLine, PreviewSpan, PreviewUiAction, PREVIEW_ACTIONS,
 };
 pub use integration_status::{
-    AgentIntegration, IntegrationReport, IntegrationState, IntegrationStatus, ReasonCode,
-    ScopeBoundary, StatusChange, StatusReason, V1_SCOPE,
+    IntegrationReport, IntegrationState, IntegrationStatus, ReasonCode, ScopeBoundary,
+    StatusChange, StatusReason, V1_SCOPE,
 };
-pub use made_platform::CompatibleTui;
 pub use metrics::{BudgetStatus, Metrics, PerformanceReport};
 pub use render::{
     paint_grid, CellMetrics, CellPoint, GridPalette, GridRenderer, PaintOptions, SelectionRange,

@@ -14,15 +14,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
     append_private_log_rotated_with_timeout, claude_plugin_dirs_separator,
-    compose_claude_plugin_dirs, detect_compatible_tuis_in_path, find_executable_on_path,
-    host_platform, install_root_for_executable, is_sensitive_env_key, open_private_log,
-    previous_private_log_path, private_log_lock_path, prune_clipboard_images,
-    repository_plugin_dir, repository_root, resolve_user_home, save_clipboard_image_png,
-    validate_user_home, AppPaths, Clipboard, ClipboardImage, CompatibleTui, Environment,
-    HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard, LogAppendOutcome,
-    LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest,
-    PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES,
-    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
+    compose_claude_plugin_dirs, detect_programs_in_path, find_executable_on_path, host_platform,
+    install_root_for_executable, is_sensitive_env_key, open_private_log, previous_private_log_path,
+    private_log_lock_path, prune_clipboard_images, repository_plugin_dir, repository_root,
+    resolve_user_home, save_clipboard_image_png, validate_user_home, AppPaths, Clipboard,
+    ClipboardImage, Environment, HomeDirectoryErrorKind, ImeComposition, ImeEvent,
+    InMemoryClipboard, LogAppendOutcome, LogIssue, LogIssueSeverity, PathsInputs, Platform,
+    PlatformFamily, PluginDirSource, PtyRequest, PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV,
+    CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES, MAX_CLIPBOARD_IMAGE_BYTES,
+    MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
 };
 
 #[cfg(unix)]
@@ -46,6 +46,13 @@ fn unique_temp(label: &str) -> PathBuf {
     path
 }
 
+/// Program names the detection tests look up, in catalog order.
+const PROGRAMS: [&str; 3] = ["opencode", "grok", "claude"];
+
+fn detect_in(path: impl AsRef<OsStr>) -> Vec<&'static str> {
+    detect_programs_in_path(PROGRAMS, path)
+}
+
 fn path_inputs(family: PlatformFamily) -> PathsInputs {
     PathsInputs {
         family,
@@ -57,8 +64,7 @@ fn path_inputs(family: PlatformFamily) -> PathsInputs {
         app_data: Some(PathBuf::from("/windows/roaming")),
         local_app_data: Some(PathBuf::from("/windows/local")),
         install_root: Some(PathBuf::from("/opt/made")),
-        grok_plugin_dir: Some(PathBuf::from("/opt/made/plugins/grok-made")),
-        claude_plugin_dir: Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
+        shipped_plugins_dir: Some(PathBuf::from("/opt/made/plugins")),
         temp_dir: PathBuf::from("/tmp"),
         user_token: "1000".to_owned(),
         plugin_override: None,
@@ -89,9 +95,9 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir(empty.join("opencode")).unwrap();
 
-    assert!(detect_compatible_tuis_in_path(OsStr::new("")).is_empty());
+    assert!(detect_in(OsStr::new("")).is_empty());
     let empty_path = std::env::join_paths([&empty]).unwrap();
-    assert!(detect_compatible_tuis_in_path(&empty_path).is_empty());
+    assert!(detect_in(&empty_path).is_empty());
     assert_eq!(
         find_executable_on_path(OsStr::new("opencode"), &empty_path),
         None
@@ -151,10 +157,7 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    assert_eq!(
-        detect_compatible_tuis_in_path(&path),
-        vec![CompatibleTui::OpenCode]
-    );
+    assert_eq!(detect_in(&path), vec!["opencode"]);
     assert_eq!(
         find_executable_on_path(executable.as_os_str(), &path),
         None,
@@ -187,21 +190,7 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
 
 #[test]
 fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
-    assert_eq!(
-        CompatibleTui::ALL,
-        &[
-            CompatibleTui::OpenCode,
-            CompatibleTui::Grok,
-            CompatibleTui::ClaudeCode
-        ]
-    );
-    assert_eq!(CompatibleTui::ClaudeCode.program(), "claude");
-    assert_eq!(CompatibleTui::ClaudeCode.label(), "Claude Code");
-    assert_eq!(CompatibleTui::OpenCode.program(), "opencode");
-    assert_eq!(CompatibleTui::OpenCode.label(), "OpenCode");
-    assert_eq!(CompatibleTui::Grok.program(), "grok");
-    assert_eq!(CompatibleTui::Grok.label(), "Grok Build");
-    assert!(detect_compatible_tuis_in_path(OsStr::new("")).is_empty());
+    assert!(detect_in(OsStr::new("")).is_empty());
 
     let root = unique_temp("tui-catalog");
     let empty = root.join("empty");
@@ -227,7 +216,7 @@ fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
             .unwrap();
     }
     let relative_path = std::env::join_paths([Path::new(""), Path::new(&relative_name)]).unwrap();
-    let relative_detected = detect_compatible_tuis_in_path(&relative_path);
+    let relative_detected = detect_in(&relative_path);
     let _ = std::fs::remove_dir_all(&relative_dir);
     assert!(
         relative_detected.is_empty(),
@@ -254,10 +243,7 @@ fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
         std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let grok_only = std::env::join_paths([&empty, &bin]).unwrap();
-    assert_eq!(
-        detect_compatible_tuis_in_path(&grok_only),
-        vec![CompatibleTui::Grok]
-    );
+    assert_eq!(detect_in(&grok_only), vec!["grok"]);
     assert_eq!(
         find_executable_on_path(OsStr::new("grok"), &grok_only),
         Some(grok.clone())
@@ -278,10 +264,7 @@ fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&opencode, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    assert_eq!(
-        detect_compatible_tuis_in_path(&grok_only),
-        vec![CompatibleTui::OpenCode, CompatibleTui::Grok]
-    );
+    assert_eq!(detect_in(&grok_only), vec!["opencode", "grok"]);
     #[cfg(unix)]
     assert!(
         !sentinel.exists(),
@@ -316,10 +299,7 @@ fn claude_code_detection_is_metadata_only_and_ignores_empty_and_relative_segment
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path = std::env::join_paths([&bin]).unwrap();
-    assert_eq!(
-        detect_compatible_tuis_in_path(&path),
-        vec![CompatibleTui::ClaudeCode]
-    );
+    assert_eq!(detect_in(&path), vec!["claude"]);
     assert_eq!(
         find_executable_on_path(OsStr::new("claude"), &path),
         Some(claude.clone())
@@ -337,7 +317,7 @@ fn claude_code_detection_is_metadata_only_and_ignores_empty_and_relative_segment
         PathBuf::from("."),
     ])
     .unwrap();
-    assert!(detect_compatible_tuis_in_path(&relative).is_empty());
+    assert!(detect_in(&relative).is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -377,9 +357,9 @@ fn path_lookup_does_not_spawn_grok_or_read_its_plugin_version() {
     )
     .unwrap();
     let path = std::env::join_paths([&bin]).unwrap();
-    let without = detect_compatible_tuis_in_path(&path);
-    let with_manifest = detect_compatible_tuis_in_path(&path);
-    assert_eq!(without, vec![CompatibleTui::Grok]);
+    let without = detect_in(&path);
+    let with_manifest = detect_in(&path);
+    assert_eq!(without, vec!["grok"]);
     assert_eq!(
         with_manifest, without,
         "a plugin.json version must not change the metadata-only lookup"
@@ -1003,19 +983,19 @@ fn grok_plugin_dir_is_the_staged_copy_in_development_and_release() {
         };
         let paths = AppPaths::resolve(&inputs).expect("paths");
         assert_eq!(
-            paths.grok_plugin_dir,
+            paths.plugin_package_dir("grok-made"),
             Some(PathBuf::from("/opt/made/plugins/grok-made")),
             "development={development}"
         );
         let unresolved = PathsInputs {
             development,
-            grok_plugin_dir: None,
+            shipped_plugins_dir: None,
             ..path_inputs(PlatformFamily::Linux)
         };
         assert_eq!(
             AppPaths::resolve(&unresolved)
                 .expect("paths")
-                .grok_plugin_dir,
+                .plugin_package_dir("grok-made"),
             None,
             "no repository fallback, development={development}"
         );
@@ -1031,19 +1011,19 @@ fn claude_plugin_dir_is_the_staged_copy_in_development_and_release() {
         };
         let paths = AppPaths::resolve(&inputs).expect("paths");
         assert_eq!(
-            paths.claude_plugin_dir,
+            paths.plugin_package_dir("claude-code-made"),
             Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
             "development={development}"
         );
         let unresolved = PathsInputs {
             development,
-            claude_plugin_dir: None,
+            shipped_plugins_dir: None,
             ..path_inputs(PlatformFamily::Linux)
         };
         assert_eq!(
             AppPaths::resolve(&unresolved)
                 .expect("paths")
-                .claude_plugin_dir,
+                .plugin_package_dir("claude-code-made"),
             None,
             "no repository fallback, development={development}"
         );
@@ -1055,7 +1035,7 @@ fn shipped_claude_plugin_dir_requires_a_readable_directory() {
     let root = unique_temp("claude-plugin-dir");
     let plugin = root.join("plugins").join("claude-code-made");
     let inputs = PathsInputs {
-        claude_plugin_dir: Some(plugin.clone()),
+        shipped_plugins_dir: Some(root.join("plugins")),
         ..path_inputs(PlatformFamily::Linux)
     };
     let paths = AppPaths::resolve(&inputs).expect("paths");
@@ -1067,10 +1047,10 @@ fn shipped_claude_plugin_dir_requires_a_readable_directory() {
 
     std::fs::remove_file(&plugin).unwrap();
     std::fs::create_dir_all(&plugin).unwrap();
-    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.as_path()));
+    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.clone()));
 
     let unresolved = PathsInputs {
-        claude_plugin_dir: None,
+        shipped_plugins_dir: None,
         ..path_inputs(PlatformFamily::Linux)
     };
     assert_eq!(
@@ -1199,7 +1179,7 @@ fn shipped_claude_plugin_dir_refuses_an_unsafe_path() {
     let plugin = root.join("a:b").join("claude-code-made");
     std::fs::create_dir_all(&plugin).unwrap();
     let inputs = PathsInputs {
-        claude_plugin_dir: Some(plugin),
+        shipped_plugins_dir: Some(root.join("a:b")),
         ..path_inputs(PlatformFamily::Linux)
     };
     assert_eq!(
@@ -3199,10 +3179,10 @@ fn shipped_claude_plugin_dir_accepts_a_drive_letter_path() {
     std::fs::create_dir_all(&plugin).unwrap();
     assert!(plugin.to_str().unwrap().contains(':'));
     let inputs = PathsInputs {
-        claude_plugin_dir: Some(plugin.clone()),
+        shipped_plugins_dir: Some(root.clone()),
         ..path_inputs(PlatformFamily::Windows)
     };
     let paths = AppPaths::resolve(&inputs).expect("paths");
-    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.as_path()));
+    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.clone()));
     let _ = std::fs::remove_dir_all(&root);
 }

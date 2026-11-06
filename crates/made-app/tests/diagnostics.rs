@@ -1581,7 +1581,7 @@ mod copied_report_characterization {
         claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
         ClaudeDiagnosticsPhase,
     };
-    use made_app::CompatibleTui;
+    use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 
     /// Apply the local Claude Code row for `inputs`.
     fn apply_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
@@ -1635,11 +1635,7 @@ mod copied_report_characterization {
         match state {
             Detection::Pending => AppOptions::new().with_compatible_tui_detection(),
             Detection::Nothing => AppOptions::new().with_compatible_tuis([]),
-            Detection::All => AppOptions::new().with_compatible_tuis([
-                CompatibleTui::OpenCode,
-                CompatibleTui::Grok,
-                CompatibleTui::ClaudeCode,
-            ]),
+            Detection::All => AppOptions::new().with_compatible_tuis([OPENCODE, GROK, CLAUDE_CODE]),
         }
     }
 

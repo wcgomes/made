@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_app::claude_follow::{shared_instance, TabSpool};
+use made_app::integrations::CLAUDE_CODE;
 use made_app::workspace::{LaunchPlan, WorkspaceSource};
-use made_app::{CompatibleTui, TerminalPane, TerminalTarget, Workbench};
+use made_app::{TerminalPane, TerminalTarget, Workbench};
 use made_platform::{host_platform, PlatformFamily};
 use made_terminal::{PtyEvent, PtyOptions, PtyProcess};
 use serde_json::Value;
@@ -271,7 +272,7 @@ impl Live {
     }
 
     fn direct() -> TerminalTarget {
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+        TerminalTarget::Tui(CLAUDE_CODE)
     }
 
     fn type_line(workbench: &mut Workbench, text: &str) {

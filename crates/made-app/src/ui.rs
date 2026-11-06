@@ -23,6 +23,7 @@ use crate::app::{AppModel, WorkspaceId};
 use crate::diagnostics::{DiagnosticsSnapshot, GrokDiagnosticsPill};
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
+use crate::integrations::{Mark, CLAUDE_CODE, GROK, OPENCODE};
 use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_text};
 use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
@@ -31,7 +32,7 @@ use crate::tui::TerminalTarget;
 use crate::updates::{UpdateAction, UpdatePanel};
 use crate::workbench::{LeftSurface, Workbench};
 use crate::{APP_DESCRIPTION, APP_NAME, APP_VERSION};
-use made_platform::{Clipboard, CompatibleTui, LogIssueSeverity, PlatformError};
+use made_platform::{Clipboard, LogIssueSeverity, PlatformError};
 
 // ── Status tone mapping ─────────────────────────────────────────────────────
 
@@ -972,7 +973,7 @@ fn workspace_tab_label_width(width: f32, session_count: usize) -> f32 {
 /// the user ran `opencode` manually. A directly launched TUI also counts while
 /// its process is alive, even before the bridge handshakes.
 fn workspace_opencode_active(target: TerminalTarget, connected: bool, running: bool) -> bool {
-    connected || (matches!(target, TerminalTarget::Tui(CompatibleTui::OpenCode)) && running)
+    connected || (target == TerminalTarget::Tui(OPENCODE) && running)
 }
 
 /// Whether a non-OpenCode tab shows the Grok Build label and mark.
@@ -991,10 +992,9 @@ fn workspace_grok_branded(
 ) -> bool {
     !opencode
         && (open_grok_sessions > 0
-            || (matches!(
-                target,
-                TerminalTarget::Tui(CompatibleTui::Grok) | TerminalTarget::RemoteGrok { .. }
-            ) && running))
+            || ((target == TerminalTarget::Tui(GROK)
+                || matches!(target, TerminalTarget::RemoteGrok { .. }))
+                && running))
 }
 
 /// Claude Code brands a tab while it is present, unless OpenCode owns the tab
@@ -1049,18 +1049,27 @@ fn opencode_icon() -> crate::explorer_icons::IconId {
 
 /// Official Grok mark from `assets/grok.svg`, outside the Material icon inventory.
 fn grok_mark() -> theme::MenuLeading {
-    theme::MenuLeading::Image {
-        uri: "bytes://grok.svg",
-        bytes: include_bytes!("../assets/grok.svg"),
-    }
+    mark_leading(GROK.descriptor().mark)
 }
 
 /// Official Claude mark from `assets/claude-code.svg`, outside the Material
 /// icon inventory. The Material `claude.svg` file icon is not this mark.
 fn claude_mark() -> theme::MenuLeading {
-    theme::MenuLeading::Image {
-        uri: "bytes://claude-code.svg",
-        bytes: include_bytes!("../assets/claude-code.svg"),
+    mark_leading(CLAUDE_CODE.descriptor().mark)
+}
+
+/// The menu leading image of an integration's declared mark.
+fn mark_leading(mark: Mark) -> theme::MenuLeading {
+    match mark {
+        Mark::Vendored(name) => {
+            let icon = crate::explorer_icons::icon_by_file_name(name)
+                .expect("a vendored mark is part of the explorer icons");
+            theme::MenuLeading::Image {
+                uri: icon.uri(),
+                bytes: icon.bytes(),
+            }
+        }
+        Mark::Image { uri, bytes } => theme::MenuLeading::Image { uri, bytes },
     }
 }
 
@@ -1830,9 +1839,9 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             let label = if opencode {
                 "OpenCode".to_owned()
             } else if claude {
-                CompatibleTui::ClaudeCode.label().to_owned()
+                CLAUDE_CODE.descriptor().label.to_owned()
             } else if grok {
-                CompatibleTui::Grok.label().to_owned()
+                GROK.descriptor().label.to_owned()
             } else if let Some(name) = workbench.remote_label() {
                 name
             } else {
@@ -2122,22 +2131,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                 ui.close();
                             }
                             for tui in &compatible_tuis {
-                                let leading = match tui {
-                                    CompatibleTui::OpenCode => {
-                                        let icon = opencode_icon();
-                                        theme::MenuLeading::Image {
-                                            uri: icon.uri(),
-                                            bytes: icon.bytes(),
-                                        }
-                                    }
-                                    CompatibleTui::Grok => grok_mark(),
-                                    CompatibleTui::ClaudeCode => claude_mark(),
-                                };
+                                let descriptor = tui.descriptor();
                                 if new_tab_menu_item(
                                     ui,
-                                    new_tab_menu_item_id(tui.program()),
-                                    leading,
-                                    tui.label(),
+                                    new_tab_menu_item_id(descriptor.menu_item_id),
+                                    mark_leading(descriptor.mark),
+                                    descriptor.label,
                                     layout.button_height,
                                 ) {
                                     launch_tui = Some(*tui);
@@ -5620,7 +5619,7 @@ mod tests {
 
     #[test]
     fn workspace_tab_icon_follows_connection_or_a_live_direct_tui() {
-        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        let opencode = TerminalTarget::Tui(OPENCODE);
         assert!(
             !workspace_opencode_active(TerminalTarget::Shell, false, true),
             "a running shell is not OpenCode"
@@ -5758,7 +5757,7 @@ mod tests {
         );
         assert_eq!(workspace_tab_accessible_label("alpha", None), "alpha");
         assert_eq!(
-            workspace_tab_accessible_label(CompatibleTui::Grok.label(), Some(&attention)),
+            workspace_tab_accessible_label(GROK.descriptor().label, Some(&attention)),
             format!("Grok Build — {attention}"),
             "a branded Grok tab uses Grok Build and the same session summary"
         );
@@ -5771,9 +5770,9 @@ mod tests {
 
     #[test]
     fn grok_build_brand_follows_a_running_tui_or_open_sessions_and_yields_to_opencode() {
-        let grok = TerminalTarget::Tui(CompatibleTui::Grok);
+        let grok = TerminalTarget::Tui(GROK);
         let shell = TerminalTarget::Shell;
-        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        let opencode = TerminalTarget::Tui(OPENCODE);
         let authority = made_remote::protocol::AuthorityId([7; 16]);
         let remote_grok = TerminalTarget::RemoteGrok { authority };
         let remote_shell = TerminalTarget::RemoteShell { authority };

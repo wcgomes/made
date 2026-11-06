@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::diagnostics::ClaudeDiagnosticsReport;
+use crate::integrations::{IntegrationList, PRODUCT};
 use made_bridge::protocol::{opencode_major, PROTOCOL_VERSION};
 use made_bridge::server::{
     BridgeEvent, ConnectionInfo, DisconnectedInfo, Goodbye, HeartbeatTimeout, ProtocolError,
@@ -868,42 +869,11 @@ pub fn is_supported_opencode_version(version: &str) -> bool {
     opencode_major(version).is_some_and(|major| major >= SUPPORTED_OPENCODE_MAJOR)
 }
 
-/// Agent integrations Made offers from the `+` menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentIntegration {
-    /// OpenCode v2 through its TUI plugin.
-    OpenCodeV2,
-    /// Grok Build session follow, offered when `grok` is on `PATH`.
-    GrokBuild,
-    /// Claude Code session follow, offered when `claude` is on `PATH`.
-    ClaudeCode,
-}
-
-impl AgentIntegration {
-    /// Stable identifier.
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::OpenCodeV2 => "opencode-v2",
-            Self::GrokBuild => "grok-build",
-            Self::ClaudeCode => "claude-code",
-        }
-    }
-
-    /// Human-readable name.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::OpenCodeV2 => "OpenCode v2",
-            Self::GrokBuild => "Grok Build",
-            Self::ClaudeCode => "Claude Code",
-        }
-    }
-}
-
 /// Compile-time v1 scope declaration used by the scope-boundary test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScopeBoundary {
     /// Agent integrations offered by the app.
-    pub agent_integrations: &'static [AgentIntegration],
+    pub agent_integrations: IntegrationList,
     /// Whether a replacement AI/chat surface exists.
     pub chat_ui: bool,
     /// Whether worktree lifecycle management is exposed.
@@ -914,11 +884,7 @@ pub struct ScopeBoundary {
 
 /// The v1 scope boundary.
 pub const V1_SCOPE: ScopeBoundary = ScopeBoundary {
-    agent_integrations: &[
-        AgentIntegration::OpenCodeV2,
-        AgentIntegration::GrokBuild,
-        AgentIntegration::ClaudeCode,
-    ],
+    agent_integrations: PRODUCT,
     chat_ui: false,
     worktree_management: false,
     separate_opencode_server: false,

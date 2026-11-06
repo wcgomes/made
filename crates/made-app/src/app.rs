@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_platform::native_backdrop::NativeBackdropStatus;
-use made_platform::{CompatibleTui, Platform};
+use made_platform::Platform;
 
 use crate::cli::LaunchArgs;
 use crate::diagnostics::GrokDiagnosticsRow;
 use crate::grok_plugin::{self, EnsureOutcome};
 use crate::integration_status::ClaudeDiagnosticsPhase;
+use crate::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE, PRODUCT};
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
@@ -95,7 +96,7 @@ pub struct AppOptions {
     /// launch a real TUI by accident. The binary enables a background `PATH`
     /// lookup with [`AppOptions::with_compatible_tui_detection`]. Tests that
     /// opt in must isolate `PATH`.
-    pub compatible_tuis: Vec<CompatibleTui>,
+    pub compatible_tuis: Vec<IntegrationRef>,
     /// Whether to detect compatible TUIs on a background thread at startup.
     ///
     /// Detection reads executable metadata only. The window, shell, and
@@ -123,7 +124,7 @@ impl AppOptions {
     /// Set the compatible TUIs offered by the `+` menu.
     ///
     /// An explicit list disables background detection.
-    pub fn with_compatible_tuis(mut self, tuis: impl IntoIterator<Item = CompatibleTui>) -> Self {
+    pub fn with_compatible_tuis(mut self, tuis: impl IntoIterator<Item = IntegrationRef>) -> Self {
         self.compatible_tuis = tuis.into_iter().collect();
         self.detect_compatible_tuis = false;
         self
@@ -387,16 +388,27 @@ struct PendingStart {
     source: WorkspaceSource,
 }
 
+/// Look up which of the product's integrations have their program on `PATH`,
+/// in catalog order. Metadata only; nothing is spawned.
+fn detect_integrations() -> Vec<IntegrationRef> {
+    let found = made_platform::detect_programs(PRODUCT.iter().map(|tui| tui.descriptor().program));
+    PRODUCT
+        .iter()
+        .copied()
+        .filter(|tui| found.contains(&tui.descriptor().program))
+        .collect()
+}
+
 /// Start the optional metadata-only TUI lookup off the UI thread.
 ///
 /// The receiver is polled by [`AppModel::logic`]; a failure to spawn a thread
 /// leaves the menu in its no-TUI state rather than blocking startup.
-fn spawn_compatible_tui_detection() -> Option<Receiver<Vec<CompatibleTui>>> {
+fn spawn_compatible_tui_detection() -> Option<Receiver<Vec<IntegrationRef>>> {
     let (sender, receiver) = mpsc::channel();
     match thread::Builder::new()
         .name("made-tui-detection".to_owned())
         .spawn(move || {
-            let _ = sender.send(made_platform::detect_compatible_tuis());
+            let _ = sender.send(detect_integrations());
         }) {
         Ok(_) => Some(receiver),
         Err(error) => {
@@ -457,8 +469,8 @@ pub struct AppModel {
     ui_frames: u64,
     theme_ready: bool,
     native_backdrop: NativeBackdropStatus,
-    compatible_tuis: Vec<CompatibleTui>,
-    compatible_tui_receiver: Option<Receiver<Vec<CompatibleTui>>>,
+    compatible_tuis: Vec<IntegrationRef>,
+    compatible_tui_receiver: Option<Receiver<Vec<IntegrationRef>>>,
     /// One-shot shipped grok-made install, started only after PATH detection
     /// reports grok. `None` once that worker has finished or was never started.
     grok_plugin_receiver: Option<Receiver<EnsureOutcome>>,
@@ -567,8 +579,8 @@ impl AppModel {
             reported: false,
         });
         let start_pending = launch.surfaces().has_terminal();
-        let catalog_has_grok = options.compatible_tuis.contains(&CompatibleTui::Grok);
-        let catalog_has_opencode = options.compatible_tuis.contains(&CompatibleTui::OpenCode);
+        let catalog_has_grok = options.compatible_tuis.contains(&GROK);
+        let catalog_has_opencode = options.compatible_tuis.contains(&OPENCODE);
         let compatible_tui_receiver = if options.detect_compatible_tuis {
             spawn_compatible_tui_detection()
         } else {
@@ -582,7 +594,7 @@ impl AppModel {
         let claude_phase = initial_claude_phase(
             options.detect_compatible_tuis,
             compatible_tui_receiver.is_some(),
-            options.compatible_tuis.contains(&CompatibleTui::ClaudeCode),
+            options.compatible_tuis.contains(&CLAUDE_CODE),
         );
         // A live worker has not answered yet. A thread that never started is
         // the same as detection finishing without OpenCode.
@@ -693,7 +705,7 @@ impl AppModel {
     }
 
     /// Compatible TUIs offered by the `+` new-tab menu.
-    pub fn compatible_tuis(&self) -> &[CompatibleTui] {
+    pub fn compatible_tuis(&self) -> &[IntegrationRef] {
         &self.compatible_tuis
     }
 
@@ -1082,7 +1094,7 @@ impl AppModel {
     /// OpenCode or grok, and the label is not the Grok running signal.
     pub fn hold_workspace_opencode_label(&mut self, id: WorkspaceId) {
         if let Some(workbench) = self.workspace_mut(id) {
-            workbench.terminal_target = TerminalTarget::Tui(CompatibleTui::OpenCode);
+            workbench.terminal_target = TerminalTarget::Tui(OPENCODE);
         }
         self.push_grok_diagnostics();
     }
@@ -1966,7 +1978,7 @@ impl AppModel {
     /// The current tab keeps running. Preparation uses the same background
     /// path as any other workspace, and the new tab is selected only when its
     /// runtime is ready.
-    pub fn begin_tui_workspace(&mut self, tui: CompatibleTui) {
+    pub fn begin_tui_workspace(&mut self, tui: IntegrationRef) {
         self.cancel_pending_start();
         self.reset_ui_focus = true;
         self.terminal_target = TerminalTarget::Tui(tui);
@@ -2406,9 +2418,9 @@ impl AppModel {
         };
         match receiver.try_recv() {
             Ok(tuis) => {
-                let detected_opencode = tuis.contains(&CompatibleTui::OpenCode);
-                let detected_grok = tuis.contains(&CompatibleTui::Grok);
-                self.claude_phase = if tuis.contains(&CompatibleTui::ClaudeCode) {
+                let detected_opencode = tuis.contains(&OPENCODE);
+                let detected_grok = tuis.contains(&GROK);
+                self.claude_phase = if tuis.contains(&CLAUDE_CODE) {
                     ClaudeDiagnosticsPhase::Available
                 } else {
                     ClaudeDiagnosticsPhase::NotOnPath
@@ -2828,7 +2840,7 @@ impl AppModel {
         let hook = format!("made-grok-status{}", std::env::consts::EXE_SUFFIX);
         let grok = paths
             .as_ref()
-            .and_then(|paths| paths.grok_plugin_dir.clone())
+            .and_then(|paths| paths.plugin_package_dir("grok-made"))
             .map(|dir| dir.join("hooks").join("bin").join(&hook).is_file())
             .map(|found| if found { "present" } else { "missing" })
             .unwrap_or("unresolved");

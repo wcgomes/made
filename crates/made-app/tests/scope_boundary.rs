@@ -1,7 +1,10 @@
 //! V1 scope-boundary tests: OpenCode v2, Grok Build and Claude Code only, no chat UI, no
 //! worktree management, and no separate server requirement.
 
-use made_app::integration_status::{AgentIntegration, V1_SCOPE};
+use std::path::{Path, PathBuf};
+
+use made_app::integration_status::V1_SCOPE;
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE, PRODUCT};
 use made_app::worktree::{
     is_read_only_git_args, GitCommand, READ_ONLY_GIT_ARGUMENTS, WORKTREE_MANAGEMENT_AVAILABLE,
 };
@@ -29,8 +32,14 @@ fn only_opencode_grok_and_claude_code_are_offered() {
     let rows: Vec<_> = V1_SCOPE
         .agent_integrations
         .iter()
-        .map(|row| (row.id(), row.name()))
+        .map(|row| (row.descriptor().scope_id, row.descriptor().scope_name))
         .collect();
+    let product: Vec<_> = PRODUCT
+        .iter()
+        .map(|row| (row.descriptor().scope_id, row.descriptor().scope_name))
+        .collect();
+    assert_eq!(rows, product);
+    assert_eq!(V1_SCOPE.agent_integrations, PRODUCT);
     assert_eq!(
         rows,
         [
@@ -39,9 +48,47 @@ fn only_opencode_grok_and_claude_code_are_offered() {
             ("claude-code", "Claude Code"),
         ]
     );
-    assert_eq!(V1_SCOPE.agent_integrations[0], AgentIntegration::OpenCodeV2);
-    assert_eq!(V1_SCOPE.agent_integrations[1], AgentIntegration::GrokBuild);
-    assert_eq!(V1_SCOPE.agent_integrations[2], AgentIntegration::ClaudeCode);
+    assert_eq!(V1_SCOPE.agent_integrations[0], OPENCODE);
+    assert_eq!(V1_SCOPE.agent_integrations[1], GROK);
+    assert_eq!(V1_SCOPE.agent_integrations[2], CLAUDE_CODE);
+}
+
+/// Every `.rs` file under `dir`, read recursively, as (path, text).
+fn read_sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("{} is unreadable: {error}", dir.display()))
+        .map(|entry| entry.expect("directory entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            read_sources(&path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
+            out.push((path, text));
+        }
+    }
+}
+
+/// The sources of the integration modules, with a guard that the walk found
+/// them: a scan over moved code must not pass because it read nothing.
+fn integration_sources() -> Vec<(PathBuf, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/integrations");
+    let mut sources = Vec::new();
+    read_sources(&root, &mut sources);
+    let modules = sources
+        .iter()
+        .filter(|(path, _)| {
+            path.file_name().is_some_and(|name| name == "mod.rs")
+                && path.parent().is_some_and(|parent| parent != root)
+        })
+        .count();
+    assert!(
+        modules >= 3,
+        "expected at least three integration modules, read {modules}"
+    );
+    sources
 }
 
 #[test]
@@ -56,7 +103,21 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
             );
         }
     }
-    let integration = include_str!("../src/integration_status.rs").to_ascii_lowercase();
+    let sources = integration_sources();
+    for (path, source) in &sources {
+        let lower = source.to_ascii_lowercase();
+        for forbidden in FORBIDDEN_SURFACES {
+            assert!(
+                !lower.contains(forbidden),
+                "{} mentions forbidden agent/chat surface {forbidden:?}",
+                path.display()
+            );
+        }
+    }
+    let integration = sources
+        .iter()
+        .map(|(_, source)| source.to_ascii_lowercase())
+        .collect::<String>();
     for offered in ["grok build", "claude code"] {
         assert!(
             integration.contains(offered),

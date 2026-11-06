@@ -2186,12 +2186,12 @@ fn tui_terminal_target_spawns_opencode_with_composed_config_in_the_isolated_home
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        TerminalTarget::Tui(made_app::integrations::OPENCODE),
         Instant::now(),
     );
     assert_eq!(
         workbench.terminal_target(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode)
+        TerminalTarget::Tui(made_app::integrations::OPENCODE)
     );
 
     let config = wait_for_capture(&config_capture);
@@ -2764,7 +2764,7 @@ fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::Grok),
+        TerminalTarget::Tui(made_app::integrations::GROK),
         Instant::now(),
     );
     {
@@ -2814,7 +2814,7 @@ fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        TerminalTarget::Tui(made_app::integrations::OPENCODE),
         Instant::now(),
     );
     assert!(
@@ -2995,7 +2995,7 @@ fn failed_plugin_install_still_starts_grok_and_records_hooks_unavailable() {
         .workspace(shell_id)
         .and_then(made_app::Workbench::terminal)
         .is_some());
-    model.begin_tui_workspace(made_app::CompatibleTui::Grok);
+    model.begin_tui_workspace(made_app::integrations::GROK);
     let grok_deadline = Instant::now() + Duration::from_secs(6);
     let grok_id = loop {
         model.logic(&ctx);

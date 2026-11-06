@@ -23,8 +23,7 @@ use made_bridge::state::SessionSnapshot;
 use made_explorer::highlight::Highlighter;
 use made_explorer::root_switch::RootGeneration;
 use made_platform::{
-    host_platform, AppPaths, CompatibleTui, LogIssue, LogIssueSeverity, Platform, PlatformFamily,
-    PtySize,
+    host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
 };
 
 use crate::claude_follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
@@ -39,6 +38,7 @@ use crate::integration_status::{
     claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
     ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus,
 };
+use crate::integrations::{CLAUDE_CODE, GROK};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFocusController};
@@ -802,9 +802,9 @@ impl Workbench {
             }
             Err(error) => path_error = Some(format!("app paths: {error}")),
         }
-        let claude_plugin = app_paths
-            .as_ref()
-            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
+        let claude_plugin = app_paths.as_ref().and_then(|paths| {
+            ready_claude_plugin_dir(paths.shipped_claude_plugin_dir().as_deref())
+        });
         let log_path = diagnostics_log_path(app_paths.as_ref());
         #[cfg(test)]
         if let Some(path) = &log_path {
@@ -1166,10 +1166,8 @@ impl Workbench {
         // the composed plugin environment; Grok and Claude Code must not
         // receive it or a written config.
         let composed_content = match self.terminal_target {
-            TerminalTarget::Tui(CompatibleTui::Grok | CompatibleTui::ClaudeCode) => None,
-            TerminalTarget::Shell | TerminalTarget::Tui(CompatibleTui::OpenCode) => {
-                composed_content
-            }
+            TerminalTarget::Tui(tui) if tui == GROK || tui == CLAUDE_CODE => None,
+            TerminalTarget::Shell | TerminalTarget::Tui(_) => composed_content,
             // Remote tabs already return before this function. If it is reached,
             // do not start a host PTY or inject the local OpenCode plugin.
             TerminalTarget::RemoteShell { .. }
@@ -1291,10 +1289,9 @@ impl Workbench {
         if !self.terminal_target.loads_claude_plugin() {
             return (None, ClaudeLaunchEnv::default());
         }
-        self.claude_plugin = self
-            .paths
-            .as_ref()
-            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
+        self.claude_plugin = self.paths.as_ref().and_then(|paths| {
+            ready_claude_plugin_dir(paths.shipped_claude_plugin_dir().as_deref())
+        });
         let shipped = self.claude_plugin.clone();
         let spool = if shipped.is_some() {
             self.open_claude_spool()
@@ -1336,7 +1333,7 @@ impl Workbench {
         if !self.terminal_target.loads_claude_plugin() {
             return;
         }
-        let direct = self.terminal_target == TerminalTarget::Tui(CompatibleTui::ClaudeCode);
+        let direct = self.terminal_target == TerminalTarget::Tui(CLAUDE_CODE);
         let mut tab = ClaudeTab::new(pid.unwrap_or(0), direct);
         tab.set_child_running(true);
         self.claude = Some(ClaudeRuntime {
@@ -4178,10 +4175,8 @@ impl Workbench {
     /// not count until that confirmation. The tab label is not part of the
     /// check: OpenCode can own the label while Grok runs.
     pub(crate) fn grok_follow_running(&self) -> bool {
-        let living_target = matches!(
-            self.terminal_target,
-            TerminalTarget::Tui(CompatibleTui::Grok)
-        ) && self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+        let living_target = self.terminal_target == TerminalTarget::Tui(GROK)
+            && self.terminal.as_ref().is_some_and(TerminalPane::is_running);
         let confirmed = self
             .grok_sessions
             .iter()
@@ -5972,14 +5967,15 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::OPENCODE;
 
     #[test]
     fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
         let authority = made_remote::protocol::AuthorityId([3; 16]);
         let launch = ClaudeLaunchEnv::default();
         for target in [
-            TerminalTarget::Tui(CompatibleTui::OpenCode),
-            TerminalTarget::Tui(CompatibleTui::Grok),
+            TerminalTarget::Tui(OPENCODE),
+            TerminalTarget::Tui(GROK),
             TerminalTarget::RemoteShell { authority },
             TerminalTarget::RemoteOpenCode { authority },
             TerminalTarget::RemoteGrok { authority },
@@ -6335,7 +6331,7 @@ mod tests {
             "a shell with no Grok session is not running Grok"
         );
 
-        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.terminal_target = TerminalTarget::Tui(GROK);
         probe.last_title = Some("OpenCode".to_owned());
         assert!(
             probe.grok_follow_running(),
@@ -6363,7 +6359,7 @@ mod tests {
         probe
             .grok_sessions
             .push(hook_or_inventory_session("recorded-without-pid", ""));
-        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.terminal_target = TerminalTarget::Tui(GROK);
         assert!(
             !probe.grok_follow_running(),
             "a hook row recorded while this terminal has no pid must not count as running"

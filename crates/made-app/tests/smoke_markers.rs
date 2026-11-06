@@ -19,19 +19,15 @@ use std::process::Command;
 
 // BEGIN characterization adapter
 use made_app::app::{AppModel, AppOptions};
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 use made_app::workspace::WorkspaceLaunch;
-use made_app::CompatibleTui;
 
 /// The smoke line of a model whose catalog lists every integration: the line
 /// must not depend on which integrations are detected.
 fn smoke_line() -> String {
     AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([
-            CompatibleTui::OpenCode,
-            CompatibleTui::Grok,
-            CompatibleTui::ClaudeCode,
-        ]),
+        AppOptions::new().with_compatible_tuis([OPENCODE, GROK, CLAUDE_CODE]),
     )
     .smoke_layout_markers()
 }

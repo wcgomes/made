@@ -7,9 +7,10 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use crate::integrations::{IntegrationRef, CLAUDE_CODE};
 use made_platform::{
     claude_plugin_dirs_separator, compose_claude_plugin_dirs, find_executable_on_path,
-    CompatibleTui, PlatformFamily, CLAUDE_CODE_PLUGIN_DIRS_ENV,
+    PlatformFamily, CLAUDE_CODE_PLUGIN_DIRS_ENV,
 };
 use made_remote::protocol::AuthorityId;
 use made_terminal::PtyOptions;
@@ -34,7 +35,8 @@ pub enum TerminalTarget {
     /// The platform-resolved user shell.
     Shell,
     /// A detected TUI started directly as the PTY child.
-    Tui(CompatibleTui),
+    Tui(IntegrationRef),
+    // BEGIN remote-path (AIA-02)
     /// A remote shell on a saved server. Never resolved against the host PATH.
     RemoteShell { authority: AuthorityId },
     /// Remote OpenCode on a saved server. Never substituted with a host binary.
@@ -47,6 +49,7 @@ pub enum TerminalTarget {
     /// arguments. Never substituted with a host binary and never given a
     /// plugin, environment or remote write.
     RemoteClaude { authority: AuthorityId },
+    // END remote-path
 }
 
 impl TerminalTarget {
@@ -55,8 +58,8 @@ impl TerminalTarget {
     /// [`TerminalTarget::Shell`] leaves shell resolution to the platform.
     /// [`TerminalTarget::Tui`] resolves the program against `path` with the
     /// same lookup as detection, then spawns that absolute path with no shell
-    /// in between. Grok's only argument is `dashboard`. OpenCode and Claude Code
-    /// get none.
+    /// in between. The program and its arguments are the integration's declared
+    /// ones.
     /// It returns `None` when the program is not found there, so nothing is
     /// spawned.
     pub fn pty_options(self, cwd: impl Into<PathBuf>, path: &OsStr) -> Option<PtyOptions> {
@@ -64,25 +67,24 @@ impl TerminalTarget {
         match self {
             Self::Shell => Some(options),
             Self::Tui(tui) => {
-                let program = find_executable_on_path(OsStr::new(tui.program()), path)?;
+                let program = find_executable_on_path(OsStr::new(tui.descriptor().program), path)?;
                 let options = options.with_shell(program.into_os_string());
-                Some(match tui {
-                    CompatibleTui::Grok => options.with_args(["dashboard"]),
-                    CompatibleTui::OpenCode | CompatibleTui::ClaudeCode => options,
-                })
+                Some(options.with_args(tui.launch_args().iter().copied()))
             }
+            // BEGIN remote-path (AIA-02)
             // Remote launches must not resolve a host executable or host cwd.
             Self::RemoteShell { .. }
             | Self::RemoteOpenCode { .. }
             | Self::RemoteGrok { .. }
             | Self::RemoteClaude { .. } => None,
+            // END remote-path
         }
     }
 
     /// Whether Made's session-only Claude Code plugin loads in this target's
     /// environment: local shell tabs and directly launched Claude Code tabs.
     pub fn loads_claude_plugin(self) -> bool {
-        matches!(self, Self::Shell | Self::Tui(CompatibleTui::ClaudeCode))
+        self == Self::Shell || self == Self::Tui(CLAUDE_CODE)
     }
 
     /// The `CLAUDE_CODE_PLUGIN_DIRS` entry and per-tab spool path for this
@@ -135,6 +137,7 @@ impl TerminalTarget {
 
     /// Whether this target belongs to a saved SSH authority.
     pub fn is_remote(self) -> bool {
+        // BEGIN remote-path (AIA-02)
         matches!(
             self,
             Self::RemoteShell { .. }
@@ -142,15 +145,18 @@ impl TerminalTarget {
                 | Self::RemoteGrok { .. }
                 | Self::RemoteClaude { .. }
         )
+        // END remote-path
     }
 
     /// Saved server for a remote target.
     pub fn authority(self) -> Option<AuthorityId> {
         match self {
+            // BEGIN remote-path (AIA-02)
             Self::RemoteShell { authority }
             | Self::RemoteOpenCode { authority }
             | Self::RemoteGrok { authority }
             | Self::RemoteClaude { authority } => Some(authority),
+            // END remote-path
             Self::Shell | Self::Tui(_) => None,
         }
     }
@@ -159,11 +165,13 @@ impl TerminalTarget {
     pub fn program_label(self) -> &'static str {
         match self {
             Self::Shell => "Shell",
-            Self::Tui(tui) => tui.label(),
+            Self::Tui(tui) => tui.descriptor().label,
+            // BEGIN remote-path (AIA-02)
             Self::RemoteShell { .. } => "Terminal SSH",
             Self::RemoteOpenCode { .. } => "OpenCode SSH",
             Self::RemoteGrok { .. } => "Grok SSH",
             Self::RemoteClaude { .. } => "Claude Code SSH",
+            // END remote-path
         }
     }
 
@@ -171,11 +179,13 @@ impl TerminalTarget {
     pub fn log_label(self) -> &'static str {
         match self {
             Self::Shell => "shell",
-            Self::Tui(tui) => tui.label(),
+            Self::Tui(tui) => tui.descriptor().label,
+            // BEGIN remote-path (AIA-02)
             Self::RemoteShell { .. } => "terminal-ssh",
             Self::RemoteOpenCode { .. } => "opencode-ssh",
             Self::RemoteGrok { .. } => "grok-ssh",
             Self::RemoteClaude { .. } => "claude-ssh",
+            // END remote-path
         }
     }
 
@@ -183,11 +193,13 @@ impl TerminalTarget {
     pub fn restart_label(self) -> String {
         match self {
             Self::Shell => "Restart shell".to_owned(),
-            Self::Tui(tui) => format!("Restart {}", tui.label()),
+            Self::Tui(tui) => format!("Restart {}", tui.descriptor().label),
+            // BEGIN remote-path (AIA-02)
             Self::RemoteShell { .. } => "Reconnect Terminal SSH".to_owned(),
             Self::RemoteOpenCode { .. } => "Reconnect OpenCode SSH".to_owned(),
             Self::RemoteGrok { .. } => "Reconnect Grok SSH".to_owned(),
             Self::RemoteClaude { .. } => "Reconnect Claude Code SSH".to_owned(),
+            // END remote-path
         }
     }
 }
@@ -197,6 +209,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
+    use crate::integrations::{GROK, OPENCODE};
 
     #[test]
     fn remote_targets_do_not_resolve_a_host_executable_or_cwd() {
@@ -258,7 +271,7 @@ mod tests {
 
     #[test]
     fn tui_target_wording_names_the_program() {
-        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        let opencode = TerminalTarget::Tui(OPENCODE);
         assert_eq!(opencode.program_label(), "OpenCode");
         assert_eq!(opencode.restart_label(), "Restart OpenCode");
         assert_eq!(TerminalTarget::Shell.program_label(), "Shell");
@@ -271,7 +284,7 @@ mod tests {
     fn tui_target_is_none_when_the_program_is_not_on_path() {
         let root = tempfile::tempdir().unwrap();
         let path = std::env::join_paths([root.path()]).unwrap();
-        let target = TerminalTarget::Tui(CompatibleTui::OpenCode);
+        let target = TerminalTarget::Tui(OPENCODE);
         assert!(target.pty_options("/tmp", &path).is_none());
         assert!(target.pty_options("/tmp", OsStr::new("")).is_none());
     }
@@ -289,7 +302,7 @@ mod tests {
         }
         let path = std::env::join_paths([root.path()]).unwrap();
 
-        let opencode = TerminalTarget::Tui(CompatibleTui::OpenCode)
+        let opencode = TerminalTarget::Tui(OPENCODE)
             .pty_options("/tmp", &path)
             .expect("the detected executable must resolve");
         assert_eq!(
@@ -298,7 +311,7 @@ mod tests {
         );
         assert!(opencode.args.is_empty());
 
-        let grok = TerminalTarget::Tui(CompatibleTui::Grok)
+        let grok = TerminalTarget::Tui(GROK)
             .pty_options("/tmp", &path)
             .expect("the detected executable must resolve");
         assert_eq!(
@@ -326,7 +339,7 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = std::env::join_paths([Path::new(""), directory]).unwrap();
 
-        let detected = TerminalTarget::Tui(CompatibleTui::OpenCode).pty_options("/tmp", &path);
+        let detected = TerminalTarget::Tui(OPENCODE).pty_options("/tmp", &path);
         let _ = std::fs::remove_dir_all(directory);
         assert!(
             detected.is_none(),

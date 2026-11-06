@@ -504,7 +504,7 @@ fn reason_codes_and_scope_are_enumerated() {
         V1_SCOPE
             .agent_integrations
             .iter()
-            .map(|integration| integration.id())
+            .map(|integration| integration.descriptor().scope_id)
             .collect::<Vec<_>>(),
         ["opencode-v2", "grok-build", "claude-code"]
     );

@@ -25,15 +25,13 @@
 //!   created/validated with mode 0700 on Unix, and a pre-existing symlink or
 //!   non-directory at that path is rejected.
 //!
-//! [`AppPaths::grok_plugin_dir`] is the shipped grok-made package at
-//! `<install_root>/plugins/grok-made` for development and release builds
-//! alike. It is resolved only from the install root of the running
+//! [`AppPaths::plugin_package_dir`] is an app-owned plugin package such as
+//! grok-made at `<install_root>/plugins/grok-made` or claude-code-made at
+//! `<install_root>/plugins/claude-code-made`, for development and release
+//! builds alike. It is resolved only from the install root of the running
 //! executable, so a development build never falls back to the repository's
-//! source-only `plugins/grok-made`; when the root cannot be derived it is
+//! source-only `plugins/<name>`; when the root cannot be derived it is
 //! `None`.
-//!
-//! [`AppPaths::claude_plugin_dir`] follows the same rule for the shipped
-//! claude-code-made package at `<install_root>/plugins/claude-code-made`.
 //!
 //! In release builds [`AppPaths::plugin_dir`] is always
 //! `<install_root>/plugins/opencode-made`. Development builds first prefer a
@@ -104,8 +102,8 @@
 //!
 //! # Compatible TUIs
 //!
-//! [`detect_compatible_tuis`] performs a metadata-only `PATH` lookup for
-//! optional terminal UIs the app can launch directly. It never spawns the
+//! [`detect_programs`] performs a metadata-only `PATH` lookup for the program
+//! names of optional terminal UIs the app can launch directly. It never spawns the
 //! candidate, probes a version, or waits for a service. Empty and relative
 //! `PATH` segments are ignored so detection never resolves an executable from
 //! the current directory.
@@ -861,19 +859,13 @@ pub struct AppPaths {
     pub plugin_root: PathBuf,
     /// Directory containing the app-owned OpenCode plugin package.
     pub plugin_dir: PathBuf,
-    /// The shipped grok-made package, `<install_root>/plugins/grok-made`.
+    /// The shipped plugins directory, `<install_root>/plugins`, which holds
+    /// the app-owned plugin packages that [`Self::plugin_package_dir`] names.
     ///
     /// `None` when the install root could not be derived from the running
     /// executable. There is no repository fallback: the repository's
-    /// `plugins/grok-made` holds source only and is never installed.
-    pub grok_plugin_dir: Option<PathBuf>,
-    /// The shipped claude-code-made package,
-    /// `<install_root>/plugins/claude-code-made`.
-    ///
-    /// `None` when the install root could not be derived from the running
-    /// executable. There is no repository fallback: the repository's
-    /// `plugins/claude-code-made` holds source only and is never installed.
-    pub claude_plugin_dir: Option<PathBuf>,
+    /// `plugins` directory holds source only and is never installed.
+    pub shipped_plugins_dir: Option<PathBuf>,
     /// Where [`Self::plugin_dir`] came from.
     pub plugin_source: PluginDirSource,
     /// User OpenCode CLI configuration (`cli.json`), read only by composition.
@@ -912,16 +904,25 @@ impl AppPaths {
     /// `None` when the install root is unknown or the package is missing or
     /// unreadable, in which case no `CLAUDE_CODE_PLUGIN_DIRS` entry may point
     /// at it.
-    pub fn shipped_claude_plugin_dir(&self) -> Option<&Path> {
-        let dir = self.claude_plugin_dir.as_deref()?;
+    pub fn shipped_claude_plugin_dir(&self) -> Option<PathBuf> {
+        let dir = self.plugin_package_dir("claude-code-made")?;
         // Only this host's list separator can split the entry: a Windows drive
         // colon is part of an ordinary `C:\...` path.
         let separator = claude_plugin_dirs_separator(PlatformFamily::current());
-        if !claude_plugin_entry_is_safe(dir, separator) {
+        if !claude_plugin_entry_is_safe(&dir, separator) {
             return None;
         }
-        std::fs::read_dir(dir).ok()?;
+        std::fs::read_dir(&dir).ok()?;
         Some(dir)
+    }
+
+    /// The shipped app-owned plugin package `name` (for example `grok-made`),
+    /// `<install_root>/plugins/<name>`.
+    ///
+    /// `None` when the install root could not be derived from the running
+    /// executable. The path is not checked for existence.
+    pub fn plugin_package_dir(&self, name: &str) -> Option<PathBuf> {
+        self.shipped_plugins_dir.as_ref().map(|dir| dir.join(name))
     }
 }
 
@@ -943,14 +944,11 @@ pub struct PathsInputs {
     /// Read-only application install/resource root. Required; resolution fails
     /// when it cannot be derived from the executable or supplied by the caller.
     pub install_root: Option<PathBuf>,
-    /// The shipped grok-made package. [`PathsInputs::from_env`] derives it from
-    /// the running executable's install root only, never from the repository
+    /// The shipped plugins directory (`<install_root>/plugins`) holding the
+    /// app-owned plugin packages. [`PathsInputs::from_env`] derives it from the
+    /// running executable's install root only, never from the repository
     /// fallback that [`Self::install_root`] may carry in development.
-    pub grok_plugin_dir: Option<PathBuf>,
-    /// The shipped claude-code-made package. Derived like
-    /// [`Self::grok_plugin_dir`]: from the running executable's install root
-    /// only, never from the repository fallback.
-    pub claude_plugin_dir: Option<PathBuf>,
+    pub shipped_plugins_dir: Option<PathBuf>,
     /// Base temp directory used by macOS/Windows and as a fallback input.
     pub temp_dir: PathBuf,
     /// Stable per-user token used in the private temp directory name. On Unix
@@ -1027,12 +1025,7 @@ impl PathsInputs {
             xdg_runtime_dir: var_path("XDG_RUNTIME_DIR"),
             app_data: var_path("APPDATA"),
             local_app_data: var_path("LOCALAPPDATA"),
-            grok_plugin_dir: executable_root
-                .as_ref()
-                .map(|root| root.join("plugins").join("grok-made")),
-            claude_plugin_dir: executable_root
-                .as_ref()
-                .map(|root| root.join("plugins").join("claude-code-made")),
+            shipped_plugins_dir: executable_root.as_ref().map(|root| root.join("plugins")),
             install_root: executable_root.or_else(|| development.then(repository_root)),
             temp_dir: env::temp_dir(),
             user_token: current_user_token(family),
@@ -1248,8 +1241,7 @@ impl AppPaths {
             data_dir,
             plugin_root,
             plugin_dir,
-            grok_plugin_dir: inputs.grok_plugin_dir.clone(),
-            claude_plugin_dir: inputs.claude_plugin_dir.clone(),
+            shipped_plugins_dir: inputs.shipped_plugins_dir.clone(),
             plugin_source,
             opencode_config_path,
             log_dir,
@@ -2508,43 +2500,6 @@ pub(crate) fn host_platform_data_dir() -> Option<PathBuf> {
     host_platform().app_paths().ok().map(|paths| paths.data_dir)
 }
 
-/// A compatible TUI that Made can launch directly in a new tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum CompatibleTui {
-    /// OpenCode v2. Detection checks the executable name only; the version is
-    /// not verified.
-    OpenCode,
-    /// Grok Build. Detection checks the executable name only; the version is
-    /// not verified.
-    Grok,
-    /// Claude Code. Detection checks the executable name only; the version is
-    /// not verified.
-    ClaudeCode,
-}
-
-impl CompatibleTui {
-    /// Every TUI Made knows how to launch, in new-tab menu order.
-    pub const ALL: &'static [Self] = &[Self::OpenCode, Self::Grok, Self::ClaudeCode];
-
-    /// Executable name resolved through `PATH`.
-    pub const fn program(self) -> &'static str {
-        match self {
-            Self::OpenCode => "opencode",
-            Self::Grok => "grok",
-            Self::ClaudeCode => "claude",
-        }
-    }
-
-    /// Product label for the new-tab menu and an open workspace tab.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::OpenCode => "OpenCode",
-            Self::Grok => "Grok Build",
-            Self::ClaudeCode => "Claude Code",
-        }
-    }
-}
-
 /// Claude Code's session-only plugin directory list variable.
 pub const CLAUDE_CODE_PLUGIN_DIRS_ENV: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 
@@ -2628,27 +2583,29 @@ pub fn compose_claude_plugin_dirs(
     composed
 }
 
-/// Detect compatible TUIs on the current process `PATH`.
+/// Detect which of `programs` are executables on the current process `PATH`.
 ///
 /// This is a metadata-only executable lookup intended to run once on a
 /// background thread. It never spawns the program, probes a version, or waits
 /// for a service. Callers must not make shell or explorer startup depend on the
-/// result.
-pub fn detect_compatible_tuis() -> Vec<CompatibleTui> {
+/// result. The result keeps the order of `programs`.
+pub fn detect_programs<'a>(programs: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let path = env::var_os("PATH").unwrap_or_default();
-    detect_compatible_tuis_in_path(&path)
+    detect_programs_in_path(programs, &path)
 }
 
-/// Detect compatible TUIs in an explicit `PATH` value.
+/// Detect which of `programs` are executables in an explicit `PATH` value.
 ///
 /// Empty and relative path segments are ignored rather than resolved against
 /// the current directory, so detection cannot pick up an untrusted relative
-/// executable.
-pub fn detect_compatible_tuis_in_path(path: impl AsRef<OsStr>) -> Vec<CompatibleTui> {
-    CompatibleTui::ALL
-        .iter()
-        .copied()
-        .filter(|tui| find_executable_on_path(OsStr::new(tui.program()), path.as_ref()).is_some())
+/// executable. The result keeps the order of `programs`.
+pub fn detect_programs_in_path<'a>(
+    programs: impl IntoIterator<Item = &'a str>,
+    path: impl AsRef<OsStr>,
+) -> Vec<&'a str> {
+    programs
+        .into_iter()
+        .filter(|program| find_executable_on_path(OsStr::new(program), path.as_ref()).is_some())
         .collect()
 }
 
