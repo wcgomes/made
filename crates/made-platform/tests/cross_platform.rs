@@ -7,9 +7,10 @@
 //! that the Linux backend was selected is OS-gated.
 //!
 //! `made-app` is the only graphical application. `made-remote` and
-//! `made-grok-hook` are the only extra headless binaries: the SSH contract
-//! requires the companion, and the grok-made plugin ships the native
-//! `made-grok-status` hook. Any other `src/main.rs`, or a GUI dependency
+//! `made-grok-hook` and `made-claude-hook` are the only extra headless
+//! binaries: the SSH contract requires the companion, and the grok-made and
+//! claude-code-made plugins ship the native `made-grok-status` and
+//! `made-claude-status` hooks. Any other `src/main.rs`, or a GUI dependency
 //! outside `made-app`, is a second graphical app.
 //!
 //! Test-only `cfg` is acceptable per `wiki/architecture.md`. Shipped Rust code
@@ -30,6 +31,7 @@ const SUPPORTED_TARGETS: &[&str] = &[
 const WORKSPACE_CRATES: &[&str] = &[
     "made-app",
     "made-bridge",
+    "made-claude-hook",
     "made-explorer",
     "made-grok-hook",
     "made-platform",
@@ -157,10 +159,11 @@ fn workspace_has_one_app_crate_and_one_ui_source_tree() {
         binaries,
         vec![
             "made-app".to_owned(),
+            "made-claude-hook".to_owned(),
             "made-grok-hook".to_owned(),
             "made-remote".to_owned()
         ],
-        "made-app is the only graphical application; made-remote and made-grok-hook are the only extra headless binaries"
+        "made-app is the only graphical application; made-remote, made-grok-hook and made-claude-hook are the only extra headless binaries"
     );
 
     for crate_dir in &crates {
@@ -223,13 +226,16 @@ fn platform_specific_code_lives_only_in_made_platform() {
     let platform_dir = root.join("crates/made-platform");
     let mut violations = Vec::new();
 
-    // The hook is a dependency-free leaf executable: it cannot link
-    // made-platform, so its one parent-pid call per OS lives in its own
-    // `main.rs` and Windows-only manifest table.
-    let hook_dir = root.join("crates/made-grok-hook");
+    // The hooks are dependency-light leaf executables: they cannot link
+    // made-platform, so their per-OS process and file calls live in their own
+    // `main.rs` and target-specific manifest tables.
+    let hook_dirs = [
+        root.join("crates/made-grok-hook"),
+        root.join("crates/made-claude-hook"),
+    ];
 
     for crate_dir in crate_dirs(&root) {
-        if crate_dir == platform_dir || crate_dir == hook_dir {
+        if crate_dir == platform_dir || hook_dirs.contains(&crate_dir) {
             continue;
         }
 

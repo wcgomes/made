@@ -309,3 +309,257 @@ fn encoded_test_uri_path(path: &std::path::Path) -> String {
     }
     result
 }
+
+mod protocol {
+    use super::terminal;
+    use made_terminal::{ProtocolEvent, ProtocolState, TerminalCore};
+
+    const PROBE_REPLY: &[u8] = b"\x1b]7501;?\x07";
+
+    fn replies(core: &mut TerminalCore) -> Vec<u8> {
+        core.take_replies(|_| [0, 0, 0])
+    }
+
+    fn events(input: &[u8]) -> Vec<ProtocolEvent> {
+        let mut core = terminal(4, 40);
+        core.feed(input);
+        core.take_protocol_events()
+    }
+
+    fn status(state: ProtocolState) -> ProtocolEvent {
+        ProtocolEvent::Status { state }
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn probe_is_answered_with_exactly_the_capability_reply() {
+        for probe in [&b"\x1b]7501;?\x07"[..], &b"\x1b]7501;?\x1b\\"[..]] {
+            let mut core = terminal(4, 40);
+            core.feed(probe);
+            assert_eq!(replies(&mut core), PROBE_REPLY);
+            assert!(replies(&mut core).is_empty());
+            assert_eq!(core.take_protocol_events(), vec![ProtocolEvent::Probe]);
+        }
+    }
+
+    #[test]
+    fn probe_split_across_chunks_is_answered_once() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b]75");
+        core.feed(b"01;?");
+        assert!(replies(&mut core).is_empty());
+        core.feed(b"\x07");
+        assert_eq!(replies(&mut core), PROBE_REPLY);
+    }
+
+    #[test]
+    fn probe_reply_precedes_a_device_attributes_reply_in_the_same_chunk() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b]7501;?\x07\x1b[>0q\x1b[c");
+        let out = replies(&mut core);
+        let da1 = find(&out, b"\x1b[?").expect("device attributes reply");
+        assert_eq!(find(&out, PROBE_REPLY), Some(0), "{out:?}");
+        assert!(da1 >= PROBE_REPLY.len(), "{out:?}");
+        assert_eq!(
+            out.windows(PROBE_REPLY.len())
+                .filter(|w| *w == PROBE_REPLY)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replies_keep_stream_order_around_the_probe() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b[c\x1b]7501;?\x1b\\\x1b[c");
+        let out = replies(&mut core);
+        let probe = find(&out, PROBE_REPLY).expect("probe reply");
+        assert!(
+            find(&out[..probe], b"\x1b[?").is_some(),
+            "first DA1 before probe"
+        );
+        assert!(
+            find(&out[probe + PROBE_REPLY.len()..], b"\x1b[?").is_some(),
+            "second DA1 after probe"
+        );
+    }
+
+    #[test]
+    fn xtversion_is_unanswered() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b[>0q");
+        assert!(replies(&mut core).is_empty());
+    }
+
+    #[test]
+    fn session_level_states_map_to_events() {
+        let cases = [
+            ("idle", ProtocolState::Idle),
+            ("working", ProtocolState::Working),
+            ("done", ProtocolState::Done),
+            ("blocked", ProtocolState::Blocked),
+            ("error", ProtocolState::Error),
+        ];
+        for (name, state) in cases {
+            let bel = format!("\x1b]7501;state={name}:app=claude-code\x07");
+            let st = format!("\x1b]7501;app=claude-code:state={name}\x1b\\");
+            assert_eq!(events(bel.as_bytes()), vec![status(state)], "{name} BEL");
+            assert_eq!(events(st.as_bytes()), vec![status(state)], "{name} ST");
+        }
+    }
+
+    #[test]
+    fn clear_events_distinguish_app_scoped_from_bare() {
+        assert_eq!(
+            events(b"\x1b]7501;state=clear:app=claude-code\x07"),
+            vec![ProtocolEvent::Clear { bare: false }]
+        );
+        assert_eq!(
+            events(b"\x1b]7501;state=clear\x07"),
+            vec![ProtocolEvent::Clear { bare: true }]
+        );
+    }
+
+    #[test]
+    fn id_rows_produce_no_event() {
+        assert!(events(b"\x1b]7501;state=working:app=claude-code:id=7:title=YWJj\x07").is_empty());
+        assert!(events(b"\x1b]7501;state=clear:id=7\x07").is_empty());
+        assert!(events(b"\x1b]7501;state=clear:app=claude-code:id=7\x07").is_empty());
+        assert!(events(b"\x1b]7501;state=working:app=claude-code:id=\x07").is_empty());
+    }
+
+    #[test]
+    fn invalid_emissions_produce_no_event() {
+        let cases: [&[u8]; 12] = [
+            b"\x1b]7501;state=sleeping:app=claude-code\x07",
+            b"\x1b]7501;state=working\x07",
+            b"\x1b]7501;state=working:app=\x07",
+            b"\x1b]7501;state=clear:app=\x07",
+            b"\x1b]7501;app=claude-code\x07",
+            b"\x1b]7501;state=working:app=claude-code:oops\x07",
+            b"\x1b]7501;state=working:app=claude-code:=x\x07",
+            b"\x1b]7501;state=working:app=claude-code:\x07",
+            b"\x1b]7501;state=Working:app=claude-code\x07",
+            b"\x1b]7501;\x07",
+            b"\x1b]7501;??\x07",
+            b"\x1b]7501\x07",
+        ];
+        for case in cases {
+            assert!(
+                events(case).is_empty(),
+                "{:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_on_a_valid_emission() {
+        assert_eq!(
+            events(b"\x1b]7501;state=working:app=claude-code:future=1:progress=50\x07"),
+            vec![status(ProtocolState::Working)]
+        );
+    }
+
+    #[test]
+    fn oversized_emissions_are_ignored() {
+        let long = format!(
+            "\x1b]7501;state=working:app=claude-code:msg={}\x07",
+            "A".repeat(4100)
+        );
+        assert!(events(long.as_bytes()).is_empty());
+        let huge = format!(
+            "\x1b]7501;state=working:app=claude-code:msg={}\x07",
+            "A".repeat(20_000)
+        );
+        assert!(events(huge.as_bytes()).is_empty());
+        let mut core = terminal(4, 40);
+        core.feed(huge.as_bytes());
+        core.feed(b"\x1b]7501;state=idle:app=claude-code\x07");
+        assert_eq!(
+            core.take_protocol_events(),
+            vec![status(ProtocolState::Idle)]
+        );
+        let ok = format!(
+            "\x1b]7501;state=working:app=claude-code:msg={}\x07",
+            "A".repeat(3900)
+        );
+        assert_eq!(events(ok.as_bytes()), vec![status(ProtocolState::Working)]);
+    }
+
+    #[test]
+    fn other_apps_change_nothing() {
+        assert!(events(b"\x1b]7501;state=working:app=opencode\x07").is_empty());
+        assert!(events(b"\x1b]7501;state=blocked:app=grok\x07").is_empty());
+        assert!(events(b"\x1b]7501;state=clear:app=opencode\x07").is_empty());
+    }
+
+    #[test]
+    fn sequences_leave_the_screen_cursor_and_title_untouched() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b]0;my title\x07hi");
+        let before = core.snapshot();
+        core.feed(b"\x1b]7501;?\x07");
+        core.feed(b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=c2VjcmV0\x1b\\");
+        core.feed(b"\x1b]7501;state=clear\x07");
+        let after = core.snapshot();
+        assert_eq!(after.text(), "hi");
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(core.title().as_deref(), Some("my title"));
+        assert_eq!(core.history_len(), 0);
+    }
+
+    #[test]
+    fn events_never_expose_the_msg_value() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=SECRETMSG\x07");
+        let events = core.take_protocol_events();
+        assert_eq!(events, vec![status(ProtocolState::Blocked)]);
+        assert!(!format!("{events:?}").contains("SECRETMSG"));
+        assert!(core.take_protocol_events().is_empty());
+    }
+
+    #[test]
+    fn replay_of_the_claude_code_2_1_319_capture() {
+        let capture: &[&[u8]] = &[
+            b"\x1b[>0q\x1b]7501;?\x07\x1b[c",
+            b"\x1b]7501;state=idle:app=claude-code\x07",
+            b"\x1b]7501;state=working:app=claude-code\x07",
+            b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiB0b3VjaCB4\x07",
+            b"\x1b]7501;state=working:app=claude-code\x07",
+            b"\x1b]7501;state=working:app=claude-code:id=a1:title=dGFzaw==\x07",
+            b"\x1b]7501;state=clear:id=a1\x07",
+            b"\x1b]7501;state=idle:app=claude-code\x07",
+            b"\x1b]7501;state=working:app=claude-code\x07\x1b]7501;state=clear\x07",
+            b"\x1b]7501;state=clear\x07\x1b]7501;state=clear\x07\x1b]0;\x07",
+        ];
+        let mut core = terminal(4, 40);
+        let mut all = Vec::new();
+        let mut out = Vec::new();
+        for chunk in capture {
+            core.feed(chunk);
+            all.extend(core.take_protocol_events());
+            out.extend(replies(&mut core));
+        }
+        assert_eq!(
+            all,
+            vec![
+                ProtocolEvent::Probe,
+                status(ProtocolState::Idle),
+                status(ProtocolState::Working),
+                status(ProtocolState::Blocked),
+                status(ProtocolState::Working),
+                status(ProtocolState::Idle),
+                status(ProtocolState::Working),
+                ProtocolEvent::Clear { bare: true },
+                ProtocolEvent::Clear { bare: true },
+                ProtocolEvent::Clear { bare: true },
+            ]
+        );
+        assert_eq!(find(&out, PROBE_REPLY), Some(0));
+        assert_eq!(core.snapshot().text(), "");
+    }
+}

@@ -45,7 +45,8 @@ pub use transport::{LocalPtyTransport, TerminalTransport, TransportStatus};
 
 pub use emulation::{
     CellAttributes, CellSnapshot, CursorShape, CursorSnapshot, DamageLine, LineSnapshot,
-    QueriedColor, TerminalColor, TerminalCore, TerminalDamage, TerminalSize, TerminalSnapshot,
+    ProtocolEvent, ProtocolState, QueriedColor, TerminalColor, TerminalCore, TerminalDamage,
+    TerminalSize, TerminalSnapshot,
 };
 pub use input::{
     InputEncoder, InputModes, Key, Modifiers, MouseButton, MouseEvent, MouseEventKind, MouseMode,

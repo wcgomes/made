@@ -1,0 +1,9 @@
+{
+  "name": "made",
+  "version": "0.1.0",
+  "description": "Reports Claude Code session metadata to Made through a local per-tab spool",
+  "author": {
+    "name": "Wyller Gomes"
+  },
+  "license": "MIT"
+}

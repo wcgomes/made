@@ -32,6 +32,9 @@
 //! source-only `plugins/grok-made`; when the root cannot be derived it is
 //! `None`.
 //!
+//! [`AppPaths::claude_plugin_dir`] follows the same rule for the shipped
+//! claude-code-made package at `<install_root>/plugins/claude-code-made`.
+//!
 //! In release builds [`AppPaths::plugin_dir`] is always
 //! `<install_root>/plugins/opencode-made`. Development builds first prefer a
 //! complete staged package at `<install_root>/plugins/opencode-made`
@@ -835,6 +838,13 @@ pub struct AppPaths {
     /// executable. There is no repository fallback: the repository's
     /// `plugins/grok-made` holds source only and is never installed.
     pub grok_plugin_dir: Option<PathBuf>,
+    /// The shipped claude-code-made package,
+    /// `<install_root>/plugins/claude-code-made`.
+    ///
+    /// `None` when the install root could not be derived from the running
+    /// executable. There is no repository fallback: the repository's
+    /// `plugins/claude-code-made` holds source only and is never installed.
+    pub claude_plugin_dir: Option<PathBuf>,
     /// Where [`Self::plugin_dir`] came from.
     pub plugin_source: PluginDirSource,
     /// User OpenCode CLI configuration (`cli.json`), read only by composition.
@@ -867,6 +877,17 @@ impl AppPaths {
     pub fn app_owned_root(&self) -> &Path {
         &self.plugin_root
     }
+
+    /// The shipped claude-code-made package when it is a readable directory.
+    ///
+    /// `None` when the install root is unknown or the package is missing or
+    /// unreadable, in which case no `CLAUDE_CODE_PLUGIN_DIRS` entry may point
+    /// at it.
+    pub fn shipped_claude_plugin_dir(&self) -> Option<&Path> {
+        let dir = self.claude_plugin_dir.as_deref()?;
+        std::fs::read_dir(dir).ok()?;
+        Some(dir)
+    }
 }
 
 /// Inputs used to resolve [`AppPaths`].
@@ -891,6 +912,10 @@ pub struct PathsInputs {
     /// the running executable's install root only, never from the repository
     /// fallback that [`Self::install_root`] may carry in development.
     pub grok_plugin_dir: Option<PathBuf>,
+    /// The shipped claude-code-made package. Derived like
+    /// [`Self::grok_plugin_dir`]: from the running executable's install root
+    /// only, never from the repository fallback.
+    pub claude_plugin_dir: Option<PathBuf>,
     /// Base temp directory used by macOS/Windows and as a fallback input.
     pub temp_dir: PathBuf,
     /// Stable per-user token used in the private temp directory name. On Unix
@@ -970,6 +995,9 @@ impl PathsInputs {
             grok_plugin_dir: executable_root
                 .as_ref()
                 .map(|root| root.join("plugins").join("grok-made")),
+            claude_plugin_dir: executable_root
+                .as_ref()
+                .map(|root| root.join("plugins").join("claude-code-made")),
             install_root: executable_root.or_else(|| development.then(repository_root)),
             temp_dir: env::temp_dir(),
             user_token: current_user_token(family),
@@ -1186,6 +1214,7 @@ impl AppPaths {
             plugin_root,
             plugin_dir,
             grok_plugin_dir: inputs.grok_plugin_dir.clone(),
+            claude_plugin_dir: inputs.claude_plugin_dir.clone(),
             plugin_source,
             opencode_config_path,
             log_dir,
@@ -2453,17 +2482,21 @@ pub enum CompatibleTui {
     /// Grok Build. Detection checks the executable name only; the version is
     /// not verified.
     Grok,
+    /// Claude Code. Detection checks the executable name only; the version is
+    /// not verified.
+    ClaudeCode,
 }
 
 impl CompatibleTui {
     /// Every TUI Made knows how to launch, in new-tab menu order.
-    pub const ALL: &'static [Self] = &[Self::OpenCode, Self::Grok];
+    pub const ALL: &'static [Self] = &[Self::OpenCode, Self::Grok, Self::ClaudeCode];
 
     /// Executable name resolved through `PATH`.
     pub const fn program(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
+            Self::ClaudeCode => "claude",
         }
     }
 
@@ -2472,8 +2505,53 @@ impl CompatibleTui {
         match self {
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok Build",
+            Self::ClaudeCode => "Claude Code",
         }
     }
+}
+
+/// Claude Code's session-only plugin directory list variable.
+pub const CLAUDE_CODE_PLUGIN_DIRS_ENV: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+
+/// Entry separator of [`CLAUDE_CODE_PLUGIN_DIRS_ENV`]: `:` on POSIX, `;` on
+/// Windows (candidate; unverified on a Windows host).
+pub const fn claude_plugin_dirs_separator(family: PlatformFamily) -> char {
+    match family {
+        PlatformFamily::Linux | PlatformFamily::MacOs => ':',
+        PlatformFamily::Windows => ';',
+    }
+}
+
+/// Compose the [`CLAUDE_CODE_PLUGIN_DIRS_ENV`] value for a Made-started process.
+///
+/// Every existing entry is kept byte-for-byte in its original order and
+/// Made's `shipped` entry is appended, unless an entry already equals it. An
+/// absent or empty `existing` value yields just `shipped`, with no leading
+/// separator. `separator` must be ASCII.
+pub fn compose_claude_plugin_dirs(
+    existing: Option<&OsStr>,
+    shipped: &Path,
+    separator: char,
+) -> OsString {
+    debug_assert!(separator.is_ascii());
+    let shipped = shipped.as_os_str();
+    let Some(existing) = existing.filter(|value| !value.is_empty()) else {
+        return shipped.to_owned();
+    };
+    let separator = separator as u8;
+    let bytes = existing.as_encoded_bytes();
+    if bytes
+        .split(|byte| *byte == separator)
+        .any(|entry| entry == shipped.as_encoded_bytes())
+    {
+        return existing.to_owned();
+    }
+    let mut composed = existing.to_owned();
+    if bytes.last() != Some(&separator) {
+        composed.push(char::from(separator).to_string());
+    }
+    composed.push(shipped);
+    composed
 }
 
 /// Detect compatible TUIs on the current process `PATH`.

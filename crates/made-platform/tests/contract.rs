@@ -13,15 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
-    append_private_log_rotated_with_timeout, detect_compatible_tuis_in_path,
-    find_executable_on_path, host_platform, install_root_for_executable, is_sensitive_env_key,
-    open_private_log, previous_private_log_path, private_log_lock_path, prune_clipboard_images,
+    append_private_log_rotated_with_timeout, claude_plugin_dirs_separator,
+    compose_claude_plugin_dirs, detect_compatible_tuis_in_path, find_executable_on_path,
+    host_platform, install_root_for_executable, is_sensitive_env_key, open_private_log,
+    previous_private_log_path, private_log_lock_path, prune_clipboard_images,
     repository_plugin_dir, repository_root, resolve_user_home, save_clipboard_image_png,
     validate_user_home, AppPaths, Clipboard, ClipboardImage, CompatibleTui, Environment,
     HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard, LogAppendOutcome,
     LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest,
-    PtySize, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES, MAX_CLIPBOARD_IMAGE_BYTES,
-    MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
+    PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
 };
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +55,7 @@ fn path_inputs(family: PlatformFamily) -> PathsInputs {
         local_app_data: Some(PathBuf::from("/windows/local")),
         install_root: Some(PathBuf::from("/opt/made")),
         grok_plugin_dir: Some(PathBuf::from("/opt/made/plugins/grok-made")),
+        claude_plugin_dir: Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
         temp_dir: PathBuf::from("/tmp"),
         user_token: "1000".to_owned(),
         plugin_override: None,
@@ -181,11 +183,17 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
 }
 
 #[test]
-fn integrated_tui_catalog_is_opencode_then_grok() {
+fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
     assert_eq!(
         CompatibleTui::ALL,
-        &[CompatibleTui::OpenCode, CompatibleTui::Grok]
+        &[
+            CompatibleTui::OpenCode,
+            CompatibleTui::Grok,
+            CompatibleTui::ClaudeCode
+        ]
     );
+    assert_eq!(CompatibleTui::ClaudeCode.program(), "claude");
+    assert_eq!(CompatibleTui::ClaudeCode.label(), "Claude Code");
     assert_eq!(CompatibleTui::OpenCode.program(), "opencode");
     assert_eq!(CompatibleTui::OpenCode.label(), "OpenCode");
     assert_eq!(CompatibleTui::Grok.program(), "grok");
@@ -276,6 +284,57 @@ fn integrated_tui_catalog_is_opencode_then_grok() {
         !sentinel.exists(),
         "detecting both TUIs must not spawn either"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn claude_code_detection_is_metadata_only_and_ignores_empty_and_relative_segments() {
+    let root = unique_temp("tui-claude");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    #[cfg(windows)]
+    let claude = bin.join("claude.exe");
+    #[cfg(not(windows))]
+    let claude = bin.join("claude");
+    #[cfg(unix)]
+    let sentinel = root.join("spawned");
+    #[cfg(unix)]
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" > '{}'\n",
+        sentinel.display()
+    );
+    #[cfg(not(unix))]
+    let body = "not a real program".to_owned();
+    std::fs::write(&claude, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths([&bin]).unwrap();
+    assert_eq!(
+        detect_compatible_tuis_in_path(&path),
+        vec![CompatibleTui::ClaudeCode]
+    );
+    assert_eq!(
+        find_executable_on_path(OsStr::new("claude"), &path),
+        Some(claude.clone())
+    );
+    #[cfg(unix)]
+    assert!(
+        !sentinel.exists(),
+        "detection must not spawn claude or read its version"
+    );
+
+    // An empty segment and a relative segment never resolve against the cwd.
+    let relative = std::env::join_paths([
+        PathBuf::from(""),
+        PathBuf::from("relative-bin"),
+        PathBuf::from("."),
+    ])
+    .unwrap();
+    assert!(detect_compatible_tuis_in_path(&relative).is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -958,6 +1017,124 @@ fn grok_plugin_dir_is_the_staged_copy_in_development_and_release() {
             "no repository fallback, development={development}"
         );
     }
+}
+
+#[test]
+fn claude_plugin_dir_is_the_staged_copy_in_development_and_release() {
+    for development in [false, true] {
+        let inputs = PathsInputs {
+            development,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        let paths = AppPaths::resolve(&inputs).expect("paths");
+        assert_eq!(
+            paths.claude_plugin_dir,
+            Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
+            "development={development}"
+        );
+        let unresolved = PathsInputs {
+            development,
+            claude_plugin_dir: None,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        assert_eq!(
+            AppPaths::resolve(&unresolved)
+                .expect("paths")
+                .claude_plugin_dir,
+            None,
+            "no repository fallback, development={development}"
+        );
+    }
+}
+
+#[test]
+fn shipped_claude_plugin_dir_requires_a_readable_directory() {
+    let root = unique_temp("claude-plugin-dir");
+    let plugin = root.join("plugins").join("claude-code-made");
+    let inputs = PathsInputs {
+        claude_plugin_dir: Some(plugin.clone()),
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    let paths = AppPaths::resolve(&inputs).expect("paths");
+    assert_eq!(paths.shipped_claude_plugin_dir(), None, "missing");
+
+    std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    std::fs::write(&plugin, "file").unwrap();
+    assert_eq!(paths.shipped_claude_plugin_dir(), None, "not a directory");
+
+    std::fs::remove_file(&plugin).unwrap();
+    std::fs::create_dir_all(&plugin).unwrap();
+    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.as_path()));
+
+    let unresolved = PathsInputs {
+        claude_plugin_dir: None,
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    assert_eq!(
+        AppPaths::resolve(&unresolved)
+            .expect("paths")
+            .shipped_claude_plugin_dir(),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn claude_plugin_dirs_composition_preserves_entries_and_never_duplicates() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    let compose = |existing: Option<&str>, separator| {
+        compose_claude_plugin_dirs(existing.map(OsStr::new), shipped, separator)
+    };
+    let made = "/opt/made/plugins/claude-code-made";
+
+    assert_eq!(compose(None, ':'), OsString::from(made));
+    assert_eq!(compose(Some(""), ':'), OsString::from(made));
+    assert_eq!(
+        compose(Some("/u/a:/u/b"), ':'),
+        OsString::from(format!("/u/a:/u/b:{made}"))
+    );
+    assert_eq!(
+        compose(Some("/u/b:/u/a"), ':'),
+        OsString::from(format!("/u/b:/u/a:{made}")),
+        "order is kept"
+    );
+    assert_eq!(
+        compose(Some("/u/a:"), ':'),
+        OsString::from(format!("/u/a:{made}")),
+        "a trailing separator is not doubled"
+    );
+    for existing in [
+        made.to_owned(),
+        format!("{made}:/u/a"),
+        format!("/u/a:{made}:/u/b"),
+    ] {
+        assert_eq!(
+            compose(Some(&existing), ':'),
+            OsString::from(&existing),
+            "already present: {existing}"
+        );
+    }
+    assert_eq!(
+        compose(Some("/u/a:/opt/made/plugins/claude-code-made-extra"), ':'),
+        OsString::from(format!(
+            "/u/a:/opt/made/plugins/claude-code-made-extra:{made}"
+        )),
+        "a prefix match is not a duplicate"
+    );
+    assert_eq!(
+        compose(Some("C:\\u\\a"), ';'),
+        OsString::from(format!("C:\\u\\a;{made}")),
+        "a drive colon is not a separator under ;"
+    );
+    assert_eq!(
+        compose(Some(&format!("C:\\u\\a;{made}")), ';'),
+        OsString::from(format!("C:\\u\\a;{made}"))
+    );
+
+    assert_eq!(CLAUDE_CODE_PLUGIN_DIRS_ENV, "CLAUDE_CODE_PLUGIN_DIRS");
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::Linux), ':');
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::MacOs), ':');
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::Windows), ';');
 }
 
 #[test]
