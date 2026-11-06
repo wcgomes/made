@@ -4447,13 +4447,29 @@ mod tab_presentation_characterization {
                 .center();
             self.render_events(vec![egui::Event::PointerMoved(position)]);
             self.render_events(vec![egui::Event::PointerMoved(position)]);
+            // Tooltip areas appear a pass or more after hover begins: take the
+            // text once it has been the same for several passes.
             let mut after = output_lines(&self.render());
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while after.iter().all(|line| before.contains(line)) && Instant::now() < deadline {
+            let mut same = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while (after.len() <= before.len() || same < 5) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
-                after = output_lines(&self.render());
+                let next = output_lines(&self.render());
+                same = if next == after { same + 1 } else { 0 };
+                after = next;
             }
-            after.retain(|line| !before.contains(line));
+            // Count-aware difference: a line the screen already paints once
+            // (the folder path, for one) can appear a second time as the tooltip.
+            let mut remaining = before;
+            after.retain(
+                |line| match remaining.iter().position(|seen| seen == line) {
+                    Some(index) => {
+                        remaining.remove(index);
+                        false
+                    }
+                    None => true,
+                },
+            );
             after
         }
     }
@@ -4799,6 +4815,12 @@ mod tab_presentation_characterization {
             ((true, true, true), opencode_local()),
         ];
         for ((opencode, claude, grok), expected) in table {
+            if claude && !cfg!(target_os = "linux") {
+                // Claude Code is made present through a foreground `tail`,
+                // which only Linux relays unbuffered (as for the Claude Code
+                // fixture of `ui_model.rs`).
+                continue;
+            }
             assert_eq!(
                 local_record(opencode, claude, grok, false),
                 expected,
@@ -4807,6 +4829,7 @@ mod tab_presentation_characterization {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn claude_code_wins_over_grok_whichever_arrives_first() {
         if isolated(

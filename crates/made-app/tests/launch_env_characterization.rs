@@ -270,6 +270,17 @@ fn mask_number(text: &str, marker: &str, what: &str) -> String {
     out
 }
 
+/// Replace the text between `start` and `end` with `what`.
+fn mask_between(text: &str, start: &str, end: &str, what: &str) -> String {
+    let Some(from) = text.find(start).map(|index| index + start.len()) else {
+        return text.to_owned();
+    };
+    let Some(to) = text[from..].find(end).map(|index| index + from) else {
+        return text.to_owned();
+    };
+    format!("{}{what}{}", &text[..from], &text[to..])
+}
+
 fn env_value(env: &[(OsString, OsString)], key: &str) -> Option<String> {
     env.iter()
         .find(|(name, _)| name == key)
@@ -330,6 +341,9 @@ fn transcript(workbench: &mut Workbench, label: &str, placeholders: &Placeholder
             continue;
         }
         let message = placeholders.apply(&entry.message);
+        // Where the user's own OpenCode configuration would be is a platform
+        // convention, not a property of the launch.
+        let message = mask_between(&message, "User config ", " was not found", "<user config>");
         let message = mask_number(&message, "(pid ", "<pid>");
         let message = mask_number(&message, "loopback port ", "<port>");
         let message = mask_number(&message, "(pane made-", "<pid>");
@@ -359,6 +373,9 @@ fn run_local(layout: Layout, cwd: &Path) -> String {
         let mut pairs = vec![
             (bin.to_string_lossy().into_owned(), "<bin>"),
             (root.to_string_lossy().into_owned(), "<install>"),
+            // The home as the process sees it and as the filesystem names it
+            // (they differ below a symlinked temporary directory).
+            (raw_home(), "<home>"),
             (home_dir().to_string_lossy().into_owned(), "<home>"),
         ];
         if let Some(spool) = spool {
@@ -374,6 +391,11 @@ fn run_local(layout: Layout, cwd: &Path) -> String {
 
 fn child_layout() -> Layout {
     Layout::parse(&std::env::var(LAYOUT_ENV).unwrap())
+}
+
+/// `HOME` as the process was given it.
+fn raw_home() -> String {
+    std::env::var("HOME").expect("isolated home")
 }
 
 fn home_dir() -> PathBuf {
@@ -488,7 +510,10 @@ fn remote_targets_start_no_host_process() {
     for (label, target) in remote_targets(authority) {
         let mut workbench = Workbench::start(None, None, home_dir(), target, Instant::now());
         let placeholders = Placeholders {
-            pairs: vec![(home_dir().to_string_lossy().into_owned(), "<home>")],
+            pairs: vec![
+                (home_dir().to_string_lossy().into_owned(), "<home>"),
+                (raw_home(), "<home>"),
+            ],
         };
         out.push_str(&transcript(&mut workbench, label, &placeholders));
         workbench.shutdown();
@@ -561,7 +586,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -576,7 +601,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -591,7 +616,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -607,7 +632,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
@@ -625,7 +650,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -641,7 +666,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -656,7 +681,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -672,7 +697,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
@@ -691,7 +716,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -708,7 +733,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -723,7 +748,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -739,7 +764,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
@@ -759,7 +784,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -774,7 +799,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -789,7 +814,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -804,7 +829,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
@@ -821,7 +846,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -837,7 +862,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -852,7 +877,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -867,7 +892,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>/locked-workspace
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
@@ -881,7 +906,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-1)
@@ -891,7 +916,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-2)
@@ -901,7 +926,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-3)
@@ -911,7 +936,7 @@ log:
   info: Made <version> starting (invalid-workspace)
   info: terminal working directory: <home>
   info: user OpenCode config captured (missing)
-  warn: configuration warning: User config <home>/config/opencode/cli.json was not found; composed from other inputs.
+  warn: configuration warning: User config <user config> was not found; composed from other inputs.
   warn: configuration warning: Forced tabs.mode to "on" for this Made launch.
   warn: configuration warning: Forced tabs.scope to "global" for this Made launch.
   info: integration ready on loopback port <port> (pane made-<pid>-4)
