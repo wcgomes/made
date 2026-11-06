@@ -28,9 +28,20 @@ The home/`--picker`/explicit-path policy is an accepted product decision; see [A
 | zsh | Source/unit coverage; real installed-shell run pending. |
 | fish | Source/unit coverage; real installed-shell run pending. |
 | PowerShell/pwsh | Source/unit coverage; real installed-shell run pending. |
-| `cmd` / unknown / restricted launch | Explicit unsupported capability and reason; shell remains usable at the latest known cwd or launch folder. |
+| `cmd` (Windows only) | Launch-local OSC 7 through a `PROMPT` environment variable (`$E]7;file://localhost/$P$E\` plus the user's `PROMPT`, or `$P$G`); no files written, and `/d` is the only extra argument allowed. `made-terminal` accepts the raw cmd `$P` path form (explicit `localhost`, `X:\`) and then applies the existing local-path checks. Native Windows run pending; a cmd AutoRun that resets `PROMPT` defeats it. |
+| Unknown / restricted launch | Explicit unsupported capability and reason; shell remains usable at the latest known cwd or launch folder. |
 
 `made-terminal` validates OSC 7 as a bounded local absolute path, decodes URI escapes/Unicode, and rejects remote, relative, malformed, or oversized data. Cwd is never derived from terminal titles, prompts, or injected discovery commands. The latest validated shell cwd is retained independently of OpenCode.
+
+## SSH remote runtime
+
+Contracts live in [`specs/ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md); this section records implementation facts that are not visible from one file.
+
+- Remote shell cwd arrives as companion `ShellCwd` frames, not OSC 7. The workbench `pump_remote_client` routes them before the `waiting_attach` match, and the supervisor re-emits the cwd on reattach.
+- `tick_remote` returns before the local idle repaint cadence, so any new remote event source needs an explicit wake through `RemoteClient::set_wake`.
+- Remote PTY locale: the supervisor ensures a UTF-8 `LC_CTYPE` chosen from the server's `locale -a`; it never invents one and leaves `LC_ALL` untouched.
+- Reattach: the resnapshot carries SGR attributes, and a rows-1 resize nudge forces full-screen children to redraw.
+- These fixes are Linux-tested only; live-SSH validation is pending (see the [platform matrix](../testing/platform-matrix.md)).
 
 ## Root precedence
 

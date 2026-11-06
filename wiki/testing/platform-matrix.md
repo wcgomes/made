@@ -21,7 +21,7 @@ Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windo
 | zsh | Source/unit coverage only; real run pending. |
 | fish | Source/unit coverage only; real run pending. |
 | PowerShell/pwsh | Source/unit coverage only; real run pending. |
-| `cmd` | Explicit unsupported cwd capability; terminal remains usable at latest known cwd/launch folder. |
+| `cmd` (Windows) | Launch-local OSC 7 via `PROMPT`; source/unit coverage only, native Windows run pending. |
 | Unknown/restricted launch | Explicit unsupported capability/reason; no live-follow claim. |
 
 The shell matrix is a release-blocking gap for v1: the spec names all four supported shells, but only bash has real evidence.
@@ -45,6 +45,10 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 Release workflows (`release.yml`, `upgrade-check.yml`) are summarized in [Release and CI](../operations/release-ci.md). Development workflows cover Linux lint/test, four-target build/test, Linux X11/Wayland smoke, macOS arm64/x64 smoke, Windows native smoke, and development artifacts. They can prove compilation, contract tests, window/PTY smoke markers, and artifact assembly. They do **not** prove native UX, real WM/compositor input, native shell hooks, IME/clipboard/mouse/paste, Job Object cleanup, native OpenCode TUI interaction, native backdrop rendering, or hardware-GPU pacing.
 
 At the 2026-10-28 snapshot, all five workflows were observed green for the CI-stabilization commit: CI (all six jobs), macOS smoke x64/arm64, Windows native smoke, Linux display smoke, and Development artifacts. Green CI proves compilation, contract/PTY tests, window/PTY smoke markers, and artifact assembly; it does not prove the native UX list above, and the packaged layout has not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
+
+## Unvalidated field fixes
+
+The v0.1.0 field-issue fixes (Windows GUI subsystem, DX12 visual swapchain/Mica alpha, cmd.exe cwd, SSH cwd/locale/reattach) are Linux-tested and cross-compiled only. Native Windows, macOS, and live-SSH validation is pending. Details: [Terminal-first runtime](../runtime/terminal-first.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [CI platform quirks](ci-platform-quirks.md).
 
 ## Release-blocking gaps
 
