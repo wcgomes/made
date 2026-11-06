@@ -64,13 +64,19 @@ Claude Code MUST be an integrated-TUI catalog entry after Grok. Detecting it MUS
 
 ### Requirement: Program status protocol in the terminal
 
-Every Made terminal tab, local or SSH, MUST implement the receiving side of the Program Status Protocol (OSC 7501) as Claude Code uses it. When any program in the tab sends the protocol's capability probe, Made MUST write exactly the protocol's capability reply to that tab's terminal input, and MUST write nothing else to the terminal in response to any protocol sequence. Made MUST consume every protocol sequence, whether terminated by BEL or ST, without rendering it as text and without changing screen contents, scrollback, cursor position or the window title. An emission is a list of `key=value` fields; the fields Claude Code sends are `state`, `app`, `id`, `kind`, `title` and `msg`. Made MUST act only on session-level emissions, which are those without an `id` field; an emission with an `id` describes a sub-task row and MUST NOT change any Made state, including a clear for that `id`. A session-level emission whose `app` is `claude-code` sets the tab's Claude Code protocol status from its `state`: `working` is busy, `blocked` is attention, `error` is attention, `done` is idle and `idle` is idle, and `clear` ends the protocol status. A session-level `state=clear` without an `app` field MUST also end the protocol status, but only while a Claude Code protocol status is live in that tab, and MUST otherwise be ignored. The `kind` and `title` fields MUST be ignored. The `msg` field can contain tool commands and MUST NOT be kept, stored, logged, displayed or copied. An emission with an unknown `state` value, a missing or empty `app` other than that bare clear, a malformed field, or a total length over 4096 bytes MUST NOT change any status, presentation or explorer root. An unknown field name MUST be ignored and MUST NOT by itself invalidate an otherwise valid emission. Session-level emissions for any other `app` MUST NOT change any Made state or presentation. Protocol status MUST apply only to the tab whose terminal received it and never supplies a directory or a title. Made MUST NOT derive status from window-title text or glyphs, including the glyph prefixes Claude Code adds to its title when it receives no probe reply.
+Every Made terminal tab, local or SSH, MUST implement the receiving side of the Program Status Protocol (OSC 7501) as Claude Code uses it. When any program in the tab sends the protocol's capability probe, Made MUST write exactly the protocol's capability reply to that tab's terminal input, and MUST write nothing else to the terminal in response to any protocol sequence. The probe reply MUST be written before any reply to a query that follows the probe in the output stream. Made MUST consume every protocol sequence, whether terminated by BEL or ST, without rendering it as text and without changing screen contents, scrollback, cursor position or the window title. An emission is a list of `key=value` fields; the fields Claude Code sends are `state`, `app`, `id`, `kind`, `title` and `msg`. Made MUST act only on session-level emissions, which are those without an `id` field; an emission with an `id` describes a sub-task row and MUST NOT change any Made state, including a clear for that `id`. A session-level emission whose `app` is `claude-code` sets the tab's Claude Code protocol status from its `state`: `working` is busy, `blocked` is attention, `error` is attention, `done` is idle and `idle` is idle, and `clear` ends the protocol status. A session-level `state=clear` without an `app` field MUST also end the protocol status, but only while a Claude Code protocol status is live in that tab, and MUST otherwise be ignored. The `kind` and `title` fields MUST be ignored. The `msg` field can contain tool commands and MUST NOT be kept, stored, logged, displayed or copied. An emission with an unknown `state` value, a missing or empty `app` other than that bare clear, a malformed field, or a total length over 4096 bytes MUST NOT change any status, presentation or explorer root. An unknown field name MUST be ignored and MUST NOT by itself invalidate an otherwise valid emission. Session-level emissions for any other `app` MUST NOT change any Made state or presentation. Protocol status MUST apply only to the tab whose terminal received it and never supplies a directory or a title. Made MUST NOT derive status from window-title text or glyphs, including the glyph prefixes Claude Code adds to its title when it receives no probe reply.
 
 #### Scenario: Probe is answered
 
 - Given a local tab and an SSH tab, each running a program that sends the OSC 7501 capability probe
 - When the probe reaches Made's terminal
 - Then Made writes exactly the protocol's capability reply to that tab's terminal input, writes nothing else, and the probe is not rendered
+
+#### Scenario: Probe reply precedes device attributes reply
+
+- Given a program writes the capability probe followed by a device-attributes query in one output chunk
+- When the chunk reaches Made's terminal
+- Then the bytes written to that tab's terminal input contain the capability reply before the device-attributes reply
 
 #### Scenario: Probe from another program gets only the reply
 
@@ -378,7 +384,7 @@ The status protocol and the session hooks MUST each work without the other, and 
 - When its session starts, receives a prompt and stops
 - Then the tab shows `Claude Code` with an idle, busy, then idle dot from hook-derived status, the explorer follows the session directory, and the diagnostics row reports the status protocol unavailable
 
-#### Scenario: Several plugin directories without the status protocol
+#### Scenario: Status protocol not enabled while hooks work
 
 - Given Made was started with a user entry in `CLAUDE_CODE_PLUGIN_DIRS`, so a shell tab's Claude Code receives that entry and Made's, and that Claude Code does not enable the status protocol
 - When the user works in Claude Code in that tab
@@ -434,7 +440,7 @@ The row MUST show exactly one state, the first of these that applies. While PATH
 
 #### Scenario: Probe without emissions is not observed
 
-- Given a live owned Claude Code session whose Claude Code sent the capability probe more than about 10 seconds ago and has sent no session-level `app=claude-code` emission, as in the two-plugin-directory case
+- Given a live owned Claude Code session whose Claude Code sent the capability probe more than about 10 seconds ago and has sent no session-level `app=claude-code` emission
 - When the user reveals About diagnostics
 - Then the row shows a degraded pill with `Claude Code status protocol is unavailable.`
 
