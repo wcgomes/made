@@ -523,6 +523,21 @@ mod live {
         }
     }
 
+    /// Waits for an interactive bash prompt. `PS1` from the environment is not
+    /// authoritative: Debian's bash reads `/etc/bash.bashrc`, which replaces it
+    /// with `user@host:dir$ ` (`# ` for root, as in the glibc 2.31 container).
+    pub fn prompt_until(stream: &mut TcpStream, collected: &mut Vec<u8>) {
+        frames_until(stream, |operation| {
+            if let Operation::TerminalOutput { data, .. } = operation {
+                collected.extend_from_slice(data.as_bytes());
+            }
+            collected
+                .windows(2)
+                .any(|window| window == b"$ " || window == b"# ")
+                .then_some(())
+        });
+    }
+
     /// Collects terminal output until it contains `needle`.
     pub fn output_until(stream: &mut TcpStream, collected: &mut Vec<u8>, needle: &str) {
         let needle = needle.as_bytes();
@@ -545,7 +560,7 @@ fn shell_cwd_follows_cd_into_a_path_with_spaces_and_non_ascii() {
     let target = session.workspace.join("dir com espaço").join("ação 日本");
     std::fs::create_dir_all(&target).unwrap();
     let mut wire = Vec::new();
-    live::output_until(&mut stream, &mut wire, "$ ");
+    live::prompt_until(&mut stream, &mut wire);
     session.type_text(
         &mut stream,
         2,
@@ -573,7 +588,7 @@ fn non_ascii_input_reaches_a_remote_shell_that_started_without_a_locale() {
     }
     let (session, mut stream) = live::Session::start(&["--noprofile", "--norc"]);
     let mut wire = Vec::new();
-    live::output_until(&mut stream, &mut wire, "$ ");
+    live::prompt_until(&mut stream, &mut wire);
     // Bash counts characters only in a UTF-8 locale; under `C` this is 12.
     session.type_text(&mut stream, 2, "x='ação ç ã'; echo \"LEN=${#x}\"\n");
     live::output_until(&mut stream, &mut wire, "LEN=8\r\n");
@@ -623,8 +638,11 @@ fn reattach_makes_a_full_screen_child_repaint() {
         "the snapshot must carry colors, not only text"
     );
 
+    // The child must be signalled although the size never changed for it, and
+    // end at the real size. Whether it also observes the 23-row step depends on
+    // how fast it runs its trap (a slow macOS runner coalesces both SIGWINCH
+    // into one handler run that already sees 24 rows), so that is not asserted.
     let mut output = Vec::new();
-    live::output_until(&mut stream, &mut output, "WINCH 23 80");
     live::output_until(&mut stream, &mut output, "WINCH 24 80");
     session.close(stream);
 }
@@ -695,7 +713,7 @@ fn reattach_restores_the_shell_cwd_the_client_forgot() {
     std::fs::create_dir_all(&target).unwrap();
     let expected = target.as_os_str().as_encoded_bytes().to_vec();
     let mut wire = Vec::new();
-    live::output_until(&mut stream, &mut wire, "$ ");
+    live::prompt_until(&mut stream, &mut wire);
     session.type_text(
         &mut stream,
         2,
