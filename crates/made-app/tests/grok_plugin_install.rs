@@ -297,6 +297,29 @@ fn expect_install(installed: Option<&str>) {
             .all(|(key, _)| key != made_bridge::config::CONFIG_CONTENT_ENV),
         "Grok must not receive OpenCode's plugin environment"
     );
+    // Grok tab unchanged: no Made Claude Code plugin entry or spool binding is
+    // composed into the Grok launch, and an inherited binding is stripped.
+    assert!(
+        terminal.options().env.iter().all(|(key, _)| {
+            key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
+        }),
+        "the Grok launch environment has no Made Claude Code plugin entry"
+    );
+    assert!(
+        terminal
+            .options()
+            .env_remove
+            .iter()
+            .any(|key| key == "MADE_CLAUDE_SPOOL"),
+        "an inherited Claude spool binding is stripped from the Grok launch"
+    );
+    assert!(
+        model
+            .workspace(grok_id)
+            .and_then(Workbench::claude_tab)
+            .is_none(),
+        "a Grok tab carries no Claude Code state"
+    );
     let program = terminal
         .options()
         .shell

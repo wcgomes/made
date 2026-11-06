@@ -3577,6 +3577,17 @@ fn remote_update_model(
     made_remote::protocol::AuthorityId,
     made_app::app::WorkspaceId,
 ) {
+    remote_update_model_for(name, false)
+}
+
+fn remote_update_model_for(
+    name: &str,
+    claude: bool,
+) -> (
+    AppModel,
+    made_remote::protocol::AuthorityId,
+    made_app::app::WorkspaceId,
+) {
     use made_app::remote_workspace::RemoteWorkspace;
     use made_app::ssh_servers::ServerMetadata;
     use made_platform::Platform;
@@ -3619,9 +3630,32 @@ fn remote_update_model(
         RemotePath::new(b"/project".to_vec()).unwrap(),
     )
     .unwrap();
-    model
-        .attach_remote_model(id, workspace, false)
-        .expect("remote model");
+    if claude {
+        model
+            .hold_ssh_probe_result(
+                id,
+                Ok(made_remote::protocol::Capabilities {
+                    target: made_remote::protocol::RemoteTarget::LinuxX64,
+                    tmux: false,
+                    opencode: false,
+                    shell_cwd: false,
+                    helper_version: "probe".to_owned(),
+                    grok: false,
+                    python3: false,
+                }),
+            )
+            .expect("probe result records");
+        model
+            .hold_ssh_claude_detection(id, true)
+            .expect("detection records");
+        model
+            .attach_remote_claude_model(id, workspace)
+            .expect("remote claude model");
+    } else {
+        model
+            .attach_remote_model(id, workspace, false)
+            .expect("remote model");
+    }
     let remote_id = model.active_workspace_id().expect("remote tab");
     model
         .workspace_mut(remote_id)
@@ -3926,6 +3960,7 @@ fn update_tests_never_write_the_host_app_data_registry() {
         "same_version_update_waits_for_separate_approval_and_reports_the_real_reason",
         "update_refusal_writes_nothing_and_failed_update_keeps_retry_actionable",
         "terminal_update_failures_clear_consent_before_a_later_normal_stage",
+        "claude_ssh_against_an_out_of_date_companion_requires_the_ssh_06_update",
     ] {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -4039,4 +4074,56 @@ fn claude_ssh_requires_detection_and_launches_remote_claude_directly() {
     let before = model.workspace_count();
     assert!(model.begin_remote_claude_launch(without_claude).is_err());
     assert_eq!(model.workspace_count(), before);
+}
+
+#[test]
+fn claude_ssh_against_an_out_of_date_companion_requires_the_ssh_06_update() {
+    if isolated("claude_ssh_against_an_out_of_date_companion_requires_the_ssh_06_update") {
+        return;
+    }
+    let (mut model, authority, remote_id) = remote_update_model_for("claude-update", true);
+    assert_eq!(
+        model.workspace(remote_id).unwrap().terminal_target(),
+        TerminalTarget::RemoteClaude { authority },
+    );
+    // The staged companion predates the Claude target: the fixed stage
+    // reports the same-version mismatch before any companion is spawned.
+    model
+        .workspace_mut(remote_id)
+        .unwrap()
+        .deliver_stage_result(Err(update_required_error()));
+    let ctx = egui::Context::default();
+    model.logic(&ctx);
+
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(workbench.remote_needs_update(), "SSH-06 update-required");
+    assert!(
+        !workbench.companion_spawn_requested(),
+        "no companion, so no remote shell or other program, starts"
+    );
+    assert!(!workbench.remote_update_approved());
+    assert_eq!(
+        workbench.terminal_target(),
+        TerminalTarget::RemoteClaude { authority },
+        "the tab does not fall back to a shell"
+    );
+    assert!(
+        workbench.terminal().is_none(),
+        "no local shell or process backs the tab"
+    );
+    assert!(workbench
+        .remote_detail()
+        .unwrap()
+        .contains("installed companion must be updated"));
+
+    // Refusing leaves everything untouched: nothing written, nothing started.
+    model.refuse_remote_companion_update();
+    let workbench = model.workspace(remote_id).unwrap();
+    assert!(!workbench.remote_needs_update());
+    assert!(!workbench.companion_spawn_requested());
+    assert!(workbench
+        .remote_detail()
+        .unwrap()
+        .contains("Nothing was written or deleted"));
+    assert!(workbench.terminal().is_none());
 }

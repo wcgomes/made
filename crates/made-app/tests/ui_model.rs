@@ -13791,3 +13791,383 @@ fn claude_code_row_walks_not_running_starting_and_ready() {
     );
     assert!(report.contains("claude status: ready"), "{report}");
 }
+
+/// Assert the fixture tab is the connected OpenCode tab: label, 16px
+/// `opencode.svg`, one busy and one idle dot, no Claude Code branding.
+#[cfg(target_os = "linux")]
+fn assert_connected_opencode_tab(fixture: &mut ClaudeFixture, phase: &str) {
+    let output = fixture.labeled("OpenCode");
+    let tab = fixture.tab();
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .iter()
+            .any(|rect| tab.contains_rect(*rect)),
+        "{phase}: the tab stays labeled OpenCode"
+    );
+    assert!(
+        text_rects(&output, "Claude Code", 55.0)
+            .iter()
+            .all(|rect| !tab.contains_rect(*rect)),
+        "{phase}: the tab is not labeled Claude Code"
+    );
+    let dots = tab_session_dots(&output, tab);
+    assert_eq!(dots.len(), 2, "{phase}: only the OpenCode dots");
+    assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the OpenCode busy dot");
+    assert_session_dot_color(
+        &dots[1],
+        made_app::theme::TEXT_TERTIARY,
+        "the OpenCode idle dot",
+    );
+    let icon = painted_images(&output)
+        .into_iter()
+        .find(|image| {
+            (image.rect.width() - 16.0).abs() < 0.75
+                && (image.rect.height() - 16.0).abs() < 0.75
+                && tab.contains_rect(image.rect)
+        })
+        .unwrap_or_else(|| panic!("{phase}: the tab keeps a 16px icon"));
+    assert_eq!(
+        icon.texture,
+        icon_texture(&fixture.headless.ctx, icon_named("opencode.svg")),
+        "{phase}: the icon is opencode.svg, not the Claude mark"
+    );
+}
+
+/// Spec `OpenCode tab unchanged` and the Claude Code precedence scenario: a
+/// connected OpenCode view keeps the tab's label, icon, dots and explorer root
+/// while Claude Code is present in the same shell tab.
+#[cfg(target_os = "linux")]
+#[test]
+fn opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present() {
+    if isolated("opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let id = fixture.id;
+    let root = fixture.root.clone();
+    let claude_dir = temp.path().join("claude-dir");
+    fs::create_dir(&claude_dir).unwrap();
+    let claude_dir = claude_dir.canonicalize().unwrap();
+
+    // A shell-typed `opencode` finds the OpenCode plugin configuration in the
+    // shell tab's environment.
+    let options = bridge_options(fixture.headless.model.workspace(id).unwrap())
+        .expect("the shell tab carries the OpenCode plugin configuration");
+    let mut socket = connect(&options);
+    fixture
+        .headless
+        .pump_until(|model| model.workspace(id).unwrap().is_connected());
+    send_sessions_state(
+        &mut socket,
+        1,
+        &root,
+        &[
+            ("busy-session", true, false),
+            ("idle-session", false, false),
+        ],
+    );
+    fixture
+        .headless
+        .pump_until(|model| model.workspace(id).unwrap().session_map().rows().len() == 2);
+    service_bridge_heartbeat(socket);
+
+    // Phase 1: no Claude Code present.
+    assert!(
+        !fixture
+            .headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::claude_tab)
+            .is_some_and(|tab| tab.present()),
+        "Claude Code is not present before any source"
+    );
+    assert_connected_opencode_tab(&mut fixture, "without Claude Code");
+    assert_eq!(
+        fixture
+            .headless
+            .model
+            .workspace(id)
+            .unwrap()
+            .explorer_root(),
+        Some(root.as_path())
+    );
+
+    // Phase 2: Claude Code becomes present through both channels, with a
+    // working directory elsewhere. OpenCode keeps everything.
+    fixture.emit(CLAUDE_ESC_WORKING);
+    fixture.hook(&claude_dir, "SessionStart", "idle", "Claude title");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        fixture.headless.render();
+        let present = fixture
+            .headless
+            .model
+            .workspace(id)
+            .and_then(Workbench::claude_tab)
+            .is_some_and(|tab| tab.present());
+        if present {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Claude Code never became present"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for _ in 0..30 {
+        fixture.headless.render();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_connected_opencode_tab(&mut fixture, "with Claude Code present");
+    let workbench = fixture.headless.model.workspace(id).unwrap();
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(root.as_path()),
+        "Claude Code does not take the explorer root from OpenCode"
+    );
+    assert_eq!(
+        workbench.session_map().rows().len(),
+        2,
+        "the OpenCode session map is untouched"
+    );
+}
+
+/// Spec `OpenCode tab unchanged` (menu launch): the OpenCode child keeps its
+/// launch injection and receives no Claude Code plugin entry or spool.
+#[cfg(unix)]
+#[test]
+fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
+    if isolated("a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "current", "main.rs");
+    let (mut headless, first) =
+        menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::ClaudeCode]);
+    headless.model.begin_tui_workspace(CompatibleTui::OpenCode);
+    let mut opened = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while opened.is_none() && Instant::now() < deadline {
+        headless.render();
+        opened = headless.model.workspace_ids().find(|id| *id != first);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let opened = opened.expect("the OpenCode tab opened");
+    let workbench = headless.model.workspace(opened).unwrap();
+    let terminal = workbench.terminal().expect("the OpenCode child spawned");
+    let options = terminal.options();
+    assert!(
+        Path::new(options.shell.as_deref().expect("explicit program")).ends_with("opencode"),
+        "{:?}",
+        options.shell
+    );
+    assert!(options.args.is_empty(), "no argument is added to opencode");
+    assert!(
+        bridge_options(workbench).is_some(),
+        "the OpenCode plugin configuration is still injected"
+    );
+    for key in [
+        made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV,
+        "MADE_CLAUDE_SPOOL",
+    ] {
+        assert!(
+            options.env.iter().all(|(name, _)| name != key),
+            "{key} must not reach the OpenCode launch"
+        );
+    }
+    assert!(
+        options
+            .env_remove
+            .iter()
+            .any(|key| key == "MADE_CLAUDE_SPOOL"),
+        "an inherited spool binding is stripped"
+    );
+    assert!(
+        workbench.claude_tab().is_none(),
+        "an OpenCode tab carries no Claude Code state"
+    );
+    let report = workbench.sanitized_diagnostics_text();
+    assert!(
+        !report.contains("Claude Code session"),
+        "no Claude Code session wording in an OpenCode tab: {report}"
+    );
+}
+
+/// Narrowed `Shell Directory Follow` regression: OSC 0/2 window-title changes
+/// in a shell tab, with and without a live Claude Code protocol status, never
+/// change the shell cwd or the explorer root.
+#[cfg(target_os = "linux")]
+#[test]
+fn osc_title_changes_never_change_the_shell_cwd_or_explorer_root() {
+    if isolated("osc_title_changes_never_change_the_shell_cwd_or_explorer_root") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let id = fixture.id;
+    let root = fixture.root.clone();
+    let mut elsewhere = Vec::new();
+    for name in ["title-a", "title-b", "title-c"] {
+        let path = temp.path().join(name);
+        fs::create_dir(&path).unwrap();
+        elsewhere.push(path.canonicalize().unwrap());
+    }
+    let shell_cwd = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .shell_cwd()
+        .to_path_buf();
+    let settle = |fixture: &mut ClaudeFixture| {
+        for _ in 0..30 {
+            fixture.headless.render();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let assert_unmoved = |fixture: &ClaudeFixture, phase: &str| {
+        let workbench = fixture.headless.model.workspace(id).unwrap();
+        assert_eq!(
+            workbench.explorer_root(),
+            Some(root.as_path()),
+            "{phase}: a title never moves the explorer"
+        );
+        assert_eq!(
+            workbench.shell_cwd(),
+            shell_cwd.as_path(),
+            "{phase}: a title never changes the shell cwd"
+        );
+        assert!(
+            workbench.shell_cwd_error().is_none(),
+            "{phase}: a title is not a cwd report"
+        );
+    };
+
+    // Without any Claude Code status.
+    for dir in &elsewhere[..2] {
+        fixture.emit(format!("\x1b]0;{}\x07", dir.display()).as_bytes());
+        fixture.emit(format!("\x1b]2;cd {}\x07", dir.display()).as_bytes());
+    }
+    settle(&mut fixture);
+    assert_unmoved(&fixture, "without Claude Code status");
+
+    // With a live Claude Code protocol status the title may be shown, but it
+    // still never drives a directory.
+    fixture.emit(CLAUDE_ESC_WORKING);
+    fixture.labeled("Claude Code");
+    fixture.emit(format!("\x1b]0;{}\x07", elsewhere[2].display()).as_bytes());
+    fixture.emit(format!("\x1b]2;{}\x07", elsewhere[1].display()).as_bytes());
+    settle(&mut fixture);
+    assert_unmoved(&fixture, "with live Claude Code status");
+
+    fixture.emit(CLAUDE_ESC_CLEAR);
+    fixture.emit(format!("\x1b]0;{}\x07", elsewhere[0].display()).as_bytes());
+    settle(&mut fixture);
+    assert_unmoved(&fixture, "after Claude Code status clears");
+}
+
+/// Spec `No prompt or message content anywhere`, `Window titles and screen are
+/// not used` and `Permission message never shown`, at the rendering level:
+/// content markers carried by spool records never appear in the tooltip, the
+/// About diagnostics, the copied report or the log, and a window-title marker
+/// reaches the tooltip only while a protocol status is live.
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_content_markers_never_reach_the_tooltip_diagnostics_report_or_log() {
+    if isolated("claude_content_markers_never_reach_the_tooltip_diagnostics_report_or_log") {
+        return;
+    }
+    use std::io::Write;
+
+    const CONTENT: [&str; 4] = [
+        "MARKER-PROMPT-5e2b",
+        "MARKER-TOOL-INPUT-5e2b",
+        "MARKER-MESSAGE-5e2b",
+        "MARKER-MSG-5e2b",
+    ];
+    const TITLE_MARKER: &str = "TITLE-MARKER-5e2b";
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = ClaudeFixture::new(temp.path());
+    let id = fixture.id;
+    let shell = fixture
+        .headless
+        .model
+        .workspace(id)
+        .and_then(Workbench::terminal)
+        .and_then(made_app::TerminalPane::pid)
+        .unwrap();
+    let append = |fixture: &ClaudeFixture, event: &str, status: &str| {
+        let line = json!({
+            "at": "t", "sessionId": "s1", "cwd": fixture.root, "event": event,
+            "notification": "", "status": status, "title": "",
+            "pids": [4_000_000u32, fixture.claude_pid, shell],
+            "prompt": CONTENT[0], "tool_input": {"command": CONTENT[1]},
+            "message": CONTENT[2], "msg": CONTENT[3],
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.spool)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    };
+    let assert_clean = |text: &str, what: &str| {
+        for marker in CONTENT {
+            assert!(!text.contains(marker), "{marker} leaked into {what}");
+        }
+    };
+
+    // Hook-only presence with a window-title marker: no live protocol status,
+    // so the title is not read and the tooltip is the plain name.
+    fixture.emit(format!("\x1b]0;{TITLE_MARKER} title\x07").as_bytes());
+    append(&fixture, "SessionStart", "idle");
+    append(&fixture, "UserPromptSubmit", "working");
+    append(&fixture, "Notification", "attention");
+    fixture.labeled("Claude Code");
+    let hovered = fixture.hover_tab("Claude Code");
+    assert_clean(&hovered, "the hook-only tooltip");
+    assert!(
+        !hovered.contains(TITLE_MARKER),
+        "the window title is not shown without a live protocol status: {hovered}"
+    );
+
+    // With a live protocol status the sanitized title is the tooltip, and
+    // still no content marker appears.
+    fixture.emit(CLAUDE_ESC_WORKING);
+    fixture.emit(format!("\x1b]0;{TITLE_MARKER} title\x07").as_bytes());
+    fixture.labeled("Claude Code");
+    let hovered = fixture.hover_tab(TITLE_MARKER);
+    assert!(hovered.contains(TITLE_MARKER), "{hovered}");
+    assert_clean(&hovered, "the protocol tooltip");
+
+    // About diagnostics, the copied report and the log.
+    open_about_diagnostics(&mut fixture.headless, id);
+    let about = output_text(&fixture.headless.render());
+    assert_clean(&about, "the About diagnostics");
+    assert!(!about.contains(TITLE_MARKER), "{about}");
+    let report = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .sanitized_diagnostics_text();
+    assert_clean(&report, "the copied report");
+    assert!(!report.contains(TITLE_MARKER), "{report}");
+    let log = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .diagnostics()
+        .log()
+        .entries()
+        .map(|entry| entry.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_clean(&log, "the workspace log");
+    assert!(!log.contains(TITLE_MARKER));
+    if let Ok(file) = fs::read_to_string(isolated_log_path()) {
+        assert_clean(&file, "the integration log");
+        assert!(!file.contains(TITLE_MARKER));
+    }
+}

@@ -927,6 +927,10 @@ impl SshProcess {
             .env("MADE_ASKPASS_SOCKET", prompts.socket_path())
             .env("DISPLAY", "made-private-askpass")
             .env_remove("SSH_ASKPASS_PROMPT")
+            // Claude Code status plumbing belongs to the terminal child only;
+            // the local ssh client never inherits it.
+            .env_remove("MADE_CLAUDE_SPOOL")
+            .env_remove("CLAUDE_CODE_PLUGIN_DIRS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

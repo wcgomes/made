@@ -875,6 +875,8 @@ pub enum AgentIntegration {
     OpenCodeV2,
     /// Grok Build session follow, offered when `grok` is on `PATH`.
     GrokBuild,
+    /// Claude Code session follow, offered when `claude` is on `PATH`.
+    ClaudeCode,
 }
 
 impl AgentIntegration {
@@ -883,6 +885,7 @@ impl AgentIntegration {
         match self {
             Self::OpenCodeV2 => "opencode-v2",
             Self::GrokBuild => "grok-build",
+            Self::ClaudeCode => "claude-code",
         }
     }
 
@@ -891,6 +894,7 @@ impl AgentIntegration {
         match self {
             Self::OpenCodeV2 => "OpenCode v2",
             Self::GrokBuild => "Grok Build",
+            Self::ClaudeCode => "Claude Code",
         }
     }
 }
@@ -910,7 +914,11 @@ pub struct ScopeBoundary {
 
 /// The v1 scope boundary.
 pub const V1_SCOPE: ScopeBoundary = ScopeBoundary {
-    agent_integrations: &[AgentIntegration::OpenCodeV2, AgentIntegration::GrokBuild],
+    agent_integrations: &[
+        AgentIntegration::OpenCodeV2,
+        AgentIntegration::GrokBuild,
+        AgentIntegration::ClaudeCode,
+    ],
     chat_ui: false,
     worktree_management: false,
     separate_opencode_server: false,

@@ -1786,6 +1786,87 @@ fn cancel_kills_the_process_group_not_only_the_direct_child() {
     );
 }
 
+/// The local ssh client must not inherit the Claude Code spool or plugin
+/// directories. The environment is set on a re-executed copy of this test so
+/// the multi-threaded parent never mutates its own environment.
+#[test]
+#[cfg(unix)]
+fn local_ssh_client_does_not_inherit_the_claude_spool_or_plugin_dirs() {
+    use made_platform::ssh::SshProcess;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "local_ssh_client_does_not_inherit_the_claude_spool_or_plugin_dirs";
+    if std::env::var_os("MADE_SSH_ENV_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env("MADE_SSH_ENV_CHILD", "1")
+            .env("MADE_CLAUDE_SPOOL", "/spool/ws-1.jsonl")
+            .env("CLAUDE_CODE_PLUGIN_DIRS", "/plugins/made")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the re-executed test must actually run"
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let known_hosts = root.join("known_hosts");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&known_hosts)
+        .unwrap();
+    let seen = root.join("seen.env");
+    let fake = root.join("ssh");
+    write_executable(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_8.4p1\\n' >&2; exit 0; fi\n\
+             printf '%s|%s' \"${{MADE_CLAUDE_SPOOL-unset}}\" \"${{CLAUDE_CODE_PLUGIN_DIRS-unset}}\" > '{}'\n\
+             sleep 30\n",
+            seen.display()
+        ),
+    );
+    let askpass = root.join("askpass");
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
+    let mut options = options();
+    options.executable = fake;
+    options.askpass_executable = askpass;
+    options.private_directory = root.to_path_buf();
+    options.known_hosts = known_hosts;
+    assert_eq!(
+        std::env::var("MADE_CLAUDE_SPOOL").as_deref(),
+        Ok("/spool/ws-1.jsonl"),
+        "the fixture parent environment carries the spool"
+    );
+    let mut process = SshProcess::spawn(options).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        if let Ok(text) = std::fs::read_to_string(&seen) {
+            if !text.is_empty() {
+                break text;
+            }
+        }
+        assert!(Instant::now() < deadline, "fake ssh did not report its env");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    process.cancel();
+    assert_eq!(text, "unset|unset");
+}
+
 #[test]
 fn ssh_failure_classification_is_sanitized_and_stable() {
     use made_platform::ssh::{

@@ -506,7 +506,7 @@ fn reason_codes_and_scope_are_enumerated() {
             .iter()
             .map(|integration| integration.id())
             .collect::<Vec<_>>(),
-        ["opencode-v2", "grok-build"]
+        ["opencode-v2", "grok-build", "claude-code"]
     );
     const { assert!(!V1_SCOPE.chat_ui) };
     const { assert!(!V1_SCOPE.worktree_management) };

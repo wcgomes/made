@@ -1,4 +1,4 @@
-//! V1 scope-boundary tests: OpenCode v2 and Grok Build only, no chat UI, no
+//! V1 scope-boundary tests: OpenCode v2, Grok Build and Claude Code only, no chat UI, no
 //! worktree management, and no separate server requirement.
 
 use made_app::integration_status::{AgentIntegration, V1_SCOPE};
@@ -20,15 +20,28 @@ const CORE_SOURCES: &[&str] = &[
     include_str!("../src/runtime_guard.rs"),
 ];
 
+/// Agents and surfaces that must stay out of the core and the integration
+/// status code. Claude Code is an offered row, so it is not listed.
+const FORBIDDEN_SURFACES: &[&str] = &["codex", "gemini", "copilot", "aider", "acp", "chat ui"];
+
 #[test]
-fn only_opencode_v2_and_grok_build_are_offered() {
-    assert_eq!(V1_SCOPE.agent_integrations.len(), 2);
+fn only_opencode_grok_and_claude_code_are_offered() {
+    let rows: Vec<_> = V1_SCOPE
+        .agent_integrations
+        .iter()
+        .map(|row| (row.id(), row.name()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("opencode-v2", "OpenCode v2"),
+            ("grok-build", "Grok Build"),
+            ("claude-code", "Claude Code"),
+        ]
+    );
     assert_eq!(V1_SCOPE.agent_integrations[0], AgentIntegration::OpenCodeV2);
-    assert_eq!(V1_SCOPE.agent_integrations[0].id(), "opencode-v2");
-    assert_eq!(V1_SCOPE.agent_integrations[0].name(), "OpenCode v2");
     assert_eq!(V1_SCOPE.agent_integrations[1], AgentIntegration::GrokBuild);
-    assert_eq!(V1_SCOPE.agent_integrations[1].id(), "grok-build");
-    assert_eq!(V1_SCOPE.agent_integrations[1].name(), "Grok Build");
+    assert_eq!(V1_SCOPE.agent_integrations[2], AgentIntegration::ClaudeCode);
 }
 
 #[test]
@@ -36,9 +49,7 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
     const { assert!(!V1_SCOPE.chat_ui) };
     for source in CORE_SOURCES {
         let lower = source.to_ascii_lowercase();
-        // Claude Code is the third catalog row (V1 Scope Boundary), so core
-        // follow code names it. Task 8.2 finishes this test.
-        for forbidden in ["codex", "acp", "chat ui"] {
+        for forbidden in FORBIDDEN_SURFACES {
             assert!(
                 !lower.contains(forbidden),
                 "core source mentions forbidden agent/chat surface {forbidden:?}"
@@ -46,15 +57,10 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
         }
     }
     let integration = include_str!("../src/integration_status.rs").to_ascii_lowercase();
-    assert!(
-        integration.contains("grok build"),
-        "Grok Build is an offered integration, not a forbidden mention"
-    );
-    // The Claude Code diagnostics row lives here; task 8.2 finishes this test.
-    for forbidden in ["codex", "acp", "chat ui"] {
+    for offered in ["grok build", "claude code"] {
         assert!(
-            !integration.contains(forbidden),
-            "integration status mentions forbidden surface {forbidden:?}"
+            integration.contains(offered),
+            "{offered} is an offered integration, not a forbidden mention"
         );
     }
 }

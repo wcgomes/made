@@ -1364,6 +1364,35 @@ impl AppModel {
         Ok(())
     }
 
+    /// Attach a remote model as a directly launched `Claude Code SSH` tab
+    /// without starting SSH, for tests of the pre-attach states.
+    pub fn attach_remote_claude_model(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        workspace: crate::remote_workspace::RemoteWorkspace,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .ssh
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .snapshot(id)
+            .map_err(|error| error.to_string())?;
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot,
+            workspace,
+            TerminalTarget::RemoteClaude { authority: id },
+            "Remote model attached",
+        );
+        if let Ok(registry) = self.ssh.as_ref() {
+            workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
+        }
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
     /// Attach a remote model as a directly launched `Grok SSH` tab: the target
     /// is the server's grok process, never a host binary. A missing live SSH
     /// process is not reported as a successful connection.

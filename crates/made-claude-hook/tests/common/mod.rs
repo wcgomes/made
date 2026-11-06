@@ -127,13 +127,25 @@ pub fn wait_open(mut child: Child, limit: Duration) -> Option<(Outcome, std::pro
     }
 }
 
+/// A hook may exit (silently, by contract) before the test finishes writing its
+/// payload; the resulting broken pipe is the hook's valid early exit, not a
+/// test failure. Any other write error is still fatal.
+fn tolerate_closed_pipe(result: std::io::Result<()>) {
+    if let Err(error) = result {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "writing the payload to the hook failed: {error}"
+        );
+    }
+}
+
 /// Write `payload`, leave standard input open and wait for exit.
 pub fn run_open(spool: Option<&Path>, payload: &[u8], limit: Duration) -> Outcome {
     let mut child = spawn(spool);
     {
         let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(payload).unwrap();
-        stdin.flush().unwrap();
+        tolerate_closed_pipe(stdin.write_all(payload).and_then(|()| stdin.flush()));
     }
     let (outcome, _stdin) =
         wait_open(child, limit).expect("hook exited without waiting for stdin to close");
@@ -145,7 +157,7 @@ pub fn run_closed(spool: Option<&Path>, payload: &[u8]) -> Outcome {
     let mut child = spawn(spool);
     drop({
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(payload).unwrap();
+        tolerate_closed_pipe(stdin.write_all(payload));
         stdin
     });
     let started = Instant::now();
