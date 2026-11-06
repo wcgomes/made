@@ -46,6 +46,60 @@ use crate::{
     SystemClipboard,
 };
 
+/// Reconnect standard streams to the launching console, if there is one.
+///
+/// The GUI binary uses the Windows GUI subsystem so a double-click opens no
+/// console window. A process started that way has no standard handles, so
+/// `--help`, `--version`, `--update` and diagnostics run from `cmd` or
+/// PowerShell would print nowhere. This attaches to the parent's console (it
+/// never creates one) and fills only the standard handles that are missing, so
+/// redirected output and pipes are left untouched. With no parent console
+/// (Explorer, shortcut, installer) it does nothing, and Rust's stdio silently
+/// discards writes to missing handles.
+pub fn attach_parent_console() {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls with valid arguments; the opened console
+    // handles are intentionally kept for the life of the process.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let streams: [(u32, &str, u32); 3] = [
+            (STD_INPUT_HANDLE, "CONIN$", GENERIC_READ),
+            (STD_OUTPUT_HANDLE, "CONOUT$", GENERIC_WRITE),
+            (STD_ERROR_HANDLE, "CONOUT$", GENERIC_WRITE),
+        ];
+        for (id, device, access) in streams {
+            let current = GetStdHandle(id);
+            if !current.is_null() && current != INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if handle != INVALID_HANDLE_VALUE {
+                SetStdHandle(id, handle);
+            }
+        }
+    }
+}
+
 /// Windows backend implementing [`Platform`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsPlatform;

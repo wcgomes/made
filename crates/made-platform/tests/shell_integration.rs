@@ -709,3 +709,54 @@ fn unsafe_modes_and_unknown_shells_are_unchanged() {
         assert!(plan.bootstrap_directory().is_none());
     }
 }
+
+#[test]
+fn cmd_launch_plan_emits_osc7_from_a_launch_local_prompt() {
+    let dir = std::env::temp_dir().join(format!("made-cmd-plan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("cmd.exe");
+    std::fs::write(&program, b"").unwrap();
+    let osc7 = r"$E]7;file://localhost/$P$E\";
+
+    let plan_for = |prompt: Option<&str>, args: &[&str]| {
+        let mut request = PtyRequest::new(&program, std::env::temp_dir());
+        request.args = args.iter().map(Into::into).collect();
+        request.env = vec![("PATH".into(), "".into())];
+        if let Some(prompt) = prompt {
+            request.env.push(("PROMPT".into(), prompt.into()));
+        }
+        ShellLaunchPlan::new(request)
+    };
+    let prompt_of = |plan: &ShellLaunchPlan| {
+        plan.request()
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PROMPT")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    };
+
+    let default = plan_for(None, &[]);
+    assert!(
+        default.capability().is_supported(),
+        "{:?}",
+        default.capability()
+    );
+    assert_eq!(prompt_of(&default), Some(format!("{osc7}$P$G")));
+    assert!(default.bootstrap_directory().is_none());
+    assert!(default.request().args.is_empty());
+
+    let custom = plan_for(Some("$T $P$G "), &["/d"]);
+    assert!(custom.capability().is_supported());
+    assert_eq!(prompt_of(&custom), Some(format!("{osc7}$T $P$G ")));
+    assert_eq!(custom.request().args, ["/d"]);
+
+    for args in [&["/c", "dir"][..], &["/k", "echo hi"][..]] {
+        let command = plan_for(Some("$P$G"), args);
+        assert!(!command.capability().is_supported());
+        assert_eq!(prompt_of(&command), Some("$P$G".into()));
+    }
+
+    drop((default, custom));
+    std::fs::remove_dir_all(dir).unwrap();
+}

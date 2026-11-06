@@ -6,6 +6,11 @@
 //! pumps frames, prints a smoke marker, and exits. `--update [--apply]` is the
 //! non-interactive update entry of an installed build.
 
+// GUI subsystem on Windows: launching Made must not open a console window.
+// `windows::attach_parent_console` restores CLI output when started from a
+// terminal.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +24,7 @@ use made_app::updates::{command_line_update, PlatformCapability, UpdateScheduler
 use made_platform::update::{self as platform_update, CliApplyOutcome, Updater};
 
 fn main() -> ExitCode {
+    made_platform::attach_parent_console();
     // Velopack's install/update hooks first. Auto-apply on startup is off:
     // a downloaded update is applied only after confirmation (REL-07).
     platform_update::run_startup_hook();

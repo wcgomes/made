@@ -151,6 +151,17 @@ impl RequestedMode {
     }
 }
 
+/// Whether the GPU surface must be a composition swapchain to carry alpha.
+///
+/// True on Windows: wgpu's default DX12 swapchain (`DxgiFromHwnd`) exposes only
+/// `CompositeAlphaMode::Opaque`, so egui-wgpu falls back to an opaque surface
+/// and the translucent clear color never reaches DWM, even with Mica applied.
+/// A DirectComposition swapchain (`DxgiFromVisual`) exposes pre-multiplied
+/// alpha. Other platforms need nothing special.
+pub const fn requires_composition_swapchain() -> bool {
+    cfg!(target_os = "windows")
+}
+
 /// Attempt to apply a native backdrop to `window`, once, at startup.
 ///
 /// This function never panics on an unavailable effect: it returns an
@@ -247,14 +258,45 @@ mod macos {
 
 #[cfg(target_os = "windows")]
 fn apply_platform(window: impl HasWindowHandle) -> NativeBackdropStatus {
-    match window_vibrancy::apply_mica(window, Some(true)) {
-        Ok(()) => NativeBackdropStatus::applied(
-            NativeBackdropKind::WindowsMica,
-            "Windows 11 Mica applied",
-        ),
+    match window_vibrancy::apply_mica(&window, Some(true)) {
+        Ok(()) => {
+            // The system backdrop only shows through the client area when the
+            // frame is extended over it (`DwmExtendFrameIntoClientArea`, -1).
+            let reason = if windows_dwm::extend_frame_into_client_area(&window) {
+                "Windows 11 Mica applied"
+            } else {
+                "Windows 11 Mica applied; extending the frame into the client area failed"
+            };
+            NativeBackdropStatus::applied(NativeBackdropKind::WindowsMica, reason)
+        }
         Err(error) => NativeBackdropStatus::fallback(format!(
             "Windows Mica unavailable: {error}; using in-app glass"
         )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_dwm {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+    use windows_sys::Win32::UI::Controls::MARGINS;
+
+    pub(super) fn extend_frame_into_client_area(window: &impl HasWindowHandle) -> bool {
+        let Ok(handle) = window.window_handle() else {
+            return false;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return false;
+        };
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        // SAFETY: the HWND belongs to the live eframe window and `margins`
+        // outlives the call.
+        unsafe { DwmExtendFrameIntoClientArea(handle.hwnd.get() as _, &margins) >= 0 }
     }
 }
 
@@ -325,6 +367,14 @@ mod tests {
         let default = NativeBackdropStatus::default();
         assert!(!default.is_applied());
         assert!(!default.reason().is_empty());
+    }
+
+    #[test]
+    fn only_windows_requires_a_composition_swapchain() {
+        assert_eq!(
+            requires_composition_swapchain(),
+            cfg!(target_os = "windows")
+        );
     }
 
     #[test]

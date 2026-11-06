@@ -162,6 +162,14 @@ pub mod update;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// Reconnect standard streams to the launching console on Windows, where the
+/// GUI binary has none of its own (see [`windows::attach_parent_console`]).
+/// Does nothing on other platforms.
+pub fn attach_parent_console() {
+    #[cfg(target_os = "windows")]
+    windows::attach_parent_console();
+}
+
 /// Environment variable that overrides the app-owned plugin directory.
 ///
 /// Development builds may point this at any staged plugin package. Release
@@ -3066,7 +3074,9 @@ pub use detach::{
     spawn_detached_command,
 };
 pub use process::process_parent;
-pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
+pub use shell_integration::{
+    local_cmd_prompt_cwd, local_cwd_path, ShellCwdCapability, ShellLaunchPlan,
+};
 pub use ssh_askpass::askpass_file_name;
 
 #[cfg(test)]
