@@ -2,7 +2,7 @@ name: Development artifacts
 
 on:
   push:
-    branches: [main, release/v0.1.0] # TEMP release/v0.1.0
+    branches: [main]
   workflow_dispatch:
 
 permissions:

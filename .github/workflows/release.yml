@@ -28,7 +28,6 @@ env:
   # FUSE-less AppImage runtime (probe 1.4, fallback A), pinned by digest.
   URUNTIME_URL: https://github.com/VHSgunzo/uruntime/releases/download/v0.8.1/uruntime-appimage-squashfs-x86_64
   URUNTIME_SHA256: 2153e68d63f570c7ebe3d1f38df0fa16814f34d839c5cce2ee42667e327708e8
-  ITERATION_NOTE: "Temporary test release — will be deleted." # TEMP release/v0.1.0
 
 jobs:
   gate:
@@ -307,10 +306,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          {
-            if [ -n "${ITERATION_NOTE:-}" ]; then printf '> **%s**\n\n' "$ITERATION_NOTE"; fi
-            sed "s/{{VERSION}}/$version/g" .github/release-notes.md
-          } > "$RUNNER_TEMP/notes.md"
+          sed "s/{{VERSION}}/$version/g" .github/release-notes.md > "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "Made $version" --notes-file "$RUNNER_TEMP/notes.md" dist/release/*
 

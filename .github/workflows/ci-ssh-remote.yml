@@ -6,8 +6,6 @@ name: SSH remote companions
 # companion for download at connection time.
 
 on:
-  push:
-    branches: [release/v0.1.0] # TEMP release/v0.1.0
   pull_request:
   workflow_dispatch:
   workflow_call:
