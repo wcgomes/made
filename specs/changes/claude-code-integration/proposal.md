@@ -58,6 +58,7 @@ Conflicts and overlaps flagged, not resolved here:
 - **Mark:** the official Claude Code mark vendored as an SVG asset, treated like `grok.svg`; the asset task records its source URL.
 - **Remote scope:** launch and OSC 7501 status through the remote PTY only; remote hooks and companion staging are a follow-up change.
 - **ADR 0008 (written during implementation):** "Claude Code via OSC 7501 and a session-only plugin", recording the two-channel decision, the rejected alternatives (including `claude agents --json` and title glyphs), and the security-policy update that replaces "Made does not scrape titles" with "Made consumes structured status-protocol metadata, and reads the window title only as a bounded tooltip while that structured status is live; never prompts, screen contents or titles for directories".
+- **Live acceptance (task 8.13, claude 2.1.319, Linux/WSL):** 9 cases PASS (shell and menu load plugin once; user plugins and plugin dirs preserved; outside Made does not load plugin; --bare keeps protocol status only; disabled title keeps hooks only; tmux yields plain terminal; neither channel gives direct branding only; /clear replaces the session; turn stop and stop failure); working-directory change UNVERIFIED (CwdChanged did not fire; fixture tests cover it).
 
 ## Clarifications
 - **Q:** What is the exact OSC 7501 field set beyond `state` and `app`, and how is the status cleared?
@@ -80,3 +81,10 @@ Conflicts and overlaps flagged, not resolved here:
   **A:** Modified. The MODIFIED copy is verbatim except the title clause, which now reads as cwd-discovery scope, says a window title is never a cwd source, and cross-references the bounded tooltip-title allowance owned by `Claude Code privacy and observation boundary`.
 - **Q:** Does a capability probe count as the status protocol being observed? (`analyze` finding)
   **A:** No. Only a session-level `app=claude-code` emission counts, because a probe can be followed by no emissions if the reply is late, misordered, or Claude Code does not enable reporting.
+
+## Archive reconciliation: REL-03 and REL-04 (task 9.9)
+`add-release-auto-update` REL-03 (installed layout) and REL-04 (bundled plugin packages, no prerequisite) enumerate only `opencode-made` and `grok-made`. The exact clauses to add so that the Claude Code package is covered:
+- **REL-03 (installed layout):** the installed layout MUST contain `plugins/claude-code-made` with its manifest (`.claude-plugin/plugin.json`), `hooks/hooks.json`, README and the executable native hook `bin/made-claude-status` (`bin/made-claude-status.exe` on Windows) for the release target, resolved from the install root without download.
+- **REL-04 (no prerequisite):** the bundled-plugin rule covers `claude-code-made`: its hook is a native executable that needs no interpreter or other prerequisite and keeps its executable bit.
+
+Application depends on archive order: if `add-release-auto-update` archives first, this change adds a MODIFIED REL-03/REL-04 entry (carrying these clauses) before its own archive; otherwise the clauses are handed to that change's archive. `specs/changes/add-release-auto-update/` is not edited by this change.

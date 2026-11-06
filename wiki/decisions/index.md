@@ -7,3 +7,4 @@
 - [0005: Home-Default Startup](0005-home-default-startup.md) — home, picker, precedence — Default home workspace with explicit picker and fallback.
 - [0006: Native Grok Status Hook](0006-native-grok-hook.md) — hook, Rust, python3 — Interpreter-free Grok status hook replacing the Python script.
 - [0007: GitHub Releases and Velopack](0007-github-releases-velopack-unsigned.md) — releases, auto-update, unsigned — Release channel, updater, unsigned builds, single version source.
+- [0008: Claude Code via OSC 7501 and Session Plugin](0008-claude-code-osc7501-session-plugin.md) — OSC 7501, plugin, window-title — Two-channel Claude Code integration, rejected alternatives, bounded title rule.
