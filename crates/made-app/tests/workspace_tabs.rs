@@ -3958,3 +3958,85 @@ fn update_tests_never_write_the_host_app_data_registry() {
         );
     }
 }
+
+#[test]
+fn claude_ssh_requires_detection_and_launches_remote_claude_directly() {
+    if isolated("claude_ssh_requires_detection_and_launches_remote_claude_directly") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemoteTarget};
+
+    let capabilities = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: false,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: false,
+        python3: false,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let mut add = |name: &str| {
+        model
+            .add_ssh_metadata(ServerMetadata {
+                display_name: name.into(),
+                host: format!("{name}.example"),
+                user: None,
+                port: None,
+                key_file: None,
+                initial_directory: None,
+            })
+            .expect("server metadata saves")
+    };
+    let with_claude = add("claude-server");
+    let without_claude = add("plain-server");
+    for id in [with_claude, without_claude] {
+        model
+            .hold_ssh_probe_result(id, Ok(capabilities.clone()))
+            .expect("probe result records");
+    }
+    model
+        .hold_ssh_claude_detection(with_claude, true)
+        .expect("detection records");
+
+    // The row exists only where that server's own probe detected claude.
+    assert!(model.remote_claude_detected_on(with_claude).unwrap());
+    assert!(!model.remote_claude_detected_on(without_claude).unwrap());
+
+    // The current tab keeps running: open a local shell tab first.
+    model.open_plan(LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let local_id = model.active_workspace_id().expect("local tab");
+
+    model
+        .begin_remote_claude_launch(with_claude)
+        .expect("claude ssh starts");
+    let claude_id = model.active_workspace_id().expect("remote claude tab");
+    assert_ne!(claude_id, local_id, "the launch opens a new tab");
+    assert!(
+        !model.remote_launch_pending(),
+        "a direct Claude Code SSH launch must not open a folder picker draft"
+    );
+    assert_eq!(
+        model.workspace(claude_id).unwrap().terminal_target(),
+        TerminalTarget::RemoteClaude {
+            authority: with_claude
+        },
+    );
+    assert!(
+        model
+            .workspace(local_id)
+            .and_then(made_app::Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "the current tab keeps running across the Claude Code SSH launch"
+    );
+
+    // An undetected server never starts a launch, locally or remotely.
+    let before = model.workspace_count();
+    assert!(model.begin_remote_claude_launch(without_claude).is_err());
+    assert_eq!(model.workspace_count(), before);
+}

@@ -216,6 +216,67 @@ fn probe_parses_grok_detection_honestly_and_never_reports_python3() {
     assert!(!detected.tmux);
 }
 
+fn probe_output_with_claude(grok: &str, claude: &str) -> Vec<u8> {
+    format!("MADE-PROBE-1\nLinux\nx86_64\n\n{grok}\n{claude}\n").into_bytes()
+}
+
+#[test]
+fn probe_report_parses_claude_as_the_line_after_grok() {
+    let detected =
+        parse_probe_report(&probe_output_with_claude("", "/home/u/.local/bin/claude")).unwrap();
+    assert!(detected.claude && !detected.capabilities.grok);
+    // Claude is independent of grok and of the companion capabilities.
+    let both = parse_probe_report(&probe_output_with_claude(
+        "/home/u/bin/grok",
+        "/usr/bin/claude",
+    ))
+    .unwrap();
+    assert!(both.claude && both.capabilities.grok);
+    // Relative, option-like, empty, controlled and missing lines are absence.
+    for line in ["claude", "-claude", "", "/bin/cl\u{7}ude"] {
+        let report = parse_probe_report(&probe_output_with_claude("", line)).unwrap();
+        assert!(!report.claude, "{line:?} must not count as detection");
+    }
+    let short = parse_probe_report(b"MADE-PROBE-1\nLinux\nx86_64\n\n/home/u/bin/grok\n").unwrap();
+    assert!(!short.claude && short.capabilities.grok);
+    // The Capabilities parser is unchanged by the extra line.
+    assert_eq!(
+        parse_probe_output(&probe_output_with_claude("", "/usr/bin/claude")),
+        Ok(detected.capabilities)
+    );
+    assert_eq!(
+        parse_probe_report(b"not-the-banner\n"),
+        Err(ErrorCode::InvalidRequest)
+    );
+}
+
+#[test]
+fn claude_detection_is_per_server_and_never_reused() {
+    let mut registry = ServerRegistry::load(Storage::default()).unwrap();
+    let a = registry.add(metadata("server-a")).unwrap();
+    let b = registry.add(metadata("server-b")).unwrap();
+    assert!(!registry.can_launch_claude(a), "no probe, no detection");
+    registry.record_probe_result(a, Ok(capabilities())).unwrap();
+    registry.record_probe_result(b, Ok(capabilities())).unwrap();
+    assert!(!registry.can_launch_claude(a));
+    registry.record_claude_detection(a, true);
+    // Claude Code SSH is offered only where this server's own probe found it.
+    assert!(registry.can_launch_claude(a));
+    assert!(!registry.can_launch_claude(b));
+    // A new probe attempt and a failed probe forget the earlier detection.
+    registry.record_probe_result(a, Ok(capabilities())).unwrap();
+    assert!(!registry.can_launch_claude(a));
+    registry.record_claude_detection(a, true);
+    registry.record_probe_result(a, Err(ErrorCode::Io)).unwrap();
+    assert!(!registry.can_launch_claude(a));
+    registry.record_probe_result(a, Ok(capabilities())).unwrap();
+    registry.record_claude_detection(a, true);
+    let (_, _) = registry.begin_probe(a).unwrap();
+    assert!(!registry.can_launch_claude(a));
+    // Detection never changes the other servers or persists in the record.
+    assert!(!registry.can_launch_claude(b));
+}
+
 #[test]
 fn grok_install_consent_is_distinct_persistent_and_edit_cleared() {
     let storage = Storage::default();

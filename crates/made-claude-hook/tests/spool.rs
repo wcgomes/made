@@ -24,13 +24,65 @@ fn stop() -> Vec<u8> {
 }
 
 #[test]
-fn creates_the_file_with_mode_0600_and_appends() {
+fn appends_to_the_precreated_file_and_never_recreates_it() {
     let spool = Spool::new();
     assert_eq!(run_event(&spool, &stop()).len(), 1);
     assert_eq!(mode(&spool.file), 0o600);
     assert_eq!(mode(&spool.dir), 0o700);
     assert_eq!(run_event(&spool, &stop()).len(), 2);
     assert_eq!(mode(&spool.file), 0o600);
+
+    // A deleted spool means the tab is gone: the hook must not bring it back.
+    std::fs::remove_file(&spool.file).unwrap();
+    assert_silent(&run_closed(Some(&spool.file), &stop()));
+    assert!(!spool.file.exists());
+}
+
+#[test]
+fn spool_without_the_owner_marker_or_the_expected_shape_is_not_written() {
+    // No owner.lock beside the spool.
+    let spool = Spool::new();
+    std::fs::remove_file(spool.dir.join("owner.lock")).unwrap();
+    assert_silent(&run_closed(Some(&spool.file), &stop()));
+    assert_eq!(spool.raw(), "");
+
+    // Private file in a private directory, but the path shape is wrong.
+    let shapes = [
+        "claude/not-a-pid-dir/ws-1.jsonl",
+        "claude/1-abc/ws-1.txt",
+        "other/1-abc/ws-1.jsonl",
+        "claude/1-abc/sub/ws-1.jsonl",
+        "claude/-abc/ws-1.jsonl",
+        "claude/1-/ws-1.jsonl",
+    ];
+    for shape in shapes {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join(shape);
+        let dir = file.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(dir.join("owner.lock"), "").unwrap();
+        std::fs::write(&file, "").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_silent(&run_closed(Some(&file), &stop()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "", "{shape}");
+    }
+}
+
+#[test]
+fn owner_marker_must_be_a_regular_file() {
+    let spool = Spool::new();
+    let marker = spool.dir.join("owner.lock");
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::create_dir(&marker).unwrap();
+    assert_silent(&run_closed(Some(&spool.file), &stop()));
+    assert_eq!(spool.raw(), "");
+    std::fs::remove_dir(&marker).unwrap();
+    let other = spool.root.path().join("other.lock");
+    std::fs::write(&other, "").unwrap();
+    symlink(&other, &marker).unwrap();
+    assert_silent(&run_closed(Some(&spool.file), &stop()));
+    assert_eq!(spool.raw(), "");
 }
 
 #[test]
@@ -45,7 +97,7 @@ fn relative_spool_path_writes_nothing() {
     let mut child = command.spawn().unwrap();
     child.stdin.take().unwrap().write_all(&stop()).unwrap();
     assert!(child.wait().unwrap().success());
-    assert!(!spool.file.exists());
+    assert_eq!(spool.raw(), "");
 }
 
 #[test]
@@ -65,7 +117,7 @@ fn non_private_parent_directory_writes_nothing() {
         let outcome = run_closed(Some(&spool.file), &stop());
         assert_silent(&outcome);
         std::fs::set_permissions(&spool.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!spool.file.exists(), "mode {bad:o}");
+        assert_eq!(spool.raw(), "", "mode {bad:o}");
     }
 }
 
@@ -76,7 +128,7 @@ fn symlinked_parent_directory_writes_nothing() {
     symlink(&spool.dir, &link).unwrap();
     let outcome = run_closed(Some(&link.join("ws-1.jsonl")), &stop());
     assert_silent(&outcome);
-    assert!(!spool.file.exists());
+    assert_eq!(spool.raw(), "");
 }
 
 #[test]
@@ -84,6 +136,7 @@ fn symlinked_spool_file_is_refused() {
     let spool = Spool::new();
     let target = spool.dir.join("target.txt");
     std::fs::write(&target, "").unwrap();
+    std::fs::remove_file(&spool.file).unwrap();
     symlink(&target, &spool.file).unwrap();
     let outcome = run_closed(Some(&spool.file), &stop());
     assert_silent(&outcome);

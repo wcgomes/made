@@ -60,15 +60,41 @@ fn run() {
     append(&spool, line.as_bytes());
 }
 
+/// Whether `path` is `<...>/claude/<pid>-<id>/<name>.jsonl` with Made's
+/// `owner.lock` marker, a regular file, beside it. Made creates both, so a
+/// stale or foreign path is never written.
+fn spool_shape_is_valid(path: &Path, parent: &Path) -> bool {
+    let name_of = |p: &Path| p.file_name().and_then(|n| n.to_str()).map(str::to_owned);
+    let Some(file_name) = name_of(path) else {
+        return false;
+    };
+    let Some(directory) = name_of(parent) else {
+        return false;
+    };
+    let owner_dir_ok = directory.split_once('-').is_some_and(|(pid, id)| {
+        !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty()
+    });
+    file_name.len() > ".jsonl".len()
+        && file_name.ends_with(".jsonl")
+        && owner_dir_ok
+        && parent
+            .parent()
+            .and_then(name_of)
+            .is_some_and(|name| name == "claude")
+        && std::fs::symlink_metadata(parent.join("owner.lock"))
+            .is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Append one record, once, to a spool that passes every safety check.
 ///
-/// The parent directory must be a real directory private to the current user,
+/// Made pre-creates the spool and its `owner.lock`; the hook never creates
+/// either. The parent directory must be a real directory private to the current user,
 /// the file must not be reached through a symlink, and the file must stay at
 /// or below [`MAX_SPOOL`]. The write happens under the advisory lock the
 /// reader takes before it truncates, and the hook gives up rather than wait.
 fn append(path: &Path, line: &[u8]) {
     let Some(parent) = path.parent() else { return };
-    if !private_directory(parent) {
+    if !spool_shape_is_valid(path, parent) || !private_directory(parent) {
         return;
     }
     let Some(mut file) = open_private_file(path) else {
@@ -129,8 +155,8 @@ fn private_directory(directory: &Path) -> bool {
         && metadata.permissions().mode() & 0o777 == 0o700
 }
 
-/// Open the spool file for appending, creating it with mode 0600, never
-/// following a symlink and only when it is a private regular file we own.
+/// Open the existing spool file for appending, never following a symlink and
+/// only when it is a private regular file we own.
 #[cfg(unix)]
 fn open_private_file(path: &Path) -> Option<File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -138,8 +164,6 @@ fn open_private_file(path: &Path) -> Option<File> {
     // on the regular file that passes the check below.
     let file = std::fs::OpenOptions::new()
         .append(true)
-        .create(true)
-        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
@@ -168,11 +192,7 @@ fn open_private_file(path: &Path) -> Option<File> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
         return None;
     }
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .ok()
+    std::fs::OpenOptions::new().append(true).open(path).ok()
 }
 
 /// The ancestor pids, nearest first: this process's parent, then its parent,

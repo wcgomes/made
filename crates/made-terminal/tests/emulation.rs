@@ -563,3 +563,45 @@ mod protocol {
         assert_eq!(core.snapshot().text(), "");
     }
 }
+
+mod protocol_rate_limit {
+    use super::terminal;
+    use made_terminal::ProtocolEvent;
+    use std::time::{Duration, Instant};
+
+    const PROBE: &[u8] = b"\x1b]7501;?\x07";
+
+    #[test]
+    fn echoed_probe_reply_is_not_answered_again() {
+        let mut core = terminal(4, 40);
+        let t0 = Instant::now();
+        core.feed_at(PROBE, t0);
+        let mut total = core.take_replies(|_| [0, 0, 0]);
+        for step in 1..=200u32 {
+            // A tty with ECHO on echoes the reply back as output.
+            core.feed_at(PROBE, t0 + Duration::from_millis(4) * step);
+            total.extend(core.take_replies(|_| [0, 0, 0]));
+        }
+        assert_eq!(total, PROBE);
+        assert_eq!(core.take_protocol_events(), vec![ProtocolEvent::Probe]);
+    }
+
+    #[test]
+    fn probe_after_the_window_is_answered_again() {
+        let mut core = terminal(4, 40);
+        let t0 = Instant::now();
+        core.feed_at(PROBE, t0);
+        core.take_replies(|_| [0, 0, 0]);
+        core.feed_at(PROBE, t0 + Duration::from_millis(999));
+        assert!(core.take_replies(|_| [0, 0, 0]).is_empty());
+        core.feed_at(PROBE, t0 + Duration::from_secs(1));
+        assert_eq!(core.take_replies(|_| [0, 0, 0]), PROBE);
+    }
+
+    #[test]
+    fn probe_directly_after_an_unterminated_osc_is_answered() {
+        let mut core = terminal(4, 40);
+        core.feed(b"\x1b]0;half a title\x1b]7501;?\x07");
+        assert_eq!(core.take_replies(|_| [0, 0, 0]), PROBE);
+    }
+}

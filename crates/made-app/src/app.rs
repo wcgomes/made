@@ -713,6 +713,30 @@ impl AppModel {
             .map_err(|error| error.to_string())
     }
 
+    /// Record whether one server's finished probe detected claude, without an
+    /// SSH attempt.
+    ///
+    /// Test-only seam: the product flow records it from the live probe.
+    pub fn hold_ssh_claude_detection(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        detected: bool,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        registry.record_claude_detection(id, detected);
+        Ok(())
+    }
+
+    /// Whether this server's own probe detected remote claude. Absent or
+    /// failed probes never count as detection.
+    pub fn remote_claude_detected_on(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<bool, String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        Ok(registry.can_launch_claude(id))
+    }
+
     /// Grant or withdraw the per-server/version Grok plugin install consent.
     ///
     /// Test-only seam: the product flow arrives through the consent card
@@ -1330,6 +1354,7 @@ impl AppModel {
             if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
             {
                 workbench.set_remote_grok_detection(capabilities.grok);
+                workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
             }
         }
         let source = self.launch.source();
@@ -1363,6 +1388,7 @@ impl AppModel {
             if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
             {
                 workbench.set_remote_grok_detection(capabilities.grok);
+                workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
             }
         }
         let source = self.launch.source();
@@ -1474,6 +1500,41 @@ impl AppModel {
             snapshot,
             directory,
             TerminalTarget::RemoteGrok { authority: id },
+            Instant::now(),
+        )?;
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
+    /// Start the selected server's detected claude executable with no
+    /// arguments as a new tab, bound to that server and its selected remote
+    /// directory. There is no shell first and no separate folder picker, the
+    /// current tab keeps running, and no plugin configuration is injected.
+    /// Servers whose own probe did not detect claude refuse here.
+    pub fn begin_remote_claude_launch(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        if !registry.can_launch_claude(id) {
+            return Err(
+                "Claude Code SSH stays hidden until this server's own detection succeeds."
+                    .to_owned(),
+            );
+        }
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        let directory = match snapshot.server().metadata().initial_directory.clone() {
+            Some(directory) => directory,
+            None => made_remote::protocol::RemotePath::new(b"/".to_vec())
+                .map_err(|_| "the default remote directory was rejected".to_owned())?,
+        };
+        let workbench = Workbench::start_remote(
+            snapshot,
+            directory,
+            TerminalTarget::RemoteClaude { authority: id },
             Instant::now(),
         )?;
         let source = self.launch.source();
@@ -1742,10 +1803,13 @@ impl AppModel {
             }
             if let (Some(ticket), Ok(registry)) = (ticket, self.ssh.as_mut()) {
                 let stored = match &result {
-                    Ok(capabilities) => Ok(capabilities.clone()),
+                    Ok(report) => Ok(report.capabilities.clone()),
                     Err(error) => Err(error.protocol_code()),
                 };
-                let _ = registry.finish_probe(ticket, stored);
+                let finished = registry.finish_probe(ticket, stored).is_ok();
+                if let (true, Ok(report)) = (finished, &result) {
+                    registry.record_claude_detection(ticket.authority, report.claude);
+                }
             }
             self.ssh_host_key_changed = matches!(
                 &result,
@@ -1753,7 +1817,7 @@ impl AppModel {
                     if error.class == crate::remote_session::SshFailureClass::ChangedHostKey
             );
             self.ssh_notice = Some(match result {
-                Ok(capabilities) if capabilities.opencode => {
+                Ok(report) if report.capabilities.opencode => {
                     "Connection succeeded. OpenCode was detected. The TUI was not started."
                         .to_owned()
                 }

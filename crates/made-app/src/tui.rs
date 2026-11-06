@@ -43,6 +43,10 @@ pub enum TerminalTarget {
     /// Never substituted with a host binary and never given the OpenCode
     /// plugin environment.
     RemoteGrok { authority: AuthorityId },
+    /// Remote Claude Code on a saved server, started directly with no
+    /// arguments. Never substituted with a host binary and never given a
+    /// plugin, environment or remote write.
+    RemoteClaude { authority: AuthorityId },
 }
 
 impl TerminalTarget {
@@ -68,9 +72,10 @@ impl TerminalTarget {
                 })
             }
             // Remote launches must not resolve a host executable or host cwd.
-            Self::RemoteShell { .. } | Self::RemoteOpenCode { .. } | Self::RemoteGrok { .. } => {
-                None
-            }
+            Self::RemoteShell { .. }
+            | Self::RemoteOpenCode { .. }
+            | Self::RemoteGrok { .. }
+            | Self::RemoteClaude { .. } => None,
         }
     }
 
@@ -125,7 +130,10 @@ impl TerminalTarget {
     pub fn is_remote(self) -> bool {
         matches!(
             self,
-            Self::RemoteShell { .. } | Self::RemoteOpenCode { .. } | Self::RemoteGrok { .. }
+            Self::RemoteShell { .. }
+                | Self::RemoteOpenCode { .. }
+                | Self::RemoteGrok { .. }
+                | Self::RemoteClaude { .. }
         )
     }
 
@@ -134,7 +142,8 @@ impl TerminalTarget {
         match self {
             Self::RemoteShell { authority }
             | Self::RemoteOpenCode { authority }
-            | Self::RemoteGrok { authority } => Some(authority),
+            | Self::RemoteGrok { authority }
+            | Self::RemoteClaude { authority } => Some(authority),
             Self::Shell | Self::Tui(_) => None,
         }
     }
@@ -147,6 +156,7 @@ impl TerminalTarget {
             Self::RemoteShell { .. } => "Terminal SSH",
             Self::RemoteOpenCode { .. } => "OpenCode SSH",
             Self::RemoteGrok { .. } => "Grok SSH",
+            Self::RemoteClaude { .. } => "Claude Code SSH",
         }
     }
 
@@ -158,6 +168,7 @@ impl TerminalTarget {
             Self::RemoteShell { .. } => "terminal-ssh",
             Self::RemoteOpenCode { .. } => "opencode-ssh",
             Self::RemoteGrok { .. } => "grok-ssh",
+            Self::RemoteClaude { .. } => "claude-ssh",
         }
     }
 
@@ -169,6 +180,7 @@ impl TerminalTarget {
             Self::RemoteShell { .. } => "Reconnect Terminal SSH".to_owned(),
             Self::RemoteOpenCode { .. } => "Reconnect OpenCode SSH".to_owned(),
             Self::RemoteGrok { .. } => "Reconnect Grok SSH".to_owned(),
+            Self::RemoteClaude { .. } => "Reconnect Claude Code SSH".to_owned(),
         }
     }
 }
@@ -203,6 +215,29 @@ mod tests {
         assert!(!TerminalTarget::Shell.is_remote());
         assert_eq!(grok.restart_label(), "Reconnect Grok SSH");
         assert_eq!(grok.log_label(), "grok-ssh");
+    }
+
+    #[test]
+    fn remote_claude_target_is_remote_loads_no_plugin_and_never_resolves_a_host_executable() {
+        let authority = AuthorityId([9; 16]);
+        let claude = TerminalTarget::RemoteClaude { authority };
+        assert!(
+            claude.pty_options("/tmp", OsStr::new("/usr/bin")).is_none(),
+            "a remote Claude Code launch must never resolve a host executable"
+        );
+        assert!(claude.is_remote());
+        assert_eq!(claude.authority(), Some(authority));
+        assert_eq!(claude.program_label(), "Claude Code SSH");
+        assert_eq!(claude.log_label(), "claude-ssh");
+        assert_eq!(claude.restart_label(), "Reconnect Claude Code SSH");
+        // Remote Claude Code gets no plugin configuration, spool or environment.
+        assert!(!claude.loads_claude_plugin());
+        let env = claude.claude_launch_env(
+            Some(Path::new("/shipped")),
+            Some(OsStr::new("/user")),
+            Some(Path::new("/spool")),
+        );
+        assert!(env.env.is_empty() && !env.hooks_unavailable);
     }
 
     #[test]

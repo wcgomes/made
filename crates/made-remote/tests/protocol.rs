@@ -948,3 +948,31 @@ fn unary_reply_is_terminal_and_truncation_is_final_only() {
     assert!(good.is_truncated());
     good.finish().unwrap();
 }
+
+#[test]
+fn claude_launch_target_is_additive_and_keeps_existing_encodings() {
+    assert_eq!(PROTOCOL_MAJOR, 1);
+    assert_eq!(
+        serde_json::from_str::<LaunchTarget>(r#""Claude""#).unwrap(),
+        LaunchTarget::Claude
+    );
+    assert_eq!(
+        serde_json::to_string(&LaunchTarget::Claude).unwrap(),
+        r#""Claude""#
+    );
+    for (text, target) in [
+        (r#""Shell""#, LaunchTarget::Shell),
+        (r#""OpenCode""#, LaunchTarget::OpenCode),
+        (r#""Grok""#, LaunchTarget::Grok),
+    ] {
+        assert_eq!(serde_json::from_str::<LaunchTarget>(text).unwrap(), target);
+    }
+    assert!(frame(Operation::Open {
+        directory: path("/project"),
+        target: LaunchTarget::Claude,
+        rows: 24,
+        cols: 80,
+    })
+    .validate()
+    .is_ok());
+}

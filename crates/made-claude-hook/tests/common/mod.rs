@@ -36,7 +36,15 @@ impl Spool {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+        // Made pre-creates the spool and the owner marker; the hook only appends.
+        std::fs::write(dir.join("owner.lock"), "").unwrap();
         let file = dir.join("ws-1.jsonl");
+        std::fs::write(&file, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         Self { root, dir, file }
     }
 

@@ -32,7 +32,14 @@ fn packaged_hook_records_one_line_without_any_interpreter() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    std::fs::write(spool_dir.join("owner.lock"), "").unwrap();
     let spool = spool_dir.join("ws-1.jsonl");
+    std::fs::write(&spool, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     // An empty directory is the whole PATH: no python, no python3, no shell.
     let path = scratch.path().join("empty-path");
     std::fs::create_dir(&path).unwrap();

@@ -885,6 +885,9 @@ impl AppPaths {
     /// at it.
     pub fn shipped_claude_plugin_dir(&self) -> Option<&Path> {
         let dir = self.claude_plugin_dir.as_deref()?;
+        if !claude_plugin_entry_is_safe(dir, ':') || !claude_plugin_entry_is_safe(dir, ';') {
+            return None;
+        }
         std::fs::read_dir(dir).ok()?;
         Some(dir)
     }
@@ -2522,27 +2525,59 @@ pub const fn claude_plugin_dirs_separator(family: PlatformFamily) -> char {
     }
 }
 
+/// Whether `path` may be written into the plugin list: absolute, and free of
+/// the list separator, quotes, backtick, `$`, newlines and, on POSIX (a `:`
+/// separator), backslash, so no consumer can split or expand it.
+fn claude_plugin_entry_is_safe(path: &Path, separator: char) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    path.is_absolute()
+        && !text
+            .chars()
+            .any(|c| c == separator || matches!(c, '"' | '`' | '$' | '\n' | '\r'))
+        && !(separator == ':' && text.contains('\\'))
+}
+
 /// Compose the [`CLAUDE_CODE_PLUGIN_DIRS_ENV`] value for a Made-started process.
 ///
 /// Every existing entry is kept byte-for-byte in its original order and
-/// Made's `shipped` entry is appended, unless an entry already equals it. An
-/// absent or empty `existing` value yields just `shipped`, with no leading
-/// separator. `separator` must be ASCII.
+/// Made's `shipped` entry is appended, unless an entry already equals it
+/// (ignoring trailing slashes). An absent or empty `existing` value yields
+/// just `shipped`, with no leading separator. A `shipped` path that is not
+/// safe (see `claude_plugin_entry_is_safe`) adds nothing: the result is
+/// `existing` unchanged, or empty. `separator` must be ASCII.
 pub fn compose_claude_plugin_dirs(
     existing: Option<&OsStr>,
     shipped: &Path,
     separator: char,
 ) -> OsString {
     debug_assert!(separator.is_ascii());
+    let safe = claude_plugin_entry_is_safe(shipped, separator);
     let shipped = shipped.as_os_str();
     let Some(existing) = existing.filter(|value| !value.is_empty()) else {
-        return shipped.to_owned();
+        return if safe {
+            shipped.to_owned()
+        } else {
+            OsString::new()
+        };
     };
+    if !safe {
+        return existing.to_owned();
+    }
     let separator = separator as u8;
     let bytes = existing.as_encoded_bytes();
+    let trimmed = |entry: &[u8]| {
+        let end = entry
+            .iter()
+            .rposition(|byte| *byte != b'/')
+            .map_or(0, |i| i + 1);
+        entry[..end].to_vec()
+    };
+    let wanted = trimmed(shipped.as_encoded_bytes());
     if bytes
         .split(|byte| *byte == separator)
-        .any(|entry| entry == shipped.as_encoded_bytes())
+        .any(|entry| trimmed(entry) == wanted)
     {
         return existing.to_owned();
     }

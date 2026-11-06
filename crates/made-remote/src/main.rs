@@ -4,6 +4,7 @@
 use made_bridge::{config, config_guard::ConfigSnapshot, remote_rpc::RpcConnection};
 use made_platform::{Environment, PathsInputs, Platform, PlatformFamily, PtyRequest};
 use made_remote::{
+    claude,
     filesystem::native,
     grok::{self, GrokFiles},
     integration::{resolve_config, Integration},
@@ -255,6 +256,12 @@ fn daemon() -> io::Result<()> {
             let program = grok::detect_on_path(&environment, "grok").ok_or_else(fail)?;
             (program, vec![OsString::from("dashboard")])
         }
+        // Direct Claude Code launch: the detected absolute claude with no
+        // arguments, no shell first, no plugin, environment or bridge.
+        LaunchTarget::Claude => {
+            let launch = claude::launch(&environment).ok_or_else(fail)?;
+            (launch.program, launch.args)
+        }
     };
     let inputs = PathsInputs::from_env(PlatformFamily::current());
     let home = inputs.home.ok_or_else(fail)?;
@@ -265,9 +272,9 @@ fn daemon() -> io::Result<()> {
         .join("opencode/cli.json");
     let user_config = resolve_config(v2, paths.opencode_config_path.clone());
     // Failure of optional plugin composition leaves terminal/fs available.
-    // Grok uses no bridge, no plugin environment and no composed config, so a
-    // Grok launch skips integration ownership entirely.
-    let integration = if *target == LaunchTarget::Grok {
+    // Grok and Claude Code use no bridge, no plugin environment and no composed
+    // config, so those launches skip integration ownership entirely.
+    let integration = if matches!(target, LaunchTarget::Grok | LaunchTarget::Claude) {
         None
     } else {
         Integration::start(

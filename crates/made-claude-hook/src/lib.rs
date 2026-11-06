@@ -69,6 +69,11 @@ where
         if buffer.len() > MAX_INPUT {
             return None;
         }
+        // A complete object ends in `}`, so decode and parse only then: this
+        // keeps a large payload that arrives in many chunks linear.
+        if buffer.iter().rfind(|byte| !byte.is_ascii_whitespace()) != Some(&b'}') {
+            continue;
+        }
         let decoded = String::from_utf8_lossy(&buffer);
         let text = decoded.trim_start();
         if text.is_empty() {
@@ -161,6 +166,7 @@ fn is_removed_format(c: char) -> bool {
         | '\u{2060}'..='\u{206f}'
         | '\u{feff}'
         | '\u{fff9}'..='\u{fffb}'
+        | '\u{1d173}'..='\u{1d17a}'
         | '\u{e0001}'
         | '\u{e0020}'..='\u{e007f}')
 }
@@ -170,7 +176,13 @@ fn is_removed_format(c: char) -> bool {
 pub fn sanitize_title(raw: &str) -> String {
     raw.chars()
         .filter(|c| !is_removed_format(*c))
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .take(MAX_TITLE_CHARS)
         .collect()
 }
@@ -313,6 +325,31 @@ mod tests {
     }
 
     #[test]
+    fn chunk_reader_handles_a_large_payload_in_small_chunks_quickly() {
+        let prompt = "p".repeat(2 * 1024 * 1024);
+        let whole = format!(
+            "{{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"{prompt}\",\"cwd\":\"/w\"}}"
+        )
+        .into_bytes();
+        let mut chunks = whole.chunks(1024);
+        let started = Instant::now();
+        let event = read_event_with(
+            |_| match chunks.next() {
+                Some(bytes) => Chunk::Data(bytes.to_vec()),
+                None => Chunk::Idle,
+            },
+            READ_DEADLINE,
+        )
+        .expect("object");
+        assert_eq!(Input::from_event(&event, None).cwd, "/w");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn chunk_reader_refuses_input_past_the_bound() {
         let mut first = true;
         let event = read_event_with(
@@ -358,6 +395,10 @@ mod tests {
         assert_eq!(sanitize_title("a\nb\r\tc"), "a b  c");
         assert_eq!(sanitize_title("x\u{202e}y\u{200f}z\u{2066}\u{feff}"), "xyz");
         assert_eq!(sanitize_title(&"é".repeat(300)).chars().count(), 120);
+        // Line and paragraph separators become spaces; musical format
+        // controls are removed, as in the app's display sanitizer.
+        assert_eq!(sanitize_title("a\u{2028}b\u{2029}c"), "a b c");
+        assert_eq!(sanitize_title("a\u{1d173}b\u{1d17a}c\u{1d174}"), "abc");
     }
 
     #[test]

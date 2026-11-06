@@ -80,9 +80,9 @@ impl SshCommand {
 // hostname, user, prompt or server response here.
 // Detection is metadata-only: command -v performs PATH lookups on the
 // sanitized PATH and never executes or version-checks a program. OpenCode is
-// additionally looked up in fixed user-owned install locations; grok is
-// PATH-only (SSH-09/SSH-10); no interpreter is looked up.
-const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); printf "%s\n" "$grok"'"#;
+// additionally looked up in fixed user-owned install locations; grok and claude
+// are PATH-only (SSH-09/SSH-10/SSH-11); no interpreter is looked up.
+const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); printf "%s\n" "$grok"; claude=$(command -v claude || :); printf "%s\n" "$claude"'"#;
 const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --stdio'"#;
 // Consent-gated Grok plugin install: identical version/target/root/stdin
 // discipline, but the staged companion starts in its `--install-grok-plugin`

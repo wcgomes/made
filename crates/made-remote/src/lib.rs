@@ -1,6 +1,7 @@
 //! UI-free companion contracts and remote runtime.
 //!
 //! The executable is `made-remote`. It does not probe, require, or fall back to tmux.
+pub mod claude;
 pub mod client;
 pub mod clipboard;
 pub mod filesystem;

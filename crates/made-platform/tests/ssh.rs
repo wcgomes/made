@@ -235,10 +235,11 @@ fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3(
     );
     assert_eq!(lines[3], "", "the fixture has no opencode");
     assert_eq!(lines[4], format!("{}/grok", bin.display()));
-    // Grok is the last probe line: python3 sits on the same PATH and is never
-    // looked up, reported or executed.
-    assert_eq!(lines.len(), 6, "{lines:?}");
+    // Claude Code is the last probe line: python3 sits on the same PATH and is
+    // never looked up, reported or executed.
+    assert_eq!(lines.len(), 7, "{lines:?}");
     assert_eq!(lines[5], "");
+    assert_eq!(lines[6], "");
     assert!(
         !SshCommand::Probe.script().contains("python3"),
         "the fixed probe must not mention python3"
@@ -255,6 +256,63 @@ fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3(
         .map(str::to_owned)
         .collect();
     assert_eq!(lines[4], "", "relative PATH entries must not be detected");
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_claude_as_one_more_metadata_only_path_line() {
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = home.join("abs-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // A launched or version-checked claude would leave this marker.
+    let executed = temp.path().join("claude-executed");
+    for name in ["claude", "grok"] {
+        write_executable(
+            &bin.join(name),
+            format!("#!/bin/sh\nprintf x >> '{}'\nexit 4\n", executed.display()),
+        );
+    }
+    let relative = temp.path().join("rel-bin");
+    std::fs::create_dir_all(&relative).unwrap();
+    write_executable(&relative.join("claude"), "#!/bin/sh\nexit 0\n");
+    let tools = temp.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools = probe_fixture_uname(&tools);
+    let run = |path: String| {
+        Command::new("/bin/sh")
+            .args(["-c", SshCommand::Probe.script()])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    };
+    let lines_of = |output: std::process::Output| -> Vec<String> {
+        assert!(output.status.success(), "fixed probe failed");
+        String::from_utf8_lossy(&output.stdout)
+            .split('\n')
+            .map(str::to_owned)
+            .collect()
+    };
+    let lines = lines_of(run(format!(
+        "rel-bin::{}:/bin:{}",
+        bin.display(),
+        tools.display()
+    )));
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert_eq!(lines[4], format!("{}/grok", bin.display()));
+    assert_eq!(lines[5], format!("{}/claude", bin.display()));
+    assert!(
+        !executed.exists(),
+        "detection must never spawn claude or check a version"
+    );
+    // Only relative and empty PATH entries: claude is not detected on them.
+    let lines = lines_of(run(format!("rel-bin::/bin:{}", tools.display())));
+    assert_eq!(lines[5], "", "relative PATH entries must not be detected");
 }
 
 #[test]

@@ -1138,6 +1138,73 @@ fn claude_plugin_dirs_composition_preserves_entries_and_never_duplicates() {
 }
 
 #[test]
+fn claude_plugin_dirs_composition_treats_a_trailing_slash_as_the_same_entry() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    for existing in [
+        "/opt/made/plugins/claude-code-made/",
+        "/u/a:/opt/made/plugins/claude-code-made//:/u/b",
+    ] {
+        assert_eq!(
+            compose_claude_plugin_dirs(Some(OsStr::new(existing)), shipped, ':'),
+            OsString::from(existing),
+            "already present: {existing}"
+        );
+    }
+    let slashed = Path::new("/opt/made/plugins/claude-code-made/");
+    assert_eq!(
+        compose_claude_plugin_dirs(
+            Some(OsStr::new("/opt/made/plugins/claude-code-made")),
+            slashed,
+            ':'
+        ),
+        OsString::from("/opt/made/plugins/claude-code-made")
+    );
+}
+
+#[test]
+fn claude_plugin_dirs_composition_adds_nothing_for_an_unsafe_shipped_path() {
+    for bad in [
+        "relative/plugins/claude-code-made",
+        "/opt/ma:de/plugins",
+        "/opt/ma\"de/plugins",
+        "/opt/ma`de/plugins",
+        "/opt/ma$de/plugins",
+        "/opt/ma\\de/plugins",
+        "/opt/ma\nde/plugins",
+    ] {
+        let shipped = Path::new(bad);
+        assert_eq!(
+            compose_claude_plugin_dirs(None, shipped, ':'),
+            OsString::new(),
+            "{bad}"
+        );
+        assert_eq!(
+            compose_claude_plugin_dirs(Some(OsStr::new("/u/a:/u/b")), shipped, ':'),
+            OsString::from("/u/a:/u/b"),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn shipped_claude_plugin_dir_refuses_an_unsafe_path() {
+    let root = unique_temp("claude-unsafe");
+    let plugin = root.join("a:b").join("claude-code-made");
+    std::fs::create_dir_all(&plugin).unwrap();
+    let inputs = PathsInputs {
+        claude_plugin_dir: Some(plugin),
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    assert_eq!(
+        AppPaths::resolve(&inputs)
+            .expect("paths")
+            .shipped_claude_plugin_dir(),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn app_paths_creates_user_writable_directories_only() {
     let root = unique_temp("paths");
     let install_root = root.join("install");

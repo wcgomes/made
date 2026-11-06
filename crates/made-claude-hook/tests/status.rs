@@ -221,7 +221,7 @@ fn bad_input_writes_nothing_and_exits_zero_silently() {
             "{:?}",
             String::from_utf8_lossy(payload)
         );
-        assert!(!spool.file.exists());
+        assert!(spool.raw().is_empty());
     }
 }
 

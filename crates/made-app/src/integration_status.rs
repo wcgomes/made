@@ -984,3 +984,31 @@ pub fn claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnos
     };
     ClaudeDiagnosticsReport::new(pill, sentence)
 }
+
+/// The Claude Code row of a remote workspace: the same state machine with
+/// hooks permanently unavailable over SSH, so it never reports ready. The
+/// plugin and live-session inputs describe local hooks and are ignored; the
+/// phase is the owning tab's own remote detection.
+pub fn remote_claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnosticsReport {
+    use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+    let (pill, sentence) = match inputs.phase {
+        ClaudeDiagnosticsPhase::Checking => (Inactive, "Checking for Claude Code."),
+        ClaudeDiagnosticsPhase::NotOnPath => (Inactive, "Claude Code is not on PATH."),
+        ClaudeDiagnosticsPhase::Available if !inputs.present => {
+            (Inactive, "Claude Code is not running.")
+        }
+        ClaudeDiagnosticsPhase::Available
+            if !inputs.protocol_observed && inputs.present_for < CLAUDE_GRACE =>
+        {
+            (Inactive, "Claude Code is starting.")
+        }
+        ClaudeDiagnosticsPhase::Available if !inputs.protocol_observed => {
+            (Degraded, "Claude Code status protocol is unavailable.")
+        }
+        ClaudeDiagnosticsPhase::Available => (
+            Degraded,
+            "Claude Code session-status hooks are unavailable over SSH.",
+        ),
+    };
+    ClaudeDiagnosticsReport::new(pill, sentence)
+}

@@ -27,6 +27,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions as VtDimensions, Scroll};
@@ -48,6 +49,9 @@ const PROTOCOL_SEQUENCE_LIMIT: usize = 4096;
 const PROTOCOL_EVENT_LIMIT: usize = 256;
 /// The Program Status Protocol capability reply.
 const PROTOCOL_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x07";
+/// A probe is answered at most once per this window, so a tty that echoes the
+/// reply (which equals the probe) cannot start an endless exchange.
+const PROTOCOL_PROBE_WINDOW: Duration = Duration::from_secs(1);
 /// The only `app` value acted upon.
 const PROTOCOL_APP: &[u8] = b"claude-code";
 
@@ -311,6 +315,7 @@ pub struct TerminalCore {
     cwd: Option<PathBuf>,
     cwd_reports: u64,
     protocol_events: Vec<ProtocolEvent>,
+    last_probe_reply: Option<Instant>,
 }
 
 impl TerminalCore {
@@ -344,6 +349,7 @@ impl TerminalCore {
             cwd: None,
             cwd_reports: 0,
             protocol_events: Vec::new(),
+            last_probe_reply: None,
         };
         core.collect_damage();
         core
@@ -351,6 +357,11 @@ impl TerminalCore {
 
     /// Feed PTY output bytes.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_at(bytes, Instant::now());
+    }
+
+    /// Feed PTY output bytes received at `now`.
+    pub fn feed_at(&mut self, bytes: &[u8], now: Instant) {
         if bytes.is_empty() {
             return;
         }
@@ -361,26 +372,33 @@ impl TerminalCore {
         while !rest.is_empty() {
             let consumed = self.osc.advance(rest);
             self.parser.advance(&mut self.term, &rest[..consumed]);
+            let mut events = self.osc.take_events();
             if self.osc.take_probe() {
-                self.listener_state_mut()
-                    .replies
-                    .push(Reply::Bytes(PROTOCOL_PROBE_REPLY.to_vec()));
+                let due = self.last_probe_reply.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= PROTOCOL_PROBE_WINDOW
+                });
+                if due {
+                    self.last_probe_reply = Some(now);
+                    self.listener_state_mut()
+                        .replies
+                        .push(Reply::Bytes(PROTOCOL_PROBE_REPLY.to_vec()));
+                } else {
+                    // The scanner stops right after the probe, so it is last.
+                    events.pop();
+                }
             }
+            self.protocol_events.extend(events);
             rest = &rest[consumed..];
         }
         if let Some(cwd) = self.osc.take_cwd() {
             self.cwd = Some(cwd);
             self.cwd_reports = self.cwd_reports.wrapping_add(1);
         }
-        let events = self.osc.take_events();
-        if !events.is_empty() {
-            self.protocol_events.extend(events);
-            let excess = self
-                .protocol_events
-                .len()
-                .saturating_sub(PROTOCOL_EVENT_LIMIT);
-            self.protocol_events.drain(..excess);
-        }
+        let excess = self
+            .protocol_events
+            .len()
+            .saturating_sub(PROTOCOL_EVENT_LIMIT);
+        self.protocol_events.drain(..excess);
         self.version = self.version.wrapping_add(1);
         self.collect_damage();
     }
@@ -949,6 +967,11 @@ impl OscScanner {
                     if byte == b'\\' {
                         self.finish();
                         self.state = OscState::Ground;
+                    } else if byte == b']' {
+                        // `ESC ]` inside an OSC starts a new one, as in vte.
+                        self.buffer.clear();
+                        self.overflow = false;
+                        self.state = OscState::Osc;
                     } else {
                         // Not a string terminator; discard the OSC attempt.
                         self.state = OscState::Ground;

@@ -1525,3 +1525,78 @@ fn grok_cwd_is_used_byte_exact_and_granted_like_any_remote_report() {
     assert_eq!(workspace.root(), &path("/srv/odd-name."));
     assert_eq!(workspace.projection().source, RootSource::Grok);
 }
+
+mod remote_claude_row {
+    use made_app::diagnostics::ClaudeDiagnosticsPill;
+    use made_app::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+    use made_app::integration_status::{
+        remote_claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase,
+        CLAUDE_GRACE,
+    };
+    use std::time::Duration;
+
+    fn inputs(
+        phase: ClaudeDiagnosticsPhase,
+        present: bool,
+        present_for: Duration,
+        protocol_observed: bool,
+    ) -> ClaudeDiagnosticsInputs {
+        ClaudeDiagnosticsInputs {
+            phase,
+            // A remote tab has no plugin and no hook sessions; these never
+            // change the remote row.
+            plugin_missing: true,
+            present,
+            present_for,
+            live_session: false,
+            protocol_observed,
+        }
+    }
+
+    fn row(inputs: ClaudeDiagnosticsInputs) -> (ClaudeDiagnosticsPill, String) {
+        let report = remote_claude_diagnostics_row(&inputs);
+        (report.pill, report.sentence)
+    }
+
+    #[test]
+    fn remote_states_use_the_tabs_own_detection_and_presence() {
+        use ClaudeDiagnosticsPhase::{Available, Checking, NotOnPath};
+        let young = Duration::from_secs(1);
+        let old = CLAUDE_GRACE + Duration::from_secs(1);
+        assert_eq!(
+            row(inputs(Checking, false, Duration::ZERO, false)),
+            (Inactive, "Checking for Claude Code.".to_owned())
+        );
+        assert_eq!(
+            row(inputs(NotOnPath, false, Duration::ZERO, false)),
+            (Inactive, "Claude Code is not on PATH.".to_owned())
+        );
+        assert_eq!(
+            row(inputs(Available, false, Duration::ZERO, false)),
+            (Inactive, "Claude Code is not running.".to_owned())
+        );
+        // A directly launched remote claude with no session-level emission.
+        assert_eq!(
+            row(inputs(Available, true, young, false)),
+            (Inactive, "Claude Code is starting.".to_owned())
+        );
+        assert_eq!(
+            row(inputs(Available, true, old, false)),
+            (
+                Degraded,
+                "Claude Code status protocol is unavailable.".to_owned()
+            )
+        );
+        // Emissions prove the protocol; remote hooks are permanently absent,
+        // so the remote row never reaches a ready state.
+        for present_for in [young, old] {
+            assert_eq!(
+                row(inputs(Available, true, present_for, true)),
+                (
+                    Degraded,
+                    "Claude Code session-status hooks are unavailable over SSH.".to_owned()
+                )
+            );
+        }
+    }
+}

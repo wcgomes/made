@@ -997,6 +997,12 @@ fn workspace_grok_branded(
             ) && running))
 }
 
+/// Claude Code brands a tab while it is present, unless OpenCode owns the tab
+/// or a remote tab already presents Grok Build under SSH-10.
+fn workspace_claude_branded(opencode: bool, remote_grok_branded: bool, present: bool) -> bool {
+    !opencode && !remote_grok_branded && present
+}
+
 /// Non-color summary across all open sessions. Counts include sessions beyond
 /// the eight-dot visual cap.
 fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
@@ -1775,14 +1781,19 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             } else {
                 workspace_opencode_active(target, workbench.is_connected(), running)
             };
-            // Claude Code presence yields to OpenCode and takes the tab from
-            // Grok. Remote tabs have no host Claude Code state.
-            let claude_tab = if workbench.is_remote() {
-                None
-            } else {
-                workbench.claude_tab().filter(|tab| tab.present())
-            };
-            let claude = !opencode && claude_tab.is_some();
+            // Claude Code presence yields to OpenCode and takes a local tab from
+            // Grok. A remote tab that already presents Grok Build under SSH-10
+            // keeps it, so remote Claude Code yields to it too.
+            let claude_tab = workbench.claude_tab().filter(|tab| tab.present());
+            let remote_grok_branded = workbench.is_remote()
+                && workspace_grok_branded(
+                    opencode,
+                    target,
+                    workbench.remote_grok_running(),
+                    workbench.remote_grok_activities().len(),
+                );
+            let claude =
+                workspace_claude_branded(opencode, remote_grok_branded, claude_tab.is_some());
             let claude_title = claude_tab
                 .filter(|_| claude)
                 .map(|tab| {
@@ -1886,6 +1897,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut create = false;
     let mut launch_tui = None;
     let mut launch_remote_grok = None;
+    let mut launch_remote_claude = None;
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
     let mut toggle_ssh = false;
@@ -2182,6 +2194,22 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                             ui.close();
                                         }
                                     }
+                                    if registry.can_launch_claude(server.id()) {
+                                        let claude_label = format!("Claude Code SSH — {name}");
+                                        if new_tab_menu_item(
+                                            ui,
+                                            new_tab_menu_item_id(&format!(
+                                                "ssh-claude-{}",
+                                                authority_key(server.id())
+                                            )),
+                                            claude_mark(),
+                                            &claude_label,
+                                            layout.button_height,
+                                        ) {
+                                            launch_remote_claude = Some(server.id());
+                                            ui.close();
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -2240,6 +2268,12 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     }
     if let Some(id) = launch_remote_grok {
         if let Err(error) = model.begin_remote_grok_launch(id) {
+            model.set_ssh_notice(error);
+            model.set_ssh_open(true);
+        }
+    }
+    if let Some(id) = launch_remote_claude {
+        if let Err(error) = model.begin_remote_claude_launch(id) {
             model.set_ssh_notice(error);
             model.set_ssh_open(true);
         }
@@ -5758,6 +5792,17 @@ mod tests {
         assert!(!workspace_grok_branded(false, remote_grok, false, 0));
         assert!(workspace_grok_branded(false, remote_shell, false, 2));
         assert!(!workspace_grok_branded(true, remote_grok, true, 3));
+    }
+
+    #[test]
+    fn claude_code_brand_yields_to_opencode_and_to_remote_grok_presentation() {
+        // Present Claude Code brands the tab on its own.
+        assert!(workspace_claude_branded(false, false, true));
+        assert!(!workspace_claude_branded(false, false, false));
+        // OpenCode keeps its label, icon and dots.
+        assert!(!workspace_claude_branded(true, false, true));
+        // A remote tab already presenting Grok Build under SSH-10 keeps it.
+        assert!(!workspace_claude_branded(false, true, true));
     }
 
     #[test]
