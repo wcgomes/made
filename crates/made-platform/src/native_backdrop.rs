@@ -10,15 +10,19 @@
 //!   [`NSVisualEffectMaterial::HudWindow`](https://developer.apple.com/documentation/appkit/nsvisualeffectmaterial/hudwindow)
 //!   in the active state, placed below the content view so the egui surface
 //!   stays visible (see the `macos` module).
-//! - Windows 11: Mica (`DWMSBT_MAINWINDOW` or the older Mica attribute
-//!   fallback used by `window-vibrancy`).
+//! - Windows 11 22H2 (build 22621) and newer: system Acrylic through the
+//!   documented `DWMWA_SYSTEMBACKDROP_TYPE` attribute set to
+//!   `DWMSBT_TRANSIENTWINDOW`, with the immersive dark mode attribute so the
+//!   tint is dark. The window surface must carry alpha (see
+//!   [`requires_composition_swapchain`]) for the material to show.
 //! - Linux and other compositors: no effect is attempted. Native backdrop blur
 //!   is compositor-managed and not portable across X11/Wayland sessions, so the
 //!   in-app glass is used. This is a successful fallback, not an error.
 //!
-//! Acrylic and blur are intentionally not used on Windows: `window-vibrancy`
-//! documents resize/drag lag for those paths on current Windows 11 builds. A
-//! native backdrop must improve rendering, never make a window feel slower.
+//! Older Windows builds, including Windows 10, get the in-app glass fallback.
+//! The undocumented `SetWindowCompositionAttribute` acrylic path is not used:
+//! it is known to lag during resize and drag. A native backdrop must improve
+//! rendering, never make a window feel slower.
 //!
 //! # Configuration
 //!
@@ -49,8 +53,8 @@ pub const NATIVE_BACKDROP_ENV: &str = "MADE_NATIVE_BACKDROP";
 pub enum NativeBackdropKind {
     /// macOS `NSVisualEffectView` vibrancy.
     MacosVibrancy,
-    /// Windows 11 Mica.
-    WindowsMica,
+    /// Windows 11 system Acrylic.
+    WindowsAcrylic,
     /// Made's portable in-app glass treatment.
     InAppGlass,
 }
@@ -60,7 +64,7 @@ impl NativeBackdropKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::MacosVibrancy => "macOS vibrancy",
-            Self::WindowsMica => "Windows Mica",
+            Self::WindowsAcrylic => "Windows Acrylic",
             Self::InAppGlass => "in-app glass",
         }
     }
@@ -117,6 +121,14 @@ impl NativeBackdropStatus {
         }
     }
 
+    /// Append a note to the reason when the applied effect cannot be seen
+    /// because the window surface has no alpha. The status stays applied.
+    pub fn note_surface_caveat(&mut self, caveat: Option<&str>) {
+        if let (true, Some(caveat)) = (self.applied, caveat) {
+            self.reason = format!("{}; {caveat}", self.reason);
+        }
+    }
+
     fn fallback(reason: impl Into<String>) -> Self {
         Self {
             kind: NativeBackdropKind::InAppGlass,
@@ -148,6 +160,49 @@ impl RequestedMode {
             Some(value) if value.eq_ignore_ascii_case("off") => Self::Off,
             _ => Self::Auto,
         }
+    }
+}
+
+/// Whether the GPU surface must be a composition swapchain to carry alpha.
+///
+/// True on Windows: wgpu's default DX12 swapchain (`DxgiFromHwnd`) exposes only
+/// `CompositeAlphaMode::Opaque`, so egui-wgpu falls back to an opaque surface
+/// and the translucent clear color never reaches DWM, even with Acrylic applied.
+/// A DirectComposition swapchain (`DxgiFromVisual`) exposes pre-multiplied
+/// alpha. Other platforms need nothing special.
+pub const fn requires_composition_swapchain() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Why the window surface probably carries no alpha although the native
+/// backdrop was applied, or `None` when nothing is known to be wrong.
+///
+/// `dx12_backend` is whether wgpu ended up on DX12. Only meaningful where
+/// [`requires_composition_swapchain`] is true.
+pub fn opaque_surface_caveat(dx12_backend: bool) -> Option<&'static str> {
+    surface_caveat(
+        requires_composition_swapchain(),
+        dx12_backend,
+        env::var("WGPU_DX12_PRESENTATION_SYSTEM").ok().as_deref(),
+    )
+}
+
+fn surface_caveat(
+    required: bool,
+    dx12_backend: bool,
+    presentation_system: Option<&str>,
+) -> Option<&'static str> {
+    if !required {
+        return None;
+    }
+    if !dx12_backend {
+        return Some("GPU backend is not DX12, so the surface is probably opaque");
+    }
+    match presentation_system.map(str::to_ascii_lowercase).as_deref() {
+        Some("dxgifromhwnd" | "hwnd") => Some(
+            "WGPU_DX12_PRESENTATION_SYSTEM selects an opaque HWND swapchain, so the surface is opaque",
+        ),
+        _ => None,
     }
 }
 
@@ -245,16 +300,129 @@ mod macos {
     }
 }
 
+/// First Windows build with the documented `DWMWA_SYSTEMBACKDROP_TYPE`
+/// attribute (Windows 11 22H2).
+#[cfg(any(target_os = "windows", test))]
+const ACRYLIC_MIN_BUILD: u32 = 22621;
+
+#[cfg(any(target_os = "windows", test))]
+const fn acrylic_supported(build: u32) -> bool {
+    build >= ACRYLIC_MIN_BUILD
+}
+
 #[cfg(target_os = "windows")]
 fn apply_platform(window: impl HasWindowHandle) -> NativeBackdropStatus {
-    match window_vibrancy::apply_mica(window, Some(true)) {
-        Ok(()) => NativeBackdropStatus::applied(
-            NativeBackdropKind::WindowsMica,
-            "Windows 11 Mica applied",
-        ),
+    let build = windows_dwm::build_number();
+    if !acrylic_supported(build) {
+        return NativeBackdropStatus::fallback(format!(
+            "Windows Acrylic needs Windows 11 22H2 (build {ACRYLIC_MIN_BUILD}) or newer, \
+             found build {build}; using in-app glass"
+        ));
+    }
+    match windows_dwm::apply_acrylic(&window) {
+        Ok(()) => {
+            // The system backdrop only shows through the client area when the
+            // frame is extended over it (`DwmExtendFrameIntoClientArea`, -1).
+            let extended = windows_dwm::extend_frame_into_client_area(&window);
+            NativeBackdropStatus::applied(
+                NativeBackdropKind::WindowsAcrylic,
+                format!(
+                    "Windows 11 Acrylic applied (build {build}){}",
+                    if extended {
+                        ""
+                    } else {
+                        "; extending the frame into the client area failed"
+                    }
+                ),
+            )
+        }
         Err(error) => NativeBackdropStatus::fallback(format!(
-            "Windows Mica unavailable: {error}; using in-app glass"
+            "Windows Acrylic unavailable: {error} (build {build}); using in-app glass"
         )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_dwm {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    };
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    use windows_sys::Win32::UI::Controls::MARGINS;
+
+    /// The real OS build number (`RtlGetVersion` is not subject to manifest
+    /// compatibility shims). Zero when it cannot be read.
+    pub(super) fn build_number() -> u32 {
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            dwMajorVersion: 0,
+            dwMinorVersion: 0,
+            dwBuildNumber: 0,
+            dwPlatformId: 0,
+            szCSDVersion: [0; 128],
+        };
+        // SAFETY: `info` is a valid, correctly sized OSVERSIONINFOW.
+        let status = unsafe { RtlGetVersion(&mut info) };
+        if status >= 0 {
+            info.dwBuildNumber
+        } else {
+            0
+        }
+    }
+
+    fn hwnd(window: &impl HasWindowHandle) -> Result<HWND, String> {
+        let handle = window.window_handle().map_err(|error| error.to_string())?;
+        match handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Ok(handle.hwnd.get() as HWND),
+            _ => Err("window handle is not Win32".into()),
+        }
+    }
+
+    fn set_attribute(hwnd: HWND, attribute: i32, value: i32) -> Result<(), String> {
+        // SAFETY: the HWND belongs to the live eframe window and `value` is a
+        // 4-byte integer that outlives the call, matching the size passed.
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute as u32,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if result >= 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "DwmSetWindowAttribute({attribute}) failed: HRESULT 0x{result:08X}"
+            ))
+        }
+    }
+
+    /// Dark immersive mode first (a cosmetic tint hint whose failure is not
+    /// fatal), then the system Acrylic backdrop.
+    pub(super) fn apply_acrylic(window: &impl HasWindowHandle) -> Result<(), String> {
+        let hwnd = hwnd(window)?;
+        let _ = set_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+        set_attribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)
+    }
+
+    pub(super) fn extend_frame_into_client_area(window: &impl HasWindowHandle) -> bool {
+        let Ok(hwnd) = hwnd(window) else {
+            return false;
+        };
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        // SAFETY: the HWND belongs to the live eframe window and `margins`
+        // outlives the call.
+        unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) >= 0 }
     }
 }
 
@@ -308,13 +476,13 @@ mod tests {
     #[test]
     fn status_accessors_describe_the_effect() {
         let native = NativeBackdropStatus::applied(
-            NativeBackdropKind::WindowsMica,
-            "Windows 11 Mica applied",
+            NativeBackdropKind::WindowsAcrylic,
+            "Windows 11 Acrylic applied",
         );
         assert!(native.is_applied());
-        assert_eq!(native.kind(), NativeBackdropKind::WindowsMica);
-        assert_eq!(native.label(), "Windows Mica");
-        assert_eq!(native.reason(), "Windows 11 Mica applied");
+        assert_eq!(native.kind(), NativeBackdropKind::WindowsAcrylic);
+        assert_eq!(native.label(), "Windows Acrylic");
+        assert_eq!(native.reason(), "Windows 11 Acrylic applied");
 
         let fallback = NativeBackdropStatus::fallback("not available");
         assert!(!fallback.is_applied());
@@ -325,6 +493,47 @@ mod tests {
         let default = NativeBackdropStatus::default();
         assert!(!default.is_applied());
         assert!(!default.reason().is_empty());
+    }
+
+    #[test]
+    fn surface_caveat_is_honest_about_opaque_surfaces() {
+        assert_eq!(surface_caveat(false, false, Some("hwnd")), None);
+        assert_eq!(surface_caveat(true, true, None), None);
+        assert_eq!(surface_caveat(true, true, Some("DxgiFromVisual")), None);
+        assert!(surface_caveat(true, false, None)
+            .unwrap()
+            .contains("not DX12"));
+        for value in ["hwnd", "DxgiFromHwnd"] {
+            assert!(surface_caveat(true, true, Some(value))
+                .unwrap()
+                .contains("opaque HWND"));
+        }
+        let mut status =
+            NativeBackdropStatus::applied(NativeBackdropKind::WindowsAcrylic, "Acrylic applied");
+        status.note_surface_caveat(Some("surface is opaque"));
+        assert!(status.is_applied());
+        assert_eq!(status.reason(), "Acrylic applied; surface is opaque");
+        let mut fallback = NativeBackdropStatus::fallback("none");
+        fallback.note_surface_caveat(Some("ignored"));
+        assert_eq!(fallback.reason(), "none");
+    }
+
+    #[test]
+    fn acrylic_is_gated_on_the_documented_backdrop_build() {
+        assert!(!acrylic_supported(0));
+        assert!(!acrylic_supported(19045)); // Windows 10 22H2
+        assert!(!acrylic_supported(22000)); // Windows 11 21H2
+        assert!(!acrylic_supported(22620));
+        assert!(acrylic_supported(22621)); // Windows 11 22H2
+        assert!(acrylic_supported(26300));
+    }
+
+    #[test]
+    fn only_windows_requires_a_composition_swapchain() {
+        assert_eq!(
+            requires_composition_swapchain(),
+            cfg!(target_os = "windows")
+        );
     }
 
     #[test]

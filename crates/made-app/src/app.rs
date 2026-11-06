@@ -43,6 +43,38 @@ pub fn native_options() -> eframe::NativeOptions {
             .with_min_inner_size([720.0, 480.0])
             .with_transparent(theme::TRANSLUCENT_WINDOW),
         clipboard_shortcuts: false,
+        wgpu_options: wgpu_options(),
+        ..Default::default()
+    }
+}
+
+/// GPU surface options.
+///
+/// Where the platform needs a composition swapchain for per-pixel alpha
+/// ([`made_platform::native_backdrop::requires_composition_swapchain`], Windows)
+/// the DX12 backend with a DirectComposition swapchain is requested; Vulkan is
+/// not guaranteed to expose a transparent surface there. Explicit `WGPU_BACKEND`
+/// and `WGPU_DX12_PRESENTATION_SYSTEM` overrides still win.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+    use eframe::wgpu::{Backends, Dx12SwapchainKind};
+
+    if !made_platform::native_backdrop::requires_composition_swapchain() {
+        return WgpuConfiguration::default();
+    }
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    if Backends::from_env().is_none() {
+        // Vulkan is intentionally dropped here: DX12 first, GL as the fallback.
+        setup.instance_descriptor.backends = Backends::DX12 | Backends::GL;
+    }
+    setup
+        .instance_descriptor
+        .backend_options
+        .dx12
+        .presentation_system =
+        Dx12SwapchainKind::from_env().unwrap_or(Dx12SwapchainKind::DxgiFromVisual);
+    WgpuConfiguration {
+        wgpu_setup: WgpuSetup::CreateNew(setup),
         ..Default::default()
     }
 }
@@ -2885,13 +2917,13 @@ mod tests {
             .contains("not been checked"));
 
         model.set_native_backdrop(NativeBackdropStatus {
-            kind: NativeBackdropKind::WindowsMica,
+            kind: NativeBackdropKind::WindowsAcrylic,
             applied: true,
             reason: "test status".to_owned(),
         });
         assert_eq!(
             model.native_backdrop().kind(),
-            NativeBackdropKind::WindowsMica
+            NativeBackdropKind::WindowsAcrylic
         );
         assert!(model.native_backdrop().is_applied());
         assert_eq!(model.native_backdrop().reason(), "test status");

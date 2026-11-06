@@ -1088,6 +1088,9 @@ fn parse_osc7(buffer: &[u8]) -> Option<PathBuf> {
 
 /// Parse bounded local OSC 7 URIs. Authority is never a remote filesystem grant.
 fn parse_file_uri(uri: &str) -> Option<PathBuf> {
+    if let Some(path) = made_platform::local_cmd_prompt_cwd(uri) {
+        return Some(path);
+    }
     if uri.len() > 16_384
         || uri
             .bytes()

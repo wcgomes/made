@@ -143,6 +143,7 @@ fn install_shipped_plugin(grok: &Path, package: &Path) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    made_platform::hide_console_window(&mut command);
     match command.status() {
         Ok(status) => status.success(),
         Err(_) => false,

@@ -31,7 +31,7 @@ Rules enforced across the workspace:
 1. `made-app` is the only composition root; no crate depends on it.
 2. Domain crates do not form cycles. `made-terminal` may depend on `made-platform`; `made-bridge` and `made-explorer` are independent siblings.
 3. `made-platform` is a leaf and owns OS capabilities, not product behavior.
-4. OS-specific code and APIs live only in `made-platform`; the exceptions are test-only fixture selection and the two standalone native status hooks, `made-grok-hook` (parent pid) and `made-claude-hook` (pid chain, file lock), which make small `cfg`-selected `libc`/`windows-sys` calls because they cannot depend on the app crates.
+4. OS-specific code and APIs live only in `made-platform`; the exceptions are test-only fixture selection, the Windows GUI-subsystem crate attribute in `made-app` `main.rs` (see [CI platform quirks](testing/ci-platform-quirks.md)), and the two standalone native status hooks, `made-grok-hook` (parent pid) and `made-claude-hook` (pid chain, file lock), which make small `cfg`-selected `libc`/`windows-sys` calls because they cannot depend on the app crates.
 5. Only `made-bridge` binds a network socket.
 6. Only the plugin calls OpenCode APIs. `made-app` consumes normalized snapshots and never parses terminal output or talks to OpenCode.
 7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata and closed-allowlist status are resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config. Git observation is read-only.

@@ -3,7 +3,7 @@
 //! The contract is `specs/changes/archive/20261029-made-ui-ux-v1/design.md`. The terminal card is glass on its
 //! primary screen and opaque for alternate-screen TUIs; preview and picker surfaces stay opaque.
 //! The Explorer card uses semi-transparent dark fills as an in-app frosted-glass approximation.
-//! A native backdrop (macOS vibrancy or Windows Mica) can be layered behind the window when the
+//! A native backdrop (macOS vibrancy or Windows Acrylic) can be layered behind the window when the
 //! platform supports it; the in-app explorer glass remains legible on its own and stays the
 //! default on every platform without that effect. The workspace header floats directly over the
 //! clear/native backdrop with no band fill, border, shadow, or highlight. Keep the palette and
@@ -60,7 +60,7 @@ pub const BG_TAB_SELECTED: Color32 = Color32::from_rgb(0x1B, 0x23, 0x1F);
 pub const BG_CARD_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 188);
 pub const BG_HEADER_GLASS: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 194);
 // Native-backdrop Explorer tints: very discreet so the macOS HudWindow or
-// Windows Mica material reads through. The fallback glass above remains
+// Windows Acrylic material reads through. The fallback glass above remains
 // unchanged and is used whenever the native effect is not actually applied.
 pub const BG_CARD_GLASS_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(23, 26, 32, 24);
 pub const BG_HEADER_GLASS_NATIVE: Color32 = Color32::from_rgba_unmultiplied_const(20, 23, 28, 32);
@@ -1928,7 +1928,7 @@ pub fn clear_color() -> [f32; 4] {
 
 /// Clear color for a window, accounting for a running native backdrop.
 ///
-/// With native vibrancy/Mica active the lower alpha (135 instead of 215) lets
+/// With native vibrancy/Acrylic active the lower alpha (135 instead of 215) lets
 /// the OS material show through. Without it, the darker fallback alpha keeps
 /// the in-app glass readable even when the compositor ignores transparency.
 pub fn clear_color_with_native(native_backdrop: bool) -> [f32; 4] {

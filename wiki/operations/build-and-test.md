@@ -90,7 +90,7 @@ The spike harness was removed after the gate passed. Outcomes are preserved in t
 
 | Variable / switch | Effect |
 |---|---|
-| `MADE_NATIVE_BACKDROP=auto` | Default (also unset/unrecognized): attempt native macOS vibrancy/Windows 11 Mica once on the first UI frame. Linux/unsupported falls back to in-app glass. |
+| `MADE_NATIVE_BACKDROP=auto` | Default (also unset/unrecognized): attempt native macOS vibrancy/Windows 11 Acrylic (22H2+) once on the first UI frame. Linux/unsupported falls back to in-app glass. |
 | `MADE_NATIVE_BACKDROP=off` | Skip the native attempt; use in-app glass with `applied=false` and the disabled reason. Useful for deterministic headless runs. |
 | `MADE_SMOKE_TEST_MS` | Enables smoke mode with a duration when the CLI flag is absent (minimum 50 ms). |
 | `MADE_PLUGIN_DIR` | Development-only plugin directory override. Release overrides must canonicalize inside the install root. |

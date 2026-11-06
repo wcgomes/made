@@ -6,6 +6,11 @@
 //! pumps frames, prints a smoke marker, and exits. `--update [--apply]` is the
 //! non-interactive update entry of an installed build.
 
+// GUI subsystem on Windows: launching Made must not open a console window.
+// `windows::attach_parent_console` restores CLI output when started from a
+// terminal.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +24,7 @@ use made_app::updates::{command_line_update, PlatformCapability, UpdateScheduler
 use made_platform::update::{self as platform_update, CliApplyOutcome, Updater};
 
 fn main() -> ExitCode {
+    made_platform::attach_parent_console();
     // Velopack's install/update hooks first. Auto-apply on startup is off:
     // a downloaded update is applied only after confirmation (REL-07).
     platform_update::run_startup_hook();
@@ -200,6 +206,13 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
         "Made",
         made_app::app::native_options(),
         Box::new(move |_cc| {
+            // A normal GUI session must not share the launching console: its
+            // Ctrl+C or close would end Made. CLI actions and smoke runs keep
+            // it for their output. Done once the window exists so a creation
+            // failure still prints to that console.
+            if smoke.is_none() {
+                made_platform::detach_console();
+            }
             Ok(Box::new(NativeApp {
                 model,
                 native_backdrop_checked: false,
@@ -229,7 +242,11 @@ impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.native_backdrop_checked {
             self.native_backdrop_checked = true;
-            let status = made_platform::native_backdrop::apply(&*frame);
+            let mut status = made_platform::native_backdrop::apply(&*frame);
+            let dx12 = frame.wgpu_render_state().is_some_and(|state| {
+                state.adapter.get_info().backend == eframe::wgpu::Backend::Dx12
+            });
+            status.note_surface_caveat(made_platform::native_backdrop::opaque_surface_caveat(dx12));
             eprintln!(
                 "made: native backdrop: {} applied={} reason={}",
                 status.label(),

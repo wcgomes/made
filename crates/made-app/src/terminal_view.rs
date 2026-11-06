@@ -583,6 +583,13 @@ impl TerminalPane {
             }
             return false;
         }
+        // A remote pane is paused until its resnapshot completes. Those frames
+        // belong to the snapshot gate, which resets the grid for the first one
+        // and finds the completing `done` frame; draining them here would paint
+        // them as live output and leave the gate waiting forever.
+        if self.remote_transport.is_some() && self.input_paused {
+            return false;
+        }
         self.flush_pending_input(log);
         let mut rendered = false;
         let mut bytes = 0_usize;
@@ -3781,6 +3788,48 @@ mod tests {
         let second = pane.take_pending_image().expect("path chord queues a PNG");
         assert!(second.starts_with(b"\x89PNG"));
         assert!(!writes.lock().unwrap().contains(&0x16));
+    }
+
+    struct QueuedTransport(std::collections::VecDeque<made_terminal::PtyEvent>);
+
+    impl made_terminal::TerminalTransport for QueuedTransport {
+        fn poll(&mut self) -> Option<made_terminal::PtyEvent> {
+            self.0.pop_front()
+        }
+        fn write(&mut self, _bytes: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+        fn resize(&mut self, _rows: u16, _cols: u16) -> Result<(), PtyError> {
+            Ok(())
+        }
+        fn status(&self) -> made_terminal::TransportStatus {
+            made_terminal::TransportStatus::Connected
+        }
+        fn detach(&mut self) -> Result<(), PtyError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pumping_a_paused_remote_pane_leaves_resnapshot_frames_to_the_gate() {
+        let mut pane = TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([5; 16]),
+            },
+            24,
+            80,
+        );
+        pane.attach_remote_transport(Box::new(QueuedTransport(
+            [made_terminal::PtyEvent::Data(b"snapshot".to_vec())].into(),
+        )));
+        let mut log = DiagnosticLog::new();
+        assert!(!pane.pump(&mut log));
+        // `resize` pumps first; it must not consume them either.
+        pane.resize(30, 100, &mut log);
+        assert_eq!(pane.output_bytes(), 0, "paused pane consumed snapshot data");
+        pane.resume_input();
+        assert!(pane.pump(&mut log));
+        assert_eq!(pane.output_bytes(), b"snapshot".len() as u64);
     }
 
     #[test]

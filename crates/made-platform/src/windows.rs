@@ -30,7 +30,8 @@
 use std::ffi::{c_void, OsStr, OsString};
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -45,6 +46,119 @@ use crate::{
     PathsInputs, Platform, PlatformError, PlatformFamily, PtyRequest, PtySession, ShellSpec,
     SystemClipboard,
 };
+
+/// Console handles opened by [`attach_parent_console`], by stream slot, so
+/// [`detach_console`] closes only handles this process created.
+static OPENED_CONSOLE_HANDLES: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+fn stream_slot(id: u32) -> usize {
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_INPUT_HANDLE};
+    match id {
+        STD_INPUT_HANDLE => 0,
+        STD_ERROR_HANDLE => 2,
+        _ => 1,
+    }
+}
+
+/// Reconnect standard streams to the launching console, if there is one.
+///
+/// The GUI binary uses the Windows GUI subsystem so a double-click opens no
+/// console window. A process started that way has no standard handles, so
+/// `--help`, `--version`, `--update` and diagnostics run from `cmd` or
+/// PowerShell would print nowhere. This attaches to the parent's console (it
+/// never creates one) and fills only the standard handles that are missing, so
+/// redirected output and pipes are left untouched. With no parent console
+/// (Explorer, shortcut, installer) it does nothing, and Rust's stdio silently
+/// discards writes to missing handles.
+pub fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls with valid arguments; the opened console
+    // handles are intentionally kept for the life of the process.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let streams: [(u32, &str, u32); 3] = [
+            (STD_INPUT_HANDLE, "CONIN$", GENERIC_READ),
+            (STD_OUTPUT_HANDLE, "CONOUT$", GENERIC_WRITE),
+            (STD_ERROR_HANDLE, "CONOUT$", GENERIC_WRITE),
+        ];
+        for (id, device, access) in streams {
+            let current = GetStdHandle(id);
+            if !current.is_null() && current != INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let name: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = CreateFileW(
+                name.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if handle != INVALID_HANDLE_VALUE {
+                SetStdHandle(id, handle);
+                OPENED_CONSOLE_HANDLES[stream_slot(id)].store(handle as usize, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Leave the launching console so a normal GUI session cannot be ended by it.
+///
+/// After [`attach_parent_console`] a GUI launch would still share the parent's
+/// console, and Ctrl+C or closing that console would send the process a control
+/// event that ends Made and every session in it. Redirected stdio (pipes,
+/// files) is unaffected.
+///
+/// Standard handles that point at the console (opened by
+/// [`attach_parent_console`] or inherited from `cmd`) are reset to null first,
+/// the state of an Explorer launch: Rust's stdio silently drops writes to a
+/// null handle, whereas a handle into a closed console makes `eprintln!`
+/// panic. Handles this process opened are closed; inherited ones are left to
+/// the process.
+pub fn detach_console() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleMode, GetStdHandle, SetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls; a handle is closed only when this process
+    // opened it and it is no longer a standard handle.
+    unsafe {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(id);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                continue;
+            }
+            SetStdHandle(id, null_mut());
+            let opened = OPENED_CONSOLE_HANDLES[stream_slot(id)].swap(0, Ordering::Relaxed);
+            if opened == handle as usize {
+                CloseHandle(handle);
+            }
+        }
+        FreeConsole();
+    }
+}
 
 /// Windows backend implementing [`Platform`].
 #[derive(Debug, Clone, Copy, Default)]

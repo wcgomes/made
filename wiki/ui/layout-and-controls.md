@@ -30,7 +30,7 @@ Panels have no separator lines; cards and gaps do the grouping. The Explorer is 
 
 ## Explorer
 
-- Full-height right card using `BG_CARD_GLASS` at 188/255 without a native backdrop (off/unsupported/failed), or `BG_CARD_GLASS_NATIVE` at 24/255 when macOS HudWindow or Windows 11 Mica is actually applied; same RGB pair, 1px border, radius 10/8, painted glass shadow.
+- Full-height right card using `BG_CARD_GLASS` at 188/255 without a native backdrop (off/unsupported/failed), or `BG_CARD_GLASS_NATIVE` at 24/255 when macOS HudWindow or Windows 11 Acrylic is actually applied; same RGB pair, 1px border, radius 10/8, painted glass shadow.
 - Card header 34/30 uses `BG_HEADER_GLASS` at 194/255 without a native backdrop, or `BG_HEADER_GLASS_NATIVE` at 32/255 when the native effect is applied; same RGB pair, 1px top highlight. The file tree shows `EXPLORER` and the root name, and the git view shows `REPOS` plus the head line in that slot ([UI spec](../../specs/made-ui-ux.md)). The explorer paints the status snapshot and does not run git; see [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
 - Source-control behavior is in the [UI spec](../../specs/made-ui-ux.md). Grouping is [`group_status`](../../crates/made-app/src/worktree.rs). A changed folder or file row paints one right-side dot.
 - Hiding/restoring animates the panel width over about 150 ms with quadratic ease-out. The tree stays laid out at its stored width and is clipped to the sliding panel, so content does not reflow. Reversal settles at the stored width; closed state removes tree/splitter input.

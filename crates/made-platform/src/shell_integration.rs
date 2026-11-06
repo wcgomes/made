@@ -32,6 +32,39 @@ pub fn local_cwd_path(decoded: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// Native path for cmd.exe's raw OSC 7 form (see `CMD_OSC7_PROMPT`), for
+/// example `file://localhost/C:\Users\a b`. Windows only: other hosts never
+/// receive this form and get `None`.
+pub fn local_cmd_prompt_cwd(uri: &str) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    local_cwd_path(&windows_prompt_uri_path(uri)?)
+}
+
+/// cmd.exe reports its cwd from `PROMPT` as `file://localhost/C:\Users\a b`:
+/// raw `$P` text, so no percent-encoding, with backslashes, spaces and non-ASCII
+/// characters. Only an explicit `localhost` authority and a `X:\` drive path are
+/// accepted. Returns the decoded `/C:/Users/a b` form for
+/// [`local_cwd_path`], which still rejects device and stream
+/// names. Standard (percent-encoded) URIs never contain a backslash and are
+/// handled by the terminal's standard `file://` parser.
+fn windows_prompt_uri_path(uri: &str) -> Option<String> {
+    let (authority, path) = uri.strip_prefix("file://")?.split_once('/')?;
+    let bytes = path.as_bytes();
+    if !authority.eq_ignore_ascii_case("localhost")
+        || uri.len() > 16_384
+        || !(bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\')
+        || path.chars().any(|c| c.is_control() || c == '/')
+    {
+        return None;
+    }
+    Some(format!("/{}", path.replace('\\', "/")))
+}
+
 /// Whether a safe emitter was installed for this launch (not proof of a report).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCwdCapability {
@@ -103,10 +136,7 @@ impl ShellLaunchPlan {
             "zsh" => &["-i", "-l", "--login"],
             "fish" => &["-i", "--interactive", "-l", "--login"],
             "pwsh" | "powershell" => &["-NoLogo", "-NoProfile", "-NoExit"],
-            "cmd" => {
-                plan.capability.reason = "cmd has no demonstrated safe cwd hook; latest known cwd or launch folder remains the fallback".into();
-                return plan;
-            }
+            "cmd" if cfg!(windows) => &["/d"],
             _ => return plan,
         };
         if plan.cwd_sink.is_some()
@@ -215,6 +245,12 @@ impl ShellLaunchPlan {
         self.request.env_remove.push(name.into());
     }
     fn prepare(&mut self, shell: &str) -> std::io::Result<()> {
+        if shell == "cmd" {
+            // No file or bootstrap directory: the prompt string is the hook.
+            let prompt = cmd_prompt(self.env("PROMPT").as_deref());
+            self.set_env("PROMPT", prompt);
+            return Ok(());
+        }
         if let Some((reporter, socket)) = self.cwd_sink.clone() {
             self.set_env("MADE_CWD_REPORTER", reporter.into_os_string());
             self.set_env("MADE_CWD_SOCKET", socket.into_os_string());
@@ -317,6 +353,28 @@ impl ShellLaunchPlan {
         }
         Ok(())
     }
+}
+
+/// OSC 7 emitted by cmd.exe's own `PROMPT` before every prompt: `$E` is ESC,
+/// `$P` the current drive and path, and `$E\` ends the OSC with ST. cmd cannot
+/// percent-encode, so the path is raw (backslashes, spaces, non-ASCII); the
+/// terminal's OSC 7 parser accepts that form only for `X:\...` drive paths.
+const CMD_OSC7_PROMPT: &str = r"$E]7;file://localhost/$P$E\";
+/// cmd's own default prompt, used when the user has no `PROMPT` set.
+const CMD_DEFAULT_PROMPT: &str = "$P$G";
+
+/// Launch-local `PROMPT` value: the OSC 7 emitter followed by the user's
+/// existing prompt, or cmd's default `$P$G`. An existing prompt that already
+/// carries the emitter (a nested Made) is kept as is; an empty one means cmd's
+/// default.
+fn cmd_prompt(existing: Option<&std::ffi::OsStr>) -> OsString {
+    let existing = existing.filter(|value| !value.is_empty());
+    if existing.is_some_and(|value| value.to_string_lossy().contains(CMD_OSC7_PROMPT)) {
+        return existing.map(OsString::from).unwrap_or_default();
+    }
+    let mut prompt = OsString::from(CMD_OSC7_PROMPT);
+    prompt.push(existing.unwrap_or(std::ffi::OsStr::new(CMD_DEFAULT_PROMPT)));
+    prompt
 }
 
 // A fresh, fixed helper invocation, not discovery injected into a live shell.
@@ -616,10 +674,13 @@ fn powershell_allows_bootstrap(request: &PtyRequest) -> bool {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    let child = Command::new(&request.program)
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Write([string]$ExecutionContext.SessionState.LanguageMode + ':' + [string](Get-ExecutionPolicy))"])
-        .env_clear().envs(request.env.iter().cloned())
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let child = crate::hide_console_window(
+        Command::new(&request.program)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Write([string]$ExecutionContext.SessionState.LanguageMode + ':' + [string](Get-ExecutionPolicy))"])
+            .env_clear().envs(request.env.iter().cloned())
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
+    )
+    .spawn();
     let Ok(mut child) = child else {
         return false;
     };
@@ -788,3 +849,70 @@ function global:prompt {
     $result
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn cmd_prompt_prefixes_the_default_when_unset_or_empty() {
+        let expected = OsString::from(r"$E]7;file://localhost/$P$E\$P$G");
+        assert_eq!(cmd_prompt(None), expected);
+        assert_eq!(cmd_prompt(Some(OsStr::new(""))), expected);
+    }
+
+    #[test]
+    fn cmd_prompt_preserves_the_user_prompt() {
+        assert_eq!(
+            cmd_prompt(Some(OsStr::new("$T $P$_$G "))),
+            OsString::from(r"$E]7;file://localhost/$P$E\$T $P$_$G ")
+        );
+    }
+
+    #[test]
+    fn cmd_prompt_is_not_stacked_for_nested_launches() {
+        let once = cmd_prompt(Some(OsStr::new("$P$G")));
+        assert_eq!(cmd_prompt(Some(&once)), once);
+    }
+
+    #[test]
+    fn cmd_prompt_uri_accepts_raw_drive_paths() {
+        for (uri, expected) in [
+            (r"file://localhost/C:\Users\wylle", "/C:/Users/wylle"),
+            (
+                r"file://LOCALHOST/c:\Program Files\Made",
+                "/c:/Program Files/Made",
+            ),
+            (
+                r"file://localhost/C:\Users\wylle\Configurações Locais",
+                "/C:/Users/wylle/Configurações Locais",
+            ),
+            (r"file://localhost/D:\", "/D:/"),
+        ] {
+            assert_eq!(
+                windows_prompt_uri_path(uri).as_deref(),
+                Some(expected),
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_prompt_uri_rejects_other_forms() {
+        for uri in [
+            r"file:///C:\Users\wylle",
+            r"file://remote/C:\Users",
+            r"file://localhost/\\server\share",
+            r"file://localhost//server/share",
+            r"file://localhost/C:relative",
+            r"file://localhost/C:/Users/mixed\slashes",
+            "file://localhost/C:\\bad\x07name",
+            "file://localhost/C:\\bad\nname",
+            r"file://localhost/Users\wylle",
+            "file:///C:/Users/wylle",
+        ] {
+            assert_eq!(windows_prompt_uri_path(uri), None, "{uri}");
+        }
+    }
+}
