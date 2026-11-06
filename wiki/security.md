@@ -45,7 +45,7 @@ Only `made-explorer` reads workspace file contents for display. Read-only git me
 - Clipboard images use the private temp directory: `clipboard-images/` is `0700`, each PNG is created `0600` with `create_new`/`O_NOFOLLOW` on Unix, and raw RGBA input is bounded to 128 MiB and 16384 px per side. Image bytes and clipboard text are never logged; `Debug` reports dimensions and byte length only.
 - App-generated clipboard PNGs are retained for at most 7 days and at most 64 files. Cleanup runs after a successful save and when a workbench starts, deletes oldest first, preserves the just-saved image, skips symlinks and unrelated files, and ignores deletion failures so the paste remains usable.
 - The image-path fallback is app-generated, absolute, and UTF-8; a non-UTF-8 temp path is refused instead of pasted lossily.
-- The shell is never asked to evaluate cwd report contents, and Made does not scrape prompts/titles or inject discovery commands into a running shell.
+- The shell is never asked to evaluate cwd report contents, and Made does not scrape prompts or screen contents, or inject discovery commands into a running shell. Made consumes structured status-protocol metadata (OSC 7501) and reads the window title only as a sanitized tooltip, capped at 120 characters, while a `claude-code` OSC 7501 status is live in that tab; a title is never used for cwd, status or identity. See [ADR 0008](decisions/0008-claude-code-osc7501-session-plugin.md).
 
 ## Private state and lifecycle
 

@@ -125,6 +125,7 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p made-app --target "$TARGET"
           cargo build --release --locked -p made-grok-hook --target "$TARGET"
+          cargo build --release --locked -p made-claude-hook --target "$TARGET"
           PROFILE=release bash .github/scripts/stage-askpass.sh
 
       - name: Check the Linux baseline (glibc 2.35, NEEDED allowlist)
@@ -132,7 +133,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bins=("target/$TARGET/release/made-app" "target/$TARGET/release/made-grok-status" "dist/ssh-askpass-$TARGET/made-askpass")
+          bins=("target/$TARGET/release/made-app" "target/$TARGET/release/made-grok-status" "target/$TARGET/release/made-claude-status" "dist/ssh-askpass-$TARGET/made-askpass")
           for bin in "${bins[@]}"; do bash .github/scripts/check-glibc-max.sh "$bin" 2.35; done
           "$PY" .github/scripts/check-linux-deps.py "${bins[@]}"
 
@@ -141,7 +142,7 @@ jobs:
         shell: bash
         run: |
           "$PY" .github/scripts/check-macos-minos.py "target/$TARGET/release/made-app" \
-            "target/$TARGET/release/made-grok-status" "dist/ssh-askpass-$TARGET/made-askpass"
+            "target/$TARGET/release/made-grok-status" "target/$TARGET/release/made-claude-status" "dist/ssh-askpass-$TARGET/made-askpass"
 
       - name: Check the Windows imports (static CRT)
         if: runner.os == 'Windows'
@@ -150,7 +151,7 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1).FullName
           New-Item -ItemType Directory -Force -Path dist\imports | Out-Null
-          $bins = @("target\$env:TARGET\release\made-app.exe", "target\$env:TARGET\release\made-grok-status.exe", "dist\ssh-askpass-$env:TARGET\made-askpass.exe")
+          $bins = @("target\$env:TARGET\release\made-app.exe", "target\$env:TARGET\release\made-grok-status.exe", "target\$env:TARGET\release\made-claude-status.exe", "dist\ssh-askpass-$env:TARGET\made-askpass.exe")
           $outputs = @()
           foreach ($bin in $bins) {
             $out = "dist\imports\$([IO.Path]::GetFileName($bin)).txt"
@@ -166,6 +167,7 @@ jobs:
           "$PY" .github/scripts/stage-desktop-package.py --profile release --target "$TARGET" \
             --app "target/$TARGET/release/made-app$EXE" \
             --hook "target/$TARGET/release/made-grok-status$EXE" \
+            --claude-hook "target/$TARGET/release/made-claude-status$EXE" \
             --stage dist/stage
 
       - name: Download the companions

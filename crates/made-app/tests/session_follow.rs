@@ -1230,3 +1230,219 @@ fn coordinator_rejects_when_neither_fallback_is_usable() {
     let missing_terminal = temp.path().join("missing-terminal");
     assert!(SessionFollowCoordinator::new(&missing_launch, &missing_terminal).is_err());
 }
+
+// ---- Claude Code precedence: OpenCode > Claude Code > Grok > shell ----------
+
+#[test]
+fn opencode_keeps_the_root_over_claude_code_and_hands_it_over_on_disconnect() {
+    let temp = tempfile::tempdir().unwrap();
+    let opencode = fixture_dir(&temp, "opencode-dir");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    follow.apply_snapshot(snapshot(
+        Some("session"),
+        vec![session("session", "Open", &opencode, None)],
+        1,
+    ));
+    let held = follow.follow_claude_directory(Some(&claude));
+    assert!(!held.root_switched);
+    assert_eq!(follow.current_root(), opencode);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert!(follow.is_agent_owned());
+
+    let released = follow.release_active_session();
+    assert!(released.root_switched);
+    assert_eq!(
+        released.root, claude,
+        "the live Claude Code session is next"
+    );
+    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    assert!(!follow.is_agent_owned());
+
+    let gone = follow.follow_claude_directory(None);
+    assert!(gone.root_switched);
+    assert_eq!(gone.root, terminal);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+}
+
+#[test]
+fn an_unusable_claude_directory_is_reported_as_rejected_and_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+    assert!(follow.follow_claude_directory(Some(&claude)).root_switched);
+
+    let missing = temp.path().join("gone");
+    let rejected = follow.follow_claude_directory(Some(&missing));
+    assert!(
+        matches!(
+            rejected.update,
+            SessionFollowUpdate::RejectedSnapshot { .. }
+        ),
+        "{:?}",
+        rejected.update
+    );
+    assert!(!rejected.root_switched);
+    assert_eq!(
+        follow.current_root(),
+        claude,
+        "the previous directory stays"
+    );
+}
+
+#[test]
+fn a_connected_view_keeps_the_root_over_claude_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let view = fixture_dir(&temp, "view-dir");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
+    assert!(!follow.follow_claude_directory(Some(&claude)).root_switched);
+    assert_eq!(follow.current_root(), view);
+    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+
+    let released = follow.release_active_session();
+    assert_eq!(released.root, claude);
+    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+}
+
+#[test]
+fn claude_code_wins_over_grok_and_the_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let elsewhere = fixture_dir(&temp, "elsewhere");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    assert!(follow.follow_grok_directory(Some(&grok)).root_switched);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+
+    let moved = follow.follow_claude_directory(Some(&claude));
+    assert!(moved.root_switched);
+    assert_eq!(follow.current_root(), claude);
+    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+
+    let shell = follow.follow_shell_cwd(&elsewhere).unwrap();
+    assert!(
+        !shell.root_switched,
+        "a shell report must not steal from Claude Code"
+    );
+    assert_eq!(follow.current_root(), claude);
+}
+
+#[test]
+fn grok_attach_or_prompt_does_not_take_the_root_from_claude_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let grok_prompted = fixture_dir(&temp, "grok-prompted");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    assert!(follow.follow_claude_directory(Some(&claude)).root_switched);
+    let attach = follow.follow_grok_directory(Some(&grok));
+    assert!(!attach.root_switched);
+    let prompt = follow.follow_grok_directory(Some(&grok_prompted));
+    assert!(!prompt.root_switched);
+    assert_eq!(follow.current_root(), claude);
+    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+}
+
+#[test]
+fn claude_code_exit_returns_to_the_open_grok_session_else_the_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    // A Grok session that opened before Claude Code.
+    follow.follow_grok_directory(Some(&grok));
+    follow.follow_claude_directory(Some(&claude));
+    let exit = follow.follow_claude_directory(None);
+    assert!(exit.root_switched);
+    assert_eq!(exit.root, grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+
+    // A Grok session that attached while Claude Code was live.
+    follow.follow_grok_directory(None);
+    assert_eq!(follow.current_root(), terminal);
+    follow.follow_claude_directory(Some(&claude));
+    follow.follow_grok_directory(Some(&grok));
+    assert_eq!(follow.current_root(), claude);
+    let exit = follow.follow_claude_directory(None);
+    assert_eq!(exit.root, grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+
+    // No Grok session: the shell directory.
+    follow.follow_grok_directory(None);
+    follow.follow_claude_directory(Some(&claude));
+    let exit = follow.follow_claude_directory(None);
+    assert_eq!(exit.root, terminal);
+    assert_eq!(follow.effective_root_source(), RootSource::Shell);
+}
+
+#[test]
+fn a_grok_session_that_closes_under_claude_code_is_not_restored_later() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, terminal) = coordinator(&temp);
+
+    follow.follow_claude_directory(Some(&claude));
+    follow.follow_grok_directory(Some(&grok));
+    assert!(!follow.follow_grok_directory(None).root_switched);
+    assert_eq!(follow.current_root(), claude);
+    assert_eq!(follow.follow_claude_directory(None).root, terminal);
+}
+
+#[test]
+fn protocol_only_presence_neither_moves_nor_holds_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let grok = fixture_dir(&temp, "grok-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    follow.follow_grok_directory(Some(&grok));
+    // Presence without a live owned session reports no directory.
+    let outcome = follow.follow_claude_directory(None);
+    assert!(!outcome.root_switched);
+    assert_eq!(follow.current_root(), grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    let moved = fixture_dir(&temp, "grok-moved");
+    assert!(follow.follow_grok_directory(Some(&moved)).root_switched);
+    assert_eq!(follow.current_root(), moved);
+}
+
+#[test]
+fn an_invalid_claude_code_directory_does_not_move_the_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+
+    follow.follow_claude_directory(Some(&claude));
+    for invalid in [
+        Path::new("relative/dir").to_path_buf(),
+        temp.path().join("missing"),
+        PathBuf::new(),
+    ] {
+        let outcome = follow.follow_claude_directory(Some(&invalid));
+        assert!(!outcome.root_switched, "{invalid:?}");
+        assert_eq!(follow.current_root(), claude);
+        assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    }
+    let fresh_temp = tempfile::tempdir().unwrap();
+    let (mut shell_only, launch, _) = coordinator(&fresh_temp);
+    assert!(
+        !shell_only
+            .follow_claude_directory(Some(Path::new("relative")))
+            .root_switched
+    );
+    assert_eq!(shell_only.current_root(), launch);
+    assert_eq!(shell_only.effective_root_source(), RootSource::Shell);
+}
+
+#[test]
+fn root_source_identifiers_are_stable() {
+    assert_eq!(RootSource::ClaudeCode.as_str(), "claude-code");
+    assert_eq!(RootSource::Grok.as_str(), "grok");
+}

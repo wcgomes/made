@@ -78,9 +78,13 @@ jobs:
       - name: Build the native Grok hook
         run: cargo build -p made-grok-hook --locked --release --target ${{ matrix.target }}
 
+      - name: Build the native Claude Code hook
+        run: cargo build -p made-claude-hook --locked --release --target ${{ matrix.target }}
+
       # Development artifacts only: debug binaries, the app-owned OpenCode
       # plugin package, the shipped Grok plugin package (staged by
-      # stage-grok-plugin.sh), README, LICENSE, and version metadata, through
+      # stage-grok-plugin.sh), the shipped Claude Code plugin package (staged
+      # by stage-claude-plugin.sh), README, LICENSE, and version metadata, through
       # the staging script shared with releases. Companions and the native
       # askpass are added after this step; they do not replace it.
       # No signing, notarization, installer, or auto-update payload is produced.
@@ -95,9 +99,11 @@ jobs:
           "$py" .github/scripts/stage-desktop-package.py --profile debug --target "$TARGET" \
             --app "target/${TARGET}/debug/made-app${EXE}" \
             --hook "target/${TARGET}/release/made-grok-status${EXE}" \
+            --claude-hook "target/${TARGET}/release/made-claude-status${EXE}" \
             --stage "dist/made-development-${TARGET}"
           stage="dist/made-development-${TARGET}"
           test -x "$stage/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          test -x "$stage/plugins/claude-code-made/bin/made-claude-status${EXE}"
           test -f "$stage/LICENSE"
 
       - name: Download Linux x64 companion
@@ -185,10 +191,41 @@ jobs:
           MADE_PACKAGED_HOOK="$hook" PATH="$clean" \
             cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" -- --nocapture
 
+      # The same packaged-layout test for the Claude Code hook: the staged
+      # hook, from the desktop package, run with python removed from PATH.
+      - name: Run the packaged Claude Code hook with Python removed from PATH
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          cargo test -p made-claude-hook --test packaged --locked --target "$TARGET" --no-run
+          hook="$PWD/dist/made-development-${TARGET}/plugins/claude-code-made/bin/made-claude-status${EXE}"
+          test -x "$hook"
+          clean=""
+          IFS=':' read -r -a entries <<< "$PATH"
+          for entry in "${entries[@]}"; do
+            [ -n "$entry" ] || continue
+            if [ -e "$entry/python" ] || [ -e "$entry/python3" ] \
+              || [ -e "$entry/python.exe" ] || [ -e "$entry/python3.exe" ]; then
+              echo "removing from PATH: $entry"
+              continue
+            fi
+            clean="${clean:+$clean:}$entry"
+          done
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            hook="$(cygpath -w "$hook")"
+          fi
+          PATH="$clean" "$BASH" -c 'command -v python python3 >/dev/null 2>&1 && { echo "python is still on PATH" >&2; exit 1; }; exit 0'
+          MADE_PACKAGED_HOOK="$hook" PATH="$clean" \
+            cargo test -p made-claude-hook --test packaged --locked --target "$TARGET" -- --nocapture
+
       - name: Upload the development artifact
         uses: actions/upload-artifact@v7
         with:
           name: made-development-${{ matrix.target }}
           path: dist/made-development-${{ matrix.target }}/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14

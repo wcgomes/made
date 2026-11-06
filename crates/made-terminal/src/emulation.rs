@@ -27,6 +27,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions as VtDimensions, Scroll};
@@ -42,6 +43,17 @@ use made_platform::{Clipboard, PlatformError};
 
 /// Maximum number of bytes retained for one OSC sequence by the cwd scanner.
 const OSC_BUFFER_LIMIT: usize = 8 * 1024;
+/// Largest accepted OSC 7501 sequence body, including the `7501;` prefix.
+const PROTOCOL_SEQUENCE_LIMIT: usize = 4096;
+/// Most protocol events kept between [`TerminalCore::take_protocol_events`] calls.
+const PROTOCOL_EVENT_LIMIT: usize = 256;
+/// The Program Status Protocol capability reply.
+const PROTOCOL_PROBE_REPLY: &[u8] = b"\x1b]7501;?\x07";
+/// A probe is answered at most once per this window, so a tty that echoes the
+/// reply (which equals the probe) cannot start an endless exchange.
+const PROTOCOL_PROBE_WINDOW: Duration = Duration::from_secs(1);
+/// The only `app` value acted upon.
+const PROTOCOL_APP: &[u8] = b"claude-code";
 
 /// Terminal viewport size in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +279,29 @@ impl TerminalDamage {
     }
 }
 
+/// Program Status Protocol state carried by a session-level emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+}
+
+/// Event produced by a Program Status Protocol (OSC 7501) sequence.
+///
+/// Events never carry emission text: `msg`, `title` and `kind` are not kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolEvent {
+    /// The capability probe was received (and already answered).
+    Probe,
+    /// A session-level `app=claude-code` status emission.
+    Status { state: ProtocolState },
+    /// A session-level `state=clear`; `bare` when it carried no `app` field.
+    Clear { bare: bool },
+}
+
 /// VT terminal state behind the replaceable `TerminalCore` boundary.
 pub struct TerminalCore {
     term: Term<CoreListener>,
@@ -278,6 +313,9 @@ pub struct TerminalCore {
     damage: TerminalDamage,
     osc: OscScanner,
     cwd: Option<PathBuf>,
+    cwd_reports: u64,
+    protocol_events: Vec<ProtocolEvent>,
+    last_probe_reply: Option<Instant>,
 }
 
 impl TerminalCore {
@@ -309,6 +347,9 @@ impl TerminalCore {
             damage: TerminalDamage::default(),
             osc: OscScanner::default(),
             cwd: None,
+            cwd_reports: 0,
+            protocol_events: Vec::new(),
+            last_probe_reply: None,
         };
         core.collect_damage();
         core
@@ -316,14 +357,48 @@ impl TerminalCore {
 
     /// Feed PTY output bytes.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.feed_at(bytes, Instant::now());
+    }
+
+    /// Feed PTY output bytes received at `now`.
+    pub fn feed_at(&mut self, bytes: &[u8], now: Instant) {
         if bytes.is_empty() {
             return;
         }
-        self.parser.advance(&mut self.term, bytes);
-        self.osc.advance(bytes);
+        // The scanner stops right after a capability probe so the probe reply
+        // is queued between the parser advances, keeping stream order with any
+        // reply (for example DA1) to a query that follows the probe.
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let consumed = self.osc.advance(rest);
+            self.parser.advance(&mut self.term, &rest[..consumed]);
+            let mut events = self.osc.take_events();
+            if self.osc.take_probe() {
+                let due = self.last_probe_reply.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= PROTOCOL_PROBE_WINDOW
+                });
+                if due {
+                    self.last_probe_reply = Some(now);
+                    self.listener_state_mut()
+                        .replies
+                        .push(Reply::Bytes(PROTOCOL_PROBE_REPLY.to_vec()));
+                } else {
+                    // The scanner stops right after the probe, so it is last.
+                    events.pop();
+                }
+            }
+            self.protocol_events.extend(events);
+            rest = &rest[consumed..];
+        }
         if let Some(cwd) = self.osc.take_cwd() {
             self.cwd = Some(cwd);
+            self.cwd_reports = self.cwd_reports.wrapping_add(1);
         }
+        let excess = self
+            .protocol_events
+            .len()
+            .saturating_sub(PROTOCOL_EVENT_LIMIT);
+        self.protocol_events.drain(..excess);
         self.version = self.version.wrapping_add(1);
         self.collect_damage();
     }
@@ -500,6 +575,12 @@ impl TerminalCore {
         self.cwd.as_deref()
     }
 
+    /// How many data chunks carried an OSC 7 report, including reports that
+    /// repeat the current directory. A shell prompt hook sends one per prompt.
+    pub fn cwd_report_count(&self) -> u64 {
+        self.cwd_reports
+    }
+
     /// Whether the alternate screen is active.
     pub fn alternate_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
@@ -524,6 +605,11 @@ impl TerminalCore {
             }
         }
         out
+    }
+
+    /// Take the Program Status Protocol events received since the last call.
+    pub fn take_protocol_events(&mut self) -> Vec<ProtocolEvent> {
+        std::mem::take(&mut self.protocol_events)
     }
 
     /// Take and clear the bell flag.
@@ -834,7 +920,8 @@ enum OscState {
     OscEscape,
 }
 
-/// Incremental OSC 7 scanner. Runs beside the emulator; never modifies bytes.
+/// Incremental OSC 7 and OSC 7501 scanner. Runs beside the emulator; never
+/// modifies bytes.
 ///
 /// It deliberately does not implement `Debug`: its buffer can hold terminal
 /// content, and there is no safe reason to dump it.
@@ -844,11 +931,15 @@ struct OscScanner {
     buffer: Vec<u8>,
     overflow: bool,
     cwd: Option<PathBuf>,
+    probe: bool,
+    events: Vec<ProtocolEvent>,
 }
 
 impl OscScanner {
-    fn advance(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
+    /// Scan `bytes`, returning how many were consumed. Stops right after the
+    /// terminator of a capability probe so the caller can answer it in order.
+    fn advance(&mut self, bytes: &[u8]) -> usize {
+        for (index, &byte) in bytes.iter().enumerate() {
             match self.state {
                 OscState::Ground => {
                     if byte == 0x1b {
@@ -876,13 +967,22 @@ impl OscScanner {
                     if byte == b'\\' {
                         self.finish();
                         self.state = OscState::Ground;
+                    } else if byte == b']' {
+                        // `ESC ]` inside an OSC starts a new one, as in vte.
+                        self.buffer.clear();
+                        self.overflow = false;
+                        self.state = OscState::Osc;
                     } else {
                         // Not a string terminator; discard the OSC attempt.
                         self.state = OscState::Ground;
                     }
                 }
             }
+            if self.probe {
+                return index + 1;
+            }
         }
+        bytes.len()
     }
 
     fn push(&mut self, byte: u8) {
@@ -897,6 +997,17 @@ impl OscScanner {
         if !self.overflow {
             if let Some(path) = parse_osc7(&self.buffer) {
                 self.cwd = Some(path);
+            } else if let Some(payload) = self.buffer.strip_prefix(b"7501;") {
+                if self.buffer.len() <= PROTOCOL_SEQUENCE_LIMIT {
+                    match parse_protocol(payload) {
+                        Some(ProtocolEvent::Probe) => {
+                            self.probe = true;
+                            self.events.push(ProtocolEvent::Probe);
+                        }
+                        Some(event) => self.events.push(event),
+                        None => {}
+                    }
+                }
             }
         }
         self.buffer.clear();
@@ -906,6 +1017,64 @@ impl OscScanner {
     fn take_cwd(&mut self) -> Option<PathBuf> {
         self.cwd.take()
     }
+
+    fn take_probe(&mut self) -> bool {
+        std::mem::take(&mut self.probe)
+    }
+
+    fn take_events(&mut self) -> Vec<ProtocolEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// Map one OSC 7501 payload (the bytes after `7501;`) to an event.
+///
+/// Only the `state`, `app` and `id` values are inspected; `msg`, `title`,
+/// `kind` and unknown fields are skipped without being copied. Anything
+/// malformed, scoped to another app, or describing an `id` row yields `None`.
+fn parse_protocol(payload: &[u8]) -> Option<ProtocolEvent> {
+    if payload == b"?" {
+        return Some(ProtocolEvent::Probe);
+    }
+    let mut state: Option<&[u8]> = None;
+    let mut app: Option<&[u8]> = None;
+    let mut has_id = false;
+    for field in payload.split(|&b| b == b':') {
+        let eq = field.iter().position(|&b| b == b'=')?;
+        let (key, value) = (&field[..eq], &field[eq + 1..]);
+        let slot = match key {
+            b"state" => &mut state,
+            b"app" => &mut app,
+            b"id" => {
+                has_id = true;
+                continue;
+            }
+            b"" => return None,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return None;
+        }
+    }
+    if has_id {
+        return None;
+    }
+    let state = match state? {
+        b"clear" => {
+            return match app {
+                None => Some(ProtocolEvent::Clear { bare: true }),
+                Some(PROTOCOL_APP) => Some(ProtocolEvent::Clear { bare: false }),
+                Some(_) => None,
+            };
+        }
+        b"idle" => ProtocolState::Idle,
+        b"working" => ProtocolState::Working,
+        b"done" => ProtocolState::Done,
+        b"blocked" => ProtocolState::Blocked,
+        b"error" => ProtocolState::Error,
+        _ => return None,
+    };
+    (app == Some(PROTOCOL_APP)).then_some(ProtocolEvent::Status { state })
 }
 
 fn parse_osc7(buffer: &[u8]) -> Option<PathBuf> {

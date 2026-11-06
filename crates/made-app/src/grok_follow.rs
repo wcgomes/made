@@ -195,7 +195,7 @@ fn process_belongs_to(pid: u32, root: u32) -> bool {
     process_belongs_to_with(pid, root, made_platform::process_parent)
 }
 
-fn process_belongs_to_with(
+pub(crate) fn process_belongs_to_with(
     mut pid: u32,
     root: u32,
     mut parent_of: impl FnMut(u32) -> Option<u32>,

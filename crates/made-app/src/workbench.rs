@@ -27,6 +27,7 @@ use made_platform::{
     PtySize,
 };
 
+use crate::claude_follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
     DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
@@ -34,7 +35,10 @@ use crate::diagnostics::{
 use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
-use crate::integration_status::{IntegrationState, IntegrationStatus};
+use crate::integration_status::{
+    claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
+    ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus,
+};
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_focus::{FocusErrorKind, FocusOutcome, FocusUpdate, SessionFocusController};
@@ -42,7 +46,7 @@ use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
 use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
-use crate::tui::TerminalTarget;
+use crate::tui::{ClaudeLaunchEnv, TerminalTarget, CLAUDE_SPOOL_ENV};
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
 use crate::worktree::{
     GitRunner, GitStatusRead, GitStatusSnapshot, MetadataStatus, WorktreeMetadata,
@@ -69,6 +73,24 @@ const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
+
+/// Claude Code state of one local tab: the joined hook and protocol channels,
+/// and the tab's spool.
+struct ClaudeRuntime {
+    tab: ClaudeTab,
+    /// `None` when the spool could not be created; hooks are then unavailable.
+    spool: Option<TabSpool>,
+    liveness_checked_at: Instant,
+    /// When Claude Code last became present in this tab.
+    present_since: Option<Instant>,
+    /// Directory last handed to the follow coordinator and accepted by it.
+    applied_directory: Option<PathBuf>,
+    /// Directory the coordinator rejected, retried on the liveness tick.
+    rejected_directory: Option<PathBuf>,
+}
+
+/// How often owned Claude Code processes are checked for exit.
+const CLAUDE_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One Grok session open in this terminal, with the latest hook status.
 #[derive(Debug, Clone)]
@@ -251,6 +273,9 @@ struct RemoteTab {
     /// Whether the remote launch target is Grok: the first frame opens
     /// `grok dashboard` through LaunchTarget::Grok.
     grok: bool,
+    /// Whether the remote launch target is Claude Code: the first frame opens
+    /// the companion's direct `LaunchTarget::Claude`.
+    claude: bool,
     /// Sanitized target triple for the update card. The version is the shipped
     /// app version; no path or hash is stored here.
     update_target: Option<String>,
@@ -261,6 +286,9 @@ struct RemoteTab {
     /// What the tab's own launch probe detected. Absence is undetected; the
     /// host PATH is never consulted for a remote tab.
     grok_detected: bool,
+    /// The same for claude: `None` until a probe finished, then the tab's own
+    /// server detection.
+    claude_detected: Option<bool>,
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
     client_rx: Option<
@@ -329,10 +357,12 @@ impl RemoteTab {
             prompt_draft: String::new(),
             opencode: false,
             grok: false,
+            claude: false,
             update_target: None,
             update_approved: false,
             update_failed: false,
             grok_detected: false,
+            claude_detected: None,
             probe: None,
             stage: None,
             client_rx: None,
@@ -571,6 +601,13 @@ pub struct Workbench {
     /// `None` while a provisional move is active means the shell owned the root.
     grok_restore_root: Option<PathBuf>,
     grok_file_newest_id: Option<String>,
+    /// Present for local shell and direct Claude Code tabs.
+    claude: Option<ClaudeRuntime>,
+    /// The shipped Claude Code plugin when it is usable, looked up once per
+    /// launch so the per-frame diagnostics row never touches the filesystem.
+    claude_plugin: Option<PathBuf>,
+    /// App-wide Claude Code detection state for the diagnostics row.
+    claude_phase: ClaudeDiagnosticsPhase,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -660,6 +697,7 @@ impl Workbench {
         let mut remote = RemoteTab::connecting(snapshot.clone(), directory)?;
         remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
         remote.grok = matches!(target, TerminalTarget::RemoteGrok { .. });
+        remote.claude = matches!(target, TerminalTarget::RemoteClaude { .. });
         remote.grok_detected = false;
         remote.probe = Some(crate::ssh_servers::spawn_probe(
             crate::ssh_servers::ProbeRequest {
@@ -698,10 +736,12 @@ impl Workbench {
             prompt_draft: String::new(),
             opencode: matches!(target, TerminalTarget::RemoteOpenCode { .. }),
             grok: matches!(target, TerminalTarget::RemoteGrok { .. }),
+            claude: matches!(target, TerminalTarget::RemoteClaude { .. }),
             update_target: None,
             update_approved: false,
             update_failed: false,
             grok_detected: false,
+            claude_detected: None,
             probe: None,
             stage: None,
             client_rx: None,
@@ -762,6 +802,9 @@ impl Workbench {
             }
             Err(error) => path_error = Some(format!("app paths: {error}")),
         }
+        let claude_plugin = app_paths
+            .as_ref()
+            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
         let log_path = diagnostics_log_path(app_paths.as_ref());
         #[cfg(test)]
         if let Some(path) = &log_path {
@@ -835,6 +878,9 @@ impl Workbench {
             grok_provisional_cwd: None,
             grok_restore_root: None,
             grok_file_newest_id: None,
+            claude: None,
+            claude_plugin,
+            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -1116,10 +1162,11 @@ impl Workbench {
     }
 
     fn start_terminal(&mut self, composed_content: Option<String>) {
-        // Grok is started as-is. OpenCode and the shell keep the composed
-        // plugin environment; Grok must not receive it or a written config.
+        // Grok and Claude Code are started as-is. OpenCode and the shell keep
+        // the composed plugin environment; Grok and Claude Code must not
+        // receive it or a written config.
         let composed_content = match self.terminal_target {
-            TerminalTarget::Tui(CompatibleTui::Grok) => None,
+            TerminalTarget::Tui(CompatibleTui::Grok | CompatibleTui::ClaudeCode) => None,
             TerminalTarget::Shell | TerminalTarget::Tui(CompatibleTui::OpenCode) => {
                 composed_content
             }
@@ -1127,7 +1174,8 @@ impl Workbench {
             // do not start a host PTY or inject the local OpenCode plugin.
             TerminalTarget::RemoteShell { .. }
             | TerminalTarget::RemoteOpenCode { .. }
-            | TerminalTarget::RemoteGrok { .. } => {
+            | TerminalTarget::RemoteGrok { .. }
+            | TerminalTarget::RemoteClaude { .. } => {
                 return;
             }
         };
@@ -1144,6 +1192,9 @@ impl Workbench {
             self.terminal_error = Some(detail);
             return;
         };
+        // Local shell and direct Claude Code tabs load Made's session-only
+        // plugin and report to this tab's own spool.
+        let (mut claude_spool, claude_launch) = self.prepare_claude_launch();
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1156,6 +1207,7 @@ impl Workbench {
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");
+        options = with_claude_launch_env(options, self.terminal_target, &claude_launch);
 
         if let Some(content) = &composed_content {
             options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
@@ -1173,6 +1225,7 @@ impl Workbench {
                         ),
                     );
                 }
+                self.install_claude(pane.pid(), claude_spool.take());
                 self.terminal = Some(pane);
                 self.terminal_error = None;
                 if composed_content.is_none() {
@@ -1197,6 +1250,7 @@ impl Workbench {
                             .without_env("SHELLOPTS")
                             .without_env("BASH_ENV")
                             .without_env("ENV");
+                        retry = with_claude_launch_env(retry, self.terminal_target, &claude_launch);
                         if let Some(content) = &composed_content {
                             retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }
@@ -1214,6 +1268,7 @@ impl Workbench {
                             if let Some(follow) = self.follow.as_mut() {
                                 follow.set_terminal_cwd(&self.terminal_cwd);
                             }
+                            self.install_claude(pane.pid(), claude_spool.take());
                             self.terminal = Some(pane);
                             self.terminal_error = None;
                             return;
@@ -1228,6 +1283,128 @@ impl Workbench {
                 self.terminal_error = Some(detail);
             }
         }
+    }
+
+    /// Create this tab's spool and compose its Claude Code environment. Only
+    /// local shell and direct Claude Code tabs get one.
+    fn prepare_claude_launch(&mut self) -> (Option<TabSpool>, ClaudeLaunchEnv) {
+        if !self.terminal_target.loads_claude_plugin() {
+            return (None, ClaudeLaunchEnv::default());
+        }
+        self.claude_plugin = self
+            .paths
+            .as_ref()
+            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
+        let shipped = self.claude_plugin.clone();
+        let spool = if shipped.is_some() {
+            self.open_claude_spool()
+        } else {
+            None
+        };
+        let existing = std::env::var_os(made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV);
+        let launch = self.terminal_target.claude_launch_env(
+            shipped.as_deref(),
+            existing.as_deref(),
+            spool.as_ref().map(TabSpool::path),
+        );
+        if launch.hooks_unavailable {
+            self.diag.log_mut().record(
+                LogLevel::Warn,
+                "Claude Code session-status hooks are unavailable for this tab",
+            );
+        }
+        (spool, launch)
+    }
+
+    fn open_claude_spool(&mut self) -> Option<TabSpool> {
+        let temp_dir = self.paths.as_ref()?.temp_dir.clone();
+        let opened =
+            shared_instance(&temp_dir).and_then(|instance| TabSpool::open(instance, &self.pane_id));
+        match opened {
+            Ok(spool) => Some(spool),
+            Err(error) => {
+                self.diag.log_mut().record(
+                    LogLevel::Warn,
+                    format!("Claude Code spool could not be created: {error}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn install_claude(&mut self, pid: Option<u32>, spool: Option<TabSpool>) {
+        if !self.terminal_target.loads_claude_plugin() {
+            return;
+        }
+        let direct = self.terminal_target == TerminalTarget::Tui(CompatibleTui::ClaudeCode);
+        let mut tab = ClaudeTab::new(pid.unwrap_or(0), direct);
+        tab.set_child_running(true);
+        self.claude = Some(ClaudeRuntime {
+            tab,
+            spool,
+            liveness_checked_at: Instant::now(),
+            present_since: None,
+            applied_directory: None,
+            rejected_directory: None,
+        });
+    }
+
+    /// Claude Code state of this tab: presence, dots and title inputs. `None`
+    /// for tabs that do not load Made's Claude Code plugin.
+    pub fn claude_tab(&self) -> Option<&ClaudeTab> {
+        self.claude.as_ref().map(|runtime| &runtime.tab)
+    }
+
+    /// Record this remote tab's own `claude` detection: `None` while its probe
+    /// is pending. The host PATH is never consulted for a remote tab.
+    pub fn set_remote_claude_detection(&mut self, detected: Option<bool>) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.claude_detected = detected;
+        }
+    }
+
+    /// Record the app-wide Claude Code detection state for the diagnostics row.
+    pub(crate) fn set_claude_phase(&mut self, phase: ClaudeDiagnosticsPhase) {
+        self.claude_phase = phase;
+    }
+
+    /// The Claude Code diagnostics row for this workspace.
+    pub(crate) fn claude_diagnostics(&self) -> crate::diagnostics::ClaudeDiagnosticsReport {
+        let runtime = self.claude.as_ref();
+        let present = runtime.is_some_and(|runtime| runtime.tab.present());
+        if let Some(remote) = self.remote.as_ref() {
+            // A remote workspace reports its own server's detection and this
+            // tab's presence; the host's plugin and PATH never apply.
+            return remote_claude_diagnostics_row(&ClaudeDiagnosticsInputs {
+                phase: match remote.claude_detected {
+                    None => ClaudeDiagnosticsPhase::Checking,
+                    Some(false) => ClaudeDiagnosticsPhase::NotOnPath,
+                    Some(true) => ClaudeDiagnosticsPhase::Available,
+                },
+                plugin_missing: false,
+                present,
+                present_for: runtime
+                    .and_then(|runtime| runtime.present_since)
+                    .map_or(Duration::ZERO, |since| {
+                        Instant::now().saturating_duration_since(since)
+                    }),
+                live_session: false,
+                protocol_observed: runtime
+                    .is_some_and(|runtime| runtime.tab.protocol_status_seen()),
+            });
+        }
+        claude_diagnostics_row(&ClaudeDiagnosticsInputs {
+            phase: self.claude_phase,
+            plugin_missing: self.claude_plugin.is_none(),
+            present,
+            present_for: runtime
+                .and_then(|runtime| runtime.present_since)
+                .map_or(Duration::ZERO, |since| {
+                    Instant::now().saturating_duration_since(since)
+                }),
+            live_session: runtime.is_some_and(|runtime| runtime.tab.session_count() > 0),
+            protocol_observed: runtime.is_some_and(|runtime| runtime.tab.protocol_status_seen()),
+        })
     }
 
     fn log_launch_context(&mut self) {
@@ -2638,6 +2815,7 @@ impl Workbench {
         self.pump_remote_client();
         self.sync_remote_sessions();
         let terminal_changed = self.pump_remote_terminal();
+        self.poll_claude(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
         // must not drive an immediate repaint of the active local tab: that
@@ -2766,7 +2944,7 @@ impl Workbench {
 
     fn finish_remote_probe(
         &mut self,
-        result: Result<made_remote::protocol::Capabilities, crate::ssh_servers::AttemptError>,
+        result: Result<crate::ssh_servers::ProbeReport, crate::ssh_servers::AttemptError>,
     ) {
         let Some(remote) = self.remote.as_mut() else {
             return;
@@ -2774,10 +2952,11 @@ impl Workbench {
         remote.probe = None;
         remote.prompt = None;
         remote.prompt_draft.clear();
-        let capabilities = match result {
-            Ok(capabilities) => capabilities,
+        let report = match result {
+            Ok(report) => report,
             Err(error) => return self.apply_attempt_error(error, OpenRetry::Probe),
         };
+        let capabilities = report.capabilities;
         // Presence is recorded; the field itself is not a gate.
         let _ = capabilities.tmux;
         if remote.opencode && !capabilities.opencode {
@@ -2797,8 +2976,18 @@ impl Workbench {
                 .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
+        if remote.claude && !report.claude {
+            remote.phase = RemotePhase::Failed;
+            remote.detail =
+                "Claude Code was not detected on this server. Nothing ran locally.".to_owned();
+            remote
+                .workspace
+                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
+            return;
+        }
         // The owning tab's own detection feeds its Grok Build diagnostics row.
         remote.grok_detected = capabilities.grok;
+        remote.claude_detected = Some(report.claude);
         let target = match capabilities.target {
             made_remote::protocol::RemoteTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
             made_remote::protocol::RemoteTarget::LinuxArm64 => "aarch64-unknown-linux-gnu",
@@ -3058,6 +3247,8 @@ impl Workbench {
             made_remote::protocol::LaunchTarget::OpenCode
         } else if remote.grok {
             made_remote::protocol::LaunchTarget::Grok
+        } else if remote.claude {
+            made_remote::protocol::LaunchTarget::Claude
         } else {
             made_remote::protocol::LaunchTarget::Shell
         };
@@ -3358,6 +3549,8 @@ impl Workbench {
         self.diag
             .log_mut()
             .record(LogLevel::Error, "remote transport disconnected");
+        // Remote Claude Code status and title do not outlive the transport.
+        self.claude = None;
         if let Some(remote) = self.remote.as_mut() {
             remote.workspace.disconnect();
             remote.phase = RemotePhase::Failed;
@@ -3511,6 +3704,8 @@ impl Workbench {
         let mut pane = TerminalPane::open_remote(target, DEFAULT_ROWS as u16, DEFAULT_COLS as u16);
         pane.attach_remote_transport(Box::new(client.terminal_transport()));
         self.terminal = Some(pane);
+        // A new remote terminal waits for its own fresh emission.
+        self.claude = None;
         self.terminal_error = None;
         if let Some(remote) = self.remote.as_mut() {
             remote.snapshot_gate = crate::remote_session::SnapshotGate::default();
@@ -3847,6 +4042,7 @@ impl Workbench {
         self.maybe_schedule_shell_root_revalidation(now);
         self.poll_grok_hooks(now);
         self.poll_grok_directory(now);
+        self.poll_claude(now);
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -4201,6 +4397,106 @@ impl Workbench {
             }
             _ => {}
         }
+    }
+
+    /// Apply this tab's Claude Code channels: terminal protocol events and the
+    /// shell-prompt report, spool records read off the UI thread, the
+    /// one-second liveness check and the session directory.
+    fn poll_claude(&mut self, now: Instant) {
+        // A remote tab has no spool, no hook sessions and no process anchor: its
+        // runtime exists to carry the status protocol of its remote terminal.
+        if self.claude.is_none() && self.remote.is_some() {
+            let direct = matches!(self.terminal_target, TerminalTarget::RemoteClaude { .. });
+            self.claude = Some(ClaudeRuntime {
+                tab: ClaudeTab::new(0, direct),
+                spool: None,
+                liveness_checked_at: now,
+                present_since: None,
+                applied_directory: None,
+                rejected_directory: None,
+            });
+        }
+        let Some(runtime) = self.claude.as_mut() else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        if let Some(pid) = terminal.pid() {
+            runtime.tab.set_root(pid);
+        }
+        let prompt_reported = terminal.take_cwd_report();
+        runtime
+            .tab
+            .apply_terminal_reports(terminal.take_protocol_events(), prompt_reported);
+        runtime.tab.set_child_running(terminal.is_running());
+        // One process map serves every ancestry and liveness check of this
+        // poll. It is built only when a check needs it, and records stay
+        // queued until the terminal process is known.
+        let tick_due =
+            now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL;
+        let records = if runtime.tab.root_known() {
+            runtime
+                .spool
+                .as_ref()
+                .map(TabSpool::drain)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut parents = None;
+        let mut parent_of = |pid: u32| -> Option<u32> {
+            parents
+                .get_or_insert_with(made_platform::process_parent_map)
+                .get(&pid)
+                .copied()
+        };
+        if !records.is_empty() {
+            runtime.tab.ingest(records, &mut parent_of);
+        }
+        if tick_due {
+            runtime.liveness_checked_at = now;
+            runtime.tab.check_liveness(&mut parent_of);
+        }
+        if runtime.tab.present() {
+            runtime.present_since.get_or_insert(now);
+        } else if runtime.present_since.take().is_some() {
+            runtime.tab.reset_observations();
+        }
+        let directory = runtime.tab.directory().map(PathBuf::from);
+        if directory == runtime.applied_directory {
+            return;
+        }
+        if !tick_due && directory.is_some() && directory == runtime.rejected_directory {
+            return;
+        }
+        let accepted = self.follow_claude_path(directory.as_deref());
+        if let Some(runtime) = self.claude.as_mut() {
+            if accepted {
+                runtime.applied_directory.clone_from(&directory);
+                runtime.rejected_directory = None;
+            } else {
+                runtime.rejected_directory = directory;
+            }
+        }
+    }
+
+    /// Hand the Claude Code directory to the follow coordinator. Returns
+    /// whether it was accepted; a rejected directory is not remembered as
+    /// applied.
+    fn follow_claude_path(&mut self, directory: Option<&Path>) -> bool {
+        let Some(outcome) = self
+            .follow
+            .as_mut()
+            .map(|follow| follow.follow_claude_directory(directory))
+        else {
+            return true;
+        };
+        let accepted = !matches!(outcome.update, SessionFollowUpdate::RejectedSnapshot { .. });
+        if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+            self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
+        }
+        accepted
     }
 
     fn follow_grok_path(&mut self, directory: Option<&Path>) {
@@ -4967,6 +5263,8 @@ impl Workbench {
         if let Some(mut terminal) = self.terminal.take() {
             terminal.terminate(self.diag.log_mut());
         }
+        // Closing the tab deletes its spool.
+        self.claude = None;
         if let Some(bridge) = self.bridge.take() {
             if let Err(error) = bridge.shutdown() {
                 self.diag
@@ -5168,6 +5466,7 @@ impl Workbench {
             snapshot.set_remote_opencode(report);
         }
         snapshot.set_grok_diagnostics(self.grok_diagnostics.clone());
+        snapshot.set_claude_diagnostics(self.claude_diagnostics());
         snapshot
     }
 
@@ -5527,6 +5826,28 @@ impl Drop for ShellRootWorker {
     }
 }
 
+/// Add a tab's Claude Code environment to its PTY options. A launch with no
+/// spool binding, including every target that does not load the plugin, also
+/// removes an inherited one, so a copied variable can never point a tab at
+/// another tab's spool.
+fn with_claude_launch_env(
+    mut options: made_terminal::PtyOptions,
+    target: TerminalTarget,
+    launch: &ClaudeLaunchEnv,
+) -> made_terminal::PtyOptions {
+    if !target.loads_claude_plugin() {
+        return options.without_env(CLAUDE_SPOOL_ENV);
+    }
+    let binds_spool = launch.env.iter().any(|(key, _)| key == CLAUDE_SPOOL_ENV);
+    for (key, value) in &launch.env {
+        options = options.with_env(key.clone(), value.clone());
+    }
+    if !binds_spool {
+        options = options.without_env(CLAUDE_SPOOL_ENV);
+    }
+    options
+}
+
 fn diagnostics_log_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
     // If app paths are unavailable, fail closed. A shared $TMPDIR path would be
     // predictable and symlink-attackable.
@@ -5651,6 +5972,52 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
+        let authority = made_remote::protocol::AuthorityId([3; 16]);
+        let launch = ClaudeLaunchEnv::default();
+        for target in [
+            TerminalTarget::Tui(CompatibleTui::OpenCode),
+            TerminalTarget::Tui(CompatibleTui::Grok),
+            TerminalTarget::RemoteShell { authority },
+            TerminalTarget::RemoteOpenCode { authority },
+            TerminalTarget::RemoteGrok { authority },
+            TerminalTarget::RemoteClaude { authority },
+        ] {
+            let options = with_claude_launch_env(
+                made_terminal::PtyOptions::new(std::env::temp_dir()),
+                target,
+                &launch,
+            );
+            assert!(
+                options.env_remove.iter().any(|key| key == CLAUDE_SPOOL_ENV),
+                "{target:?} must not inherit another tab's spool"
+            );
+            assert!(
+                options.env.iter().all(|(key, _)| key != CLAUDE_SPOOL_ENV
+                    && key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV),
+                "{target:?} receives neither a spool nor the composed plugin list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_diagnostics_row_reads_the_cached_plugin_state_not_the_filesystem() {
+        let mut workbench = idle_workbench(TerminalTarget::Shell, None);
+        workbench.set_claude_phase(ClaudeDiagnosticsPhase::Available);
+        let sentence = |workbench: &Workbench| workbench.claude_diagnostics().sentence;
+
+        assert_eq!(
+            sentence(&workbench),
+            "Claude Code session-status hooks are unavailable."
+        );
+        // A path that exists nowhere: only the cached value can say "present".
+        workbench.claude_plugin = Some(PathBuf::from("/nonexistent/made/claude-code-made"));
+        for _ in 0..3 {
+            assert_eq!(sentence(&workbench), "Claude Code is not running.");
+        }
+    }
 
     #[test]
     fn shell_root_availability_transitions_once_and_recovers() {
@@ -5906,6 +6273,9 @@ mod tests {
             grok_provisional_cwd: None,
             grok_restore_root: None,
             grok_file_newest_id: None,
+            claude: None,
+            claude_plugin: None,
+            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),
             visible: false,
@@ -8020,6 +8390,370 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .identity()
+        }
+
+        fn remote_claude_bench() -> (RemoteBench, u64) {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            for _ in 0..400 {
+                bench.pump();
+                if !bench.workbench.remote.as_ref().unwrap().holding_input {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                !bench.workbench.remote.as_ref().unwrap().holding_input,
+                "the attach snapshot completes before live output"
+            );
+            (bench, attach)
+        }
+
+        /// Deliver remote terminal bytes through the companion's output frame
+        /// and let the tab apply its Claude Code channels once.
+        fn remote_terminal_bytes(bench: &mut RemoteBench, attach: u64, bytes: &[u8]) {
+            bench.send(WireEnvelope::new(
+                current_identity(bench),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(bytes.to_vec()).unwrap(),
+                    done: false,
+                },
+            ));
+            let before = bench.workbench.terminal.as_ref().unwrap().output_bytes();
+            for _ in 0..400 {
+                bench.pump();
+                if bench.workbench.terminal.as_ref().unwrap().output_bytes() != before {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            // One more pump flushes a reply the output queued for the transport.
+            bench.pump();
+            bench.workbench.poll_claude(Instant::now());
+        }
+
+        #[test]
+        fn remote_claude_status_arrives_through_the_remote_terminal_only() {
+            use crate::claude_follow::ClaudeActivity;
+
+            let (mut bench, attach) = remote_claude_bench();
+            bench.take_written();
+            bench.workbench.poll_claude(Instant::now());
+            assert!(
+                !bench
+                    .workbench
+                    .claude_tab()
+                    .is_some_and(|tab| tab.present()),
+                "a remote tab without emissions has no Claude Code"
+            );
+            let root = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .workspace
+                .root()
+                .clone();
+
+            // The probe is answered through the same remote terminal.
+            remote_terminal_bytes(&mut bench, attach, b"\x1b]7501;?\x07");
+            let mut answered = false;
+            for _ in 0..400 {
+                answered = bench.take_written().into_iter().any(|frame| {
+                    matches!(
+                        frame.operation,
+                        Operation::TerminalInput { data } if data.as_bytes() == b"\x1b]7501;?\x07"
+                    )
+                });
+                if answered {
+                    break;
+                }
+                bench.pump();
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                answered,
+                "the capability probe is answered over the transport"
+            );
+            let tab = bench.workbench.claude_tab().unwrap();
+            assert!(!tab.protocol_status_seen());
+            assert!(!tab.present(), "a probe alone is not presence");
+
+            for (state, expected) in [
+                ("working", ClaudeActivity::Busy),
+                ("blocked", ClaudeActivity::Attention),
+                ("done", ClaudeActivity::Idle),
+            ] {
+                let bytes = format!("\x1b]7501;state={state}:app=claude-code\x07");
+                remote_terminal_bytes(&mut bench, attach, bytes.as_bytes());
+                let tab = bench.workbench.claude_tab().unwrap();
+                assert!(tab.present() && tab.protocol_status_seen());
+                assert_eq!(tab.dots(), vec![expected], "{state}");
+            }
+            remote_terminal_bytes(&mut bench, attach, b"\x1b]0;Refactor parser\x07");
+            let title = bench
+                .workbench
+                .claude_tab()
+                .unwrap()
+                .tooltip_title(bench.workbench.terminal().and_then(TerminalPane::title));
+            assert_eq!(title, "Refactor parser");
+            assert_eq!(
+                bench.workbench.remote.as_ref().unwrap().workspace.root(),
+                &root,
+                "remote Claude Code never moves the explorer"
+            );
+            assert!(bench.workbench.session_map().rows().is_empty());
+            assert!(bench.workbench.remote_grok_activities().is_empty());
+        }
+
+        #[test]
+        fn remote_claude_presence_ends_on_clear_and_on_remote_exit() {
+            let (mut bench, attach) = remote_claude_bench();
+            let working = b"\x1b]7501;state=working:app=claude-code\x07";
+            remote_terminal_bytes(&mut bench, attach, working);
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=clear:app=claude-code\x07",
+            );
+            assert!(!bench.workbench.claude_tab().unwrap().present());
+
+            // A remote child that exited ends protocol-only presence.
+            remote_terminal_bytes(&mut bench, attach, working);
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalExit { code: 0 },
+            ));
+            for _ in 0..400 {
+                bench.pump();
+                if !bench.workbench.terminal.as_ref().unwrap().is_running() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            bench.workbench.poll_claude(Instant::now());
+            assert!(!bench.workbench.claude_tab().unwrap().present());
+        }
+
+        #[test]
+        fn remote_claude_status_is_cleared_on_disconnect() {
+            let (mut bench, attach) = remote_claude_bench();
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            bench.pump();
+            bench.workbench.poll_claude(Instant::now());
+            assert!(
+                !bench
+                    .workbench
+                    .claude_tab()
+                    .is_some_and(|tab| tab.present() || !tab.dots().is_empty()),
+                "a disconnected tab shows no stale Claude Code status"
+            );
+            assert!(
+                !bench
+                    .workbench
+                    .claude_tab()
+                    .is_some_and(|tab| tab.protocol_status_seen()),
+                "a reconnected tab waits for a fresh emission"
+            );
+        }
+
+        #[test]
+        fn remote_claude_diagnostics_follow_the_tab_detection_and_presence() {
+            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+
+            let (mut bench, attach) = remote_claude_bench();
+            let row = |bench: &RemoteBench| {
+                let snapshot = bench.workbench.diagnostics_snapshot();
+                (snapshot.claude_pill, snapshot.claude_sentence)
+            };
+            assert_eq!(row(&bench).1, "Checking for Claude Code.");
+            bench.workbench.set_remote_claude_detection(Some(false));
+            assert_eq!(
+                row(&bench),
+                (Inactive, "Claude Code is not on PATH.".to_owned())
+            );
+            bench.workbench.set_remote_claude_detection(Some(true));
+            assert_eq!(
+                row(&bench),
+                (Inactive, "Claude Code is not running.".to_owned())
+            );
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            assert_eq!(
+                row(&bench),
+                (
+                    Degraded,
+                    "Claude Code session-status hooks are unavailable over SSH.".to_owned()
+                ),
+                "an emission proves the protocol, never remote hooks"
+            );
+            let report = bench.workbench.sanitized_diagnostics_text();
+            assert!(
+                report
+                    .contains("claude: Claude Code session-status hooks are unavailable over SSH."),
+                "{report}"
+            );
+            assert!(
+                !report.contains("Claude Code session follow is ready."),
+                "{report}"
+            );
+        }
+
+        fn direct_claude_bench() -> (RemoteBench, u64) {
+            let mut bench = remote_bench();
+            let authority = bench.identity.authority;
+            bench.workbench.terminal_target = TerminalTarget::RemoteClaude { authority };
+            bench.workbench.remote.as_mut().unwrap().claude = true;
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"claude-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            for _ in 0..400 {
+                bench.pump();
+                if !bench.workbench.remote.as_ref().unwrap().holding_input {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            bench.workbench.poll_claude(Instant::now());
+            (bench, attach)
+        }
+
+        #[test]
+        fn remote_claude_launch_sends_the_claude_open_with_no_shell_first() {
+            let mut bench = remote_bench();
+            let authority = bench.identity.authority;
+            bench.workbench.terminal_target = TerminalTarget::RemoteClaude { authority };
+            bench.workbench.remote.as_mut().unwrap().claude = true;
+            bench.workbench.remote.as_mut().unwrap().client = None;
+            bench.workbench.remote.as_mut().unwrap().attach_request = None;
+            let client = made_remote::client::RemoteClient::new(
+                bench.stream.clone(),
+                bench.identity.clone(),
+                bench.root.clone(),
+            )
+            .unwrap();
+            bench.workbench.arm_remote_client(client);
+            let mut open_frame = None;
+            pump_until(&mut bench, |_bench, frame| {
+                if let Some(frame) = frame {
+                    if matches!(frame.operation, Operation::Open { .. }) {
+                        open_frame = Some(frame.operation.clone());
+                    }
+                }
+                open_frame.is_some()
+            });
+            match open_frame.expect("the first authenticated frame") {
+                Operation::Open {
+                    target, directory, ..
+                } => {
+                    assert_eq!(target, LaunchTarget::Claude);
+                    assert_eq!(directory, bench.root);
+                }
+                other => panic!("expected an Open frame, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn direct_remote_claude_is_present_until_it_exits_and_reports_honest_diagnostics() {
+            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+
+            let (mut bench, attach) = direct_claude_bench();
+            bench.workbench.set_remote_claude_detection(Some(true));
+            let row = |bench: &RemoteBench| {
+                let snapshot = bench.workbench.diagnostics_snapshot();
+                (snapshot.claude_pill, snapshot.claude_sentence)
+            };
+            // Present as soon as the remote claude runs, before any emission.
+            let tab = bench.workbench.claude_tab().unwrap();
+            assert!(tab.present() && !tab.protocol_status_seen());
+            assert!(tab.dots().is_empty(), "no dot without a protocol status");
+            assert_eq!(
+                row(&bench),
+                (Inactive, "Claude Code is starting.".to_owned())
+            );
+            // A probe alone, past the grace period: protocol unavailable.
+            bench.workbench.claude.as_mut().unwrap().present_since =
+                Some(Instant::now() - crate::integration_status::CLAUDE_GRACE * 2);
+            assert_eq!(
+                row(&bench),
+                (
+                    Degraded,
+                    "Claude Code status protocol is unavailable.".to_owned()
+                )
+            );
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            assert_eq!(
+                row(&bench).1,
+                "Claude Code session-status hooks are unavailable over SSH."
+            );
+            // The remote claude exits: not present, so the tab returns to the
+            // server-name label and terminal glyph.
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                attach,
+                Operation::TerminalExit { code: 0 },
+            ));
+            for _ in 0..400 {
+                bench.pump();
+                if !bench.workbench.terminal.as_ref().unwrap().is_running() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            bench.workbench.poll_claude(Instant::now());
+            assert!(!bench.workbench.claude_tab().unwrap().present());
+            assert_eq!(row(&bench).1, "Claude Code is not running.");
         }
 
         #[test]

@@ -179,6 +179,10 @@ pub struct ServerRegistry<S> {
     storage: S,
     servers: Vec<SavedServer>,
     probes: HashMap<AuthorityId, ProbeState>,
+    /// Servers whose own finished probe found `claude` on the remote PATH. The
+    /// companion `Capabilities` has no such field, so it lives beside the probe
+    /// state and is dropped with it.
+    claude: std::collections::HashSet<AuthorityId>,
     next_attempt: u64,
 }
 impl<S: ServerStorage> ServerRegistry<S> {
@@ -230,6 +234,7 @@ impl<S: ServerStorage> ServerRegistry<S> {
             storage,
             servers,
             probes: HashMap::new(),
+            claude: std::collections::HashSet::new(),
             next_attempt: 1,
         })
     }
@@ -345,6 +350,7 @@ impl<S: ServerStorage> ServerRegistry<S> {
         self.persist(servers)
     }
     fn invalidate_probe(&mut self, id: AuthorityId) -> Option<ProbeTicket> {
+        self.claude.remove(&id);
         match self.probes.remove(&id) {
             Some(ProbeState::Running(ticket)) => Some(ticket),
             _ => None,
@@ -411,6 +417,21 @@ impl<S: ServerStorage> ServerRegistry<S> {
     pub fn can_launch_grok(&self, id: AuthorityId) -> bool {
         matches!(self.probes.get(&id), Some(ProbeState::Complete(capabilities)) if capabilities.grok)
     }
+    /// Whether this server's own probe detected claude on its remote PATH.
+    /// Detection never starts claude or installs anything, and is never shared
+    /// between servers.
+    pub fn can_launch_claude(&self, id: AuthorityId) -> bool {
+        self.claude.contains(&id) && matches!(self.probes.get(&id), Some(ProbeState::Complete(_)))
+    }
+    /// Record the `claude` line of a finished probe for one server. Call it
+    /// after the probe completed; a later probe attempt forgets it.
+    pub fn record_claude_detection(&mut self, id: AuthorityId, detected: bool) {
+        if detected {
+            self.claude.insert(id);
+        } else {
+            self.claude.remove(&id);
+        }
+    }
     /// Record a finished probe outcome for one server without any SSH attempt.
     ///
     /// Test-only seam: the product flow arrives through a live
@@ -428,6 +449,7 @@ impl<S: ServerStorage> ServerRegistry<S> {
             .validate()
             .map_err(|_| RegistryError::InvalidMetadata)?;
         }
+        self.claude.remove(&id);
         self.probes.insert(
             id,
             match result {
@@ -515,6 +537,21 @@ impl ServerStorage for PrivateMetadataStorage {
 /// keeps the honest inventory tier. No interpreter is probed or parsed, and the
 /// frozen `Capabilities.python3` field is encoded false.
 pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
+    parse_probe_report(bytes).map(|report| report.capabilities)
+}
+
+/// A parsed probe: the companion capabilities plus the client-side `claude`
+/// detection, which the frozen `Capabilities` wire struct cannot carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport {
+    pub capabilities: Capabilities,
+    pub claude: bool,
+}
+
+/// Parse the fixed probe including the line after grok: the absolute `claude`
+/// path from a metadata-only PATH lookup. Missing, relative or option-like
+/// text is absence.
+pub fn parse_probe_report(bytes: &[u8]) -> Result<ProbeReport, ErrorCode> {
     let text = std::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidRequest)?;
     let mut lines = text.split('\n');
     if lines.next().unwrap_or("") != "MADE-PROBE-1" {
@@ -524,6 +561,7 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let arch = lines.next().unwrap_or("").trim();
     let opencode = lines.next().unwrap_or("").trim();
     let grok = lines.next().unwrap_or("").trim();
+    let claude = lines.next().unwrap_or("").trim();
     if os.chars().any(char::is_control) || arch.chars().any(char::is_control) {
         return Err(ErrorCode::InvalidRequest);
     }
@@ -539,14 +577,17 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let detected = |value: &str| {
         value.starts_with('/') && !value.chars().any(char::is_control) && value.len() <= 4096
     };
-    Ok(Capabilities {
-        target,
-        tmux: false,
-        opencode: detected(opencode),
-        shell_cwd: false,
-        helper_version: "probe".to_owned(),
-        grok: detected(grok),
-        python3: false,
+    Ok(ProbeReport {
+        capabilities: Capabilities {
+            target,
+            tmux: false,
+            opencode: detected(opencode),
+            shell_cwd: false,
+            helper_version: "probe".to_owned(),
+            grok: detected(grok),
+            python3: false,
+        },
+        claude: detected(claude),
     })
 }
 
@@ -603,7 +644,7 @@ pub struct ProbeAttempt {
     prompts: std::sync::mpsc::Receiver<made_platform::ssh_askpass::PromptRequest>,
     answers: std::sync::mpsc::Sender<ProbeAnswer>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    done: std::sync::mpsc::Receiver<Result<Capabilities, AttemptError>>,
+    done: std::sync::mpsc::Receiver<Result<ProbeReport, AttemptError>>,
 }
 
 struct ProbeAnswer {
@@ -633,7 +674,7 @@ impl ProbeAttempt {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub fn poll(&self) -> Option<Result<Capabilities, AttemptError>> {
+    pub fn poll(&self) -> Option<Result<ProbeReport, AttemptError>> {
         self.done.try_recv().ok()
     }
 }
@@ -667,7 +708,7 @@ fn run_probe(
     prompts: &std::sync::mpsc::SyncSender<made_platform::ssh_askpass::PromptRequest>,
     answers: &std::sync::mpsc::Receiver<ProbeAnswer>,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<Capabilities, AttemptError> {
+) -> Result<ProbeReport, AttemptError> {
     let mut process = spawn_ssh(
         metadata,
         made_platform::ssh::SshCommand::Probe,
@@ -715,7 +756,7 @@ fn run_probe(
             None => std::thread::sleep(std::time::Duration::from_millis(15)),
         }
     }
-    parse_probe_output(&stdout).map_err(AttemptError::from_code)
+    parse_probe_report(&stdout).map_err(AttemptError::from_code)
 }
 
 fn spawn_ssh(

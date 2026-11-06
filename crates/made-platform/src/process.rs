@@ -3,6 +3,8 @@
 //! This is the only supported query. Other crates must not read `/proc`, call
 //! `proc_pidinfo`, or walk the Toolhelp snapshot themselves.
 
+use std::collections::HashMap;
+
 /// Parent process id of `pid`, when the operating system can report one.
 ///
 /// Returns `None` when the process does not exist or the query fails. The
@@ -10,6 +12,16 @@
 /// treat those sentinels.
 pub fn process_parent(pid: u32) -> Option<u32> {
     parent_pid(pid)
+}
+
+/// Parent process id of every running process, from one enumeration.
+///
+/// A caller that walks several ancestries in one pass (liveness, ownership)
+/// builds this once instead of asking [`process_parent`] per hop, which on
+/// Windows takes a full process snapshot each time. A pid that is absent has
+/// exited or could not be read. The map is a point-in-time view.
+pub fn process_parent_map() -> HashMap<u32, u32> {
+    parent_map()
 }
 
 #[cfg(target_os = "macos")]
@@ -75,8 +87,87 @@ fn parent_pid(pid: u32) -> Option<u32> {
     fields.next()?.parse().ok()
 }
 
+#[cfg(target_os = "linux")]
+fn parent_map() -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(parent) = parent_pid(pid) {
+            map.insert(pid, parent);
+        }
+    }
+    map
+}
+
+#[cfg(target_os = "macos")]
+fn parent_map() -> HashMap<u32, u32> {
+    #[link(name = "proc", kind = "dylib")]
+    extern "C" {
+        fn proc_listallpids(buffer: *mut std::ffi::c_void, buffersize: i32) -> i32;
+    }
+
+    let mut map = HashMap::new();
+    // SAFETY: a null buffer with size 0 only asks for the process count.
+    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(count) = usize::try_from(count) else {
+        return map;
+    };
+    let mut pids = vec![0_i32; count + 64];
+    let bytes = i32::try_from(pids.len() * std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: `pids` is writable for `bytes` bytes; the call writes at most
+    // that many and returns the number of pids it stored.
+    let stored = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let stored = usize::try_from(stored).unwrap_or(0).min(pids.len());
+    for pid in pids[..stored]
+        .iter()
+        .filter_map(|pid| u32::try_from(*pid).ok())
+    {
+        if pid == 0 {
+            continue;
+        }
+        if let Some(parent) = parent_pid(pid) {
+            map.insert(pid, parent);
+        }
+    }
+    map
+}
+
 #[cfg(target_os = "windows")]
 fn parent_pid(pid: u32) -> Option<u32> {
+    let mut found = None;
+    each_process(|id, parent| {
+        if id == pid {
+            found = Some(parent);
+            return false;
+        }
+        true
+    });
+    found
+}
+
+#[cfg(target_os = "windows")]
+fn parent_map() -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    each_process(|id, parent| {
+        map.insert(id, parent);
+        true
+    });
+    map
+}
+
+/// Visit `(pid, parent pid)` of each process in one Toolhelp snapshot until
+/// `visit` returns false.
+#[cfg(target_os = "windows")]
+fn each_process(mut visit: impl FnMut(u32, u32) -> bool) {
     #[repr(C)]
     struct ProcessEntry32W {
         size: u32,
@@ -116,7 +207,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
     // call failed and there is nothing to close.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot.is_null() || snapshot == usize::MAX as *mut std::ffi::c_void {
-        return None;
+        return;
     }
     let _snapshot = Snapshot(snapshot);
     let mut entry = ProcessEntry32W {
@@ -131,24 +222,34 @@ fn parent_pid(pid: u32) -> Option<u32> {
         flags: 0,
         exe_file: [0; 260],
     };
-    let mut found = None;
     // SAFETY: `entry.size` is the struct size Toolhelp requires, and `snapshot`
     // is a live process snapshot. The loop stops when Toolhelp returns false.
     let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) };
     while ok != 0 {
-        if entry.process_id == pid {
-            found = Some(entry.parent_process_id);
+        if !visit(entry.process_id, entry.parent_process_id) {
             break;
         }
         // SAFETY: same snapshot and entry as Process32FirstW.
         ok = unsafe { Process32NextW(snapshot, &mut entry) };
     }
-    found
 }
 
 #[cfg(test)]
 mod tests {
-    use super::process_parent;
+    use super::{process_parent, process_parent_map};
+
+    #[test]
+    fn the_map_agrees_with_single_lookups() {
+        let own = std::process::id();
+        let map = process_parent_map();
+        assert_eq!(map.get(&own).copied(), process_parent(own));
+        let parent = process_parent(own).expect("a parent");
+        assert!(
+            map.contains_key(&parent) || process_parent(parent).is_none(),
+            "a live parent is listed"
+        );
+        assert!(!map.contains_key(&u32::MAX));
+    }
 
     #[test]
     fn current_process_has_a_parent() {

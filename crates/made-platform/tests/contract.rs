@@ -13,16 +13,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use made_platform::{
     append_private_log_rotated, append_private_log_rotated_with_rename,
-    append_private_log_rotated_with_timeout, detect_compatible_tuis_in_path,
-    find_executable_on_path, host_platform, install_root_for_executable, is_sensitive_env_key,
-    open_private_log, previous_private_log_path, private_log_lock_path, prune_clipboard_images,
+    append_private_log_rotated_with_timeout, claude_plugin_dirs_separator,
+    compose_claude_plugin_dirs, detect_compatible_tuis_in_path, find_executable_on_path,
+    host_platform, install_root_for_executable, is_sensitive_env_key, open_private_log,
+    previous_private_log_path, private_log_lock_path, prune_clipboard_images,
     repository_plugin_dir, repository_root, resolve_user_home, save_clipboard_image_png,
     validate_user_home, AppPaths, Clipboard, ClipboardImage, CompatibleTui, Environment,
     HomeDirectoryErrorKind, ImeComposition, ImeEvent, InMemoryClipboard, LogAppendOutcome,
     LogIssue, LogIssueSeverity, PathsInputs, Platform, PlatformFamily, PluginDirSource, PtyRequest,
-    PtySize, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES, MAX_CLIPBOARD_IMAGE_BYTES,
-    MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
+    PtySize, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLIPBOARD_IMAGE_RETENTION_AGE, MAX_CLIPBOARD_IMAGES,
+    MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_IMAGE_SIDE, REDACTED_VALUE,
 };
+
+#[cfg(unix)]
+use made_platform::{is_executable_file, open_regular_file_nofollow};
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +58,7 @@ fn path_inputs(family: PlatformFamily) -> PathsInputs {
         local_app_data: Some(PathBuf::from("/windows/local")),
         install_root: Some(PathBuf::from("/opt/made")),
         grok_plugin_dir: Some(PathBuf::from("/opt/made/plugins/grok-made")),
+        claude_plugin_dir: Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
         temp_dir: PathBuf::from("/tmp"),
         user_token: "1000".to_owned(),
         plugin_override: None,
@@ -181,11 +186,17 @@ fn compatible_tui_detection_is_a_metadata_only_path_lookup() {
 }
 
 #[test]
-fn integrated_tui_catalog_is_opencode_then_grok() {
+fn integrated_tui_catalog_is_opencode_then_grok_then_claude_code() {
     assert_eq!(
         CompatibleTui::ALL,
-        &[CompatibleTui::OpenCode, CompatibleTui::Grok]
+        &[
+            CompatibleTui::OpenCode,
+            CompatibleTui::Grok,
+            CompatibleTui::ClaudeCode
+        ]
     );
+    assert_eq!(CompatibleTui::ClaudeCode.program(), "claude");
+    assert_eq!(CompatibleTui::ClaudeCode.label(), "Claude Code");
     assert_eq!(CompatibleTui::OpenCode.program(), "opencode");
     assert_eq!(CompatibleTui::OpenCode.label(), "OpenCode");
     assert_eq!(CompatibleTui::Grok.program(), "grok");
@@ -276,6 +287,57 @@ fn integrated_tui_catalog_is_opencode_then_grok() {
         !sentinel.exists(),
         "detecting both TUIs must not spawn either"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn claude_code_detection_is_metadata_only_and_ignores_empty_and_relative_segments() {
+    let root = unique_temp("tui-claude");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    #[cfg(windows)]
+    let claude = bin.join("claude.exe");
+    #[cfg(not(windows))]
+    let claude = bin.join("claude");
+    #[cfg(unix)]
+    let sentinel = root.join("spawned");
+    #[cfg(unix)]
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" > '{}'\n",
+        sentinel.display()
+    );
+    #[cfg(not(unix))]
+    let body = "not a real program".to_owned();
+    std::fs::write(&claude, &body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths([&bin]).unwrap();
+    assert_eq!(
+        detect_compatible_tuis_in_path(&path),
+        vec![CompatibleTui::ClaudeCode]
+    );
+    assert_eq!(
+        find_executable_on_path(OsStr::new("claude"), &path),
+        Some(claude.clone())
+    );
+    #[cfg(unix)]
+    assert!(
+        !sentinel.exists(),
+        "detection must not spawn claude or read its version"
+    );
+
+    // An empty segment and a relative segment never resolve against the cwd.
+    let relative = std::env::join_paths([
+        PathBuf::from(""),
+        PathBuf::from("relative-bin"),
+        PathBuf::from("."),
+    ])
+    .unwrap();
+    assert!(detect_compatible_tuis_in_path(&relative).is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -958,6 +1020,195 @@ fn grok_plugin_dir_is_the_staged_copy_in_development_and_release() {
             "no repository fallback, development={development}"
         );
     }
+}
+
+#[test]
+fn claude_plugin_dir_is_the_staged_copy_in_development_and_release() {
+    for development in [false, true] {
+        let inputs = PathsInputs {
+            development,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        let paths = AppPaths::resolve(&inputs).expect("paths");
+        assert_eq!(
+            paths.claude_plugin_dir,
+            Some(PathBuf::from("/opt/made/plugins/claude-code-made")),
+            "development={development}"
+        );
+        let unresolved = PathsInputs {
+            development,
+            claude_plugin_dir: None,
+            ..path_inputs(PlatformFamily::Linux)
+        };
+        assert_eq!(
+            AppPaths::resolve(&unresolved)
+                .expect("paths")
+                .claude_plugin_dir,
+            None,
+            "no repository fallback, development={development}"
+        );
+    }
+}
+
+#[test]
+fn shipped_claude_plugin_dir_requires_a_readable_directory() {
+    let root = unique_temp("claude-plugin-dir");
+    let plugin = root.join("plugins").join("claude-code-made");
+    let inputs = PathsInputs {
+        claude_plugin_dir: Some(plugin.clone()),
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    let paths = AppPaths::resolve(&inputs).expect("paths");
+    assert_eq!(paths.shipped_claude_plugin_dir(), None, "missing");
+
+    std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    std::fs::write(&plugin, "file").unwrap();
+    assert_eq!(paths.shipped_claude_plugin_dir(), None, "not a directory");
+
+    std::fs::remove_file(&plugin).unwrap();
+    std::fs::create_dir_all(&plugin).unwrap();
+    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.as_path()));
+
+    let unresolved = PathsInputs {
+        claude_plugin_dir: None,
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    assert_eq!(
+        AppPaths::resolve(&unresolved)
+            .expect("paths")
+            .shipped_claude_plugin_dir(),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_plugin_dirs_composition_preserves_entries_and_never_duplicates() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    let compose = |existing: Option<&str>, separator| {
+        compose_claude_plugin_dirs(existing.map(OsStr::new), shipped, separator)
+    };
+    let made = "/opt/made/plugins/claude-code-made";
+
+    assert_eq!(compose(None, ':'), OsString::from(made));
+    assert_eq!(compose(Some(""), ':'), OsString::from(made));
+    assert_eq!(
+        compose(Some("/u/a:/u/b"), ':'),
+        OsString::from(format!("/u/a:/u/b:{made}"))
+    );
+    assert_eq!(
+        compose(Some("/u/b:/u/a"), ':'),
+        OsString::from(format!("/u/b:/u/a:{made}")),
+        "order is kept"
+    );
+    assert_eq!(
+        compose(Some("/u/a:"), ':'),
+        OsString::from(format!("/u/a:{made}")),
+        "a trailing separator is not doubled"
+    );
+    for existing in [
+        made.to_owned(),
+        format!("{made}:/u/a"),
+        format!("/u/a:{made}:/u/b"),
+    ] {
+        assert_eq!(
+            compose(Some(&existing), ':'),
+            OsString::from(&existing),
+            "already present: {existing}"
+        );
+    }
+    assert_eq!(
+        compose(Some("/u/a:/opt/made/plugins/claude-code-made-extra"), ':'),
+        OsString::from(format!(
+            "/u/a:/opt/made/plugins/claude-code-made-extra:{made}"
+        )),
+        "a prefix match is not a duplicate"
+    );
+    assert_eq!(
+        compose(Some("C:\\u\\a"), ';'),
+        OsString::from(format!("C:\\u\\a;{made}")),
+        "a drive colon is not a separator under ;"
+    );
+    assert_eq!(
+        compose(Some(&format!("C:\\u\\a;{made}")), ';'),
+        OsString::from(format!("C:\\u\\a;{made}"))
+    );
+
+    assert_eq!(CLAUDE_CODE_PLUGIN_DIRS_ENV, "CLAUDE_CODE_PLUGIN_DIRS");
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::Linux), ':');
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::MacOs), ':');
+    assert_eq!(claude_plugin_dirs_separator(PlatformFamily::Windows), ';');
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_plugin_dirs_composition_treats_a_trailing_slash_as_the_same_entry() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    for existing in [
+        "/opt/made/plugins/claude-code-made/",
+        "/u/a:/opt/made/plugins/claude-code-made//:/u/b",
+    ] {
+        assert_eq!(
+            compose_claude_plugin_dirs(Some(OsStr::new(existing)), shipped, ':'),
+            OsString::from(existing),
+            "already present: {existing}"
+        );
+    }
+    let slashed = Path::new("/opt/made/plugins/claude-code-made/");
+    assert_eq!(
+        compose_claude_plugin_dirs(
+            Some(OsStr::new("/opt/made/plugins/claude-code-made")),
+            slashed,
+            ':'
+        ),
+        OsString::from("/opt/made/plugins/claude-code-made")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_plugin_dirs_composition_adds_nothing_for_an_unsafe_shipped_path() {
+    for bad in [
+        "relative/plugins/claude-code-made",
+        "/opt/ma:de/plugins",
+        "/opt/ma\"de/plugins",
+        "/opt/ma`de/plugins",
+        "/opt/ma$de/plugins",
+        "/opt/ma\\de/plugins",
+        "/opt/ma\nde/plugins",
+    ] {
+        let shipped = Path::new(bad);
+        assert_eq!(
+            compose_claude_plugin_dirs(None, shipped, ':'),
+            OsString::new(),
+            "{bad}"
+        );
+        assert_eq!(
+            compose_claude_plugin_dirs(Some(OsStr::new("/u/a:/u/b")), shipped, ':'),
+            OsString::from("/u/a:/u/b"),
+            "{bad}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shipped_claude_plugin_dir_refuses_an_unsafe_path() {
+    let root = unique_temp("claude-unsafe");
+    let plugin = root.join("a:b").join("claude-code-made");
+    std::fs::create_dir_all(&plugin).unwrap();
+    let inputs = PathsInputs {
+        claude_plugin_dir: Some(plugin),
+        ..path_inputs(PlatformFamily::Linux)
+    };
+    assert_eq!(
+        AppPaths::resolve(&inputs)
+            .expect("paths")
+            .shipped_claude_plugin_dir(),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -2854,4 +3105,104 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
         let _ = reader_thread.join();
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_file_open_refuses_symlinks_and_special_files() {
+    use std::io::Read;
+    use std::os::unix::fs::symlink;
+    let root = unique_temp("nofollow");
+    let real = root.join("real");
+    std::fs::write(&real, b"payload").unwrap();
+
+    let mut text = String::new();
+    open_regular_file_nofollow(&real, false)
+        .expect("a regular file opens")
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "payload");
+    assert!(open_regular_file_nofollow(&real, true).is_ok());
+
+    let link = root.join("link");
+    symlink(&real, &link).unwrap();
+    assert!(open_regular_file_nofollow(&link, false).is_err(), "symlink");
+    assert!(open_regular_file_nofollow(&link, true).is_err(), "symlink");
+    assert!(
+        open_regular_file_nofollow(&root, false).is_err(),
+        "directory"
+    );
+    assert!(open_regular_file_nofollow(&root.join("missing"), false).is_err());
+
+    let fifo = root.join("fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        open_regular_file_nofollow(&fifo, false).is_err(),
+        "a FIFO is refused without blocking"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_file_needs_a_regular_file_with_an_execute_bit() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_temp("exec-bit");
+    let file = root.join("tool");
+    std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!is_executable_file(&file));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(is_executable_file(&file));
+    assert!(!is_executable_file(&root), "a directory is not a program");
+    assert!(!is_executable_file(&root.join("missing")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_windows_list_compares_entries_without_case_or_trailing_backslashes() {
+    // Platform-neutral: a `;` list is compared the way Windows paths are.
+    let shipped = Path::new(if cfg!(windows) {
+        "C:\\Made\\plugins\\claude-code-made"
+    } else {
+        "/Made/plugins/claude-code-made"
+    });
+    let made = shipped.to_str().unwrap();
+    for existing in [
+        made.to_ascii_uppercase(),
+        format!("{made}\\"),
+        format!("{made}/"),
+        format!("{};{}", made.to_ascii_lowercase(), "D:\\u"),
+    ] {
+        assert_eq!(
+            compose_claude_plugin_dirs(Some(OsStr::new(&existing)), shipped, ';'),
+            OsString::from(&existing),
+            "already present: {existing}"
+        );
+    }
+    assert_eq!(
+        compose_claude_plugin_dirs(Some(OsStr::new("D:\\u")), shipped, ';'),
+        OsString::from(format!("D:\\u;{made}")),
+        "a drive colon is not a separator under ;"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn shipped_claude_plugin_dir_accepts_a_drive_letter_path() {
+    let root = unique_temp("claude-drive");
+    let plugin = root.join("claude-code-made");
+    std::fs::create_dir_all(&plugin).unwrap();
+    assert!(plugin.to_str().unwrap().contains(':'));
+    let inputs = PathsInputs {
+        claude_plugin_dir: Some(plugin.clone()),
+        ..path_inputs(PlatformFamily::Windows)
+    };
+    let paths = AppPaths::resolve(&inputs).expect("paths");
+    assert_eq!(paths.shipped_claude_plugin_dir(), Some(plugin.as_path()));
+    let _ = std::fs::remove_dir_all(&root);
 }

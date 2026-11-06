@@ -11,6 +11,7 @@ Made is a native Rust desktop application built on eframe/egui with one window a
 | [`made-platform`](../crates/made-platform/src/lib.rs) | library | Only OS-specific crate: PTY/ConPTY, shell launch and cwd hooks, process lifecycle, app paths, clipboard, IME, native backdrop, home resolution. | none |
 | [`made-explorer`](../crates/made-explorer/src/lib.rs) | library | Lazy tree, watcher, canonical path guard, read-only preview, highlighting, root generations. | none |
 | [`made-grok-hook`](../crates/made-grok-hook/src/lib.rs) | library + binary `made-grok-status` | Native Grok session-status hook: reads one hook event from stdin within a ~2 s deadline, appends one JSONL line to `made-grok-status.jsonl`, always exits 0 with empty stdout. Replaced the Python `status.py`; see [ADR 0006](decisions/0006-native-grok-hook.md). | none (`serde_json` only) |
+| [`made-claude-hook`](../crates/made-claude-hook/src/lib.rs) | library + binary `made-claude-status` | Native Claude Code session-status hook for the session-only `claude-code-made` plugin: reads one hook event from stdin within a ~2 s deadline, appends one metadata-only JSONL record (with the process ancestry) to the tab's private spool, always exits 0 with empty stdout. See [Claude Code](integration/claude-code.md) and [ADR 0008](decisions/0008-claude-code-osc7501-session-plugin.md). | none (`serde_json`, plus `libc` on Unix and `windows-sys` on Windows for the pid chain) |
 | [`made-bridge`](../crates/made-bridge/src/lib.rs) | library | Loopback WebSocket server, protocol state machine, session snapshots, config composition and immutability guard, token helpers. | none |
 
 The OpenCode plugin is TypeScript outside the Cargo workspace at [`plugins/opencode-made`](../plugins/opencode-made/README.md). The Phase 0 gate harness was removed after the gate; its outcomes are preserved in the [Phase 0 gate record](records/20261025-phase-0-gate.md), with integration details in [OpenCode bridge](integration/opencode.md).
@@ -30,7 +31,7 @@ Rules enforced across the workspace:
 1. `made-app` is the only composition root; no crate depends on it.
 2. Domain crates do not form cycles. `made-terminal` may depend on `made-platform`; `made-bridge` and `made-explorer` are independent siblings.
 3. `made-platform` is a leaf and owns OS capabilities, not product behavior.
-4. OS-specific code and APIs live only in `made-platform`; test-only fixture selection and the Windows GUI-subsystem crate attribute in `made-app` `main.rs` (see [CI platform quirks](testing/ci-platform-quirks.md)) are the exceptions.
+4. OS-specific code and APIs live only in `made-platform`; the exceptions are test-only fixture selection, the Windows GUI-subsystem crate attribute in `made-app` `main.rs` (see [CI platform quirks](testing/ci-platform-quirks.md)), and the two standalone native status hooks, `made-grok-hook` (parent pid) and `made-claude-hook` (pid chain, file lock), which make small `cfg`-selected `libc`/`windows-sys` calls because they cannot depend on the app crates.
 5. Only `made-bridge` binds a network socket.
 6. Only the plugin calls OpenCode APIs. `made-app` consumes normalized snapshots and never parses terminal output or talks to OpenCode.
 7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata and closed-allowlist status are resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config. Git observation is read-only.
@@ -97,6 +98,7 @@ OpenCode v2 TUI (user-run child inside the workspace PTY)
   -> normalized SessionSnapshot
   -> session_follow root precedence: connected active session directory
      > usable connected view directory (tabs enabled, no active session)
+     > most recent live owned Claude Code session directory (local, while OpenCode is not connected)
      > newest open Grok session directory (local or remote, while OpenCode is not connected)
      > latest shell cwd
   -> explorer root in that tab

@@ -2,11 +2,12 @@
 """Stage one desktop package tree for a development artifact or a release.
 
 Usage: stage-desktop-package.py --profile debug|release --target TRIPLE
-       --app PATH --hook PATH --stage DIR
+       --app PATH --hook PATH --claude-hook PATH --stage DIR
 
 The tree holds made-app, the app-owned `plugins/opencode-made` package without
 `node_modules`, the shipped `plugins/grok-made` package staged only through
-`stage-grok-plugin.sh`, README.md, LICENSE and `version.json`. Debug artifacts
+`stage-grok-plugin.sh`, the shipped `plugins/claude-code-made` package staged
+only through `stage-claude-plugin.sh`, README.md, LICENSE and `version.json`. Debug artifacts
 also carry the Cargo metadata and toolchain files they always carried.
 Companions and askpass are added afterwards by assemble-desktop-package.py.
 """
@@ -140,6 +141,21 @@ def stage(args: argparse.Namespace, root: Path = ROOT) -> Path:
         fail(f"native hook missing or empty: {hook}")
     if any((out / "plugins/grok-made").rglob("*.py")):
         fail("plugins/grok-made must not contain a Python file")
+    # The shipped claude-code-made package follows the same rule.
+    subprocess.run(
+        [bash, str(root / ".github/scripts/stage-claude-plugin.sh"), args.target, str(args.claude_hook),
+         str(out / "plugins/claude-code-made")],
+        check=True,
+    )
+    claude = out / "plugins/claude-code-made"
+    claude_hook = claude / "bin" / f"made-claude-status{exe}"
+    for required in (".claude-plugin/plugin.json", "README.md", "hooks/hooks.json"):
+        if not (claude / required).is_file():
+            fail(f"plugins/claude-code-made/{required} was not staged")
+    if not claude_hook.is_file() or claude_hook.stat().st_size <= 0:
+        fail(f"native Claude Code hook missing or empty: {claude_hook}")
+    if os.name != "nt" and not claude_hook.stat().st_mode & stat.S_IXUSR:
+        fail(f"native Claude Code hook is not executable: {claude_hook}")
     if (out / "plugin").exists():
         fail("stage contains the obsolete plugin/ path")
 
@@ -157,6 +173,7 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target", required=True)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--hook", type=Path, required=True)
+    parser.add_argument("--claude-hook", type=Path, required=True)
     parser.add_argument("--stage", type=Path, required=True)
     return parser.parse_args(argv)
 

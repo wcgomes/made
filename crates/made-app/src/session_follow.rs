@@ -76,6 +76,8 @@ pub enum RootSource {
     Shell,
     /// A connected OpenCode active session or view directory.
     OpenCode,
+    /// The most recent live owned Claude Code session in this terminal.
+    ClaudeCode,
     /// The single Grok session open in this terminal.
     Grok,
 }
@@ -96,6 +98,7 @@ impl RootSource {
         match self {
             Self::Shell => "shell",
             Self::OpenCode => "opencode",
+            Self::ClaudeCode => "claude-code",
             Self::Grok => "grok",
         }
     }
@@ -246,6 +249,10 @@ pub struct SessionFollowCoordinator {
     fallback_cache: Option<(PathBuf, Instant)>,
     /// Directory of the single Grok session in this terminal, when one is open.
     grok_root: Option<PathBuf>,
+    /// Directory of the most recent live owned Claude Code session in this
+    /// terminal. Retained while OpenCode holds the root so it can take over
+    /// when OpenCode releases.
+    claude_root: Option<PathBuf>,
 }
 
 impl SessionFollowCoordinator {
@@ -311,6 +318,7 @@ impl SessionFollowCoordinator {
             directory_validation_count: 0,
             fallback_cache: None,
             grok_root: None,
+            claude_root: None,
         })
     }
 
@@ -344,6 +352,8 @@ impl SessionFollowCoordinator {
     pub fn effective_root_source(&self) -> RootSource {
         if self.active_session.is_some() || self.view_is_effective() {
             RootSource::OpenCode
+        } else if self.claude_root.is_some() {
+            RootSource::ClaudeCode
         } else if self.grok_root.is_some() {
             RootSource::Grok
         } else {
@@ -523,18 +533,73 @@ impl SessionFollowCoordinator {
         if self.view_is_effective() {
             return Ok(self.outcome(SessionFollowUpdate::ViewDirectory, false));
         }
-        if self.grok_root.is_some() {
+        if self.claude_root.is_some() || self.grok_root.is_some() {
             return Ok(self.outcome(SessionFollowUpdate::NoActiveSession, false));
         }
         Ok(self.release_to_fallback(SessionFollowUpdate::NoActiveSession))
     }
 
+    /// Follow the directory of the most recent live owned Claude Code session
+    /// in this terminal.
+    ///
+    /// `None` releases that follow: the root returns to the open Grok session,
+    /// else the shell. A relative, missing or unreadable directory leaves the
+    /// root and the previous Claude Code directory unchanged and is reported as
+    /// [`SessionFollowUpdate::RejectedSnapshot`]. A connected
+    /// OpenCode session or view keeps the root, and the directory is retained
+    /// so Claude Code takes the root when OpenCode releases it.
+    pub fn follow_claude_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
+        let opencode_holds = self.active_session.is_some() || self.view_is_effective();
+        let Some(directory) = directory else {
+            if self.claude_root.take().is_none() {
+                return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+            }
+            if opencode_holds {
+                return self.outcome(SessionFollowUpdate::ActiveSession, false);
+            }
+            return self.release_to_fallback(SessionFollowUpdate::NoActiveSession);
+        };
+        let Ok(canonical) = usable_directory(directory) else {
+            // The previous directory stays; the caller must not treat this one
+            // as applied.
+            return self.outcome(
+                SessionFollowUpdate::RejectedSnapshot {
+                    detail: "Claude Code directory is not usable".to_owned(),
+                },
+                false,
+            );
+        };
+        self.claude_root = Some(canonical.clone());
+        if opencode_holds {
+            return self.outcome(SessionFollowUpdate::ActiveSession, false);
+        }
+        let switched = canonical != self.current_root;
+        if switched {
+            self.generation.advance();
+            self.current_root = canonical;
+        }
+        self.outcome(SessionFollowUpdate::NoActiveSession, switched)
+    }
+
     /// Follow the directory of the single Grok session in this terminal.
     ///
     /// `None` releases that follow. A connected OpenCode session keeps the root.
+    /// A live Claude Code session also keeps it: the Grok directory is retained
+    /// for when Claude Code exits.
     pub fn follow_grok_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
         if self.active_session.is_some() || self.view_is_effective() {
             return self.outcome(SessionFollowUpdate::ActiveSession, false);
+        }
+        if self.claude_root.is_some() {
+            match directory {
+                None => self.grok_root = None,
+                Some(directory) => {
+                    if let Ok(canonical) = usable_directory(directory) {
+                        self.grok_root = Some(canonical);
+                    }
+                }
+            }
+            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
         }
         let Some(directory) = directory else {
             if self.grok_root.take().is_none() {
@@ -568,6 +633,18 @@ impl SessionFollowCoordinator {
         self.unavailable = None;
         self.directory_check = None;
         let now = Instant::now();
+        if let Some(claude) = self
+            .claude_root
+            .clone()
+            .filter(|path| is_usable_directory(path))
+        {
+            let switched = claude != self.current_root;
+            if switched {
+                self.generation.advance();
+                self.current_root = claude;
+            }
+            return self.outcome(update, switched);
+        }
         if let Some(grok) = self
             .grok_root
             .clone()

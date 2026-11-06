@@ -18,6 +18,7 @@ use made_platform::{CompatibleTui, Platform};
 use crate::cli::LaunchArgs;
 use crate::diagnostics::GrokDiagnosticsRow;
 use crate::grok_plugin::{self, EnsureOutcome};
+use crate::integration_status::ClaudeDiagnosticsPhase;
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
 use crate::theme;
@@ -323,6 +324,25 @@ impl RemoteGrokInstallState {
     }
 }
 
+fn initial_claude_phase(
+    detecting: bool,
+    detection_started: bool,
+    catalog_has_claude: bool,
+) -> ClaudeDiagnosticsPhase {
+    if detecting {
+        if detection_started {
+            ClaudeDiagnosticsPhase::Checking
+        } else {
+            ClaudeDiagnosticsPhase::NotOnPath
+        }
+    } else if catalog_has_claude {
+        // Plugin loading does not depend on detection.
+        ClaudeDiagnosticsPhase::Available
+    } else {
+        ClaudeDiagnosticsPhase::NotOnPath
+    }
+}
+
 fn initial_grok_phase(
     detecting: bool,
     detection_started: bool,
@@ -465,6 +485,8 @@ pub struct AppModel {
     remote_grok_install_refusals: Vec<made_remote::protocol::AuthorityId>,
     /// Row derived from detection and install, unless a test hold is set.
     grok_phase: GrokDiagnosticsPhase,
+    /// Claude Code PATH detection state for every workspace's diagnostics row.
+    claude_phase: ClaudeDiagnosticsPhase,
     /// Set only by [`AppModel::hold_grok_diagnostics`].
     grok_hold: Option<GrokDiagnosticsHold>,
     /// Per-workspace running marks set only by [`AppModel::hold_workspace_grok_running`].
@@ -557,6 +579,11 @@ impl AppModel {
             compatible_tui_receiver.is_some(),
             catalog_has_grok,
         );
+        let claude_phase = initial_claude_phase(
+            options.detect_compatible_tuis,
+            compatible_tui_receiver.is_some(),
+            options.compatible_tuis.contains(&CompatibleTui::ClaudeCode),
+        );
         // A live worker has not answered yet. A thread that never started is
         // the same as detection finishing without OpenCode.
         let opencode_missing = if options.detect_compatible_tuis {
@@ -586,6 +613,7 @@ impl AppModel {
             grok_plugin_receiver: None,
             grok_hooks_unavailable: false,
             grok_phase,
+            claude_phase,
             grok_hold: None,
             grok_running_hold: Vec::new(),
             remote_grok_installs: Vec::new(),
@@ -715,6 +743,30 @@ impl AppModel {
         registry
             .record_probe_result(id, result)
             .map_err(|error| error.to_string())
+    }
+
+    /// Record whether one server's finished probe detected claude, without an
+    /// SSH attempt.
+    ///
+    /// Test-only seam: the product flow records it from the live probe.
+    pub fn hold_ssh_claude_detection(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        detected: bool,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_mut().map_err(|error| error.clone())?;
+        registry.record_claude_detection(id, detected);
+        Ok(())
+    }
+
+    /// Whether this server's own probe detected remote claude. Absent or
+    /// failed probes never count as detection.
+    pub fn remote_claude_detected_on(
+        &self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<bool, String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        Ok(registry.can_launch_claude(id))
     }
 
     /// Grant or withdraw the per-server/version Grok plugin install consent.
@@ -1040,6 +1092,7 @@ impl AppModel {
             .grok_hold
             .map(GrokDiagnosticsHold::phase)
             .unwrap_or(self.grok_phase);
+        let claude_phase = self.claude_phase;
         // Taken so each workspace can be updated while its mark is read.
         let running = std::mem::take(&mut self.grok_running_hold);
         let mut provisioned = Vec::new();
@@ -1081,6 +1134,7 @@ impl AppModel {
                 continue;
             }
             workbench.set_grok_diagnostics(grok_row_for(phase, mark, workbench));
+            workbench.set_claude_phase(claude_phase);
         }
         // A failed or update-required transition is not a provisioned path for
         // the Grok installer, even if an earlier attempt succeeded.
@@ -1332,7 +1386,37 @@ impl AppModel {
             if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
             {
                 workbench.set_remote_grok_detection(capabilities.grok);
+                workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
             }
+        }
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
+    /// Attach a remote model as a directly launched `Claude Code SSH` tab
+    /// without starting SSH, for tests of the pre-attach states.
+    pub fn attach_remote_claude_model(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+        workspace: crate::remote_workspace::RemoteWorkspace,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .ssh
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .snapshot(id)
+            .map_err(|error| error.to_string())?;
+        let mut workbench = Workbench::bind_remote_model(
+            snapshot,
+            workspace,
+            TerminalTarget::RemoteClaude { authority: id },
+            "Remote model attached",
+        );
+        if let Ok(registry) = self.ssh.as_ref() {
+            workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
         }
         let source = self.launch.source();
         self.leave_picker_for_remote();
@@ -1365,6 +1449,7 @@ impl AppModel {
             if let crate::ssh_servers::ProbeState::Complete(capabilities) = registry.probe_state(id)
             {
                 workbench.set_remote_grok_detection(capabilities.grok);
+                workbench.set_remote_claude_detection(Some(registry.can_launch_claude(id)));
             }
         }
         let source = self.launch.source();
@@ -1476,6 +1561,41 @@ impl AppModel {
             snapshot,
             directory,
             TerminalTarget::RemoteGrok { authority: id },
+            Instant::now(),
+        )?;
+        let source = self.launch.source();
+        self.leave_picker_for_remote();
+        self.insert_workbench(workbench, source);
+        self.start_pending = false;
+        Ok(())
+    }
+
+    /// Start the selected server's detected claude executable with no
+    /// arguments as a new tab, bound to that server and its selected remote
+    /// directory. There is no shell first and no separate folder picker, the
+    /// current tab keeps running, and no plugin configuration is injected.
+    /// Servers whose own probe did not detect claude refuse here.
+    pub fn begin_remote_claude_launch(
+        &mut self,
+        id: made_remote::protocol::AuthorityId,
+    ) -> Result<(), String> {
+        let registry = self.ssh.as_ref().map_err(|error| error.clone())?;
+        if !registry.can_launch_claude(id) {
+            return Err(
+                "Claude Code SSH stays hidden until this server's own detection succeeds."
+                    .to_owned(),
+            );
+        }
+        let snapshot = registry.snapshot(id).map_err(|error| error.to_string())?;
+        let directory = match snapshot.server().metadata().initial_directory.clone() {
+            Some(directory) => directory,
+            None => made_remote::protocol::RemotePath::new(b"/".to_vec())
+                .map_err(|_| "the default remote directory was rejected".to_owned())?,
+        };
+        let workbench = Workbench::start_remote(
+            snapshot,
+            directory,
+            TerminalTarget::RemoteClaude { authority: id },
             Instant::now(),
         )?;
         let source = self.launch.source();
@@ -1744,10 +1864,13 @@ impl AppModel {
             }
             if let (Some(ticket), Ok(registry)) = (ticket, self.ssh.as_mut()) {
                 let stored = match &result {
-                    Ok(capabilities) => Ok(capabilities.clone()),
+                    Ok(report) => Ok(report.capabilities.clone()),
                     Err(error) => Err(error.protocol_code()),
                 };
-                let _ = registry.finish_probe(ticket, stored);
+                let finished = registry.finish_probe(ticket, stored).is_ok();
+                if let (true, Ok(report)) = (finished, &result) {
+                    registry.record_claude_detection(ticket.authority, report.claude);
+                }
             }
             self.ssh_host_key_changed = matches!(
                 &result,
@@ -1755,7 +1878,7 @@ impl AppModel {
                     if error.class == crate::remote_session::SshFailureClass::ChangedHostKey
             );
             self.ssh_notice = Some(match result {
-                Ok(capabilities) if capabilities.opencode => {
+                Ok(report) if report.capabilities.opencode => {
                     "Connection succeeded. OpenCode was detected. The TUI was not started."
                         .to_owned()
                 }
@@ -1999,6 +2122,7 @@ impl AppModel {
             workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, &workbench));
         } else {
             workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
+            workbench.set_claude_phase(self.claude_phase);
         }
         if self.grok_hooks_unavailable {
             workbench.note_grok_session_hooks_unavailable();
@@ -2284,6 +2408,11 @@ impl AppModel {
             Ok(tuis) => {
                 let detected_opencode = tuis.contains(&CompatibleTui::OpenCode);
                 let detected_grok = tuis.contains(&CompatibleTui::Grok);
+                self.claude_phase = if tuis.contains(&CompatibleTui::ClaudeCode) {
+                    ClaudeDiagnosticsPhase::Available
+                } else {
+                    ClaudeDiagnosticsPhase::NotOnPath
+                };
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
                 if !detected_opencode {
@@ -2308,6 +2437,10 @@ impl AppModel {
             }
             Err(TryRecvError::Disconnected) => {
                 self.compatible_tui_receiver = None;
+                if self.claude_phase == ClaudeDiagnosticsPhase::Checking {
+                    self.claude_phase = ClaudeDiagnosticsPhase::NotOnPath;
+                    self.push_grok_diagnostics();
+                }
                 if self.grok_phase == GrokDiagnosticsPhase::Detecting {
                     self.grok_phase = GrokDiagnosticsPhase::NotOnPath;
                     self.push_grok_diagnostics();

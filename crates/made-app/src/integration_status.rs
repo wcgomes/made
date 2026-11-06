@@ -11,6 +11,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::diagnostics::ClaudeDiagnosticsReport;
 use made_bridge::protocol::{opencode_major, PROTOCOL_VERSION};
 use made_bridge::server::{
     BridgeEvent, ConnectionInfo, DisconnectedInfo, Goodbye, HeartbeatTimeout, ProtocolError,
@@ -874,6 +875,8 @@ pub enum AgentIntegration {
     OpenCodeV2,
     /// Grok Build session follow, offered when `grok` is on `PATH`.
     GrokBuild,
+    /// Claude Code session follow, offered when `claude` is on `PATH`.
+    ClaudeCode,
 }
 
 impl AgentIntegration {
@@ -882,6 +885,7 @@ impl AgentIntegration {
         match self {
             Self::OpenCodeV2 => "opencode-v2",
             Self::GrokBuild => "grok-build",
+            Self::ClaudeCode => "claude-code",
         }
     }
 
@@ -890,6 +894,7 @@ impl AgentIntegration {
         match self {
             Self::OpenCodeV2 => "OpenCode v2",
             Self::GrokBuild => "Grok Build",
+            Self::ClaudeCode => "Claude Code",
         }
     }
 }
@@ -909,7 +914,11 @@ pub struct ScopeBoundary {
 
 /// The v1 scope boundary.
 pub const V1_SCOPE: ScopeBoundary = ScopeBoundary {
-    agent_integrations: &[AgentIntegration::OpenCodeV2, AgentIntegration::GrokBuild],
+    agent_integrations: &[
+        AgentIntegration::OpenCodeV2,
+        AgentIntegration::GrokBuild,
+        AgentIntegration::ClaudeCode,
+    ],
     chat_ui: false,
     worktree_management: false,
     separate_opencode_server: false,
@@ -923,4 +932,91 @@ fn bounded_detail(detail: &str) -> String {
     let mut bounded: String = detail.chars().take(MAX_CHARS - 1).collect();
     bounded.push('…');
     bounded
+}
+
+/// How long after Claude Code becomes present a missing channel still reads as
+/// starting rather than unavailable.
+pub const CLAUDE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What PATH detection says about Claude Code for the whole app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeDiagnosticsPhase {
+    /// PATH detection is still running.
+    Checking,
+    /// Detection finished without finding `claude`, or an explicit catalog
+    /// omits it.
+    NotOnPath,
+    /// `claude` was detected, or an explicit catalog lists it without
+    /// detection. Plugin loading does not depend on detection.
+    Available,
+}
+
+/// Inputs of the Claude Code diagnostics row for one workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaudeDiagnosticsInputs {
+    /// App-wide detection state.
+    pub phase: ClaudeDiagnosticsPhase,
+    /// The shipped plugin is missing or unreadable.
+    pub plugin_missing: bool,
+    /// Claude Code is present in this workspace, whoever owns the tab label.
+    pub present: bool,
+    /// How long it has been present.
+    pub present_for: std::time::Duration,
+    /// This workspace has at least one live owned Claude Code session.
+    pub live_session: bool,
+    /// A session-level `app=claude-code` emission arrived since that Claude
+    /// Code started. A capability probe alone does not count.
+    pub protocol_observed: bool,
+}
+
+/// The Claude Code row: the first state that applies.
+pub fn claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnosticsReport {
+    use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive, Ready};
+    const HOOKS: &str = "Claude Code session-status hooks are unavailable.";
+    let waiting = !inputs.live_session || !inputs.protocol_observed;
+    let (pill, sentence) = match inputs.phase {
+        ClaudeDiagnosticsPhase::Checking => (Inactive, "Checking for Claude Code."),
+        ClaudeDiagnosticsPhase::NotOnPath => (Inactive, "Claude Code is not on PATH."),
+        ClaudeDiagnosticsPhase::Available if inputs.plugin_missing => (Degraded, HOOKS),
+        ClaudeDiagnosticsPhase::Available if !inputs.present => {
+            (Inactive, "Claude Code is not running.")
+        }
+        ClaudeDiagnosticsPhase::Available if waiting && inputs.present_for < CLAUDE_GRACE => {
+            (Inactive, "Claude Code is starting.")
+        }
+        ClaudeDiagnosticsPhase::Available if !inputs.live_session => (Degraded, HOOKS),
+        ClaudeDiagnosticsPhase::Available if !inputs.protocol_observed => {
+            (Degraded, "Claude Code status protocol is unavailable.")
+        }
+        ClaudeDiagnosticsPhase::Available => (Ready, "Claude Code session follow is ready."),
+    };
+    ClaudeDiagnosticsReport::new(pill, sentence)
+}
+
+/// The Claude Code row of a remote workspace: the same state machine with
+/// hooks permanently unavailable over SSH, so it never reports ready. The
+/// plugin and live-session inputs describe local hooks and are ignored; the
+/// phase is the owning tab's own remote detection.
+pub fn remote_claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnosticsReport {
+    use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+    let (pill, sentence) = match inputs.phase {
+        ClaudeDiagnosticsPhase::Checking => (Inactive, "Checking for Claude Code."),
+        ClaudeDiagnosticsPhase::NotOnPath => (Inactive, "Claude Code is not on PATH."),
+        ClaudeDiagnosticsPhase::Available if !inputs.present => {
+            (Inactive, "Claude Code is not running.")
+        }
+        ClaudeDiagnosticsPhase::Available
+            if !inputs.protocol_observed && inputs.present_for < CLAUDE_GRACE =>
+        {
+            (Inactive, "Claude Code is starting.")
+        }
+        ClaudeDiagnosticsPhase::Available if !inputs.protocol_observed => {
+            (Degraded, "Claude Code status protocol is unavailable.")
+        }
+        ClaudeDiagnosticsPhase::Available => (
+            Degraded,
+            "Claude Code session-status hooks are unavailable over SSH.",
+        ),
+    };
+    ClaudeDiagnosticsReport::new(pill, sentence)
 }

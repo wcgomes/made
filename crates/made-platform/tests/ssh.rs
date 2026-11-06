@@ -235,10 +235,11 @@ fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3(
     );
     assert_eq!(lines[3], "", "the fixture has no opencode");
     assert_eq!(lines[4], format!("{}/grok", bin.display()));
-    // Grok is the last probe line: python3 sits on the same PATH and is never
-    // looked up, reported or executed.
-    assert_eq!(lines.len(), 6, "{lines:?}");
+    // Claude Code is the last probe line: python3 sits on the same PATH and is
+    // never looked up, reported or executed.
+    assert_eq!(lines.len(), 7, "{lines:?}");
     assert_eq!(lines[5], "");
+    assert_eq!(lines[6], "");
     assert!(
         !SshCommand::Probe.script().contains("python3"),
         "the fixed probe must not mention python3"
@@ -255,6 +256,63 @@ fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3(
         .map(str::to_owned)
         .collect();
     assert_eq!(lines[4], "", "relative PATH entries must not be detected");
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_claude_as_one_more_metadata_only_path_line() {
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin = home.join("abs-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // A launched or version-checked claude would leave this marker.
+    let executed = temp.path().join("claude-executed");
+    for name in ["claude", "grok"] {
+        write_executable(
+            &bin.join(name),
+            format!("#!/bin/sh\nprintf x >> '{}'\nexit 4\n", executed.display()),
+        );
+    }
+    let relative = temp.path().join("rel-bin");
+    std::fs::create_dir_all(&relative).unwrap();
+    write_executable(&relative.join("claude"), "#!/bin/sh\nexit 0\n");
+    let tools = temp.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools = probe_fixture_uname(&tools);
+    let run = |path: String| {
+        Command::new("/bin/sh")
+            .args(["-c", SshCommand::Probe.script()])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    };
+    let lines_of = |output: std::process::Output| -> Vec<String> {
+        assert!(output.status.success(), "fixed probe failed");
+        String::from_utf8_lossy(&output.stdout)
+            .split('\n')
+            .map(str::to_owned)
+            .collect()
+    };
+    let lines = lines_of(run(format!(
+        "rel-bin::{}:/bin:{}",
+        bin.display(),
+        tools.display()
+    )));
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert_eq!(lines[4], format!("{}/grok", bin.display()));
+    assert_eq!(lines[5], format!("{}/claude", bin.display()));
+    assert!(
+        !executed.exists(),
+        "detection must never spawn claude or check a version"
+    );
+    // Only relative and empty PATH entries: claude is not detected on them.
+    let lines = lines_of(run(format!("rel-bin::/bin:{}", tools.display())));
+    assert_eq!(lines[5], "", "relative PATH entries must not be detected");
 }
 
 #[test]
@@ -1726,6 +1784,87 @@ fn cancel_kills_the_process_group_not_only_the_direct_child() {
         !pid_alive(pid),
         "process-group descendant survived cancellation"
     );
+}
+
+/// The local ssh client must not inherit the Claude Code spool or plugin
+/// directories. The environment is set on a re-executed copy of this test so
+/// the multi-threaded parent never mutates its own environment.
+#[test]
+#[cfg(unix)]
+fn local_ssh_client_does_not_inherit_the_claude_spool_or_plugin_dirs() {
+    use made_platform::ssh::SshProcess;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::time::{Duration, Instant};
+
+    const NAME: &str = "local_ssh_client_does_not_inherit_the_claude_spool_or_plugin_dirs";
+    if std::env::var_os("MADE_SSH_ENV_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env("MADE_SSH_ENV_CHILD", "1")
+            .env("MADE_CLAUDE_SPOOL", "/spool/ws-1.jsonl")
+            .env("CLAUDE_CODE_PLUGIN_DIRS", "/plugins/made")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the re-executed test must actually run"
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let known_hosts = root.join("known_hosts");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&known_hosts)
+        .unwrap();
+    let seen = root.join("seen.env");
+    let fake = root.join("ssh");
+    write_executable(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_8.4p1\\n' >&2; exit 0; fi\n\
+             printf '%s|%s' \"${{MADE_CLAUDE_SPOOL-unset}}\" \"${{CLAUDE_CODE_PLUGIN_DIRS-unset}}\" > '{}'\n\
+             sleep 30\n",
+            seen.display()
+        ),
+    );
+    let askpass = root.join("askpass");
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
+    let mut options = options();
+    options.executable = fake;
+    options.askpass_executable = askpass;
+    options.private_directory = root.to_path_buf();
+    options.known_hosts = known_hosts;
+    assert_eq!(
+        std::env::var("MADE_CLAUDE_SPOOL").as_deref(),
+        Ok("/spool/ws-1.jsonl"),
+        "the fixture parent environment carries the spool"
+    );
+    let mut process = SshProcess::spawn(options).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        if let Ok(text) = std::fs::read_to_string(&seen) {
+            if !text.is_empty() {
+                break text;
+            }
+        }
+        assert!(Instant::now() < deadline, "fake ssh did not report its env");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    process.cancel();
+    assert_eq!(text, "unset|unset");
 }
 
 #[test]

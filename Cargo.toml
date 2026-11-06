@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/made-app",
     "crates/made-bridge",
+    "crates/made-claude-hook",
     "crates/made-explorer",
     "crates/made-grok-hook",
     "crates/made-platform",
