@@ -276,6 +276,8 @@ struct RemoteTab {
     /// Whether this tab is on screen, read by the client's wake callback on
     /// the transport thread. A hidden tab's output must not repaint the window.
     wake_visible: Arc<std::sync::atomic::AtomicBool>,
+    /// Shell cwd report that arrived before the attach reply was processed.
+    deferred_shell_cwd: Option<made_remote::protocol::RemotePath>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Client request id -> workspace request id. RemoteClient assigns its own ids.
     id_map: std::collections::HashMap<u64, u64>,
@@ -337,6 +339,7 @@ impl RemoteTab {
             companion_spawn_requested: false,
             client: None,
             wake_visible: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_shell_cwd: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             id_map: std::collections::HashMap::new(),
             cleanup_unconfirmed: false,
@@ -705,6 +708,7 @@ impl Workbench {
             companion_spawn_requested: false,
             client: None,
             wake_visible: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_shell_cwd: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             id_map: std::collections::HashMap::new(),
             cleanup_unconfirmed: false,
@@ -3113,6 +3117,27 @@ impl Workbench {
                     let mut attach_reply = None;
                     let mut upload_replies = Vec::new();
                     while let Some(reply) = client.poll_reply() {
+                        // The shell's cwd report is an unsolicited, untrusted
+                        // event, not a reply to a pending request. It enters
+                        // the root precedence only through server validation.
+                        // The report is not a filesystem result, so a root
+                        // generation that moved while it was in flight must
+                        // not drop it; transport authority and epoch still
+                        // have to match. A reattach re-sends it right behind
+                        // `Attached`, carrying the same request id, so it must
+                        // neither replace the attach reply nor be applied
+                        // before the new epoch is attached: it is held.
+                        if let made_remote::protocol::Operation::ShellCwd { path } = reply.operation
+                        {
+                            if remote.attach_request.is_some() {
+                                remote.deferred_shell_cwd = Some(path);
+                            } else {
+                                let mut identity = reply.identity;
+                                identity.generation = remote.workspace.identity().generation;
+                                let _ = remote.workspace.report_shell_cwd(&identity, path);
+                            }
+                            continue;
+                        }
                         if waiting_attach == Some(reply.request_id) {
                             attach_reply = Some(reply);
                             continue;
@@ -3126,20 +3151,6 @@ impl Workbench {
                             continue;
                         }
                         if remote.attach_request.is_some() {
-                            continue;
-                        }
-                        // The shell's cwd report is an unsolicited, untrusted
-                        // event, not a reply to a pending request. It enters
-                        // the root precedence only through server validation.
-                        // The report is not a filesystem result, so a root
-                        // generation that moved while it was in flight must
-                        // not drop it; transport authority and epoch still
-                        // have to match.
-                        if let made_remote::protocol::Operation::ShellCwd { path } = reply.operation
-                        {
-                            let mut identity = reply.identity;
-                            identity.generation = remote.workspace.identity().generation;
-                            let _ = remote.workspace.report_shell_cwd(&identity, path);
                             continue;
                         }
                         let listed = matches!(
@@ -3249,6 +3260,14 @@ impl Workbench {
         }
         if attach_reply.is_some() || !upload_replies.is_empty() {
             self.finish_remote_replies(attach_reply, upload_replies);
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            if remote.attach_request.is_none() {
+                if let Some(path) = remote.deferred_shell_cwd.take() {
+                    let identity = remote.workspace.identity().clone();
+                    let _ = remote.workspace.report_shell_cwd(&identity, path);
+                }
+            }
         }
         {
             let Some(remote) = self.remote.as_mut() else {
@@ -7412,6 +7431,56 @@ mod tests {
                         .directories
                         .contains_key(&target)
             });
+        }
+
+        #[test]
+        fn shell_cwd_riding_the_attach_reply_neither_replaces_it_nor_is_lost() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            let target = remote_path("/home/vscode/depois do cd");
+            // The companion re-sends the cwd right after a reattach, under the
+            // attach request id, possibly in the same read as `Attached`.
+            for operation in [
+                Operation::Attached,
+                Operation::ShellCwd {
+                    path: target.clone(),
+                },
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"$ ".to_vec()).unwrap(),
+                    done: true,
+                },
+            ] {
+                bench.send(WireEnvelope::new(bench.identity.clone(), attach, operation));
+            }
+            let mut validated = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } | Operation::RootSelect { path } => {
+                            validated |= path == &target;
+                            let mut result = root_result(&frame, path);
+                            if let Operation::RootResult { generation, .. } = &mut result {
+                                if matches!(frame.operation, Operation::RootSelect { .. }) {
+                                    *generation += 1;
+                                }
+                            }
+                            bench.reply(&frame, result);
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        Operation::SessionState => bench.reply(
+                            &frame,
+                            Operation::Error {
+                                code: ErrorCode::Unavailable,
+                            },
+                        ),
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                validated && remote.workspace.root() == &target
+            });
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(matches!(remote.phase, RemotePhase::Ready));
         }
 
         #[test]

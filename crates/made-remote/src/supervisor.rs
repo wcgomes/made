@@ -95,19 +95,18 @@ fn is_utf8_locale(name: &str) -> bool {
 /// Make the remote child decode input as UTF-8 so accented characters typed in
 /// the client reach the shell (readline and zle edit bytes, not characters,
 /// under the `C` locale). A UTF-8 locale that the SSH session already carries,
-/// for example a client `LANG` accepted through `AcceptEnv`, is kept as is.
-/// Otherwise only `LC_CTYPE` is set, from `installed` (the server's own
-/// `locale -a`), preferring `C.UTF-8` and then `en_US.UTF-8`. A locale the
-/// server does not list is never invented, an explicit non-UTF-8 `LC_ALL` is
-/// the user's choice and is left alone, and message languages (`LANG`,
-/// `LC_MESSAGES`) are not touched.
+/// for example a client `LANG` accepted through `AcceptEnv`, is kept only when
+/// the server's own `locale -a` (`installed`) lists it: glibc has no locale
+/// named plain `UTF-8` and silently falls back to `C`. Otherwise `LC_CTYPE`
+/// is set, replacing any previous value including an explicit `LC_CTYPE=C`,
+/// from `installed`, preferring `C.UTF-8` and then `en_US.UTF-8`. A locale the
+/// server does not list is never invented, a non-empty `LC_ALL` is the user's
+/// choice and is left alone, and message languages (`LANG`, `LC_MESSAGES`) are
+/// not touched. If the server lists no locales, nothing changes.
 pub fn ensure_utf8_locale(
     env: &mut Vec<(OsString, OsString)>,
     installed: impl FnOnce() -> Vec<String>,
 ) {
-    if effective_ctype(env).is_some_and(|value| is_utf8_locale(&value.to_string_lossy())) {
-        return;
-    }
     if env
         .iter()
         .any(|(key, value)| key == "LC_ALL" && !value.is_empty())
@@ -120,6 +119,12 @@ pub fn ensure_utf8_locale(
         .collect();
     // `locale -a` spells the same locale `C.utf8` or `C.UTF-8` by libc.
     let key = |name: &str| name.to_ascii_lowercase().replace('-', "");
+    if effective_ctype(env).is_some_and(|value| {
+        let value = value.to_string_lossy();
+        is_utf8_locale(&value) && installed.iter().any(|name| key(name) == key(&value))
+    }) {
+        return;
+    }
     let pick = |wanted: &str| installed.iter().find(|name| key(name) == key(wanted));
     let Some(choice) = pick("C.UTF-8")
         .or_else(|| pick("en_US.UTF-8"))
@@ -627,6 +632,8 @@ struct Attachment {
     snapshot_rest: Vec<u8>,
     /// Set only after the single completing `done: true` frame is queued.
     snapshot_closed: bool,
+    /// Re-emit the shell cwd once the resnapshot has been queued.
+    cwd_pending: bool,
     pending_relay: Option<Vec<u8>>,
     pending_control: Vec<WireEnvelope>,
 }
@@ -672,6 +679,9 @@ pub struct Supervisor {
     cwd_sink: CwdReportSink,
     shell_plan: Option<ShellLaunchPlan>,
     shell_cwd: Option<RemotePath>,
+    /// A validated report has arrived, so a reattach must restore it: the
+    /// client forgets the shell root with each new epoch.
+    cwd_reported: bool,
     /// Current PTY window size as last requested by an attach or resize.
     pty_size: (u16, u16),
     /// The child is the user's shell rather than a TUI launched by Made.
@@ -688,7 +698,11 @@ const NUDGE_STEP: Duration = Duration::from_millis(60);
 /// After a reattach the client holds only the supervisor's bounded text
 /// snapshot, while the application believes its previous screen is intact and
 /// repaints only what changes. Resizing the PTY to a transient size and back
-/// makes it send SIGWINCH and repaint everything.
+/// makes it send SIGWINCH and repaint everything. The client's own follow-up
+/// `TerminalResize` (reattach always opens at the default size) usually does
+/// this too and then cancels the nudge, but it sends nothing when the real
+/// size equals the default or the hidden tab never lays out, so the nudge is
+/// the guarantee.
 struct RedrawNudge {
     shrunk: bool,
     due: Instant,
@@ -785,6 +799,7 @@ impl Supervisor {
             cwd_sink,
             shell_plan,
             shell_cwd: Some(directory.clone()),
+            cwd_reported: false,
             pty_size: (*rows, *cols),
             shell_target: matches!(
                 first.operation,
@@ -907,6 +922,7 @@ impl Supervisor {
             watch_request: None,
             snapshot_rest: snapshot,
             snapshot_closed: false,
+            cwd_pending: reattach,
             pending_relay: None,
             pending_control: Vec::new(),
         });
@@ -1108,9 +1124,9 @@ impl Supervisor {
             }
             TerminalResize { rows, cols } => {
                 // A real resize signals the child itself.
-                self.redraw = None;
                 self.session.resize(*rows, *cols)?;
                 self.pty_size = (*rows, *cols);
+                self.redraw = None;
                 Ack
             }
             UploadBegin { upload_id, total } => {
@@ -1155,6 +1171,11 @@ impl Supervisor {
             return;
         };
         if self.attachment.is_none() {
+            // The frontend left between the two sizes: do not strand the child.
+            if nudge.shrunk {
+                let (rows, cols) = self.pty_size;
+                let _ = self.session.resize_pty_only(rows, cols);
+            }
             self.redraw = None;
             return;
         }
@@ -1183,6 +1204,7 @@ impl Supervisor {
                 if let Ok(native) = crate::filesystem::native(&path) {
                     if let Ok(guard) = made_explorer::paths::PathGuard::new(native) {
                         self.shell_cwd = crate::filesystem::remote(guard.root()).ok();
+                        self.cwd_reported = self.cwd_reported || self.shell_cwd.is_some();
                     }
                 }
             }
@@ -1206,7 +1228,11 @@ impl Supervisor {
             }
             return;
         }
-        if previous_cwd != self.shell_cwd {
+        let restore_cwd = self.cwd_reported
+            && self.attachment.as_mut().is_some_and(|attachment| {
+                attachment.snapshot_closed && std::mem::take(&mut attachment.cwd_pending)
+            });
+        if previous_cwd != self.shell_cwd || restore_cwd {
             if let Some(path) = self.shell_cwd.clone() {
                 if let Some(attachment) = &self.attachment {
                     let frame = WireEnvelope::new(

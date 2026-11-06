@@ -632,3 +632,70 @@ fn resnapshot_keeps_cell_colors_and_attributes() {
         );
     }
 }
+
+#[test]
+fn utf8_locale_selection_trusts_only_what_the_server_lists() {
+    use made_remote::supervisor::ensure_utf8_locale;
+    use std::ffi::OsString;
+    let env = |pairs: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
+    };
+    let ctype = |env: &[(OsString, OsString)]| {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == "LC_CTYPE")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    };
+    // A forwarded plain `UTF-8` (macOS client) is not a glibc locale.
+    let mut forwarded = env(&[("LC_CTYPE", "UTF-8")]);
+    ensure_utf8_locale(&mut forwarded, || vec!["C".into(), "C.utf8".into()]);
+    assert_eq!(ctype(&forwarded).as_deref(), Some("C.utf8"));
+    // A forwarded locale the server lists is kept, whatever its spelling.
+    let mut listed = env(&[("LANG", "en_US.UTF-8")]);
+    ensure_utf8_locale(&mut listed, || vec!["en_US.utf8".into(), "C.utf8".into()]);
+    assert_eq!(ctype(&listed), None);
+    // LANG is not trusted by name alone either.
+    let mut unlisted = env(&[("LANG", "pt_BR.UTF-8")]);
+    ensure_utf8_locale(&mut unlisted, || vec!["C.utf8".into()]);
+    assert_eq!(ctype(&unlisted).as_deref(), Some("C.utf8"));
+    // No locale session, none installed: nothing is invented.
+    let mut none = env(&[]);
+    ensure_utf8_locale(&mut none, || vec!["C".into(), "POSIX".into()]);
+    assert_eq!(ctype(&none), None);
+    // A non-empty LC_ALL is the user's choice.
+    let mut pinned = env(&[("LC_ALL", "C")]);
+    ensure_utf8_locale(&mut pinned, || vec!["C.utf8".into()]);
+    assert_eq!(ctype(&pinned), None);
+}
+
+#[test]
+#[cfg(unix)]
+fn reattach_restores_the_shell_cwd_the_client_forgot() {
+    let (mut session, mut stream) = live::Session::start(&["--noprofile", "--norc"]);
+    let target = session.workspace.join("depois do cd");
+    std::fs::create_dir_all(&target).unwrap();
+    let expected = target.as_os_str().as_encoded_bytes().to_vec();
+    let mut wire = Vec::new();
+    live::output_until(&mut stream, &mut wire, "$ ");
+    session.type_text(
+        &mut stream,
+        2,
+        &format!("cd '{}'\n", target.to_str().unwrap()),
+    );
+    live::frames_until(&mut stream, |operation| match operation {
+        Operation::ShellCwd { path } if path.as_bytes() == expected => Some(()),
+        _ => None,
+    });
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+    let mut stream = session.reattach(2, 24, 80);
+    // The report is re-sent without another cd, after the attach reply.
+    live::frames_until(&mut stream, |operation| match operation {
+        Operation::ShellCwd { path } if path.as_bytes() == expected => Some(()),
+        _ => None,
+    });
+    session.close(stream);
+}
