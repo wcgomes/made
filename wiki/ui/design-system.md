@@ -76,7 +76,7 @@ Tints are opaque precomposited colors, not alpha fills. The persistent alpha sur
 | Terminal card, alternate screen | 255 (`BG_TERMINAL`) |
 | Preview, picker, diagnostics, tooltip, toast | 255 |
 
-The Explorer card/header fills are conditional: `BG_CARD_GLASS` 188/255 and `BG_HEADER_GLASS` 194/255 when no native backdrop is applied (off, unsupported, or failed), or `BG_CARD_GLASS_NATIVE` 24/255 and `BG_HEADER_GLASS_NATIVE` 32/255 when the status reports a macOS HudWindow or Windows 11 Mica effect. Both pairs use the same RGB values and keep the border, shadow, and 1px top highlight unchanged; the native pair lets the material read through, while the fallback pair preserves legibility without blur.
+The Explorer card/header fills are conditional: `BG_CARD_GLASS` 188/255 and `BG_HEADER_GLASS` 194/255 when no native backdrop is applied (off, unsupported, or failed), or `BG_CARD_GLASS_NATIVE` 24/255 and `BG_HEADER_GLASS_NATIVE` 32/255 when the status reports a macOS HudWindow or Windows 11 Acrylic effect. Both pairs use the same RGB values and keep the border, shadow, and 1px top highlight unchanged; the native pair lets the material read through, while the fallback pair preserves legibility without blur.
 
 macOS arm64 1280×800 native Explorer tint was visually approved by the user on 2026-10-28. With `MADE_NATIVE_BACKDROP=off`, the Explorer card/header rendered as 17,22,28 / 18,23,29 with primary text 196,201,210 and tertiary header text 128,134,147; primary/tertiary contrast measured 10.93:1 and 4.93:1, so it passed and the fallback was not darkened. Native Explorer tint contrast remains uncertified.
 
@@ -87,7 +87,7 @@ Never stack the same translucent glass fill twice. On the primary screen the ter
 `made-platform::native_backdrop` optionally layers an OS material behind the window:
 
 - **macOS:** `NSVisualEffectView` HudWindow vibrancy, active state, inserted into the content view's superview directly below the content view ([source](../../crates/made-platform/src/native_backdrop.rs)). AppKit composites subviews above the parent view's layer, so a content-view subview would cover the wgpu `CAMetalLayer` and hide the UI.
-- **Windows 11:** Mica only. Acrylic/blur are intentionally not used because `window-vibrancy` documents resize/drag lag.
+- **Windows 11:** system Acrylic through the documented DWM backdrop API, on 22H2 (build 22621+) only; older builds use in-app glass. Native resize/drag performance is unverified; see the [ADR 0003 amendment](../decisions/0003-in-app-glass-native-backdrop.md).
 - **Linux/unsupported compositor/failure:** `InAppGlass` with `applied=false` and an honest reason.
 - `MADE_NATIVE_BACKDROP=auto` (default, including unset/unrecognized values) attempts the effect once on the first UI frame; `off` skips it. There is no retry or runtime material switch.
 - The clear color uses alpha 135 only when the status says the native effect was applied.
