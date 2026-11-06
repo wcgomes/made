@@ -202,15 +202,17 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
         (None, _) => {}
     }
 
-    // A normal GUI session must not share the launching console: its Ctrl+C or
-    // close would end Made. CLI actions and smoke runs keep it for their output.
-    if smoke.is_none() {
-        made_platform::detach_console();
-    }
     let result = eframe::run_native(
         "Made",
         made_app::app::native_options(),
         Box::new(move |_cc| {
+            // A normal GUI session must not share the launching console: its
+            // Ctrl+C or close would end Made. CLI actions and smoke runs keep
+            // it for their output. Done once the window exists so a creation
+            // failure still prints to that console.
+            if smoke.is_none() {
+                made_platform::detach_console();
+            }
             Ok(Box::new(NativeApp {
                 model,
                 native_backdrop_checked: false,

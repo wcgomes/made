@@ -30,7 +30,8 @@
 use std::ffi::{c_void, OsStr, OsString};
 use std::mem::size_of;
 use std::path::PathBuf;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
@@ -46,6 +47,23 @@ use crate::{
     SystemClipboard,
 };
 
+/// Console handles opened by [`attach_parent_console`], by stream slot, so
+/// [`detach_console`] closes only handles this process created.
+static OPENED_CONSOLE_HANDLES: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+fn stream_slot(id: u32) -> usize {
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_INPUT_HANDLE};
+    match id {
+        STD_INPUT_HANDLE => 0,
+        STD_ERROR_HANDLE => 2,
+        _ => 1,
+    }
+}
+
 /// Reconnect standard streams to the launching console, if there is one.
 ///
 /// The GUI binary uses the Windows GUI subsystem so a double-click opens no
@@ -57,7 +75,6 @@ use crate::{
 /// (Explorer, shortcut, installer) it does nothing, and Rust's stdio silently
 /// discards writes to missing handles.
 pub fn attach_parent_console() {
-    use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -95,6 +112,7 @@ pub fn attach_parent_console() {
             );
             if handle != INVALID_HANDLE_VALUE {
                 SetStdHandle(id, handle);
+                OPENED_CONSOLE_HANDLES[stream_slot(id)].store(handle as usize, Ordering::Relaxed);
             }
         }
     }
@@ -106,10 +124,39 @@ pub fn attach_parent_console() {
 /// console, and Ctrl+C or closing that console would send the process a control
 /// event that ends Made and every session in it. Redirected stdio (pipes,
 /// files) is unaffected.
+///
+/// Standard handles that point at the console (opened by
+/// [`attach_parent_console`] or inherited from `cmd`) are reset to null first,
+/// the state of an Explorer launch: Rust's stdio silently drops writes to a
+/// null handle, whereas a handle into a closed console makes `eprintln!`
+/// panic. Handles this process opened are closed; inherited ones are left to
+/// the process.
 pub fn detach_console() {
-    // SAFETY: FreeConsole has no arguments and only detaches this process.
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        FreeConsole, GetConsoleMode, GetStdHandle, SetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    // SAFETY: plain Win32 calls; a handle is closed only when this process
+    // opened it and it is no longer a standard handle.
     unsafe {
-        windows_sys::Win32::System::Console::FreeConsole();
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = GetStdHandle(id);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut mode = 0;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                continue;
+            }
+            SetStdHandle(id, null_mut());
+            let opened = OPENED_CONSOLE_HANDLES[stream_slot(id)].swap(0, Ordering::Relaxed);
+            if opened == handle as usize {
+                CloseHandle(handle);
+            }
+        }
+        FreeConsole();
     }
 }
 
