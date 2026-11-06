@@ -309,3 +309,44 @@ fn encoded_test_uri_path(path: &std::path::Path) -> String {
     }
     result
 }
+
+#[test]
+#[cfg(windows)]
+fn osc7_accepts_raw_cmd_prompt_paths_with_spaces_and_non_ascii() {
+    for (raw, expected) in [
+        (r"C:\Users\wylle", "C:/Users/wylle"),
+        (
+            r"C:\Users\wylle\Configurações Locais",
+            "C:/Users/wylle/Configurações Locais",
+        ),
+        (r"D:\", "D:/"),
+    ] {
+        let mut core = made_terminal::TerminalCore::new();
+        core.feed(format!("\x1b]7;file://localhost/{raw}\x1b\\").as_bytes());
+        assert_eq!(core.cwd(), Some(std::path::Path::new(expected)), "{raw}");
+    }
+    for raw in [r"C:\file:stream", r"C:\bad?name", r"\\server\share"] {
+        let mut core = made_terminal::TerminalCore::new();
+        core.feed(format!("\x1b]7;file://localhost/{raw}\x1b\\").as_bytes());
+        assert!(core.cwd().is_none(), "{raw}");
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn osc7_accepts_powershell_uri_for_windows_paths() {
+    let mut core = made_terminal::TerminalCore::new();
+    core.feed(b"\x1b]7;file:///C:/Users/wylle/Configura%C3%A7%C3%B5es%20Locais\x07");
+    assert_eq!(
+        core.cwd(),
+        Some(std::path::Path::new("C:/Users/wylle/Configurações Locais"))
+    );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn osc7_ignores_raw_cmd_prompt_form_off_windows() {
+    let mut core = made_terminal::TerminalCore::new();
+    core.feed("\x1b]7;file://localhost/C:\\Users\\a b\x1b\\".as_bytes());
+    assert!(core.cwd().is_none());
+}

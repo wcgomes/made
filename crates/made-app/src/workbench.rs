@@ -273,6 +273,16 @@ struct RemoteTab {
     snapshot_gate: crate::remote_session::SnapshotGate,
     companion_spawn_requested: bool,
     client: Option<made_remote::client::RemoteClient>,
+    /// Whether this tab is on screen, read by the client's wake callback on
+    /// the transport thread. A hidden tab's output must not repaint the window.
+    wake_visible: Arc<std::sync::atomic::AtomicBool>,
+    /// Shell cwd report that arrived before the attach reply was processed.
+    /// The frame's own identity is kept so applying it re-checks authority,
+    /// tab and epoch against the workspace.
+    deferred_shell_cwd: Option<(
+        made_remote::protocol::Identity,
+        made_remote::protocol::RemotePath,
+    )>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Client request id -> workspace request id. RemoteClient assigns its own ids.
     id_map: std::collections::HashMap<u64, u64>,
@@ -333,6 +343,8 @@ impl RemoteTab {
             snapshot_gate: crate::remote_session::SnapshotGate::default(),
             companion_spawn_requested: false,
             client: None,
+            wake_visible: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_shell_cwd: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             id_map: std::collections::HashMap::new(),
             cleanup_unconfirmed: false,
@@ -700,6 +712,8 @@ impl Workbench {
             snapshot_gate: crate::remote_session::SnapshotGate::default(),
             companion_spawn_requested: false,
             client: None,
+            wake_visible: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_shell_cwd: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             id_map: std::collections::HashMap::new(),
             cleanup_unconfirmed: false,
@@ -2116,6 +2130,7 @@ impl Workbench {
         remote.prompt = None;
         remote.prompt_draft.clear();
         remote.attach_request = None;
+        remote.deferred_shell_cwd = None;
         remote.workspace.disconnect();
         let snapshot = remote.snapshot.clone();
         remote.probe = Some(crate::ssh_servers::spawn_probe(
@@ -2583,6 +2598,9 @@ impl Workbench {
     }
 
     fn tick_remote(&mut self, ctx: &egui::Context) {
+        if let Some(remote) = self.remote.as_ref() {
+            remote.wake_visible.store(self.visible, Ordering::Relaxed);
+        }
         self.poll_remote_prompt();
         self.take_observed_failure();
         let probe_done = self
@@ -2631,6 +2649,17 @@ impl Workbench {
             if let Some(delay) = Self::remote_output_repaint_delay(self.visible) {
                 ctx.request_repaint_after(delay);
             }
+        }
+        // The wake callback covers output; this bounded poll covers whatever it
+        // cannot signal, and replaces the idle cadence the local tick ends with,
+        // which a remote tab never reaches.
+        if self.visible
+            && self
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.client.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         if self.visible
             && self.remote.as_ref().is_some_and(|remote| {
@@ -3040,6 +3069,17 @@ impl Workbench {
             DEFAULT_COLS as u16,
         );
         debug_assert!(crate::remote_session::allow_before_attached(&operation));
+        // Remote output arrives on the transport thread. Without a wake the
+        // window repaints only on the next poll, so an animation frame that
+        // lands after an idle gap waits for it.
+        if let Some(ctx) = self.frame_ctx.clone() {
+            let visible = remote.wake_visible.clone();
+            client.set_wake(move || {
+                if visible.load(Ordering::Relaxed) {
+                    ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
+                }
+            });
+        }
         self.diag.log_mut().record(
             LogLevel::Info,
             format!("remote opening: {:?} epoch {}", launch, remote.client_epoch),
@@ -3083,6 +3123,27 @@ impl Workbench {
                     let mut attach_reply = None;
                     let mut upload_replies = Vec::new();
                     while let Some(reply) = client.poll_reply() {
+                        // The shell's cwd report is an unsolicited, untrusted
+                        // event, not a reply to a pending request. It enters
+                        // the root precedence only through server validation.
+                        // The report is not a filesystem result, so a root
+                        // generation that moved while it was in flight must
+                        // not drop it; transport authority and epoch still
+                        // have to match. A reattach re-sends it right behind
+                        // `Attached`, carrying the same request id, so it must
+                        // neither replace the attach reply nor be applied
+                        // before the new epoch is attached: it is held.
+                        if let made_remote::protocol::Operation::ShellCwd { path } = reply.operation
+                        {
+                            if remote.attach_request.is_some() {
+                                remote.deferred_shell_cwd = Some((reply.identity, path));
+                            } else {
+                                let mut identity = reply.identity;
+                                identity.generation = remote.workspace.identity().generation;
+                                let _ = remote.workspace.report_shell_cwd(&identity, path);
+                            }
+                            continue;
+                        }
                         if waiting_attach == Some(reply.request_id) {
                             attach_reply = Some(reply);
                             continue;
@@ -3206,6 +3267,16 @@ impl Workbench {
         if attach_reply.is_some() || !upload_replies.is_empty() {
             self.finish_remote_replies(attach_reply, upload_replies);
         }
+        if let Some(remote) = self.remote.as_mut() {
+            if remote.attach_request.is_none() {
+                if let Some((mut identity, path)) = remote.deferred_shell_cwd.take() {
+                    // Only the generation is rebased; a report from another
+                    // epoch fails `Identity::matches` and is dropped.
+                    identity.generation = remote.workspace.identity().generation;
+                    let _ = remote.workspace.report_shell_cwd(&identity, path);
+                }
+            }
+        }
         {
             let Some(remote) = self.remote.as_mut() else {
                 return;
@@ -3295,6 +3366,7 @@ impl Workbench {
             remote.companion_provisioned = false;
             remote.client = None;
             remote.attach_request = None;
+            remote.deferred_shell_cwd = None;
             remote.holding_input = false;
             remote.upload = None;
             // Stale remote session rows must not outlive the transport.
@@ -3372,6 +3444,9 @@ impl Workbench {
             return;
         };
         remote.attach_request = None;
+        if !matches!(reply.operation, made_remote::protocol::Operation::Attached) {
+            remote.deferred_shell_cwd = None;
+        }
         match reply.operation {
             made_remote::protocol::Operation::Attached => {}
             made_remote::protocol::Operation::Error { code } => {
@@ -7281,6 +7356,195 @@ mod tests {
                 3
             );
             assert_terminal_continues(&bench, terminal_output);
+        }
+
+        #[test]
+        fn shell_cwd_report_moves_the_remote_root_after_cd() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"$ ".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            let root = bench.root.clone();
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        Operation::SessionState => bench.reply(
+                            &frame,
+                            Operation::Error {
+                                code: ErrorCode::Unavailable,
+                            },
+                        ),
+                        _ => {}
+                    }
+                }
+                bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .workspace
+                    .projection()
+                    .directories
+                    .contains_key(&root)
+            });
+
+            // The companion reports the shell's cwd after `cd`, as raw POSIX
+            // bytes: spaces and non-ASCII must survive untouched.
+            let target = remote_path("/home/vscode/dir com espaço/ação 日本");
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::ShellCwd {
+                    path: target.clone(),
+                },
+            ));
+            let mut validated = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } | Operation::RootSelect { path } => {
+                            assert_eq!(path, &target);
+                            validated = true;
+                            let mut result = root_result(&frame, path);
+                            if let Operation::RootResult { generation, .. } = &mut result {
+                                if matches!(frame.operation, Operation::RootSelect { .. }) {
+                                    *generation += 1;
+                                }
+                            }
+                            bench.reply(&frame, result);
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                validated
+                    && remote.workspace.root() == &target
+                    && remote.workspace.projection().source
+                        == crate::remote_workspace::RootSource::Shell
+                    && remote
+                        .workspace
+                        .projection()
+                        .directories
+                        .contains_key(&target)
+            });
+        }
+
+        #[test]
+        fn shell_cwd_riding_the_attach_reply_neither_replaces_it_nor_is_lost() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            let target = remote_path("/home/vscode/depois do cd");
+            // The companion re-sends the cwd right after a reattach, under the
+            // attach request id, possibly in the same read as `Attached`.
+            for operation in [
+                Operation::Attached,
+                Operation::ShellCwd {
+                    path: target.clone(),
+                },
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"$ ".to_vec()).unwrap(),
+                    done: true,
+                },
+            ] {
+                bench.send(WireEnvelope::new(bench.identity.clone(), attach, operation));
+            }
+            let mut validated = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } | Operation::RootSelect { path } => {
+                            validated |= path == &target;
+                            let mut result = root_result(&frame, path);
+                            if let Operation::RootResult { generation, .. } = &mut result {
+                                if matches!(frame.operation, Operation::RootSelect { .. }) {
+                                    *generation += 1;
+                                }
+                            }
+                            bench.reply(&frame, result);
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        Operation::SessionState => bench.reply(
+                            &frame,
+                            Operation::Error {
+                                code: ErrorCode::Unavailable,
+                            },
+                        ),
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                validated && remote.workspace.root() == &target
+            });
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(matches!(remote.phase, RemotePhase::Ready));
+        }
+
+        #[test]
+        fn deferred_shell_cwd_from_another_epoch_or_a_failed_session_is_not_applied() {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            let stale = remote_path("/home/vscode/velho");
+            // A report held from epoch 99 must fail the identity re-check.
+            let mut other = bench.identity.clone();
+            other.epoch = 99;
+            bench.workbench.remote.as_mut().unwrap().deferred_shell_cwd =
+                Some((other, stale.clone()));
+            for operation in [
+                Operation::Attached,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"$ ".to_vec()).unwrap(),
+                    done: true,
+                },
+            ] {
+                bench.send(WireEnvelope::new(bench.identity.clone(), attach, operation));
+            }
+            let mut saw_stale = false;
+            let mut attached = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } | Operation::RootSelect { path } => {
+                            saw_stale |= path == &stale;
+                            bench.reply(&frame, root_result(&frame, path));
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                attached |= remote.attached_once && remote.attach_request.is_none();
+                attached && remote.deferred_shell_cwd.is_none() && !remote.holding_input
+            });
+            assert!(!saw_stale, "a report from another epoch was applied");
+
+            // A deferral that survives a failed transport must not be applied
+            // after the next attach.
+            let remote = bench.workbench.remote.as_mut().unwrap();
+            remote.deferred_shell_cwd = Some((bench.identity.clone(), stale));
+            bench.workbench.fail_remote_transport();
+            assert!(bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .deferred_shell_cwd
+                .is_none());
         }
 
         #[test]

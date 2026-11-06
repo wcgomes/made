@@ -6776,7 +6776,7 @@ fn explorer_glass_uses_native_tokens_only_when_backdrop_is_applied() {
 
     for (kind, reason) in [
         (NativeBackdropKind::MacosVibrancy, "test macOS vibrancy"),
-        (NativeBackdropKind::WindowsMica, "test Windows Mica"),
+        (NativeBackdropKind::WindowsAcrylic, "test Windows Acrylic"),
     ] {
         headless.model.set_native_backdrop(NativeBackdropStatus {
             kind,

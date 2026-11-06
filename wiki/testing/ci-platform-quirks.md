@@ -8,6 +8,13 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - Whole-line harness input uses CRLF on Windows; the product's physical-Enter encoding is one `\r`. Keep the test submission distinct from the product encoding.
 - Coverage: [`pty.rs`](../../crates/made-terminal/tests/pty.rs) `answer_console_dsr`/`settle_console`, [`shell_integration.rs`](../../crates/made-platform/tests/shell_integration.rs), [`contract.rs`](../../crates/made-platform/tests/contract.rs).
 
+## Windows GUI subsystem
+
+- `made-app` `main.rs` carries `#![cfg_attr(windows, windows_subsystem = "windows")]`, the one accepted OS `cfg` outside `made-platform` (a crate-root attribute). CLI actions and `--smoke-test` attach to the parent console; GUI runs detach inside the `run_native` creator closure, after nulling console-backed std handles.
+- Every non-PTY console child must go through `made_platform::hide_console_window` (`CREATE_NO_WINDOW`) or it pops a console window.
+- Interactive cmd/PowerShell do not wait for `made --version` or `--update` output; piped and CI invocations do.
+- Source: [`main.rs`](../../crates/made-app/src/main.rs), [`lib.rs`](../../crates/made-platform/src/lib.rs).
+
 ## macOS bash 3.2 prompt hooks
 
 - macOS `/bin/bash` 3.2 executes only element 0 of a `PROMPT_COMMAND` array. The shell hook appends natively on bash 5.1+, but flattens existing hooks through `IFS=$'\n'` and `"${PROMPT_COMMAND[*]}"` on older shells so every user hook runs before `__made_cwd`.

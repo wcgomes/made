@@ -11,7 +11,7 @@ Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windo
 | Linux x64 native Wayland | CI green 2026-10-28 (build/test); headless Weston smoke | Weston smoke only | **PENDING native UX** | Native compositor input/IME/clipboard and real OpenCode TUI. |
 | macOS arm64 | CI green 2026-10-28 (build/contract/app smoke) | Manual native check 2026-10-28: window/UI rendered, HudWindow vibrancy applied and visible; windowed/resized/fullscreen. Clipboard image paste user-confirmed 2026-11-01. | **PENDING native UX** | Rendering/vibrancy and clipboard image paste checked; native home, terminal, tabs, cwd, preview, IME/mouse/full clipboard, full UX pass pending. |
 | macOS x64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | No native run; native backdrop and UI remain compile-checked only. |
-| Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Mica, IME/clipboard. WSL is not a substitute. |
+| Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Acrylic (focus-loss solid fallback, resize/drag smoothness), IME/clipboard. WSL is not a substitute. |
 
 ## Shell support
 
@@ -21,7 +21,7 @@ Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windo
 | zsh | Source/unit coverage only; real run pending. |
 | fish | Source/unit coverage only; real run pending. |
 | PowerShell/pwsh | Source/unit coverage only; real run pending. |
-| `cmd` | Explicit unsupported cwd capability; terminal remains usable at latest known cwd/launch folder. |
+| `cmd` (Windows) | Launch-local OSC 7 via `PROMPT`; source/unit coverage only, native Windows run pending. |
 | Unknown/restricted launch | Explicit unsupported capability/reason; no live-follow claim. |
 
 The shell matrix is a release-blocking gap for v1: the spec names all four supported shells, but only bash has real evidence.
@@ -31,7 +31,7 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 | Capability | Linux Xvfb | Native Linux | macOS | Windows |
 |---|---|---|---|---|
 | In-app glass fallback (Explorer) | Verified | Pending compositor | **Rendered on arm64**; x64 compile-only | Compile-only |
-| Native backdrop | N/A (honest fallback log) | N/A | **Verified on arm64**; x64 compile-only | **Compile-only** (Mica only; no acrylic) |
+| Native backdrop | N/A (honest fallback log) | N/A | **Verified on arm64**; x64 compile-only | **Compile-only** (Acrylic on 22H2+; native unverified) |
 | Mint header, 26/24 card-edge header, 215 fallback alpha, tab/close scale per the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md), splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
 | Preview roundtrip | Native Xvfb | Pending | Pending | Pending |
 | Diagnostics log rotation, `.1` retention, 0600/0700, bounded lock/refusal, final-exit stderr visibility gap | Verified Linux automated | Pending native lock/reparse check | Pending native lock/reparse check | Pending native lock/reparse check |
@@ -46,11 +46,15 @@ Release workflows (`release.yml`, `upgrade-check.yml`) are summarized in [Releas
 
 At the 2026-10-28 snapshot, all five workflows were observed green for the CI-stabilization commit: CI (all six jobs), macOS smoke x64/arm64, Windows native smoke, Linux display smoke, and Development artifacts. Green CI proves compilation, contract/PTY tests, window/PTY smoke markers, and artifact assembly; it does not prove the native UX list above, and the packaged layout has not been launched end-to-end. Visual captures are ad hoc validation artifacts and are not committed or maintained in the wiki. See [Release and CI](../operations/release-ci.md) and [v1 evidence](../records/20261026-v1-evidence.md).
 
+## Unvalidated field fixes
+
+The v0.1.0 field-issue fixes (Windows GUI subsystem, DX12 visual swapchain/Acrylic backdrop, cmd.exe cwd, SSH cwd/locale/reattach) are Linux-tested and cross-compiled only. Native Windows, macOS, and live-SSH validation is pending. Details: [Terminal-first runtime](../runtime/terminal-first.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [CI platform quirks](ci-platform-quirks.md).
+
 ## Release-blocking gaps
 
 - Native Linux X11/Wayland with real desktop input.
 - macOS arm64 full native UX pass; macOS x64 native run, including HudWindow vibrancy.
-- Windows x64 native/ConPTY, including Mica, Job Object cleanup, and native OpenCode.
+- Windows x64 native/ConPTY, including Acrylic (focus-loss appearance, resize/drag smoothness; DWM shows a solid fallback when inactive, with Transparency effects off, or in energy saver, while status stays `applied=true`), Job Object cleanup, and native OpenCode.
 - Real zsh/fish/PowerShell cwd runs.
 - Live real-OpenCode switching, worktree removal/indicator, and native session-map focus.
 - Native IME/clipboard/mouse/paste/title/focus (macOS clipboard image paste user-confirmed 2026-11-01; Linux and Windows not yet tested; no known defect).

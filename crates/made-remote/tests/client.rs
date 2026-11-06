@@ -695,3 +695,29 @@ fn root_port_never_consults_host_filesystem() {
     });
     assert_eq!(received.unwrap().result, Ok(path));
 }
+
+#[test]
+fn terminal_output_wakes_the_ui_without_a_poll() {
+    let (client, fake) = client();
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = woken.clone();
+    client.set_wake(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let frame = WireEnvelope::new(
+        client.identity(),
+        9,
+        Operation::TerminalOutput {
+            data: Chunk::new(b"frame".to_vec()).unwrap(),
+            done: false,
+        },
+    );
+    fake.lock()
+        .unwrap()
+        .received
+        .push_back(SshEvent::Data(encode(&frame).unwrap()));
+    wait(|| woken.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    client.disconnect();
+    let before = woken.load(std::sync::atomic::Ordering::SeqCst);
+    wait(|| woken.load(std::sync::atomic::Ordering::SeqCst) > before);
+}

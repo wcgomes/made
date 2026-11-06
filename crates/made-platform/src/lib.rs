@@ -93,11 +93,11 @@
 //!
 //! # Native backdrop
 //!
-//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Mica to the
+//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Acrylic to the
 //! app window once at startup. Platforms without a portable native backdrop,
 //! disabled configurations, and failed attempts keep Made's current in-app
-//! glass. The module never uses Windows acrylic/blur, whose resize lag is a
-//! documented regression risk.
+//! glass. The module never uses the undocumented `SetWindowCompositionAttribute`
+//! acrylic path.
 //!
 //! # Compatible TUIs
 //!
@@ -161,6 +161,35 @@ pub mod native_backdrop;
 pub mod update;
 #[cfg(target_os = "windows")]
 pub mod windows;
+
+/// Reconnect standard streams to the launching console on Windows, where the
+/// GUI binary has none of its own (see `windows::attach_parent_console`).
+/// Does nothing on other platforms.
+pub fn attach_parent_console() {
+    #[cfg(target_os = "windows")]
+    windows::attach_parent_console();
+}
+
+/// Release the console attached by [`attach_parent_console`] before the GUI
+/// session starts, so the launching terminal's Ctrl+C or close cannot end
+/// Made. Does nothing on other platforms.
+pub fn detach_console() {
+    #[cfg(target_os = "windows")]
+    windows::detach_console();
+}
+
+/// Keep a non-PTY console child (probes, `ssh-keygen`, plugin installers,
+/// `Update.exe`) from opening a console window when Made has no console of its
+/// own. Never apply this to a shell started on a pseudo-terminal. Replaces any
+/// other creation flags. Does nothing on other platforms.
+pub fn hide_console_window(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// Environment variable that overrides the app-owned plugin directory.
 ///
@@ -3066,7 +3095,9 @@ pub use detach::{
     spawn_detached_command,
 };
 pub use process::process_parent;
-pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
+pub use shell_integration::{
+    local_cmd_prompt_cwd, local_cwd_path, ShellCwdCapability, ShellLaunchPlan,
+};
 pub use ssh_askpass::askpass_file_name;
 
 #[cfg(test)]
