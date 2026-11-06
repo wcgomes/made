@@ -59,4 +59,35 @@ Conflicts and overlaps flagged, not resolved here:
 - **design.md created:** overflow rule met (interface and module design, seam inventory, follow-policy table, migration order, alternatives).
 
 ## Evidence
-<!-- Execution evidence recorded during implementation (baselines, decisions settled by tests, CI run ids, scenario-to-test map). Empty until implementation starts. -->
+<!-- Execution evidence recorded during implementation (baselines, decisions settled by tests, CI run ids, scenario-to-test map). -->
+
+### Phase 0 baselines (tests on unchanged production code; `rustc 1.99.0`)
+
+Scenario-to-test map (every test passes on the production code of `main` at `3c7f6d9`; no production source changed):
+
+| Verify scenario | Phase 0 test |
+|---|---|
+| Branch table preserved; Precedence by rank; Rank is independent of catalog order | `crates/made-app/tests/follow_characterization.rs` (every row for the rejecting and the ignoring policy, both session-channel kinds, both release orders) |
+| Launch environment matrix; Grok arguments; Remote behavior unchanged | `crates/made-app/tests/launch_env_characterization.rs` (shell, OpenCode, Grok, Claude Code and the four remote targets; plugin and spool, no plugin, no spool; first spawn and fallback-directory retry; typing `grok` in a shell tab adds no `dashboard` argument) |
+| Copied report unchanged; Rows before detection; Report order follows the list | `crates/made-app/tests/diagnostics.rs`, module `copied_report_characterization` (byte-for-byte reports for fixed snapshots; rows before and after detection) |
+| Smoke markers unchanged | `crates/made-app/tests/smoke_markers.rs` (fixed template, packaged and plugin-only layouts) |
+| Precedence by rank; Remote behavior unchanged | `crates/made-app/tests/workspace_tabs.rs`, module `tab_presentation_characterization` (every combination of OpenCode active, Claude Code present and Grok open for a local shell tab, both arrival orders of Grok and Claude Code, and OpenCode and Grok for a remote shell tab) |
+| Golden corpus byte-identical; Diverged read limits kept | `crates/made-grok-hook/tests/golden.rs` and `crates/made-claude-hook/tests/golden.rs` |
+
+Decisions settled by the characterization tests (today's behavior, kept by the refactor):
+- The two hooks diverge on reading: the Grok Build hook has no input cap and no completion gate (a 9 MiB object and an object followed by text are read at once, a syntax error ends the read at once); the Claude Code hook refuses more than 8 MiB, parses only a buffer whose last non-whitespace byte is `}`, so text without a closing brace is waited on until the 2 second deadline.
+- The dot of a Grok session that is only attached (inventory row, no hook line) is idle; the tab precedence is OpenCode, then Claude Code, then Grok Build, whichever of Claude Code and Grok Build arrives first.
+- Launch: the shell and a directly launched Claude Code tab receive the plugin list and the tab's spool; a launch with no spool binding (any other local target, or a Claude Code launch whose spool cannot be created) removes an inherited `MADE_CLAUDE_SPOOL`; `SHELLOPTS`, `BASH_ENV` and `ENV` are removed from every local launch; the fallback-directory retry logs only the fallback warning and not the "original environment" warning; remote targets start no host process.
+
+Coverage gaps (not reachable from an external test on unchanged code):
+- Tab presentation of a remote tab that presents Claude Code, and so remote Grok Build before Claude Code (SSH-10): remote Claude Code presence arrives only through the remote terminal stream, which only the in-crate `RemoteBench` tests of `workbench.rs` can drive. The remote OpenCode and Grok Build combinations are pinned.
+- `fallback_directory_retry_*` in `launch_env_characterization.rs` needs a directory the user cannot enter; for a user that bypasses permissions (root) the test prints a notice and does not exercise the retry.
+
+External dependency sets (`cargo tree -p <crate> -e normal --prefix none --locked --target <target>`, workspace root line omitted), recorded at `3c7f6d9`:
+
+| Crate | Target | Crates listed after the root |
+|---|---|---|
+| `made-grok-hook` | `x86_64-unknown-linux-gnu` | `serde_json v1.0.154`, `itoa v1.0.18`, `memchr v2.8.3`, `serde_core v1.0.229`, `zmij v1.0.23` |
+| `made-grok-hook` | `x86_64-pc-windows-msvc` | `serde_json v1.0.154`, `itoa v1.0.18`, `memchr v2.8.3`, `serde_core v1.0.229`, `zmij v1.0.23`, `windows-sys v0.61.2`, `windows-link v0.2.1` |
+| `made-claude-hook` | `x86_64-unknown-linux-gnu` | `libc v0.2.191`, `serde_json v1.0.154`, `itoa v1.0.18`, `memchr v2.8.3`, `serde_core v1.0.229`, `zmij v1.0.23` |
+| `made-claude-hook` | `x86_64-pc-windows-msvc` | `serde_json v1.0.154`, `itoa v1.0.18`, `memchr v2.8.3`, `serde_core v1.0.229`, `zmij v1.0.23`, `windows-sys v0.61.2`, `windows-link v0.2.1` |

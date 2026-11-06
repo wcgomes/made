@@ -1560,3 +1560,544 @@ mod claude_row {
         }
     }
 }
+
+// ---- Characterization: copied report and rows (agent-integration-modules phase 0) ----
+
+/// Byte-for-byte golden text of the copied report for fixed snapshots, and the
+/// Grok Build and Claude Code rows before and after detection, written against
+/// the code before the integration-module refactor. The expected text below
+/// does not change during the refactor; only the adapter block does.
+mod copied_report_characterization {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use made_app::diagnostics::{Diagnostics, DiagnosticsSnapshot};
+    use made_app::integration_status::{IntegrationState, CLAUDE_GRACE};
+
+    // BEGIN characterization adapter
+    use made_app::app::{AppModel, AppOptions, GrokDiagnosticsHold, GrokRunningHold};
+    use made_app::diagnostics::{remote_grok_row, RemoteGrokInstallOutcome};
+    use made_app::integration_status::{
+        claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
+        ClaudeDiagnosticsPhase,
+    };
+    use made_app::CompatibleTui;
+
+    /// Apply the local Claude Code row for `inputs`.
+    fn apply_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
+        view.set_claude_diagnostics(claude_diagnostics_row(inputs));
+    }
+
+    /// Apply the remote Claude Code row for `inputs`.
+    fn apply_remote_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
+        view.set_claude_diagnostics(remote_claude_diagnostics_row(inputs));
+    }
+
+    /// Apply a remote Grok Build row.
+    fn apply_remote_grok(view: &mut DiagnosticsSnapshot, case: RemoteGrok) {
+        let report = match case {
+            RemoteGrok::InstallFailed => remote_grok_row(
+                false,
+                true,
+                None,
+                true,
+                Some(RemoteGrokInstallOutcome::Failed {
+                    reason: Some("install-failed"),
+                }),
+                true,
+                true,
+            ),
+            RemoteGrok::NotDetected => {
+                remote_grok_row(false, true, None, false, None, false, false)
+            }
+            RemoteGrok::TransportDown => {
+                remote_grok_row(true, false, None, true, None, true, false)
+            }
+        };
+        view.set_remote_grok(report);
+    }
+
+    /// Copy both secondary rows the open workspace derived into `view`.
+    fn copy_rows(view: &mut DiagnosticsSnapshot, model: &AppModel) {
+        let derived = model
+            .workbench()
+            .expect("a workspace is open")
+            .diagnostics_snapshot();
+        view.grok_pill = derived.grok_pill;
+        view.grok_sentence = derived.grok_sentence;
+        view.claude_pill = derived.claude_pill;
+        view.claude_sentence = derived.claude_sentence;
+    }
+
+    /// Model options for a state of detection: pending, or finished with an
+    /// explicit list of detected programs.
+    fn options(state: Detection) -> AppOptions {
+        match state {
+            Detection::Pending => AppOptions::new().with_compatible_tui_detection(),
+            Detection::Nothing => AppOptions::new().with_compatible_tuis([]),
+            Detection::All => AppOptions::new().with_compatible_tuis([
+                CompatibleTui::OpenCode,
+                CompatibleTui::Grok,
+                CompatibleTui::ClaudeCode,
+            ]),
+        }
+    }
+
+    fn hold_grok(model: &mut AppModel, hold: Hold) {
+        model.hold_grok_diagnostics(match hold {
+            Hold::Detecting => GrokDiagnosticsHold::Detecting,
+            Hold::NotOnPath => GrokDiagnosticsHold::NotOnPath,
+            Hold::Installing => GrokDiagnosticsHold::Installing,
+            Hold::Installed => GrokDiagnosticsHold::Installed,
+            Hold::AlreadyCurrent => GrokDiagnosticsHold::AlreadyCurrent,
+            Hold::InstallFailed => GrokDiagnosticsHold::InstallFailed,
+        });
+    }
+
+    fn hold_grok_running(model: &mut AppModel, running: Mark) {
+        let id = model.active_workspace_id().expect("a workspace is open");
+        model.hold_workspace_grok_running(
+            id,
+            match running {
+                Mark::LivingTarget => GrokRunningHold::LivingTarget,
+                Mark::OpenSession => GrokRunningHold::OpenSession,
+                Mark::NotRunning => GrokRunningHold::NotRunning,
+            },
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum RemoteGrok {
+        InstallFailed,
+        NotDetected,
+        TransportDown,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Detection {
+        Pending,
+        Nothing,
+        All,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Hold {
+        Detecting,
+        NotOnPath,
+        Installing,
+        Installed,
+        AlreadyCurrent,
+        InstallFailed,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Mark {
+        LivingTarget,
+        OpenSession,
+        NotRunning,
+    }
+
+    type Phase = ClaudeDiagnosticsPhase;
+    // END characterization adapter
+
+    fn fixed() -> DiagnosticsSnapshot {
+        Diagnostics::new("/home/user/.local/state/made/log/integration.log")
+            .with_app_version("9.9.9")
+            .snapshot(
+                &IntegrationState::new(None, PathBuf::from("/workspace")),
+                None,
+                None,
+                None,
+            )
+    }
+
+    fn inputs(phase: Phase) -> ClaudeDiagnosticsInputs {
+        ClaudeDiagnosticsInputs {
+            phase,
+            plugin_missing: false,
+            present: true,
+            present_for: CLAUDE_GRACE + Duration::from_secs(1),
+            live_session: true,
+            protocol_observed: true,
+        }
+    }
+
+    /// The copied report around the two secondary rows.
+    fn report(grok: (&str, &str), claude: (&str, &str)) -> String {
+        format!(
+            "{PREFIX}grok status: {}\ngrok: {}\nclaude status: {}\nclaude: {}\n{SUFFIX}",
+            grok.0, grok.1, claude.0, claude.1
+        )
+    }
+
+    const PREFIX: &str = "Made diagnostics\n\
+status: inactive\n\
+reason code: inactive\n\
+reason: OpenCode is not running.\n";
+    const SUFFIX: &str = "view directory: none\n\
+active session: none\n\
+active title: none\n\
+effective root: none\n\
+worktree: none\n\
+plugin version: none\n\
+protocol version: none\n\
+opencode version: none\n\
+app version: 9.9.9\n\
+last command-line apply: none\n\
+last revision: none\n\
+last heartbeat: none\n\
+tabs enabled: no\n\
+log location: /home/user/.local/state/made/log/integration.log\n\
+previous log location: /home/user/.local/state/made/log/integration.log.1\n\
+recent log:\n";
+
+    const GROK_NOT_ON_PATH: (&str, &str) = ("inactive", "Grok Build is not on PATH.");
+    const CLAUDE_NOT_ON_PATH: (&str, &str) = ("inactive", "Claude Code is not on PATH.");
+    /// No shipped Claude Code plugin is present beside the child executable.
+    const CLAUDE_HOOKS_UNAVAILABLE: (&str, &str) = (
+        "degraded",
+        "Claude Code session-status hooks are unavailable.",
+    );
+
+    #[test]
+    fn rows_before_detection_are_the_not_on_path_rows_in_the_copied_report() {
+        let view = fixed();
+        assert_eq!(view.grok_pill.label(), GROK_NOT_ON_PATH.0);
+        assert_eq!(view.grok_sentence, GROK_NOT_ON_PATH.1);
+        assert_eq!(view.claude_pill.label(), CLAUDE_NOT_ON_PATH.0);
+        assert_eq!(view.claude_sentence, CLAUDE_NOT_ON_PATH.1);
+        assert_eq!(view.to_text(), report(GROK_NOT_ON_PATH, CLAUDE_NOT_ON_PATH));
+    }
+
+    #[test]
+    fn local_claude_rows_in_the_copied_report() {
+        let cases: [(&str, ClaudeDiagnosticsInputs, (&str, &str)); 8] = [
+            (
+                "checking",
+                inputs(Phase::Checking),
+                ("inactive", "Checking for Claude Code."),
+            ),
+            ("not on path", inputs(Phase::NotOnPath), CLAUDE_NOT_ON_PATH),
+            (
+                "not running",
+                ClaudeDiagnosticsInputs {
+                    present: false,
+                    ..inputs(Phase::Available)
+                },
+                ("inactive", "Claude Code is not running."),
+            ),
+            (
+                "starting",
+                ClaudeDiagnosticsInputs {
+                    present_for: Duration::from_secs(3),
+                    live_session: false,
+                    ..inputs(Phase::Available)
+                },
+                ("inactive", "Claude Code is starting."),
+            ),
+            (
+                "plugin missing",
+                ClaudeDiagnosticsInputs {
+                    plugin_missing: true,
+                    ..inputs(Phase::Available)
+                },
+                (
+                    "degraded",
+                    "Claude Code session-status hooks are unavailable.",
+                ),
+            ),
+            (
+                "no live session",
+                ClaudeDiagnosticsInputs {
+                    live_session: false,
+                    ..inputs(Phase::Available)
+                },
+                (
+                    "degraded",
+                    "Claude Code session-status hooks are unavailable.",
+                ),
+            ),
+            (
+                "protocol unavailable",
+                ClaudeDiagnosticsInputs {
+                    protocol_observed: false,
+                    ..inputs(Phase::Available)
+                },
+                ("degraded", "Claude Code status protocol is unavailable."),
+            ),
+            (
+                "ready",
+                inputs(Phase::Available),
+                ("ready", "Claude Code session follow is ready."),
+            ),
+        ];
+        for (name, claude_inputs, claude) in cases {
+            let mut view = fixed();
+            apply_claude(&mut view, &claude_inputs);
+            assert_eq!(
+                view.to_text(),
+                report(GROK_NOT_ON_PATH, claude),
+                "local Claude Code row: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_claude_rows_in_the_copied_report() {
+        let cases: [(&str, ClaudeDiagnosticsInputs, (&str, &str)); 6] = [
+            (
+                "checking",
+                inputs(Phase::Checking),
+                ("inactive", "Checking for Claude Code."),
+            ),
+            ("not on path", inputs(Phase::NotOnPath), CLAUDE_NOT_ON_PATH),
+            (
+                "not running",
+                ClaudeDiagnosticsInputs {
+                    present: false,
+                    ..inputs(Phase::Available)
+                },
+                ("inactive", "Claude Code is not running."),
+            ),
+            (
+                "starting",
+                ClaudeDiagnosticsInputs {
+                    present_for: Duration::from_secs(3),
+                    protocol_observed: false,
+                    ..inputs(Phase::Available)
+                },
+                ("inactive", "Claude Code is starting."),
+            ),
+            (
+                "protocol unavailable",
+                ClaudeDiagnosticsInputs {
+                    protocol_observed: false,
+                    ..inputs(Phase::Available)
+                },
+                ("degraded", "Claude Code status protocol is unavailable."),
+            ),
+            (
+                "hooks unavailable over ssh",
+                inputs(Phase::Available),
+                (
+                    "degraded",
+                    "Claude Code session-status hooks are unavailable over SSH.",
+                ),
+            ),
+        ];
+        for (name, claude_inputs, claude) in cases {
+            let mut view = fixed();
+            apply_remote_claude(&mut view, &claude_inputs);
+            assert_eq!(
+                view.to_text(),
+                report(GROK_NOT_ON_PATH, claude),
+                "remote Claude Code row: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_grok_rows_in_the_copied_report() {
+        let cases: [(&str, RemoteGrok, (&str, &str)); 3] = [
+            (
+                "install failed",
+                RemoteGrok::InstallFailed,
+                (
+                    "degraded",
+                    "Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server.",
+                ),
+            ),
+            (
+                "not detected",
+                RemoteGrok::NotDetected,
+                ("inactive", "Grok Build is not detected on this server."),
+            ),
+            (
+                "transport down",
+                RemoteGrok::TransportDown,
+                (
+                    "degraded",
+                    "The SSH transport is disconnected; the remote Grok Build state is unknown until reattach.",
+                ),
+            ),
+        ];
+        for (name, case, grok) in cases {
+            let mut view = fixed();
+            apply_remote_grok(&mut view, case);
+            assert_eq!(
+                view.to_text(),
+                report(grok, CLAUDE_NOT_ON_PATH),
+                "remote Grok Build row: {name}"
+            );
+        }
+    }
+
+    /// Re-run `name` in a child process with an isolated home. Returns `true`
+    /// in the parent after the child passed.
+    #[cfg(unix)]
+    fn isolated(name: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("MADE_DIAGNOSTICS_CHILD").is_some() {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let tmp = home.path().join("tmp");
+        let runtime = home.path().join("runtime");
+        let roaming = home.path().join("AppData").join("Roaming");
+        let local = home.path().join("AppData").join("Local");
+        for directory in [&tmp, &runtime, &roaming, &local] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // An install root of its own, so no shipped plugin staged beside the
+        // cargo `deps` directory by another test is visible to the child.
+        let install = home.path().join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        let executable = install.join("diagnostics-characterization");
+        let current = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&current, &executable).is_err() {
+            std::fs::copy(&current, &executable).unwrap();
+        }
+        let output = std::process::Command::new(&executable)
+            .args(["--exact", name, "--nocapture"])
+            .env("MADE_DIAGNOSTICS_CHILD", "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TMPDIR", &tmp)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("APPDATA", &roaming)
+            .env("LOCALAPPDATA", &local)
+            .env("SHELL", "/bin/bash")
+            .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
+            .env_remove(made_platform::SHELL_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// A model with one open workspace for the given detection state.
+    #[cfg(unix)]
+    fn model_with_workspace(state: Detection) -> (AppModel, tempfile::TempDir) {
+        use made_app::workspace::{LaunchPlan, WorkspaceLaunch, WorkspaceSource};
+        let root = tempfile::tempdir().unwrap();
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), options(state));
+        model.open_plan(LaunchPlan::open(root.path(), WorkspaceSource::Picker).unwrap());
+        model.ensure_workbench();
+        (model, root)
+    }
+
+    /// The copied report of the open workspace's two secondary rows.
+    #[cfg(unix)]
+    fn model_report(model: &AppModel) -> String {
+        let mut view = fixed();
+        copy_rows(&mut view, model);
+        view.to_text()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rows_before_and_after_detection_in_the_copied_report() {
+        if isolated(
+            "copied_report_characterization::rows_before_and_after_detection_in_the_copied_report",
+        ) {
+            return;
+        }
+        let mut out = String::new();
+        let mut check = |name: &str, model: &AppModel, grok: (&str, &str), claude: (&str, &str)| {
+            let actual = model_report(model);
+            let expected = report(grok, claude);
+            if actual != expected {
+                out.push_str(&format!("{name}:\n{actual}\n"));
+            }
+        };
+
+        // Before detection finishes: both rows are checking.
+        let (model, _root) = model_with_workspace(Detection::Pending);
+        check(
+            "pending",
+            &model,
+            ("inactive", "Checking for Grok Build."),
+            ("inactive", "Checking for Claude Code."),
+        );
+        drop(model);
+
+        // After detection found nothing.
+        let (model, _root) = model_with_workspace(Detection::Nothing);
+        check("nothing", &model, GROK_NOT_ON_PATH, CLAUDE_NOT_ON_PATH);
+        drop(model);
+
+        // After detection found everything.
+        let (mut model, _root) = model_with_workspace(Detection::All);
+        check(
+            "all",
+            &model,
+            (
+                "inactive",
+                "Grok Build plugin was not installed for this launch.",
+            ),
+            CLAUDE_HOOKS_UNAVAILABLE,
+        );
+        let not_running = ("inactive", "Grok Build is not running.");
+        for (name, hold, grok) in [
+            (
+                "detecting",
+                Hold::Detecting,
+                ("inactive", "Checking for Grok Build."),
+            ),
+            ("not on path", Hold::NotOnPath, GROK_NOT_ON_PATH),
+            (
+                "installing",
+                Hold::Installing,
+                ("inactive", "Installing the Grok Build plugin."),
+            ),
+            ("installed", Hold::Installed, not_running),
+            ("already current", Hold::AlreadyCurrent, not_running),
+            (
+                "install failed",
+                Hold::InstallFailed,
+                (
+                    "degraded",
+                    "Grok Build session-status hooks are unavailable.",
+                ),
+            ),
+        ] {
+            hold_grok(&mut model, hold);
+            check(
+                &format!("hold {name}"),
+                &model,
+                grok,
+                CLAUDE_HOOKS_UNAVAILABLE,
+            );
+        }
+        // An install is ready only while Grok Build is running in the workspace.
+        let ready = ("ready", "Grok Build session follow is ready.");
+        for hold in [Hold::Installed, Hold::AlreadyCurrent] {
+            hold_grok(&mut model, hold);
+            for (name, running, grok) in [
+                ("living target", Mark::LivingTarget, ready),
+                ("open session", Mark::OpenSession, ready),
+                ("not running", Mark::NotRunning, not_running),
+            ] {
+                hold_grok_running(&mut model, running);
+                check(
+                    &format!("running {name}"),
+                    &model,
+                    grok,
+                    CLAUDE_HOOKS_UNAVAILABLE,
+                );
+            }
+        }
+        assert_eq!(out, "");
+    }
+}
