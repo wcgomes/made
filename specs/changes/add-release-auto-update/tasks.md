@@ -268,7 +268,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - apply kill points on real machines, with power loss marked unverified on any OS whose swap atomicity 1.7 did not establish;
   - About/indicator behavior;
   - installed-layout launch with components resolved.
-- [ ] 9.2 After user approval, push iteration tags `v0.1.0`, `v0.1.1`, ... in the production repository as implementation needs, with notes labelled as temporary test releases, and record each release URL and per-target evidence. After verification, and only once the Phase 11 checkpoint passes and the REL-01 approval gate is configured, follow the rollout plan: delete all iteration releases, then their tags, re-release `v0.1.0` from the final commit, and record its evidence (path: tests/e2e/release_validation.md)
+- [x] 9.2 After user approval, push iteration tags `v0.1.0`, `v0.1.1`, ... in the production repository as implementation needs, with notes labelled as temporary test releases, and record each release URL and per-target evidence. After verification, and only once the Phase 11 checkpoint passes and the REL-01 approval gate is configured, follow the rollout plan: delete all iteration releases, then their tags, re-release `v0.1.0` from the final commit, and record its evidence (path: tests/e2e/release_validation.md)
 - [ ] 9.3 At the second published release counted from the final `v0.1.0`, confirm the 7.12 upgrade check passed and verify the in-app upgrade from the first on every target with SSH records and settings preserved (path: tests/e2e/release_validation.md)
 
 ## Checkpoint
@@ -282,12 +282,12 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - REL-12 "Post-publish upgrade check", "Failed upgrade check" (if one occurs) and "Upgrade from the previous release" at the second release.
 
 ## 10. Cleanup
-- [ ] 10.1 Remove the probe crate after the 1.8 outcomes are recorded and Phase 7 is green (path: tests/release-probe/Cargo.toml)
-- [ ] 10.2 Remove the probe source (path: tests/release-probe/src/main.rs)
-- [ ] 10.3 Remove the probe workflow (path: .github/workflows/release-probe.yml)
+- [x] 10.1 Remove the probe crate after the 1.8 outcomes are recorded and Phase 7 is green (path: tests/release-probe/Cargo.toml)
+- [x] 10.2 Remove the probe source (path: tests/release-probe/src/main.rs)
+- [x] 10.3 Remove the probe workflow (path: .github/workflows/release-probe.yml)
 
 ## Checkpoint
-- [ ] No probe files, dead references or new warnings remain; `cargo clippy --workspace` and all CI workflows are green
+- [x] No probe files, dead references or new warnings remain; `cargo clippy --workspace` and all CI workflows are green
 
 ## 11. Security-review fixes
 - [x] 11.1 Write failing tests for the Windows hand-off (path: crates/made-platform/tests/update.rs):
@@ -314,7 +314,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 11.10 Make the Windows upgrade check poll `--update` until it no longer reports "apply in progress", within a bounded wait that fails the upgrade check on timeout, then assert the recorded helper outcome and the new version (path: .github/workflows/upgrade-check.yml)
 
 ## Checkpoint
-- [ ] verify REL-12 "Windows command-line apply hand-off", "Windows hand-off failure", "Killed apply never blocks startup", "Command-line upgrade uses the same path" and "GUI startup refused during command-line apply"; REL-04 "AppImage extraction directory is private"; REL-12 "Post-publish upgrade check" on Windows through 11.10
+- [x] verify REL-12 "Windows command-line apply hand-off", "Windows hand-off failure", "Killed apply never blocks startup", "Command-line upgrade uses the same path" and "GUI startup refused during command-line apply"; REL-04 "AppImage extraction directory is private"; REL-12 "Post-publish upgrade check" on Windows through 11.10
 
 ## Cross-change dependencies
 `specs/changes/grok-native-hook/` lands its tasks 2.6 through 6.3 in one merge to main. This change archives before or together with it, because it cites REL-02.

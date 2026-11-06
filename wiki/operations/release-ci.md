@@ -52,24 +52,30 @@ Releases are produced only by pushing a `v<major>.<minor>.<patch>` tag; branch p
 
 ### Bump and release
 
-1. Run `scripts/bump-version.sh X.Y.Z` (stable versions only). It rewrites the workspace version, `plugins/opencode-made/package.json` and `package-lock.json` (through `npm version`), the plugin's `PLUGIN_VERSION`, `plugins/grok-made/plugin.json` and the README `appVersion` example, refreshes `Cargo.lock` through cargo and runs `.github/scripts/check-versions.py`. Commit the result through a pull request.
-2. After the merge: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. CI then runs, in order: the version gate (`release-gate.py`: refuses prerelease or build tags, a version not greater than the newest published stable release, an already published tag, or any version-site disagreement); the SSH companions and the release build and Velopack pack for Windows x64, macOS arm64, macOS x64 and Linux x64 with the glibc 2.35, `NEEDED`, import and minimum-OS checks; the installed-layout smoke of every target and macOS form; maintainer approval in the protected `release` environment; publish (stale draft removed, draft created with every asset and `SHA256SUMS`, notes from `.github/release-notes.md`, then published with `make_latest=true`); and the post-publish upgrade check from the previous release. A failure before publish leaves at most an unpublished draft.
-4. A failed upgrade check is remedied by publishing a fixed, newer release. The failing release is never modified or replaced.
+`main` accepts changes only through pull requests, so a release bump is a pull request too:
 
-If the gate refuses the tag, read its message, fix the sites with the bump script or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
+1. Create a branch from `main` and run `scripts/bump-version.sh X.Y.Z` (stable versions only). It rewrites the workspace version, `plugins/opencode-made/package.json` and `package-lock.json` (through `npm version`), the plugin's `PLUGIN_VERSION`, `plugins/grok-made/plugin.json` and the README `appVersion` example, refreshes `Cargo.lock` through cargo and runs `.github/scripts/check-versions.py`.
+2. Commit, push the branch and open a pull request against `main`; merge it once its checks are green.
+3. On the updated `main`, tag the merge commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. CI then runs, in order: the version gate (`release-gate.py`: refuses prerelease or build tags, a version not greater than the newest published stable release, an already published tag, or any version-site disagreement); the SSH companions and the release build and Velopack pack for Windows x64, macOS arm64, macOS x64 and Linux x64 with the glibc 2.35, `NEEDED`, import and minimum-OS checks; the installed-layout smoke of every target and macOS form; then the publish job waits for approval in the `release` environment.
+5. Approve the pending `release` deployment (the run's **Review deployments** button). Publish then removes any stale draft, creates the draft with every asset and `SHA256SUMS` and notes from `.github/release-notes.md`, publishes it with `make_latest=true`, and runs the post-publish upgrade check from the previous release. A failure before publish leaves at most an unpublished draft.
+6. A failed upgrade check is remedied by publishing a fixed, newer release. The failing release is never modified or replaced.
 
-### Manual maintainer steps
+If the gate refuses the tag, read its message, fix the sites with the bump script (through a pull request) or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
 
-These are not automated and are not configured by implementers:
+### Repository settings
 
-- A repository ruleset for `v*` tags restricting creation, update and deletion to a maintainer bypass list. GitHub rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
-- The protected `release` environment with required reviewers (GitHub creates it unprotected on the first release run; add the protection under **Settings › Environments › release**).
-- GitHub immutable releases, enabled only after the final `v0.1.0` re-release, never before.
+Configured for the release flow:
 
-### One-time rollout cleanup
+- The `release` environment requires approval by the maintainer (`wcgomes`) and accepts deployments only from `v*` tags.
+- A ruleset on `main` allows changes only through pull requests.
+- A ruleset on `v*` tags restricts creating, updating and deleting them to a maintainer bypass list. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
 
-Iteration releases (`v0.1.0`, `v0.1.1`, …) were cut during implementation and marked as temporary. Once verified: delete every iteration release first, then their tags, then re-release `v0.1.0` from the final commit. On every machine that installed an iteration release: uninstall Made (`0.1.0` is lower than the installed version); run `grok plugin uninstall grok-made --confirm` locally and on each SSH server where Made installed it; and remove Made's staged remote version directories on each SSH server.
+Optional, manual: GitHub immutable releases (**Settings › General › Releases**). Enable it only after the `v0.1.0` release is published.
+
+### Rollout cleanup (done)
+
+The temporary iteration releases cut during implementation (`v0.1.0` to `v0.1.9`) and their tags were deleted, and `v0.1.0` was released again from the final `main`. Machines that installed an iteration release need Made uninstalled first (`0.1.0` is lower than the installed version), `grok plugin uninstall grok-made --confirm` run locally and on each SSH server where Made installed it, and Made's staged remote version directories removed on each SSH server.
 
 ## Release-blocking boundary
 
