@@ -93,7 +93,7 @@
 //!
 //! # Native backdrop
 //!
-//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Mica to the
+//! `native_backdrop` (desktop feature) optionally applies macOS vibrancy or Windows Acrylic to the
 //! app window once at startup. Platforms without a portable native backdrop,
 //! disabled configurations, and failed attempts keep Made's current in-app
 //! glass. The module never uses Windows acrylic/blur, whose resize lag is a

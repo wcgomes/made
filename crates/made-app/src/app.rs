@@ -2784,13 +2784,13 @@ mod tests {
             .contains("not been checked"));
 
         model.set_native_backdrop(NativeBackdropStatus {
-            kind: NativeBackdropKind::WindowsMica,
+            kind: NativeBackdropKind::WindowsAcrylic,
             applied: true,
             reason: "test status".to_owned(),
         });
         assert_eq!(
             model.native_backdrop().kind(),
-            NativeBackdropKind::WindowsMica
+            NativeBackdropKind::WindowsAcrylic
         );
         assert!(model.native_backdrop().is_applied());
         assert_eq!(model.native_backdrop().reason(), "test status");
