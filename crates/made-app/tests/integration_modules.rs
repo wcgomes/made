@@ -5,8 +5,8 @@
 //! with lists defined only in this file.
 
 use made_app::integrations::{
-    validate, Descriptor, Integration, IntegrationList, ListError, Mark, Rank, CLAUDE_CODE, GROK,
-    OPENCODE, PRODUCT,
+    validate, Descriptor, FollowKind, Integration, IntegrationList, ListError, Mark, Rank,
+    CLAUDE_CODE, GROK, OPENCODE, PRODUCT,
 };
 
 #[test]
@@ -85,7 +85,7 @@ fn integration_references_are_equal_by_key() {
 /// A test-only integration that exists to exercise list validation.
 struct Probe {
     descriptor: &'static Descriptor,
-    owns_session_channel: bool,
+    follow: FollowKind,
 }
 
 impl Integration for Probe {
@@ -93,8 +93,8 @@ impl Integration for Probe {
         self.descriptor
     }
 
-    fn owns_session_channel(&self) -> bool {
-        self.owns_session_channel
+    fn follow(&self) -> FollowKind {
+        self.follow
     }
 }
 
@@ -120,27 +120,27 @@ static THIRD: Descriptor = descriptor("third", 300);
 
 static PROBE_FIRST: Probe = Probe {
     descriptor: &FIRST,
-    owns_session_channel: false,
+    follow: FollowKind::None,
 };
 static PROBE_SAME_KEY: Probe = Probe {
     descriptor: &SAME_KEY,
-    owns_session_channel: false,
+    follow: FollowKind::None,
 };
 static PROBE_SAME_RANK: Probe = Probe {
     descriptor: &SAME_RANK,
-    owns_session_channel: false,
+    follow: FollowKind::None,
 };
 static PROBE_SECOND: Probe = Probe {
     descriptor: &SECOND,
-    owns_session_channel: false,
+    follow: FollowKind::None,
 };
 static PROBE_THIRD_OWNER: Probe = Probe {
     descriptor: &THIRD,
-    owns_session_channel: true,
+    follow: FollowKind::SessionChannel,
 };
 static PROBE_FIRST_OWNER: Probe = Probe {
     descriptor: &FIRST,
-    owns_session_channel: true,
+    follow: FollowKind::SessionChannel,
 };
 
 #[test]

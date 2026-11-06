@@ -1,6 +1,6 @@
 //! OpenCode v2 integration.
 
-use super::{Descriptor, Integration, Mark, Rank};
+use super::{Descriptor, FollowKind, Integration, Mark, Rank};
 
 /// OpenCode v2, the owner of the bridge session channel.
 pub(super) struct OpenCode;
@@ -22,7 +22,7 @@ impl Integration for OpenCode {
         &DESCRIPTOR
     }
 
-    fn owns_session_channel(&self) -> bool {
-        true
+    fn follow(&self) -> FollowKind {
+        FollowKind::SessionChannel
     }
 }

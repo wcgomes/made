@@ -75,18 +75,18 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [ ] verify: List order is catalog order; Product list is exact; Duplicate rank rejected; A list change trips the pin; Moved sources stay scanned; Grok arguments; Launch environment matrix
 
 ### 1a-G2 Follow (ATOMIC: not compile-green until 1.36)
-- [ ] 1.29 `FollowKind`, `FollowPolicy`, `OnUnusable`, `WhileOutranked` and `Integration::follow()` (path: crates/made-app/src/integrations/mod.rs)
-- [ ] 1.30 Ranked directory holders replacing `grok_root`/`claude_root`; generic `follow_directory` encoding each policy row in its declared check order; `release_to_fallback` and `follow_shell_cwd` by rank; `RootSource::{Shell, Agent(IntegrationRef)}` with `as_str` from `root_source_id`; `is_agent_owned` = session channel owns the root; `#[doc(hidden)] with_integrations(list)` (path: crates/made-app/src/session_follow.rs)
-- [ ] 1.31 Claude Code policy `{ Reject("Claude Code directory is not usable"), Retain, Retain }` (path: crates/made-app/src/integrations/claude_code/mod.rs)
-- [ ] 1.32 Grok policy `{ Ignore, Ignore, Retain }` (path: crates/made-app/src/integrations/grok/mod.rs)
-- [ ] 1.33 OpenCode `FollowKind::SessionChannel` (path: crates/made-app/src/integrations/opencode/mod.rs)
-- [ ] 1.34 Follow call sites use `follow_directory(entry, report)`; `RootSource` comparisons by entry (path: crates/made-app/src/workbench.rs)
-- [ ] 1.35 Adapter-block adaptation only (path: crates/made-app/tests/follow_characterization.rs)
-- [ ] 1.36 Path-only adaptation (`RootSource` variants via entries; `as_str` expectations unchanged) (path: crates/made-app/tests/session_follow.rs)
+- [x] 1.29 `FollowKind`, `FollowPolicy`, `OnUnusable`, `WhileOutranked` and `Integration::follow()` (path: crates/made-app/src/integrations/mod.rs)
+- [x] 1.30 Ranked directory holders replacing `grok_root`/`claude_root`; generic `follow_directory` encoding each policy row in its declared check order; `release_to_fallback` and `follow_shell_cwd` by rank; `RootSource::{Shell, Agent(IntegrationRef)}` with `as_str` from `root_source_id`; `is_agent_owned` = session channel owns the root; `#[doc(hidden)] with_integrations(list)` (path: crates/made-app/src/session_follow.rs)
+- [x] 1.31 Claude Code policy `{ Reject("Claude Code directory is not usable"), Retain, Retain }` (path: crates/made-app/src/integrations/claude_code/mod.rs)
+- [x] 1.32 Grok policy `{ Ignore, Ignore, Retain }` (path: crates/made-app/src/integrations/grok/mod.rs)
+- [x] 1.33 OpenCode `FollowKind::SessionChannel` (path: crates/made-app/src/integrations/opencode/mod.rs)
+- [x] 1.34 Follow call sites use `follow_directory(entry, report)`; `RootSource` comparisons by entry (path: crates/made-app/src/workbench.rs)
+- [x] 1.35 Adapter-block adaptation only (path: crates/made-app/tests/follow_characterization.rs)
+- [x] 1.36 Path-only adaptation (`RootSource` variants via entries; `as_str` expectations unchanged) (path: crates/made-app/tests/session_follow.rs)
 
 #### Checkpoint G2
-- [ ] compile-green; then gates pass; adapter check passes for `follow_characterization.rs`
-- [ ] verify: Branch table preserved; Precedence by rank; Rank is independent of catalog order; Claude Code rejects an unusable directory; Grok ignores an unusable directory silently; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Grok retains under Claude Code
+- [x] compile-green; then gates pass; adapter check passes for `follow_characterization.rs`
+- [x] verify: Branch table preserved; Precedence by rank; Rank is independent of catalog order; Claude Code rejects an unusable directory; Grok ignores an unusable directory silently; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Grok retains under Claude Code
 
 ### 1a-G3a State skeleton (additive, each task green)
 - [ ] 1.37 `AppState`, `TabState`, `Slots<T>`, `EnvPolicy`, `EnvContribution`, `TabReport`, `AppInit`, `TabInit`, `TabIo`, `LaunchCtx`, `AppCtx`; `Integration::{env_policy, new_app_state, new_tab_state, polls_remote_tabs}` with defaults returning `None` or empty, so every integration still has no slot state (path: crates/made-app/src/integrations/mod.rs)

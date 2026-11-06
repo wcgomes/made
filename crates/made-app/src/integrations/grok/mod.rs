@@ -1,6 +1,8 @@
 //! Grok Build integration.
 
-use super::{Descriptor, Integration, Mark, Rank};
+use super::{
+    Descriptor, FollowKind, FollowPolicy, Integration, Mark, OnUnusable, Rank, WhileOutranked,
+};
 
 /// Grok Build, started directly as `grok dashboard`.
 pub(super) struct Grok;
@@ -23,6 +25,14 @@ static DESCRIPTOR: Descriptor = Descriptor {
 impl Integration for Grok {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
+    }
+
+    fn follow(&self) -> FollowKind {
+        FollowKind::Directory(FollowPolicy {
+            on_unusable: OnUnusable::Ignore,
+            under_session_channel: WhileOutranked::Ignore,
+            under_higher_directory: WhileOutranked::Retain,
+        })
     }
 
     fn launch_args(&self) -> &'static [&'static str] {

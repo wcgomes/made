@@ -20,6 +20,9 @@ use made_bridge::server::BridgeEvent;
 use made_bridge::state::{SessionSnapshot, SnapshotError, SnapshotTracker};
 use made_explorer::root_switch::{GenerationGate, RootGeneration};
 
+use crate::integrations::{
+    self, FollowKind, IntegrationList, IntegrationRef, OnUnusable, WhileOutranked,
+};
 use crate::workspace::{LaunchPlan, WorkspaceError, WorkspaceErrorKind};
 use made_remote::protocol::RemotePath;
 
@@ -74,12 +77,9 @@ impl FollowedViewDirectory {
 pub enum RootSource {
     /// The latest validated shell cwd or launch folder.
     Shell,
-    /// A connected OpenCode active session or view directory.
-    OpenCode,
-    /// The most recent live owned Claude Code session in this terminal.
-    ClaudeCode,
-    /// The single Grok session open in this terminal.
-    Grok,
+    /// An integration: the session channel owner's connected active session or
+    /// view directory, or a directory holder's session directory.
+    Agent(IntegrationRef),
 }
 
 /// Accept a remote directory report without consulting the host filesystem.
@@ -93,13 +93,15 @@ pub fn validate_remote_directory(bytes: &[u8]) -> Result<RemotePath, &'static st
 }
 
 impl RootSource {
-    /// Stable identifier used by diagnostics.
-    pub const fn as_str(self) -> &'static str {
+    /// Stable identifier used by diagnostics: `shell`, or the integration's
+    /// declared root-source identifier.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Shell => "shell",
-            Self::OpenCode => "opencode",
-            Self::ClaudeCode => "claude-code",
-            Self::Grok => "grok",
+            Self::Agent(entry) => {
+                let descriptor = entry.descriptor();
+                descriptor.root_source_id.unwrap_or(descriptor.key)
+            }
         }
     }
 }
@@ -247,12 +249,19 @@ pub struct SessionFollowCoordinator {
     directory_cache_ttl: Duration,
     directory_validation_count: u64,
     fallback_cache: Option<(PathBuf, Instant)>,
-    /// Directory of the single Grok session in this terminal, when one is open.
-    grok_root: Option<PathBuf>,
-    /// Directory of the most recent live owned Claude Code session in this
-    /// terminal. Retained while OpenCode holds the root so it can take over
-    /// when OpenCode releases.
-    claude_root: Option<PathBuf>,
+    /// The integration that owns the session channel, when the list has one.
+    channel_owner: Option<IntegrationRef>,
+    /// The directory-follow integrations in rank order (lowest rank first),
+    /// each with the directory it retains. A retained directory is kept while a
+    /// higher-precedence holder owns the root so it can take over on release.
+    holders: Vec<DirectoryHolder>,
+}
+
+/// One directory-follow integration and the directory it retains.
+#[derive(Debug, Clone)]
+struct DirectoryHolder {
+    entry: IntegrationRef,
+    directory: Option<PathBuf>,
 }
 
 impl SessionFollowCoordinator {
@@ -317,9 +326,36 @@ impl SessionFollowCoordinator {
             directory_cache_ttl: DEFAULT_DIRECTORY_CACHE_TTL,
             directory_validation_count: 0,
             fallback_cache: None,
-            grok_root: None,
-            claude_root: None,
-        })
+            channel_owner: None,
+            holders: Vec::new(),
+        }
+        .with_integrations(integrations::PRODUCT))
+    }
+
+    /// Replace the integration list. Test support: the list is fixed at
+    /// compile time and never comes from configuration.
+    ///
+    /// Retained directories are cleared, so call it before any follow.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_integrations(mut self, list: IntegrationList) -> Self {
+        debug_assert_eq!(integrations::validate(list), Ok(()));
+        self.channel_owner = list
+            .iter()
+            .copied()
+            .find(|entry| entry.follow() == FollowKind::SessionChannel);
+        let mut holders: Vec<DirectoryHolder> = list
+            .iter()
+            .copied()
+            .filter(|entry| matches!(entry.follow(), FollowKind::Directory(_)))
+            .map(|entry| DirectoryHolder {
+                entry,
+                directory: None,
+            })
+            .collect();
+        holders.sort_by_key(|holder| holder.entry.descriptor().rank);
+        self.holders = holders;
+        self
     }
 
     /// Create a coordinator from a validated launch plan.
@@ -350,15 +386,23 @@ impl SessionFollowCoordinator {
 
     /// Which owner selected the effective explorer root.
     pub fn effective_root_source(&self) -> RootSource {
-        if self.active_session.is_some() || self.view_is_effective() {
-            RootSource::OpenCode
-        } else if self.claude_root.is_some() {
-            RootSource::ClaudeCode
-        } else if self.grok_root.is_some() {
-            RootSource::Grok
+        if let Some(owner) = self.channel_owner.filter(|_| self.session_channel_holds()) {
+            RootSource::Agent(owner)
+        } else if let Some(holder) = self
+            .holders
+            .iter()
+            .find(|holder| holder.directory.is_some())
+        {
+            RootSource::Agent(holder.entry)
         } else {
             RootSource::Shell
         }
+    }
+
+    /// Whether the session channel has an active session or an effective view
+    /// directory.
+    fn session_channel_holds(&self) -> bool {
+        self.active_session.is_some() || self.view_is_effective()
     }
 
     fn view_is_effective(&self) -> bool {
@@ -369,9 +413,12 @@ impl SessionFollowCoordinator {
                 .is_some_and(|view| view.available)
     }
 
-    /// Whether OpenCode currently owns the effective root.
+    /// Whether the session channel owner currently owns the effective root.
     pub fn is_agent_owned(&self) -> bool {
-        self.effective_root_source() == RootSource::OpenCode
+        matches!(
+            self.effective_root_source(),
+            RootSource::Agent(entry) if entry.follow() == FollowKind::SessionChannel
+        )
     }
 
     /// Last root established by an active session.
@@ -533,84 +580,85 @@ impl SessionFollowCoordinator {
         if self.view_is_effective() {
             return Ok(self.outcome(SessionFollowUpdate::ViewDirectory, false));
         }
-        if self.claude_root.is_some() || self.grok_root.is_some() {
+        if self.holders.iter().any(|holder| holder.directory.is_some()) {
             return Ok(self.outcome(SessionFollowUpdate::NoActiveSession, false));
         }
         Ok(self.release_to_fallback(SessionFollowUpdate::NoActiveSession))
     }
 
-    /// Follow the directory of the most recent live owned Claude Code session
-    /// in this terminal.
+    /// Follow the directory a directory-follow integration reports for its
+    /// session in this terminal.
     ///
-    /// `None` releases that follow: the root returns to the open Grok session,
-    /// else the shell. A relative, missing or unreadable directory leaves the
-    /// root and the previous Claude Code directory unchanged and is reported as
-    /// [`SessionFollowUpdate::RejectedSnapshot`]. A connected
-    /// OpenCode session or view keeps the root, and the directory is retained
-    /// so Claude Code takes the root when OpenCode releases it.
-    pub fn follow_claude_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
-        let opencode_holds = self.active_session.is_some() || self.view_is_effective();
+    /// `None` releases that follow: the root returns to the highest-ranked
+    /// remaining holder with a usable directory, else the shell. What else a
+    /// report does depends on the integration's declared
+    /// [`FollowPolicy`](crate::integrations::FollowPolicy): how an unusable
+    /// directory is handled, and whether the report is retained or ignored
+    /// while the session channel or a higher-ranked directory holder keeps the
+    /// root. A retained directory takes the root when that holder releases it.
+    /// An entry that does not follow a directory leaves everything unchanged.
+    pub fn follow_directory(
+        &mut self,
+        entry: IntegrationRef,
+        directory: Option<&Path>,
+    ) -> SessionFollowOutcome {
+        let FollowKind::Directory(policy) = entry.follow() else {
+            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+        };
+        let Some(index) = self.holders.iter().position(|holder| holder.entry == entry) else {
+            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+        };
+        // What keeps the root away from this entry, with the policy for it and
+        // the update reported while it does.
+        let blocked = if self.session_channel_holds() {
+            Some((
+                policy.under_session_channel,
+                SessionFollowUpdate::ActiveSession,
+            ))
+        } else if self.holders[..index]
+            .iter()
+            .any(|holder| holder.directory.is_some())
+        {
+            Some((
+                policy.under_higher_directory,
+                SessionFollowUpdate::NoActiveSession,
+            ))
+        } else {
+            None
+        };
+        if let Some((WhileOutranked::Ignore, update)) = blocked {
+            return self.outcome(update, false);
+        }
+        let blocked_update = blocked.map(|(_, update)| update);
         let Some(directory) = directory else {
-            if self.claude_root.take().is_none() {
+            if self.holders[index].directory.take().is_none() {
                 return self.outcome(SessionFollowUpdate::NoActiveSession, false);
             }
-            if opencode_holds {
-                return self.outcome(SessionFollowUpdate::ActiveSession, false);
-            }
-            return self.release_to_fallback(SessionFollowUpdate::NoActiveSession);
+            return match blocked_update {
+                Some(update) => self.outcome(update, false),
+                None => self.release_to_fallback(SessionFollowUpdate::NoActiveSession),
+            };
         };
         let Ok(canonical) = usable_directory(directory) else {
             // The previous directory stays; the caller must not treat this one
             // as applied.
-            return self.outcome(
-                SessionFollowUpdate::RejectedSnapshot {
-                    detail: "Claude Code directory is not usable".to_owned(),
-                },
-                false,
-            );
+            return match policy.on_unusable {
+                OnUnusable::Reject(detail) => self.outcome(
+                    SessionFollowUpdate::RejectedSnapshot {
+                        detail: detail.to_owned(),
+                    },
+                    false,
+                ),
+                OnUnusable::Ignore => self.outcome(
+                    blocked_update.unwrap_or(SessionFollowUpdate::NoActiveSession),
+                    false,
+                ),
+            };
         };
-        self.claude_root = Some(canonical.clone());
-        if opencode_holds {
-            return self.outcome(SessionFollowUpdate::ActiveSession, false);
+        self.holders[index].directory = Some(canonical.clone());
+        if let Some(update) = blocked_update {
+            return self.outcome(update, false);
         }
-        let switched = canonical != self.current_root;
-        if switched {
-            self.generation.advance();
-            self.current_root = canonical;
-        }
-        self.outcome(SessionFollowUpdate::NoActiveSession, switched)
-    }
-
-    /// Follow the directory of the single Grok session in this terminal.
-    ///
-    /// `None` releases that follow. A connected OpenCode session keeps the root.
-    /// A live Claude Code session also keeps it: the Grok directory is retained
-    /// for when Claude Code exits.
-    pub fn follow_grok_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
-        if self.active_session.is_some() || self.view_is_effective() {
-            return self.outcome(SessionFollowUpdate::ActiveSession, false);
-        }
-        if self.claude_root.is_some() {
-            match directory {
-                None => self.grok_root = None,
-                Some(directory) => {
-                    if let Ok(canonical) = usable_directory(directory) {
-                        self.grok_root = Some(canonical);
-                    }
-                }
-            }
-            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
-        }
-        let Some(directory) = directory else {
-            if self.grok_root.take().is_none() {
-                return self.outcome(SessionFollowUpdate::NoActiveSession, false);
-            }
-            return self.release_to_fallback(SessionFollowUpdate::NoActiveSession);
-        };
-        let Ok(canonical) = usable_directory(directory) else {
-            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
-        };
-        self.grok_root = Some(canonical.clone());
         let switched = canonical != self.current_root;
         if switched {
             self.generation.advance();
@@ -633,27 +681,17 @@ impl SessionFollowCoordinator {
         self.unavailable = None;
         self.directory_check = None;
         let now = Instant::now();
-        if let Some(claude) = self
-            .claude_root
-            .clone()
-            .filter(|path| is_usable_directory(path))
+        if let Some(held) = self
+            .holders
+            .iter()
+            .filter_map(|holder| holder.directory.as_ref())
+            .find(|path| is_usable_directory(path))
+            .cloned()
         {
-            let switched = claude != self.current_root;
+            let switched = held != self.current_root;
             if switched {
                 self.generation.advance();
-                self.current_root = claude;
-            }
-            return self.outcome(update, switched);
-        }
-        if let Some(grok) = self
-            .grok_root
-            .clone()
-            .filter(|path| is_usable_directory(path))
-        {
-            let switched = grok != self.current_root;
-            if switched {
-                self.generation.advance();
-                self.current_root = grok;
+                self.current_root = held;
             }
             return self.outcome(update, switched);
         }

@@ -1,6 +1,8 @@
 //! Claude Code integration.
 
-use super::{Descriptor, Integration, Mark, Rank};
+use super::{
+    Descriptor, FollowKind, FollowPolicy, Integration, Mark, OnUnusable, Rank, WhileOutranked,
+};
 
 /// Claude Code, started directly with no arguments.
 pub(super) struct ClaudeCode;
@@ -23,5 +25,13 @@ static DESCRIPTOR: Descriptor = Descriptor {
 impl Integration for ClaudeCode {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
+    }
+
+    fn follow(&self) -> FollowKind {
+        FollowKind::Directory(FollowPolicy {
+            on_unusable: OnUnusable::Reject("Claude Code directory is not usable"),
+            under_session_channel: WhileOutranked::Retain,
+            under_higher_directory: WhileOutranked::Retain,
+        })
     }
 }

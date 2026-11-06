@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 use made_app::session_follow::{
     FollowedSession, RootSource, SessionFollowCoordinator, SessionFollowUpdate,
 };
@@ -625,12 +626,12 @@ fn opencode_keeps_the_explorer_when_grok_reports_a_directory() {
     ));
     assert!(connected.root_switched);
     assert_eq!(connected.root, opencode);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 
-    let blocked = follow.follow_grok_directory(Some(&grok));
+    let blocked = follow.follow_directory(GROK, Some(&grok));
     assert!(!blocked.root_switched);
     assert_eq!(follow.current_root(), opencode);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
     assert!(follow.is_agent_owned());
 }
 
@@ -643,12 +644,12 @@ fn a_connected_view_keeps_the_explorer_when_grok_reports_a_directory() {
 
     let connected = follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
     assert_eq!(connected.root, view);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 
-    let blocked = follow.follow_grok_directory(Some(&grok));
+    let blocked = follow.follow_directory(GROK, Some(&grok));
     assert!(!blocked.root_switched);
     assert_eq!(follow.current_root(), view);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 }
 
 #[test]
@@ -658,26 +659,26 @@ fn grok_exit_restores_the_shell_and_shell_reports_do_not_steal() {
     let elsewhere = fixture_dir(&temp, "elsewhere");
     let (mut follow, _, terminal) = coordinator(&temp);
 
-    let moved = follow.follow_grok_directory(Some(&grok));
+    let moved = follow.follow_directory(GROK, Some(&grok));
     assert!(moved.root_switched);
     assert_eq!(follow.current_root(), grok);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 
-    let closed = follow.follow_grok_directory(None);
+    let closed = follow.follow_directory(GROK, None);
     assert!(closed.root_switched);
     assert_eq!(closed.root, terminal);
     assert_eq!(follow.effective_root_source(), RootSource::Shell);
 
-    assert!(follow.follow_grok_directory(Some(&grok)).root_switched);
+    assert!(follow.follow_directory(GROK, Some(&grok)).root_switched);
     let shell = follow.follow_shell_cwd(&elsewhere).unwrap();
     assert!(
         !shell.root_switched,
         "a shell report must not steal from Grok"
     );
     assert_eq!(follow.current_root(), grok);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 
-    let restored = follow.follow_grok_directory(None);
+    let restored = follow.follow_directory(GROK, None);
     assert!(restored.root_switched);
     assert_eq!(restored.root, elsewhere);
     assert_eq!(follow.current_root(), elsewhere);
@@ -691,15 +692,15 @@ fn a_prompted_grok_directory_stays_until_a_new_directory_is_applied() {
     let newer = fixture_dir(&temp, "newer");
     let (mut follow, _, _) = coordinator(&temp);
 
-    assert!(follow.follow_grok_directory(Some(&newer)).root_switched);
-    let prompted = follow.follow_grok_directory(Some(&older));
+    assert!(follow.follow_directory(GROK, Some(&newer)).root_switched);
+    let prompted = follow.follow_directory(GROK, Some(&older));
     assert!(prompted.root_switched);
     assert_eq!(follow.current_root(), older);
 
-    let repeated = follow.follow_grok_directory(Some(&older));
+    let repeated = follow.follow_directory(GROK, Some(&older));
     assert!(!repeated.root_switched);
     assert_eq!(follow.current_root(), older);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 }
 
 #[test]
@@ -726,7 +727,7 @@ fn usable_view_directory_is_followed_without_an_active_session() {
     assert_eq!(outcome.root, fs::canonicalize(&view).unwrap());
     assert!(outcome.root_switched);
     assert!(outcome.active_session.is_none());
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
     assert!(follow.is_agent_owned());
     let recorded = follow.view_directory().expect("view directory retained");
     assert_eq!(recorded.requested, view);
@@ -778,7 +779,7 @@ fn active_session_directory_wins_over_a_view_directory() {
     ));
     assert!(matches!(active.update, SessionFollowUpdate::ActiveSession));
     assert_eq!(active.root, fs::canonicalize(&active_dir).unwrap());
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 
     // A view-directory change never replaces an active session root.
     let changed = follow.apply_snapshot(snapshot_with_view(
@@ -844,7 +845,7 @@ fn missing_view_directory_falls_back_to_shell_with_a_reason() {
     ));
     assert_eq!(recovered.root, fs::canonicalize(&missing).unwrap());
     assert!(recovered.root_switched);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 }
 
 #[test]
@@ -1245,10 +1246,10 @@ fn opencode_keeps_the_root_over_claude_code_and_hands_it_over_on_disconnect() {
         vec![session("session", "Open", &opencode, None)],
         1,
     ));
-    let held = follow.follow_claude_directory(Some(&claude));
+    let held = follow.follow_directory(CLAUDE_CODE, Some(&claude));
     assert!(!held.root_switched);
     assert_eq!(follow.current_root(), opencode);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
     assert!(follow.is_agent_owned());
 
     let released = follow.release_active_session();
@@ -1257,10 +1258,13 @@ fn opencode_keeps_the_root_over_claude_code_and_hands_it_over_on_disconnect() {
         released.root, claude,
         "the live Claude Code session is next"
     );
-    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    assert_eq!(
+        follow.effective_root_source(),
+        RootSource::Agent(CLAUDE_CODE)
+    );
     assert!(!follow.is_agent_owned());
 
-    let gone = follow.follow_claude_directory(None);
+    let gone = follow.follow_directory(CLAUDE_CODE, None);
     assert!(gone.root_switched);
     assert_eq!(gone.root, terminal);
     assert_eq!(follow.effective_root_source(), RootSource::Shell);
@@ -1271,10 +1275,14 @@ fn an_unusable_claude_directory_is_reported_as_rejected_and_changes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let claude = fixture_dir(&temp, "claude-dir");
     let (mut follow, _, _) = coordinator(&temp);
-    assert!(follow.follow_claude_directory(Some(&claude)).root_switched);
+    assert!(
+        follow
+            .follow_directory(CLAUDE_CODE, Some(&claude))
+            .root_switched
+    );
 
     let missing = temp.path().join("gone");
-    let rejected = follow.follow_claude_directory(Some(&missing));
+    let rejected = follow.follow_directory(CLAUDE_CODE, Some(&missing));
     assert!(
         matches!(
             rejected.update,
@@ -1299,13 +1307,20 @@ fn a_connected_view_keeps_the_root_over_claude_code() {
     let (mut follow, _, _) = coordinator(&temp);
 
     follow.apply_snapshot(snapshot_with_view(None, Vec::new(), Some(&view), 1));
-    assert!(!follow.follow_claude_directory(Some(&claude)).root_switched);
+    assert!(
+        !follow
+            .follow_directory(CLAUDE_CODE, Some(&claude))
+            .root_switched
+    );
     assert_eq!(follow.current_root(), view);
-    assert_eq!(follow.effective_root_source(), RootSource::OpenCode);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(OPENCODE));
 
     let released = follow.release_active_session();
     assert_eq!(released.root, claude);
-    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    assert_eq!(
+        follow.effective_root_source(),
+        RootSource::Agent(CLAUDE_CODE)
+    );
 }
 
 #[test]
@@ -1316,13 +1331,16 @@ fn claude_code_wins_over_grok_and_the_shell() {
     let elsewhere = fixture_dir(&temp, "elsewhere");
     let (mut follow, _, _) = coordinator(&temp);
 
-    assert!(follow.follow_grok_directory(Some(&grok)).root_switched);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert!(follow.follow_directory(GROK, Some(&grok)).root_switched);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 
-    let moved = follow.follow_claude_directory(Some(&claude));
+    let moved = follow.follow_directory(CLAUDE_CODE, Some(&claude));
     assert!(moved.root_switched);
     assert_eq!(follow.current_root(), claude);
-    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    assert_eq!(
+        follow.effective_root_source(),
+        RootSource::Agent(CLAUDE_CODE)
+    );
 
     let shell = follow.follow_shell_cwd(&elsewhere).unwrap();
     assert!(
@@ -1340,13 +1358,20 @@ fn grok_attach_or_prompt_does_not_take_the_root_from_claude_code() {
     let claude = fixture_dir(&temp, "claude-dir");
     let (mut follow, _, _) = coordinator(&temp);
 
-    assert!(follow.follow_claude_directory(Some(&claude)).root_switched);
-    let attach = follow.follow_grok_directory(Some(&grok));
+    assert!(
+        follow
+            .follow_directory(CLAUDE_CODE, Some(&claude))
+            .root_switched
+    );
+    let attach = follow.follow_directory(GROK, Some(&grok));
     assert!(!attach.root_switched);
-    let prompt = follow.follow_grok_directory(Some(&grok_prompted));
+    let prompt = follow.follow_directory(GROK, Some(&grok_prompted));
     assert!(!prompt.root_switched);
     assert_eq!(follow.current_root(), claude);
-    assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+    assert_eq!(
+        follow.effective_root_source(),
+        RootSource::Agent(CLAUDE_CODE)
+    );
 }
 
 #[test]
@@ -1357,27 +1382,27 @@ fn claude_code_exit_returns_to_the_open_grok_session_else_the_shell() {
     let (mut follow, _, terminal) = coordinator(&temp);
 
     // A Grok session that opened before Claude Code.
-    follow.follow_grok_directory(Some(&grok));
-    follow.follow_claude_directory(Some(&claude));
-    let exit = follow.follow_claude_directory(None);
+    follow.follow_directory(GROK, Some(&grok));
+    follow.follow_directory(CLAUDE_CODE, Some(&claude));
+    let exit = follow.follow_directory(CLAUDE_CODE, None);
     assert!(exit.root_switched);
     assert_eq!(exit.root, grok);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 
     // A Grok session that attached while Claude Code was live.
-    follow.follow_grok_directory(None);
+    follow.follow_directory(GROK, None);
     assert_eq!(follow.current_root(), terminal);
-    follow.follow_claude_directory(Some(&claude));
-    follow.follow_grok_directory(Some(&grok));
+    follow.follow_directory(CLAUDE_CODE, Some(&claude));
+    follow.follow_directory(GROK, Some(&grok));
     assert_eq!(follow.current_root(), claude);
-    let exit = follow.follow_claude_directory(None);
+    let exit = follow.follow_directory(CLAUDE_CODE, None);
     assert_eq!(exit.root, grok);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
 
     // No Grok session: the shell directory.
-    follow.follow_grok_directory(None);
-    follow.follow_claude_directory(Some(&claude));
-    let exit = follow.follow_claude_directory(None);
+    follow.follow_directory(GROK, None);
+    follow.follow_directory(CLAUDE_CODE, Some(&claude));
+    let exit = follow.follow_directory(CLAUDE_CODE, None);
     assert_eq!(exit.root, terminal);
     assert_eq!(follow.effective_root_source(), RootSource::Shell);
 }
@@ -1389,11 +1414,11 @@ fn a_grok_session_that_closes_under_claude_code_is_not_restored_later() {
     let claude = fixture_dir(&temp, "claude-dir");
     let (mut follow, _, terminal) = coordinator(&temp);
 
-    follow.follow_claude_directory(Some(&claude));
-    follow.follow_grok_directory(Some(&grok));
-    assert!(!follow.follow_grok_directory(None).root_switched);
+    follow.follow_directory(CLAUDE_CODE, Some(&claude));
+    follow.follow_directory(GROK, Some(&grok));
+    assert!(!follow.follow_directory(GROK, None).root_switched);
     assert_eq!(follow.current_root(), claude);
-    assert_eq!(follow.follow_claude_directory(None).root, terminal);
+    assert_eq!(follow.follow_directory(CLAUDE_CODE, None).root, terminal);
 }
 
 #[test]
@@ -1402,14 +1427,14 @@ fn protocol_only_presence_neither_moves_nor_holds_the_root() {
     let grok = fixture_dir(&temp, "grok-dir");
     let (mut follow, _, _) = coordinator(&temp);
 
-    follow.follow_grok_directory(Some(&grok));
+    follow.follow_directory(GROK, Some(&grok));
     // Presence without a live owned session reports no directory.
-    let outcome = follow.follow_claude_directory(None);
+    let outcome = follow.follow_directory(CLAUDE_CODE, None);
     assert!(!outcome.root_switched);
     assert_eq!(follow.current_root(), grok);
-    assert_eq!(follow.effective_root_source(), RootSource::Grok);
+    assert_eq!(follow.effective_root_source(), RootSource::Agent(GROK));
     let moved = fixture_dir(&temp, "grok-moved");
-    assert!(follow.follow_grok_directory(Some(&moved)).root_switched);
+    assert!(follow.follow_directory(GROK, Some(&moved)).root_switched);
     assert_eq!(follow.current_root(), moved);
 }
 
@@ -1419,22 +1444,25 @@ fn an_invalid_claude_code_directory_does_not_move_the_root() {
     let claude = fixture_dir(&temp, "claude-dir");
     let (mut follow, _, _) = coordinator(&temp);
 
-    follow.follow_claude_directory(Some(&claude));
+    follow.follow_directory(CLAUDE_CODE, Some(&claude));
     for invalid in [
         Path::new("relative/dir").to_path_buf(),
         temp.path().join("missing"),
         PathBuf::new(),
     ] {
-        let outcome = follow.follow_claude_directory(Some(&invalid));
+        let outcome = follow.follow_directory(CLAUDE_CODE, Some(&invalid));
         assert!(!outcome.root_switched, "{invalid:?}");
         assert_eq!(follow.current_root(), claude);
-        assert_eq!(follow.effective_root_source(), RootSource::ClaudeCode);
+        assert_eq!(
+            follow.effective_root_source(),
+            RootSource::Agent(CLAUDE_CODE)
+        );
     }
     let fresh_temp = tempfile::tempdir().unwrap();
     let (mut shell_only, launch, _) = coordinator(&fresh_temp);
     assert!(
         !shell_only
-            .follow_claude_directory(Some(Path::new("relative")))
+            .follow_directory(CLAUDE_CODE, Some(Path::new("relative")))
             .root_switched
     );
     assert_eq!(shell_only.current_root(), launch);
@@ -1443,6 +1471,6 @@ fn an_invalid_claude_code_directory_does_not_move_the_root() {
 
 #[test]
 fn root_source_identifiers_are_stable() {
-    assert_eq!(RootSource::ClaudeCode.as_str(), "claude-code");
-    assert_eq!(RootSource::Grok.as_str(), "grok");
+    assert_eq!(RootSource::Agent(CLAUDE_CODE).as_str(), "claude-code");
+    assert_eq!(RootSource::Agent(GROK).as_str(), "grok");
 }

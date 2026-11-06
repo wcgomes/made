@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use made_bridge::state::{SessionInfo, SessionSnapshot};
 
 // BEGIN characterization adapter
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 use made_app::session_follow::{
     RootSource, SessionFollowCoordinator, SessionFollowOutcome, SessionFollowUpdate,
 };
@@ -23,6 +24,17 @@ use made_app::session_follow::{
 type Coordinator = SessionFollowCoordinator;
 type Outcome = SessionFollowOutcome;
 type Update = SessionFollowUpdate;
+
+/// The Claude Code entry point under the name the phase 0 tests used.
+trait ClaudeFollow {
+    fn follow_claude_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome;
+}
+
+impl ClaudeFollow for SessionFollowCoordinator {
+    fn follow_claude_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
+        self.follow_directory(CLAUDE_CODE, directory)
+    }
+}
 
 /// One directory-follow entry point, addressed by its declared policy.
 #[derive(Clone, Copy)]
@@ -32,11 +44,11 @@ struct Follower {
 
 /// Rank 200, policy `{ Reject, Retain, Retain }`.
 const POLICY_REJECT: Follower = Follower {
-    follow: |c, d| c.follow_claude_directory(d),
+    follow: |c, d| c.follow_directory(CLAUDE_CODE, d),
 };
 /// Rank 300, policy `{ Ignore, Ignore, Retain }`.
 const POLICY_IGNORE: Follower = Follower {
-    follow: |c, d| c.follow_grok_directory(d),
+    follow: |c, d| c.follow_directory(GROK, d),
 };
 
 fn new_coordinator(launch: &Path, terminal: &Path) -> Coordinator {
@@ -49,7 +61,7 @@ fn source_id(c: &Coordinator) -> &'static str {
 }
 
 fn session_channel_owns(c: &Coordinator) -> bool {
-    c.effective_root_source() == RootSource::OpenCode
+    c.effective_root_source() == RootSource::Agent(OPENCODE)
 }
 // END characterization adapter
 

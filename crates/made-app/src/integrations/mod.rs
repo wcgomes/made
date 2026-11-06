@@ -93,10 +93,63 @@ pub trait Integration: Sync + 'static {
         &[]
     }
 
-    /// Whether the integration owns the bridge session channel.
-    fn owns_session_channel(&self) -> bool {
-        false
+    /// How the integration takes part in explorer-root follow.
+    fn follow(&self) -> FollowKind {
+        FollowKind::None
     }
+}
+
+/// How an integration takes part in explorer-root follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowKind {
+    /// The integration does not follow a directory.
+    None,
+    /// The integration owns the bridge session channel (active session, view
+    /// directory, connection epoch). At most one entry of a list does, and it
+    /// has the lowest rank.
+    SessionChannel,
+    /// The integration reports the directory of its session, ranked against
+    /// the other directory holders by its declared policy.
+    Directory(FollowPolicy),
+}
+
+/// What a directory-follow integration does with a report. The differences
+/// between integrations are declared here, never decided by identity.
+///
+/// An integration that retains while outranked processes a report as usual and
+/// only withholds the root move. One that ignores while outranked drops the
+/// report before looking at it. A report is checked against the session
+/// channel first, then against higher-ranked directory holders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowPolicy {
+    /// What a relative, missing or unreadable directory does.
+    pub on_unusable: OnUnusable,
+    /// Behavior while the session channel holds the root.
+    pub under_session_channel: WhileOutranked,
+    /// Behavior while a higher-ranked directory holder holds the root.
+    pub under_higher_directory: WhileOutranked,
+}
+
+/// How an unusable reported directory is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnUnusable {
+    /// Reject the report with this detail. The root and the previously
+    /// retained directory stay unchanged.
+    Reject(&'static str),
+    /// Drop the report without a rejection. The previously retained directory
+    /// stays.
+    Ignore,
+}
+
+/// What an integration does with a report while a higher-precedence holder
+/// owns the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhileOutranked {
+    /// Retain or clear the reported directory so it can take the root when the
+    /// holder releases it.
+    Retain,
+    /// Drop the report: nothing is retained or cleared.
+    Ignore,
 }
 
 impl PartialEq for dyn Integration {
@@ -150,7 +203,7 @@ pub fn validate(list: IntegrationList) -> Result<(), ListError> {
     }
     let lowest = list.iter().map(|entry| entry.descriptor().rank).min();
     for entry in list {
-        if entry.owns_session_channel() && Some(entry.descriptor().rank) != lowest {
+        if entry.follow() == FollowKind::SessionChannel && Some(entry.descriptor().rank) != lowest {
             return Err(ListError::SessionChannelOwnerNotLowest(
                 entry.descriptor().key,
             ));

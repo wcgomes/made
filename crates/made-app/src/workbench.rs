@@ -4282,7 +4282,7 @@ impl Workbench {
     fn begin_provisional_move(&mut self, session_id: &str, cwd: &Path) {
         if self.grok_provisional_id.is_none() {
             self.grok_restore_root = self.follow.as_ref().and_then(|follow| {
-                (follow.effective_root_source() == crate::session_follow::RootSource::Grok)
+                (follow.effective_root_source() == crate::session_follow::RootSource::Agent(GROK))
                     .then(|| follow.current_root().to_path_buf())
             });
         }
@@ -4483,7 +4483,7 @@ impl Workbench {
         let Some(outcome) = self
             .follow
             .as_mut()
-            .map(|follow| follow.follow_claude_directory(directory))
+            .map(|follow| follow.follow_directory(CLAUDE_CODE, directory))
         else {
             return true;
         };
@@ -4498,7 +4498,7 @@ impl Workbench {
         let Some(outcome) = self
             .follow
             .as_mut()
-            .map(|follow| follow.follow_grok_directory(directory))
+            .map(|follow| follow.follow_directory(GROK, directory))
         else {
             return;
         };
