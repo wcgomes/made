@@ -163,7 +163,7 @@ pub mod update;
 pub mod windows;
 
 /// Reconnect standard streams to the launching console on Windows, where the
-/// GUI binary has none of its own (see [`windows::attach_parent_console`]).
+/// GUI binary has none of its own (see `windows::attach_parent_console`).
 /// Does nothing on other platforms.
 pub fn attach_parent_console() {
     #[cfg(target_os = "windows")]

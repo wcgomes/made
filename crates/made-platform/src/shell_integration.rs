@@ -32,7 +32,7 @@ pub fn local_cwd_path(decoded: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-/// Native path for cmd.exe's raw OSC 7 form (see [`CMD_OSC7_PROMPT`]), for
+/// Native path for cmd.exe's raw OSC 7 form (see `CMD_OSC7_PROMPT`), for
 /// example `file://localhost/C:\Users\a b`. Windows only: other hosts never
 /// receive this form and get `None`.
 pub fn local_cmd_prompt_cwd(uri: &str) -> Option<PathBuf> {
