@@ -131,10 +131,6 @@ fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
             "made-claude-hook/src/main.rs",
             include_str!("../../made-claude-hook/src/main.rs"),
         ),
-        (
-            "made-remote/src/claude.rs",
-            include_str!("../../made-remote/src/claude.rs"),
-        ),
     ];
     for (name, source) in sources {
         let lower = source.to_ascii_lowercase();

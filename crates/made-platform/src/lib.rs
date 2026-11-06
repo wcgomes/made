@@ -885,7 +885,10 @@ impl AppPaths {
     /// at it.
     pub fn shipped_claude_plugin_dir(&self) -> Option<&Path> {
         let dir = self.claude_plugin_dir.as_deref()?;
-        if !claude_plugin_entry_is_safe(dir, ':') || !claude_plugin_entry_is_safe(dir, ';') {
+        // Only this host's list separator can split the entry: a Windows drive
+        // colon is part of an ordinary `C:\...` path.
+        let separator = claude_plugin_dirs_separator(PlatformFamily::current());
+        if !claude_plugin_entry_is_safe(dir, separator) {
             return None;
         }
         std::fs::read_dir(dir).ok()?;
@@ -2567,12 +2570,19 @@ pub fn compose_claude_plugin_dirs(
     }
     let separator = separator as u8;
     let bytes = existing.as_encoded_bytes();
+    // A `;` list is a Windows one: both slashes end an entry and paths compare
+    // case-insensitively.
+    let windows = separator == b';';
     let trimmed = |entry: &[u8]| {
         let end = entry
             .iter()
-            .rposition(|byte| *byte != b'/')
+            .rposition(|byte| *byte != b'/' && !(windows && *byte == b'\\'))
             .map_or(0, |i| i + 1);
-        entry[..end].to_vec()
+        let mut entry = entry[..end].to_vec();
+        if windows {
+            entry.make_ascii_lowercase();
+        }
+        entry
     };
     let wanted = trimmed(shipped.as_encoded_bytes());
     if bytes
@@ -3222,7 +3232,7 @@ pub use detach::{
     remote_path_from_bytes, remote_program_version_supported, remote_target,
     spawn_detached_command,
 };
-pub use process::process_parent;
+pub use process::{process_parent, process_parent_map};
 pub use shell_integration::{local_cwd_path, ShellCwdCapability, ShellLaunchPlan};
 pub use ssh_askpass::askpass_file_name;
 

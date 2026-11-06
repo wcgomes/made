@@ -1267,6 +1267,31 @@ fn opencode_keeps_the_root_over_claude_code_and_hands_it_over_on_disconnect() {
 }
 
 #[test]
+fn an_unusable_claude_directory_is_reported_as_rejected_and_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let claude = fixture_dir(&temp, "claude-dir");
+    let (mut follow, _, _) = coordinator(&temp);
+    assert!(follow.follow_claude_directory(Some(&claude)).root_switched);
+
+    let missing = temp.path().join("gone");
+    let rejected = follow.follow_claude_directory(Some(&missing));
+    assert!(
+        matches!(
+            rejected.update,
+            SessionFollowUpdate::RejectedSnapshot { .. }
+        ),
+        "{:?}",
+        rejected.update
+    );
+    assert!(!rejected.root_switched);
+    assert_eq!(
+        follow.current_root(),
+        claude,
+        "the previous directory stays"
+    );
+}
+
+#[test]
 fn a_connected_view_keeps_the_root_over_claude_code() {
     let temp = tempfile::tempdir().unwrap();
     let view = fixture_dir(&temp, "view-dir");

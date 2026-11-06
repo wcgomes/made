@@ -668,8 +668,10 @@ pub struct ClaudeTab {
     sessions: Vec<Session>,
     next_recency: u64,
     protocol: Option<ClaudeActivity>,
-    probe_seen: bool,
     status_seen: bool,
+    /// Ids of sessions that ended, newest last. Records still in flight after
+    /// a session's end are ignored.
+    closed: Vec<String>,
 }
 
 impl ClaudeTab {
@@ -683,8 +685,8 @@ impl ClaudeTab {
             sessions: Vec::new(),
             next_recency: 0,
             protocol: None,
-            probe_seen: false,
             status_seen: false,
+            closed: Vec::new(),
         }
     }
 
@@ -694,17 +696,59 @@ impl ClaudeTab {
         self.root = root;
     }
 
+    /// Whether the terminal process is known. Until it is, no record can be
+    /// attributed to this tab.
+    pub fn root_known(&self) -> bool {
+        self.root != 0
+    }
+
     /// Apply hook records. A record is ignored unless this tab owns the Claude
     /// Code process that ran its hook; see [`resolve_anchor`].
     pub fn ingest(&mut self, records: Vec<Record>, mut parent_of: impl FnMut(u32) -> Option<u32>) {
+        if !self.root_known() {
+            return;
+        }
         for record in records {
+            let ended = record.status == Some(HookStatus::Ended);
+            if record.event == "SessionStart" {
+                // A resumed session reuses its id.
+                self.closed.retain(|id| *id != record.session_id);
+            } else if !ended && self.closed.contains(&record.session_id) {
+                continue;
+            }
             let Some(anchor) = resolve_anchor(self.root, self.direct, &record.pids, &mut parent_of)
             else {
                 continue;
             };
+            // A shell tab's root is the shell. A record that resolves to it
+            // came from a Claude Code that has already exited, so it may only
+            // update a session that exists, never start one.
+            if !self.direct
+                && anchor == self.root
+                && !self
+                    .sessions
+                    .iter()
+                    .any(|s| s.anchor == anchor && s.id == record.session_id)
+            {
+                continue;
+            }
+            if ended {
+                self.close(&record.session_id);
+            }
             self.reanchor(anchor, &record.session_id, &mut parent_of);
             self.apply(anchor, record);
         }
+    }
+
+    fn close(&mut self, session_id: &str) {
+        const MAX_CLOSED: usize = 64;
+        if self.closed.iter().any(|id| id == session_id) {
+            return;
+        }
+        if self.closed.len() >= MAX_CLOSED {
+            self.closed.remove(0);
+        }
+        self.closed.push(session_id.to_owned());
     }
 
     /// A record read while its transient hook shell was still running anchors
@@ -793,8 +837,32 @@ impl ClaudeTab {
 
     /// Drop sessions whose Claude Code process has exited. Returns whether any
     /// session was dropped.
+    ///
+    /// A session anchored on a pid that has gone (the transient hook shell
+    /// caught by an early record) is first re-resolved from its stored hook
+    /// ancestry (when the dead pid was the hook's direct parent), so only a
+    /// session with no live process left is dropped.
     pub fn check_liveness(&mut self, mut parent_of: impl FnMut(u32) -> Option<u32>) -> bool {
         let before = self.sessions.len();
+        for index in 0..self.sessions.len() {
+            if parent_of(self.sessions[index].anchor).is_some() {
+                continue;
+            }
+            let chain = self.sessions[index].chain.clone();
+            // Only the hook's direct parent can be the transient hook shell. A
+            // session anchored deeper in the chain lost its real process.
+            if chain.first() != Some(&self.sessions[index].anchor) {
+                continue;
+            }
+            let Some(anchor) = resolve_anchor(self.root, self.direct, &chain, &mut parent_of)
+            else {
+                continue;
+            };
+            let free = !self.sessions.iter().any(|s| s.anchor == anchor);
+            if free && (self.direct || anchor != self.root) {
+                self.sessions[index].anchor = anchor;
+            }
+        }
         self.sessions
             .retain(|session| parent_of(session.anchor).is_some());
         self.sessions.len() != before
@@ -812,7 +880,8 @@ impl ClaudeTab {
     /// Apply a Program Status Protocol event from this tab's terminal.
     pub fn note_protocol(&mut self, event: ProtocolEvent) {
         match event {
-            ProtocolEvent::Probe => self.probe_seen = true,
+            // The capability probe is not presence and is not tracked.
+            ProtocolEvent::Probe => {}
             ProtocolEvent::Status { state } => {
                 self.status_seen = true;
                 self.protocol = Some(state.into());
@@ -854,18 +923,12 @@ impl ClaudeTab {
     /// Forget which channels were observed. Called when Claude Code is no
     /// longer present, so the next Claude Code in this tab starts clean.
     pub fn reset_observations(&mut self) {
-        self.probe_seen = false;
         self.status_seen = false;
     }
 
     /// Whether a session-level protocol status is live.
     pub fn protocol_live(&self) -> bool {
         self.protocol.is_some()
-    }
-
-    /// Whether the terminal ever received the capability probe from Claude Code.
-    pub fn protocol_probe_seen(&self) -> bool {
-        self.probe_seen
     }
 
     /// Whether at least one session-level status emission arrived.

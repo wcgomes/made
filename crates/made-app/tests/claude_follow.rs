@@ -480,6 +480,91 @@ fn a_nested_shell_session_is_attributed_to_claude_and_a_foreign_one_is_not() {
     assert_eq!(tab.directory().as_deref(), Some("/own"));
 }
 
+#[test]
+fn a_late_record_after_claude_exited_creates_no_session_on_a_shell_tab() {
+    // The hook ran without a /bin/sh hop: [claude, tab shell, ...]. claude has
+    // exited by the time the record is read, so only the shell is left.
+    let tree = Tree::new(&[(ROOT, 50), (50, 1)]);
+    let mut tab = ClaudeTab::new(ROOT, false);
+    let mut late = record("s", "/w", "Stop", Some(HookStatus::Idle));
+    late.pids = vec![CLAUDE, ROOT, 50];
+    tab.ingest(vec![late], tree.parent());
+    assert_eq!(tab.session_count(), 0);
+    assert!(!tab.present(), "the shell is not Claude Code");
+    assert_eq!(tab.directory(), None);
+}
+
+#[test]
+fn records_after_a_session_end_are_ignored_until_the_session_starts_again() {
+    let tree = shell_tree();
+    let mut tab = ClaudeTab::new(ROOT, false);
+    tab.ingest(
+        vec![
+            record("s", "/w", "SessionStart", Some(HookStatus::Idle)),
+            record("s", "/w", "SessionEnd", Some(HookStatus::Ended)),
+            record("s", "/w", "Stop", Some(HookStatus::Idle)),
+        ],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 0, "a late Stop does not revive it");
+
+    // A resumed session reuses its id and begins with SessionStart.
+    tab.ingest(
+        vec![record("s", "/w", "SessionStart", Some(HookStatus::Idle))],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 1);
+    // An end that arrives on its own, with no earlier record, also closes it.
+    tab.ingest(
+        vec![
+            record("other", "/w", "SessionEnd", Some(HookStatus::Ended)),
+            record("other", "/w", "Stop", Some(HookStatus::Idle)),
+        ],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 1, "only the resumed session remains");
+}
+
+#[test]
+fn liveness_re_resolves_a_session_anchored_on_a_dead_transient_pid() {
+    let mut tree = Tree::new(&[(ROOT, 50), (CLAUDE, ROOT), (HOOK_SHELL, CLAUDE)]);
+    let mut tab = ClaudeTab::new(ROOT, false);
+    tab.ingest(
+        vec![record("s", "/w", "SessionStart", Some(HookStatus::Working))],
+        tree.parent(),
+    );
+    tree.kill(HOOK_SHELL);
+    assert!(
+        !tab.check_liveness(tree.parent()),
+        "the session lives on claude, not on the exited hook shell"
+    );
+    assert_eq!(tab.session_count(), 1);
+    assert_eq!(tab.dots(), vec![ClaudeActivity::Busy]);
+
+    tree.kill(CLAUDE);
+    assert!(tab.check_liveness(tree.parent()));
+    assert!(!tab.present());
+}
+
+#[test]
+fn a_tab_with_an_unknown_root_ingests_nothing() {
+    let tree = shell_tree();
+    let mut tab = ClaudeTab::new(0, false);
+    assert!(!tab.root_known());
+    tab.ingest(
+        vec![record("s", "/w", "SessionStart", Some(HookStatus::Idle))],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 0);
+    tab.set_root(ROOT);
+    assert!(tab.root_known());
+    tab.ingest(
+        vec![record("s", "/w", "SessionStart", Some(HookStatus::Idle))],
+        tree.parent(),
+    );
+    assert_eq!(tab.session_count(), 1);
+}
+
 // ---- terminal reports ---------------------------------------------------------
 
 #[test]
@@ -753,10 +838,8 @@ fn a_direct_tab_stays_present_while_its_child_runs() {
 #[test]
 fn channel_observations_are_exposed_for_diagnostics() {
     let mut tab = ClaudeTab::new(ROOT, false);
-    assert!(!tab.protocol_probe_seen());
     assert!(!tab.protocol_status_seen());
     tab.note_protocol(ProtocolEvent::Probe);
-    assert!(tab.protocol_probe_seen());
     assert!(
         !tab.protocol_status_seen(),
         "the probe alone is not a status emission"

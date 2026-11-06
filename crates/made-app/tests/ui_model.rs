@@ -13217,6 +13217,29 @@ fn choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker() 
         .is_some_and(made_app::TerminalPane::is_running));
 }
 
+/// Stage the shipped Claude Code plugin beside the test executable: its
+/// directory and an executable hook binary, which together count as present.
+fn stage_claude_plugin() {
+    let hook = made_platform::install_root_from_current_executable(
+        made_platform::PlatformFamily::current(),
+    )
+    .expect("install root")
+    .join("plugins")
+    .join("claude-code-made")
+    .join("bin")
+    .join(format!(
+        "made-claude-status{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct ClaudeFixture {
     headless: Headless,
@@ -13230,21 +13253,7 @@ struct ClaudeFixture {
 #[cfg(target_os = "linux")]
 impl ClaudeFixture {
     fn new(temp: &Path) -> Self {
-        // The shipped plugin the tab needs to get a spool: its directory and an
-        // executable hook binary.
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let plugin = made_platform::install_root_from_current_executable(
-                made_platform::PlatformFamily::current(),
-            )
-            .expect("install root")
-            .join("plugins")
-            .join("claude-code-made");
-            std::fs::create_dir_all(plugin.join("bin")).unwrap();
-            let hook = plugin.join("bin").join("made-claude-status");
-            std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        stage_claude_plugin();
         let root = fixture_workspace(temp, "project-alpha", "main.rs");
         let mut model = AppModel::from_launch(
             WorkspaceLaunch::waiting_for_picker(),
@@ -13698,6 +13707,7 @@ fn claude_code_diagnostics_row_stays_hidden_until_revealed() {
     if isolated("claude_code_diagnostics_row_stays_hidden_until_revealed") {
         return;
     }
+    stage_claude_plugin();
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "hidden-row", "main.rs");
     let (mut headless, id) = menu_model(&root, &[CompatibleTui::ClaudeCode]);

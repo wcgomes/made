@@ -192,7 +192,12 @@ fn open_private_file(path: &Path) -> Option<File> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
         return None;
     }
-    std::fs::OpenOptions::new().append(true).open(path).ok()
+    // Windows byte-range locking needs read or write access, which append-only lacks.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 /// The ancestor pids, nearest first: this process's parent, then its parent,

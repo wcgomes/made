@@ -83,8 +83,10 @@ struct ClaudeRuntime {
     liveness_checked_at: Instant,
     /// When Claude Code last became present in this tab.
     present_since: Option<Instant>,
-    /// Directory last handed to the follow coordinator.
+    /// Directory last handed to the follow coordinator and accepted by it.
     applied_directory: Option<PathBuf>,
+    /// Directory the coordinator rejected, retried on the liveness tick.
+    rejected_directory: Option<PathBuf>,
 }
 
 /// How often owned Claude Code processes are checked for exit.
@@ -589,9 +591,6 @@ pub struct Workbench {
     grok_file_newest_id: Option<String>,
     /// Present for local shell and direct Claude Code tabs.
     claude: Option<ClaudeRuntime>,
-    /// Session-status hooks cannot report for this tab: the shipped plugin is
-    /// missing or unreadable, or the tab's spool could not be created.
-    claude_hooks_unavailable: bool,
     /// The shipped Claude Code plugin when it is usable, looked up once per
     /// launch so the per-frame diagnostics row never touches the filesystem.
     claude_plugin: Option<PathBuf>,
@@ -866,7 +865,6 @@ impl Workbench {
             grok_restore_root: None,
             grok_file_newest_id: None,
             claude: None,
-            claude_hooks_unavailable: false,
             claude_plugin,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
@@ -1296,7 +1294,6 @@ impl Workbench {
             spool.as_ref().map(TabSpool::path),
         );
         if launch.hooks_unavailable {
-            self.claude_hooks_unavailable = true;
             self.diag.log_mut().record(
                 LogLevel::Warn,
                 "Claude Code session-status hooks are unavailable for this tab",
@@ -1334,6 +1331,7 @@ impl Workbench {
             liveness_checked_at: Instant::now(),
             present_since: None,
             applied_directory: None,
+            rejected_directory: None,
         });
     }
 
@@ -1393,12 +1391,6 @@ impl Workbench {
             live_session: runtime.is_some_and(|runtime| runtime.tab.session_count() > 0),
             protocol_observed: runtime.is_some_and(|runtime| runtime.tab.protocol_status_seen()),
         })
-    }
-
-    /// Whether session-status hooks cannot report for this tab because the
-    /// shipped plugin or the tab's spool is unavailable.
-    pub fn claude_hooks_unavailable(&self) -> bool {
-        self.claude_hooks_unavailable
     }
 
     fn log_launch_context(&mut self) {
@@ -4346,6 +4338,7 @@ impl Workbench {
                 liveness_checked_at: now,
                 present_since: None,
                 applied_directory: None,
+                rejected_directory: None,
             });
         }
         let Some(runtime) = self.claude.as_mut() else {
@@ -4362,17 +4355,33 @@ impl Workbench {
             .tab
             .apply_terminal_reports(terminal.take_protocol_events(), prompt_reported);
         runtime.tab.set_child_running(terminal.is_running());
-        let records = runtime
-            .spool
-            .as_ref()
-            .map(TabSpool::drain)
-            .unwrap_or_default();
+        // One process map serves every ancestry and liveness check of this
+        // poll. It is built only when a check needs it, and records stay
+        // queued until the terminal process is known.
+        let tick_due =
+            now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL;
+        let records = if runtime.tab.root_known() {
+            runtime
+                .spool
+                .as_ref()
+                .map(TabSpool::drain)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut parents = None;
+        let mut parent_of = |pid: u32| -> Option<u32> {
+            parents
+                .get_or_insert_with(made_platform::process_parent_map)
+                .get(&pid)
+                .copied()
+        };
         if !records.is_empty() {
-            runtime.tab.ingest(records, made_platform::process_parent);
+            runtime.tab.ingest(records, &mut parent_of);
         }
-        if now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL {
+        if tick_due {
             runtime.liveness_checked_at = now;
-            runtime.tab.check_liveness(made_platform::process_parent);
+            runtime.tab.check_liveness(&mut parent_of);
         }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);
@@ -4383,21 +4392,36 @@ impl Workbench {
         if directory == runtime.applied_directory {
             return;
         }
-        runtime.applied_directory.clone_from(&directory);
-        self.follow_claude_path(directory.as_deref());
+        if !tick_due && directory.is_some() && directory == runtime.rejected_directory {
+            return;
+        }
+        let accepted = self.follow_claude_path(directory.as_deref());
+        if let Some(runtime) = self.claude.as_mut() {
+            if accepted {
+                runtime.applied_directory.clone_from(&directory);
+                runtime.rejected_directory = None;
+            } else {
+                runtime.rejected_directory = directory;
+            }
+        }
     }
 
-    fn follow_claude_path(&mut self, directory: Option<&Path>) {
+    /// Hand the Claude Code directory to the follow coordinator. Returns
+    /// whether it was accepted; a rejected directory is not remembered as
+    /// applied.
+    fn follow_claude_path(&mut self, directory: Option<&Path>) -> bool {
         let Some(outcome) = self
             .follow
             .as_mut()
             .map(|follow| follow.follow_claude_directory(directory))
         else {
-            return;
+            return true;
         };
+        let accepted = !matches!(outcome.update, SessionFollowUpdate::RejectedSnapshot { .. });
         if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
             self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
         }
+        accepted
     }
 
     fn follow_grok_path(&mut self, directory: Option<&Path>) {
@@ -6175,7 +6199,6 @@ mod tests {
             grok_restore_root: None,
             grok_file_newest_id: None,
             claude: None,
-            claude_hooks_unavailable: false,
             claude_plugin: None,
             claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
             instrumentation: RuntimeInstrumentation::new(),
@@ -8204,7 +8227,7 @@ mod tests {
                 "the capability probe is answered over the transport"
             );
             let tab = bench.workbench.claude_tab().unwrap();
-            assert!(tab.protocol_probe_seen() && !tab.protocol_status_seen());
+            assert!(!tab.protocol_status_seen());
             assert!(!tab.present(), "a probe alone is not presence");
 
             for (state, expected) in [

@@ -4,7 +4,6 @@
 use made_bridge::{config, config_guard::ConfigSnapshot, remote_rpc::RpcConnection};
 use made_platform::{Environment, PathsInputs, Platform, PlatformFamily, PtyRequest};
 use made_remote::{
-    claude,
     filesystem::native,
     grok::{self, GrokFiles},
     integration::{resolve_config, Integration},
@@ -259,8 +258,8 @@ fn daemon() -> io::Result<()> {
         // Direct Claude Code launch: the detected absolute claude with no
         // arguments, no shell first, no plugin, environment or bridge.
         LaunchTarget::Claude => {
-            let launch = claude::launch(&environment).ok_or_else(fail)?;
-            (launch.program, launch.args)
+            let program = grok::detect_on_path(&environment, "claude").ok_or_else(fail)?;
+            (program, Vec::new())
         }
     };
     let inputs = PathsInputs::from_env(PlatformFamily::current());

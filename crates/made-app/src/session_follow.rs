@@ -544,7 +544,8 @@ impl SessionFollowCoordinator {
     ///
     /// `None` releases that follow: the root returns to the open Grok session,
     /// else the shell. A relative, missing or unreadable directory leaves the
-    /// root and the previous Claude Code directory unchanged. A connected
+    /// root and the previous Claude Code directory unchanged and is reported as
+    /// [`SessionFollowUpdate::RejectedSnapshot`]. A connected
     /// OpenCode session or view keeps the root, and the directory is retained
     /// so Claude Code takes the root when OpenCode releases it.
     pub fn follow_claude_directory(&mut self, directory: Option<&Path>) -> SessionFollowOutcome {
@@ -559,7 +560,14 @@ impl SessionFollowCoordinator {
             return self.release_to_fallback(SessionFollowUpdate::NoActiveSession);
         };
         let Ok(canonical) = usable_directory(directory) else {
-            return self.outcome(SessionFollowUpdate::NoActiveSession, false);
+            // The previous directory stays; the caller must not treat this one
+            // as applied.
+            return self.outcome(
+                SessionFollowUpdate::RejectedSnapshot {
+                    detail: "Claude Code directory is not usable".to_owned(),
+                },
+                false,
+            );
         };
         self.claude_root = Some(canonical.clone());
         if opencode_holds {

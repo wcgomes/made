@@ -330,6 +330,7 @@ fn env_of(env: &[(OsString, OsString)], key: &str) -> Option<OsString> {
         .map(|(_, value)| value.clone())
 }
 
+#[cfg(unix)]
 #[test]
 fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
@@ -373,6 +374,7 @@ fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn other_launches_get_no_claude_environment() {
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
@@ -398,6 +400,7 @@ fn other_launches_get_no_claude_environment() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
