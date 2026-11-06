@@ -1,0 +1,122 @@
+name: Upgrade check
+
+# REL-12 post-publish upgrade check. Per target, and for both macOS install
+# forms, install the previous published stable release from this repository,
+# seed app data (SSH server records and the automatic-check choice, once on
+# and once off), update it through the installed build's command-line entry
+# (the same client, allowlist and verification as About) to the latest
+# published release, and confirm the new version runs with the app data
+# preserved and the production update location. With a single published
+# release the first-release exemption applies. A failure is remedied by
+# publishing a fixed newer release; this workflow never modifies a release.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  releases:
+    name: Find the previous and latest releases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      latest: ${{ steps.find.outputs.latest }}
+      previous: ${{ steps.find.outputs.previous }}
+      exempt: ${{ steps.find.outputs.exempt }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' > tags.txt
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          tags = [t.strip() for t in open("tags.txt") if re.fullmatch(r"v\d+\.\d+\.\d+", t.strip())]
+          ordered = sorted(tags, key=lambda t: tuple(int(p) for p in t[1:].split(".")), reverse=True)
+          print(f"latest={ordered[0] if ordered else ''}")
+          print(f"previous={ordered[1] if len(ordered) > 1 else ''}")
+          print(f"exempt={'true' if len(ordered) < 2 else 'false'}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  exemption:
+    name: First-release exemption
+    needs: releases
+    if: needs.releases.outputs.exempt == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report the exemption
+        env:
+          LATEST: ${{ needs.releases.outputs.latest }}
+        run: |
+          echo "Only one published stable release ($LATEST): the first release is exempt from the upgrade check (REL-12)."
+          echo "## Upgrade check: first-release exemption ($LATEST)" >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade:
+    name: Upgrade ${{ matrix.form }} on ${{ matrix.os }} (automatic checks ${{ matrix.automatic }})
+    needs: releases
+    if: needs.releases.outputs.exempt == 'false'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15, macos-15-intel, ubuntu-24.04]
+        form: [setup, pkg, zip, appimage]
+        automatic: ["on", "off"]
+        exclude:
+          - { os: windows-2025, form: pkg }
+          - { os: windows-2025, form: zip }
+          - { os: windows-2025, form: appimage }
+          - { os: macos-15, form: setup }
+          - { os: macos-15, form: appimage }
+          - { os: macos-15-intel, form: setup }
+          - { os: macos-15-intel, form: appimage }
+          - { os: ubuntu-24.04, form: setup }
+          - { os: ubuntu-24.04, form: pkg }
+          - { os: ubuntu-24.04, form: zip }
+    env:
+      PREVIOUS: ${{ needs.releases.outputs.previous }}
+      LATEST: ${{ needs.releases.outputs.latest }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the previous release from the production repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${PREVIOUS#v}"
+          case "${{ matrix.os }}/${{ matrix.form }}" in
+            windows-2025/setup) pattern="made-$version-windows-x64-setup.exe" ;;
+            macos-15/pkg) pattern="made-$version-macos-arm64.pkg" ;;
+            macos-15/zip) pattern="made-$version-macos-arm64.zip" ;;
+            macos-15-intel/pkg) pattern="made-$version-macos-x64.pkg" ;;
+            macos-15-intel/zip) pattern="made-$version-macos-x64.zip" ;;
+            ubuntu-24.04/appimage) pattern="made-$version-linux-x64.AppImage" ;;
+          esac
+          gh release download "$PREVIOUS" --repo wcgomes/made --pattern "$pattern" --dir previous
+
+      - name: Install the display stack for the Linux smoke
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb libxkbcommon-x11-0 libegl1 libgl1 \
+            libgl1-mesa-dri mesa-vulkan-drivers libvulkan1
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+
+      - name: Install the previous release, update it in place and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" .github/scripts/upgrade-check.py --form "${{ matrix.form }}" --assets previous \
+            --previous "${PREVIOUS#v}" --latest "${LATEST#v}" --automatic "${{ matrix.automatic }}"

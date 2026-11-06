@@ -300,6 +300,73 @@ impl DiagnosticLog {
     }
 }
 
+/// Fixed log wording for an update outcome.
+pub fn update_log_message(event: &crate::updates::UpdateEvent) -> (LogLevel, String) {
+    use crate::updates::UpdateEvent;
+    let version = |version: &str| {
+        if version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+            && version.len() <= 64
+        {
+            version.to_owned()
+        } else {
+            "unknown".to_owned()
+        }
+    };
+    match event {
+        UpdateEvent::KeptFound(v) => (
+            LogLevel::Info,
+            format!("update: kept verified update {} found", version(v)),
+        ),
+        UpdateEvent::CheckStarted { manual: true } => {
+            (LogLevel::Info, "update: manual check started".to_owned())
+        }
+        UpdateEvent::CheckStarted { manual: false } => {
+            (LogLevel::Info, "update: automatic check started".to_owned())
+        }
+        UpdateEvent::UpToDate => (LogLevel::Info, "update: up to date".to_owned()),
+        UpdateEvent::Available(v) => (
+            LogLevel::Info,
+            format!("update: version {} available, downloading", version(v)),
+        ),
+        UpdateEvent::CheckFailed => (
+            LogLevel::Warn,
+            "update: check failed: the update service could not be reached".to_owned(),
+        ),
+        UpdateEvent::Ready(v) => (
+            LogLevel::Info,
+            format!("update: version {} downloaded and verified", version(v)),
+        ),
+        UpdateEvent::DownloadFailed(v) => (
+            LogLevel::Warn,
+            format!("update: download of version {} failed", version(v)),
+        ),
+        UpdateEvent::VerificationFailed(v) => (
+            LogLevel::Warn,
+            format!(
+                "update: version {} failed verification and was discarded",
+                version(v)
+            ),
+        ),
+        UpdateEvent::Busy => (
+            LogLevel::Info,
+            "update: another update operation was in progress".to_owned(),
+        ),
+        UpdateEvent::RestartRequested(v) => (
+            LogLevel::Info,
+            format!("update: restart into version {} confirmed", version(v)),
+        ),
+        UpdateEvent::RestartFailed(v) => (
+            LogLevel::Error,
+            format!(
+                "update: the updater for version {} could not start",
+                version(v)
+            ),
+        ),
+    }
+}
+
 /// Diagnostics container owned by the app.
 #[derive(Debug, Clone)]
 pub struct Diagnostics {
@@ -310,6 +377,7 @@ pub struct Diagnostics {
     previous_log_location_display: String,
     app_version: String,
     token_fingerprint: Option<String>,
+    update_apply: Option<String>,
 }
 
 impl Diagnostics {
@@ -330,6 +398,7 @@ impl Diagnostics {
             previous_log_location,
             previous_log_location_display,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            update_apply: None,
             token_fingerprint: None,
         }
     }
@@ -348,6 +417,7 @@ impl Diagnostics {
             previous_log_location: PathBuf::new(),
             previous_log_location_display: String::new(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            update_apply: None,
             token_fingerprint: None,
         }
     }
@@ -372,6 +442,27 @@ impl Diagnostics {
     /// Mutable log for integration lifecycle entries.
     pub fn log_mut(&mut self) -> &mut DiagnosticLog {
         &mut self.log
+    }
+
+    /// The last command-line apply outcome. Shown only through fixed wording
+    /// with a validated version; anything else is dropped.
+    pub fn set_update_apply_outcome(&mut self, outcome: Option<String>) {
+        self.update_apply = outcome
+            .filter(|text| {
+                text.len() <= 96
+                    && text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b" .;-+".contains(&b))
+            })
+            .map(|text| sanitize_display(&text, 96));
+    }
+
+    /// Record one update outcome (REL-08, REL-09). Only fixed wording and
+    /// validated version numbers reach the log: never a path, user name,
+    /// token or transport detail.
+    pub fn record_update(&mut self, event: &crate::updates::UpdateEvent) {
+        let (level, message) = update_log_message(event);
+        self.log.record(level, sanitize_log_text(&message));
     }
 
     /// Log file location.
@@ -523,6 +614,7 @@ impl Diagnostics {
                 .map(|value| sanitize_display(&value, 128)),
             protocol_version: report.protocol_version,
             app_version: self.app_version.clone(),
+            update_apply: self.update_apply.clone(),
             last_revision: report.last_revision,
             last_heartbeat: report
                 .last_heartbeat
@@ -682,12 +774,6 @@ impl GrokDiagnosticsRow {
         pill: GrokDiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
     };
-    pub(crate) const REMOTE_PYTHON3_MISSING: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed(
-            "Remote Grok Build session-status hooks are unavailable: remote python3 is missing.",
-        ),
-    };
     pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
         pill: GrokDiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
@@ -769,6 +855,8 @@ pub struct DiagnosticsSnapshot {
     pub protocol_version: Option<u32>,
     /// App version.
     pub app_version: String,
+    /// The last command-line apply outcome, when one was recorded.
+    pub update_apply: Option<String>,
     /// Last accepted state revision.
     pub last_revision: Option<u64>,
     /// Age of the last heartbeat at snapshot time.
@@ -853,9 +941,6 @@ pub fn remote_grok_row(
         return RemoteGrokReport::from(GrokDiagnosticsRow::READY);
     }
     match install {
-        Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
-        }) => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING),
         Some(RemoteGrokInstallOutcome::Failed { .. }) => {
             RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_INSTALL_FAILED)
         }
@@ -872,7 +957,7 @@ pub enum RemoteGrokInstallOutcome {
     /// The official installer reported installed or already-current.
     Succeeded,
     /// The attempt failed; `reason` is the companion's bounded machine reason
-    /// when one was reported (for example `python3-missing`).
+    /// when one was reported (for example `install-failed`).
     Failed { reason: Option<&'static str> },
 }
 
@@ -1195,6 +1280,11 @@ impl DiagnosticsSnapshot {
             self.opencode_version.as_deref().unwrap_or("none"),
         );
         push_line(&mut text, "app version", &self.app_version);
+        push_line(
+            &mut text,
+            "last command-line apply",
+            self.update_apply.as_deref().unwrap_or("none"),
+        );
         push_line(
             &mut text,
             "last revision",

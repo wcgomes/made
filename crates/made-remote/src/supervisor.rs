@@ -511,7 +511,6 @@ pub struct Supervisor {
     integration: Option<Integration>,
     grok: GrokTracker,
     grok_detected: bool,
-    python3_detected: bool,
     lease: Lease,
     attachment: Option<Attachment>,
     attached_once: bool,
@@ -581,7 +580,6 @@ impl Supervisor {
             .parent()
             .map(|directory| directory.join("plugins/grok-made"));
         let environment = made_platform::Environment::current();
-        let python3_detected = grok::detect_on_path(&environment, "python3").is_some();
         let grok_tracker = GrokTracker::new(
             session.pid(),
             matches!(
@@ -594,7 +592,6 @@ impl Supervisor {
             grok::GrokSources {
                 files: grok::GrokFiles::from_environment(&environment),
                 staged,
-                python3: python3_detected,
             },
         );
         let grok_detected = grok::detect_on_path(&environment, "grok").is_some();
@@ -607,7 +604,6 @@ impl Supervisor {
             integration,
             grok: grok_tracker,
             grok_detected,
-            python3_detected,
             lease: Lease::new(Instant::now()),
             attachment: None,
             attached_once: false,
@@ -855,7 +851,7 @@ impl Supervisor {
                     helper_version: env!("CARGO_PKG_VERSION").into(),
                     // Honest runtime detection. tmux stays false on the wire.
                     grok: self.grok_detected,
-                    python3: self.python3_detected,
+                    python3: false,
                 },
             },
             Heartbeat => {

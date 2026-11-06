@@ -1,9 +1,10 @@
 //! Companion Grok ingestion and the consented installer (SSH-10, tasks
 //! 2.38/2.40). Every fixture is a temp directory or a fake process chain; no
 //! live grok install, no server execution, no Grok-home writes.
-use made_remote::grok::{
-    self, GrokFiles, GrokSources, GrokTracker, InstallInputs, InstallOutcome, INVENTORY_CADENCE,
-};
+use made_remote::grok::{self, GrokFiles, GrokSources, GrokTracker, INVENTORY_CADENCE};
+// POSIX-only: used by the installer tests that drive a /bin/sh fake grok.
+#[cfg(unix)]
+use made_remote::grok::{InstallInputs, InstallOutcome};
 use made_remote::protocol::{
     GrokActivity, GrokEventKind, GrokSessionEvent, GrokSessionSnapshot, Operation,
 };
@@ -90,24 +91,12 @@ fn tracker(
     grok_target: bool,
     parent_of: impl FnMut(u32) -> Option<u32> + Send + 'static,
 ) -> GrokTracker {
-    tracker_with_python3(home, staged, child, grok_target, true, parent_of)
-}
-
-fn tracker_with_python3(
-    home: Option<PathBuf>,
-    staged: Option<PathBuf>,
-    child: Option<u32>,
-    grok_target: bool,
-    python3: bool,
-    parent_of: impl FnMut(u32) -> Option<u32> + Send + 'static,
-) -> GrokTracker {
     GrokTracker::with_parent(
         child,
         grok_target,
         GrokSources {
             files: home.map(|home| GrokFiles { home }),
             staged,
-            python3,
         },
         Box::new(parent_of),
     )
@@ -276,7 +265,6 @@ fn a_live_descendant_counts_and_a_dead_one_does_not_with_real_processes() {
         GrokSources {
             files: Some(GrokFiles { home: home.clone() }),
             staged: None,
-            python3: true,
         },
     );
     let mut clock = Clock::start();
@@ -894,95 +882,56 @@ fn self_installed_newer_plugin_reports_ready_before_any_session_or_hook() {
 }
 
 #[test]
-fn self_installed_plugin_needs_remote_python3_before_hooks_are_ready() {
+fn equal_or_newer_install_makes_hooks_ready_regardless_of_python3() {
     let root = tempfile::tempdir().unwrap();
     let home = grok_home(root.path());
     inventory(&home, &format!("[{}]", owned_row(10, "s1", "/one", "t")));
     let staged = root.path().join("staged/grok-made");
     write_manifest(&staged, "0.1.0");
-    // Equal or newer self-installed copies still cannot run the Python hook.
+    // The native hook needs no interpreter: an equal or newer installed copy
+    // is ready whatever the server's PATH holds, and nothing consults python3.
     let log = home.join("made-grok-status.jsonl");
-    append(
-        &log,
-        &pid_hook_line("s1", 10, "/one", "UserPromptSubmit", "working"),
-    );
 
     for installed in ["0.1.0", "0.2.0"] {
         write_manifest(&home.join("installed-plugins/grok-made"), installed);
-        let mut missing = tracker_with_python3(
+        let mut ready = tracker(
             Some(home.clone()),
             Some(staged.clone()),
             Some(10),
             true,
-            false,
-            Box::new(parent_chain(vec![])),
+            parent_chain(vec![]),
         );
-        let operations = missing.tick(Clock::start().now(), true);
+        let mut clock = Clock::start();
+        let _ = ready.tick(clock.now(), true);
         assert!(
-            events(&operations).is_empty(),
-            "without remote python3 the hook log is never ingested"
+            snap(&ready.state()).hooks_ready,
+            "a {installed} install must be ready without any interpreter"
         );
-        let snapshot = snapshot_of(&operations).expect("the initial snapshot is pushed");
+        append(
+            &log,
+            &pid_hook_line("s1", 10, "/one", "UserPromptSubmit", "working"),
+        );
+        let operations = ready.tick(clock.step(INVENTORY_CADENCE), true);
         assert!(
-            !snapshot.hooks_ready,
-            "a self-installed {installed} plugin must not bypass the python3 prerequisite"
+            !events(&operations).is_empty(),
+            "owned hook lines are ingested once hooks are ready"
         );
-        assert_eq!(
-            session_ids(&snapshot),
-            vec!["s1"],
-            "inventory still works while python3 is missing"
-        );
-        assert_eq!(
-            snapshot.sessions[0].activity,
-            GrokActivity::Idle,
-            "no hook activity is applied without the prerequisite"
-        );
-        assert!(!snap(&missing.state()).hooks_ready);
+        let snapshot = snap(&ready.state());
+        assert_eq!(snapshot.sessions[0].activity, GrokActivity::Working);
+        let _ = std::fs::remove_file(&log);
     }
 
-    let mut present = tracker_with_python3(
+    write_manifest(&home.join("installed-plugins/grok-made"), "0.0.9");
+    let mut older = tracker(
         Some(home),
         Some(staged),
         Some(10),
         true,
-        true,
-        Box::new(parent_chain(vec![])),
+        parent_chain(vec![]),
     );
     assert!(
-        snap(&present.state()).hooks_ready,
-        "the same installed plugin reports ready when python3 is present"
-    );
-}
-
-#[test]
-fn python3_capability_detection_reports_absence_without_spawning() {
-    let root = tempfile::tempdir().unwrap();
-    let bin = root.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let executable = bin.join("python3");
-    std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    assert!(
-        grok::detect_on_path(
-            &made_platform::Environment::from_pairs([("PATH", bin.as_os_str().to_os_string())]),
-            "python3"
-        )
-        .is_some(),
-        "the capability input reports python3 when an absolute PATH entry has it"
-    );
-    let empty = root.path().join("empty");
-    std::fs::create_dir_all(&empty).unwrap();
-    assert!(
-        grok::detect_on_path(
-            &made_platform::Environment::from_pairs([("PATH", empty.as_os_str().to_os_string())]),
-            "python3"
-        )
-        .is_none(),
-        "the capability input reports python3-missing without spawning or version-checking"
+        !snap(&older.state()).hooks_ready,
+        "an older install is still not ready"
     );
 }
 
@@ -1137,14 +1086,15 @@ fn staged_artifacts_list_the_complete_shipped_grok_made_package() {
             "plugins/grok-made/plugin.json",
             "plugins/grok-made/README.md",
             "plugins/grok-made/hooks/hooks.json",
-            "plugins/grok-made/hooks/status_test.py",
-            "plugins/grok-made/hooks/bin/status.py",
+            "plugins/grok-made/hooks/bin/made-grok-status",
         ][..],
         "the companion manifest must list the complete shipped grok-made \
          package, exactly the grok-made slice of the fixed platform/app list"
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
 fn grok_detection_is_metadata_only_over_absolute_path_entries() {
     let root = tempfile::tempdir().unwrap();
@@ -1199,12 +1149,16 @@ fn grok_state_requests_are_generation_exempt_like_session_state() {
 
 // --------------------------------------------------------------- installer
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 struct FakeGrok {
     grok: PathBuf,
     argv_log: PathBuf,
     env_log: PathBuf,
     data_dir: PathBuf,
 }
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 impl FakeGrok {
     /// A fake `grok` executable that records its argv and inherited
     /// `GROK_HOME`, then runs `body`. The fixture home path is baked into the
@@ -1245,6 +1199,8 @@ impl FakeGrok {
     }
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 /// The fake installer body: creates an installed grok-made copy at the
 /// fixture home, like the real plugin install would.
 fn installer_body(home: &Path) -> String {
@@ -1254,16 +1210,11 @@ fn installer_body(home: &Path) -> String {
     )
 }
 
-fn install_inputs(
-    fake: &FakeGrok,
-    home: &Path,
-    staged: &Path,
-    python3: bool,
-    budget: Duration,
-) -> InstallInputs {
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
+fn install_inputs(fake: &FakeGrok, home: &Path, staged: &Path, budget: Duration) -> InstallInputs {
     InstallInputs {
         grok: Some(fake.grok.clone()),
-        python3,
         files: Some(GrokFiles {
             home: home.to_path_buf(),
         }),
@@ -1273,12 +1224,40 @@ fn install_inputs(
     }
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 const INSTALL_BUDGET: Duration = Duration::from_secs(120);
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 fn installer_fake(root: &Path, home: &Path) -> FakeGrok {
     FakeGrok::new(root, &installer_body(home))
 }
 
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
+/// Run the installer, retrying while the freshly written fake script is still
+/// open for writing in a sibling test thread's forked child (ETXTBSY). A spawn
+/// that never ran leaves no argv entry, so a retry cannot double-count a run.
+fn install_retrying_busy(
+    fake: &FakeGrok,
+    home: &Path,
+    staged: &Path,
+    budget: Duration,
+) -> grok::InstallReport {
+    let mut report = grok::install_grok_plugin(install_inputs(fake, home, staged, budget));
+    for _ in 0..50 {
+        if report.reason != Some("install-failed") || !fake.argv().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        report = grok::install_grok_plugin(install_inputs(fake, home, staged, budget));
+    }
+    report
+}
+
+// POSIX-only: the fake grok is a /bin/sh script.
+#[cfg(unix)]
 fn read_manifest_version(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap();
     let marker = "\"version\":\"";
@@ -1286,24 +1265,27 @@ fn read_manifest_version(path: &Path) -> String {
     text[start..].split('"').next().unwrap().to_owned()
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
-fn install_requires_remote_python3_and_reports_the_declared_failure() {
+fn install_runs_without_any_interpreter_prerequisite() {
     let root = tempfile::tempdir().unwrap();
-    let fake = FakeGrok::new(root.path(), "true");
-    let home = grok_home(root.path());
     let staged = root.path().join("staged/grok-made");
     write_manifest(&staged, "0.1.0");
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, false, INSTALL_BUDGET));
-    assert_eq!(report.outcome, InstallOutcome::Failed);
-    assert_eq!(report.reason, Some("python3-missing"));
-    assert!(!report.new_sessions_only);
-    assert!(
-        fake.argv().is_empty(),
-        "a declared prerequisite failure must not run the installer"
+    let home = grok_home(root.path());
+    let fake = installer_fake(root.path(), &home);
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
+    assert_eq!(report.outcome, InstallOutcome::Installed);
+    assert_eq!(report.reason, None);
+    assert_eq!(
+        fake.argv(),
+        vec!["plugin", "install", staged.to_str().unwrap(), "--trust"],
+        "the official installer ran exactly once with no interpreter input"
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
 fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     let root = tempfile::tempdir().unwrap();
@@ -1313,8 +1295,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     let fake = installer_fake(root.path(), &home);
 
     // Missing: runs once and the installed copy appears.
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert!(report.new_sessions_only, "hooks apply only to new sessions");
     assert_eq!(
@@ -1325,8 +1306,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Equal: skipped, no second run.
     let ran_once = fake.argv().len();
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Skipped);
     assert_eq!(
         fake.argv().len(),
@@ -1336,8 +1316,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Newer installed copy: skipped and left in place.
     write_manifest(&home.join("installed-plugins/grok-made"), "9.9.9");
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Skipped);
     assert_eq!(
         fake.argv().len(),
@@ -1352,8 +1331,7 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
 
     // Older installed copy: exactly one more run.
     write_manifest(&home.join("installed-plugins/grok-made"), "0.0.1");
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(
         fake.argv().len(),
@@ -1362,6 +1340,8 @@ fn install_skips_equal_and_newer_and_installs_missing_or_older_exactly_once() {
     );
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
 fn install_never_edits_config_toml_or_redirects_grok_home() {
     let root = tempfile::tempdir().unwrap();
@@ -1375,8 +1355,7 @@ fn install_never_edits_config_toml_or_redirects_grok_home() {
     write_manifest(&staged, "0.1.0");
     let before_grok_home = std::env::var_os("GROK_HOME");
 
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     assert_eq!(report.outcome, InstallOutcome::Installed);
     assert_eq!(
         std::fs::read(&config).unwrap(),
@@ -1399,6 +1378,8 @@ fn install_never_edits_config_toml_or_redirects_grok_home() {
     }
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
 fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
     let root = tempfile::tempdir().unwrap();
@@ -1411,7 +1392,6 @@ fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
         &fake,
         &home,
         &staged,
-        true,
         Duration::from_millis(300),
     ));
     assert!(
@@ -1433,7 +1413,6 @@ fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
         &fake,
         &home,
         &staged,
-        true,
         Duration::from_millis(300),
     ));
     drop(_held);
@@ -1441,6 +1420,8 @@ fn install_is_bounded_when_the_command_hangs_and_when_the_lock_is_held() {
     assert_eq!(report.reason, Some("lock-timeout"));
 }
 
+// POSIX-only: drives a /bin/sh fake grok.
+#[cfg(unix)]
 #[test]
 fn install_reports_a_bounded_honest_line() {
     let root = tempfile::tempdir().unwrap();
@@ -1448,18 +1429,18 @@ fn install_reports_a_bounded_honest_line() {
     write_manifest(&staged, "0.1.0");
     let home = grok_home(root.path());
     let fake = installer_fake(root.path(), &home);
-    let report =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, true, INSTALL_BUDGET));
+    let report = install_retrying_busy(&fake, &home, &staged, INSTALL_BUDGET);
     let line = report.line();
     assert!(line.len() < 512, "the report line is bounded: {line}");
     let value: serde_json::Value = serde_json::from_str(&line).expect("one JSON line");
     assert_eq!(value["outcome"], "installed");
     assert_eq!(value["new_sessions_only"], true);
-    let failed =
-        grok::install_grok_plugin(install_inputs(&fake, &home, &staged, false, INSTALL_BUDGET));
+    let mut inputs = install_inputs(&fake, &home, &staged, INSTALL_BUDGET);
+    inputs.grok = None;
+    let failed = grok::install_grok_plugin(inputs);
     let value: serde_json::Value = serde_json::from_str(&failed.line()).expect("one JSON line");
     assert_eq!(value["outcome"], "failed");
-    assert_eq!(value["reason"], "python3-missing");
+    assert_eq!(value["reason"], "grok-missing");
 }
 
 #[test]

@@ -11,8 +11,8 @@
 //! There is no Grok-home write here, no host-style path canonicalization, and
 //! no other file access.
 //!
-//! The consented installer is a separate explicit mode: it requires remote
-//! python3, compares dotted numeric `plugin.json` versions, skips equal or
+//! The consented installer is a separate explicit mode: it needs no
+//! interpreter, compares dotted numeric `plugin.json` versions, skips equal or
 //! newer installs, and runs the official `grok plugin install <staged>
 //! --trust` exactly once per missing/older version under a private lock and a
 //! hard time bound. It never edits `config.toml` and never redirects
@@ -66,14 +66,13 @@ pub const INSTALL_BUDGET: Duration = Duration::from_secs(120);
 
 /// The complete shipped grok-made package the companion stages beside
 /// `plugins/opencode-made` — exactly the grok-made slice of the fixed
-/// platform/app staging list. The hook script is staged executable so the
-/// installed hook can run.
+/// platform/app staging list. The native hook executable is staged with the
+/// executable mode so the installed hook can run without any interpreter.
 pub const GROK_ARTIFACTS: &[&str] = &[
     "plugins/grok-made/plugin.json",
     "plugins/grok-made/README.md",
     "plugins/grok-made/hooks/hooks.json",
-    "plugins/grok-made/hooks/status_test.py",
-    "plugins/grok-made/hooks/bin/status.py",
+    "plugins/grok-made/hooks/bin/made-grok-status",
 ];
 
 /// The fixed Grok-home locations ingestion may touch. Nothing else under the
@@ -103,13 +102,11 @@ impl GrokFiles {
     }
 }
 
-/// Everything the tracker may read, resolved by the caller. `python3` is the
-/// supervisor's existing metadata-only PATH detection; the Python hook cannot
-/// run without it, so it gates readiness just like the installed version.
+/// Everything the tracker may read, resolved by the caller. The native hook
+/// needs no interpreter, so readiness depends only on the installed version.
 pub struct GrokSources {
     pub files: Option<GrokFiles>,
     pub staged: Option<PathBuf>,
-    pub python3: bool,
 }
 
 pub type ParentOf = dyn FnMut(u32) -> Option<u32> + Send;
@@ -136,7 +133,6 @@ pub struct GrokTracker {
     grok_target: bool,
     files: Option<GrokFiles>,
     staged: Option<PathBuf>,
-    python3: bool,
     parent_of: Box<ParentOf>,
     revision: u64,
     /// Last pushed (revision, running, hooks ready, sessions); `None` after re-attach.
@@ -171,17 +167,12 @@ impl GrokTracker {
         sources: GrokSources,
         parent_of: Box<ParentOf>,
     ) -> Self {
-        let GrokSources {
-            files,
-            staged,
-            python3,
-        } = sources;
+        let GrokSources { files, staged } = sources;
         Self {
             child,
             grok_target,
             files,
             staged,
-            python3,
             parent_of,
             revision: 0,
             pushed: None,
@@ -280,13 +271,10 @@ impl GrokTracker {
         self.hooks_ready = ready;
     }
 
-    /// Hook tier two requires remote python3 and an installed grok-made copy at
-    /// least the shipped staged version. Nothing is spawned and nothing is
-    /// installed.
+    /// Hook tier two requires an installed grok-made copy at least the shipped
+    /// staged version; no interpreter is involved. Nothing is spawned and
+    /// nothing is installed.
     fn compute_hooks_ready(&self) -> bool {
-        if !self.python3 {
-            return false;
-        }
         let Some(staged) = &self.staged else {
             return false;
         };
@@ -895,7 +883,6 @@ fn cmp_dotted(left: &[u64], right: &[u64]) -> Ordering {
 /// caller; the function never reads the process environment.
 pub struct InstallInputs {
     pub grok: Option<PathBuf>,
-    pub python3: bool,
     pub files: Option<GrokFiles>,
     pub staged: Option<PathBuf>,
     pub data_dir: Option<PathBuf>,
@@ -943,17 +930,11 @@ fn failed(reason: &'static str) -> InstallReport {
 pub fn install_grok_plugin(inputs: InstallInputs) -> InstallReport {
     let InstallInputs {
         grok,
-        python3,
         files,
         staged,
         data_dir,
         budget,
     } = inputs;
-    // The shipped hook needs remote python3; its absence is a declared honest
-    // failure, not a fallback to hand-editing configuration.
-    if !python3 {
-        return failed("python3-missing");
-    }
     let (Some(grok), Some(files), Some(data_dir)) = (grok, files, data_dir) else {
         return failed("grok-missing");
     };

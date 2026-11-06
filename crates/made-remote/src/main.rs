@@ -86,11 +86,11 @@ fn capabilities() -> io::Result<Capabilities> {
     let opencode = find("opencode").is_ok_and(|path| {
         made_platform::remote_program_version_supported(&path, "opencode").unwrap_or(false)
     });
-    // Grok and python3 are metadata-only PATH detections: no spawn, no version
-    // check, no plugin install from here (SSH-09/SSH-10).
+    // Grok is a metadata-only PATH detection: no spawn, no version check, no
+    // plugin install from here (SSH-09/SSH-10). No interpreter is detected; the
+    // frozen `Capabilities.python3` field is always encoded false.
     let environment = Environment::current();
     let grok = grok::detect_on_path(&environment, "grok").is_some();
-    let python3 = grok::detect_on_path(&environment, "python3").is_some();
     Ok(Capabilities {
         target,
         tmux: false,
@@ -98,7 +98,7 @@ fn capabilities() -> io::Result<Capabilities> {
         shell_cwd: false,
         helper_version: env!("CARGO_PKG_VERSION").into(),
         grok,
-        python3,
+        python3: false,
     })
 }
 fn run() -> io::Result<()> {
@@ -330,7 +330,6 @@ fn install_mode() -> io::Result<()> {
     });
     let report = grok::install_grok_plugin(grok::InstallInputs {
         grok: grok::detect_on_path(&environment, "grok"),
-        python3: grok::detect_on_path(&environment, "python3").is_some(),
         files: GrokFiles::from_environment(&environment),
         staged,
         data_dir: paths().ok().map(|paths| paths.data_dir),
@@ -397,7 +396,7 @@ fn recovery_required() -> io::Error {
 }
 
 fn executable_artifact(name: &str) -> bool {
-    name == "made-remote" || name == "plugins/grok-made/hooks/bin/status.py"
+    name == "made-remote" || name == "plugins/grok-made/hooks/bin/made-grok-status"
 }
 
 /// One already-written staging artifact must match size, hash and mode.
@@ -806,8 +805,7 @@ mod tests {
                 "plugins/grok-made/plugin.json",
                 "plugins/grok-made/README.md",
                 "plugins/grok-made/hooks/hooks.json",
-                "plugins/grok-made/hooks/status_test.py",
-                "plugins/grok-made/hooks/bin/status.py",
+                "plugins/grok-made/hooks/bin/made-grok-status",
             ],
             "the legacy --stage manifest must accept exactly the fixed \
              platform/app staging list"

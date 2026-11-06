@@ -162,6 +162,10 @@ pub const WORDMARK: &str = "MADE";
 pub const WORDMARK_TOOLTIP: &str = "Minimal Agentic Development Environment";
 /// Tooltip and accessibility name of the header MADE wordmark trigger.
 pub const WORDMARK_ABOUT_TOOLTIP: &str = "About";
+/// Tooltip and accessibility name of the wordmark while an update is ready.
+pub const WORDMARK_ABOUT_UPDATE_TOOLTIP: &str = "About, update ready";
+/// Radius of the wordmark's update-ready accent dot.
+pub const UPDATE_DOT_RADIUS: f32 = 2.5;
 /// Wordmark font size.
 pub const WORDMARK_SIZE: f32 = 14.0;
 /// Wordmark tracking in points.
@@ -314,7 +318,16 @@ pub fn wordmark_brand(ui: &mut Ui) -> egui::Rect {
 /// actions' minimum square target, exposes [`WORDMARK_ABOUT_TOOLTIP`] as both
 /// its tooltip and accessibility name, and reports pointer or Enter/Space
 /// activation. The caller gates the toggle on an active workspace.
-pub fn wordmark_about_action(ui: &mut Ui, height: f32, gap: Color32) -> ActionResponse {
+///
+/// With `update_ready`, one app-drawn accent dot is painted inside the
+/// target's top-right corner and the name becomes
+/// [`WORDMARK_ABOUT_UPDATE_TOOLTIP`]; the target size is unchanged.
+pub fn wordmark_about_action(
+    ui: &mut Ui,
+    height: f32,
+    gap: Color32,
+    update_ready: bool,
+) -> ActionResponse {
     let galley = wordmark_galley(ui);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(galley.size().x.max(24.0), icon_action_extent(height)),
@@ -325,7 +338,16 @@ pub fn wordmark_about_action(ui: &mut Ui, height: f32, gap: Color32) -> ActionRe
         rect.center().x - galley.size().x / 2.0,
         rect.center().y - galley.size().y * 0.5,
     );
+    let galley_width = galley.size().x;
     ui.painter().galley(origin, galley, TEXT_PRIMARY);
+    if update_ready {
+        let center = egui::pos2(
+            (origin.x + galley_width + UPDATE_DOT_RADIUS).min(rect.right() - UPDATE_DOT_RADIUS),
+            (origin.y + UPDATE_DOT_RADIUS).max(rect.top() + UPDATE_DOT_RADIUS),
+        );
+        ui.painter()
+            .circle_filled(center, UPDATE_DOT_RADIUS, ACCENT);
+    }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -337,10 +359,13 @@ pub fn wordmark_about_action(ui: &mut Ui, height: f32, gap: Color32) -> ActionRe
             input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
         });
     let activated = response.clicked() || keyboard;
-    response = response.on_hover_text(WORDMARK_ABOUT_TOOLTIP);
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::Role::Button, true, WORDMARK_ABOUT_TOOLTIP)
-    });
+    let name = if update_ready {
+        WORDMARK_ABOUT_UPDATE_TOOLTIP
+    } else {
+        WORDMARK_ABOUT_TOOLTIP
+    };
+    response = response.on_hover_text(name);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
     ActionResponse {
         response,
         activated,
@@ -1484,6 +1509,77 @@ pub fn primary_action(
         gap,
         enabled,
     )
+}
+
+/// A labeled on/off toggle with an app-drawn check box, a visible focus ring,
+/// pointer and Enter/Space activation, and a checkbox accessibility role.
+pub fn toggle_action(
+    ui: &mut Ui,
+    id: egui::Id,
+    label: &str,
+    on: bool,
+    height: f32,
+    gap: Color32,
+) -> ActionResponse {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(BODY_SIZE),
+        TEXT_SECONDARY,
+    );
+    let box_size = 12.0;
+    let target_height = height.max(24.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(box_size + 8.0 + galley.size().x + 8.0, target_height),
+        egui::Sense::hover(),
+    );
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let check = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 4.0 + box_size / 2.0, rect.center().y),
+        egui::vec2(box_size, box_size),
+    );
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(check, CornerRadius::same(3), ACCENT);
+        painter.line_segment(
+            [
+                egui::pos2(check.left() + 2.5, check.center().y),
+                egui::pos2(check.left() + 5.0, check.bottom() - 3.0),
+            ],
+            Stroke::new(1.5, ACCENT_TEXT),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(check.left() + 5.0, check.bottom() - 3.0),
+                egui::pos2(check.right() - 2.5, check.top() + 3.0),
+            ],
+            Stroke::new(1.5, ACCENT_TEXT),
+        );
+    } else {
+        painter.rect_stroke(
+            check,
+            CornerRadius::same(3),
+            Stroke::new(1.0, BORDER_CONTROL),
+            egui::StrokeKind::Inside,
+        );
+    }
+    painter.galley(
+        egui::pos2(check.right() + 8.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        TEXT_SECONDARY,
+    );
+    if response.has_focus() {
+        paint_focus_ring(ui, rect, CornerRadius::same(6), gap);
+    }
+    let keyboard = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let activated = response.clicked() || keyboard;
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, label));
+    ActionResponse {
+        response,
+        activated,
+    }
 }
 
 /// Secondary action with a caller-supplied stable widget id.

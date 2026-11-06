@@ -1037,23 +1037,29 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
         row.sentence
     );
 
-    // Missing remote python3 is a declared honest failure reason.
-    let row = remote_grok_row(
-        false,
-        true,
+    // No remote Grok state mentions python3: a reason the companion no longer
+    // reports degrades to the generic failed install row, and every state
+    // names no interpreter.
+    for install in [
         None,
-        true,
+        Some(RemoteGrokInstallOutcome::Running),
+        Some(RemoteGrokInstallOutcome::Succeeded),
+        Some(RemoteGrokInstallOutcome::Failed { reason: None }),
         Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
+            reason: Some("install-failed"),
         }),
-        true,
-        true,
-    );
-    assert!(
-        row.sentence.contains("remote python3 is missing"),
-        "{}",
-        row.sentence
-    );
+    ] {
+        for consented in [false, true] {
+            for (detected, running) in [(false, false), (true, false), (true, true)] {
+                let row = remote_grok_row(false, detected, None, consented, install, running, true);
+                assert!(
+                    !row.sentence.to_lowercase().contains("python"),
+                    "{install:?}: {}",
+                    row.sentence
+                );
+            }
+        }
+    }
 
     // A successful install is ready while a session is open; it stays ready
     // even after a withdrawal, because Made never uninstalls.
@@ -1101,7 +1107,7 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         None,
         true,
         Some(RemoteGrokInstallOutcome::Failed {
-            reason: Some("python3-missing"),
+            reason: Some("install-failed"),
         }),
         true,
         true,
@@ -1115,8 +1121,8 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         "the copied report must include the Grok pill: {text}"
     );
     assert!(
-        text.contains("remote python3 is missing"),
-        "the copied report must include the honest reason: {text}"
+        text.contains("the plugin install failed") && !text.contains("python3"),
+        "the copied report must include the honest reason and no interpreter: {text}"
     );
     assert!(
         !text.contains("Grok Build is not on PATH"),
@@ -1194,4 +1200,98 @@ fn remote_grok_failure_names_the_actual_failure_not_generic_transport() {
         !text.contains("SSH transport is disconnected"),
         "the copy must not replace the stage failure with transport: {text}"
     );
+}
+
+#[test]
+fn update_outcomes_reach_the_bounded_redacted_log() {
+    use made_app::updates::UpdateEvent;
+    let mut diagnostics = Diagnostics::new("/home/alice/.local/state/made/log/integration.log");
+    let events = [
+        UpdateEvent::KeptFound("0.3.0".into()),
+        UpdateEvent::CheckStarted { manual: false },
+        UpdateEvent::CheckStarted { manual: true },
+        UpdateEvent::UpToDate,
+        UpdateEvent::Available("0.3.0".into()),
+        UpdateEvent::CheckFailed,
+        UpdateEvent::Ready("0.3.0".into()),
+        UpdateEvent::DownloadFailed("0.3.0".into()),
+        UpdateEvent::VerificationFailed("0.3.0".into()),
+        UpdateEvent::Busy,
+        UpdateEvent::RestartRequested("0.3.0".into()),
+        UpdateEvent::RestartFailed("0.3.0".into()),
+        // A version string carrying a path, user name or token never reaches the log.
+        UpdateEvent::Available(format!("/home/alice/{}", "0123456789abcdef".repeat(4))),
+    ];
+    for event in &events {
+        diagnostics.record_update(event);
+    }
+    let text: Vec<String> = diagnostics
+        .log()
+        .entries()
+        .map(|entry| entry.message.clone())
+        .collect();
+    assert_eq!(text.len(), events.len());
+    for expected in [
+        "update: kept verified update 0.3.0 found",
+        "update: automatic check started",
+        "update: manual check started",
+        "update: up to date",
+        "update: check failed: the update service could not be reached",
+        "update: version 0.3.0 downloaded and verified",
+        "update: download of version 0.3.0 failed",
+        "update: version 0.3.0 failed verification and was discarded",
+        "update: restart into version 0.3.0 confirmed",
+        "update: version unknown available, downloading",
+    ] {
+        assert!(
+            text.iter().any(|line| line == expected),
+            "missing {expected:?} in {text:?}"
+        );
+    }
+    for line in &text {
+        assert!(
+            !line.contains("alice") && !line.contains('/') && !line.contains("0123456789abcdef"),
+            "{line}"
+        );
+    }
+    for _ in 0..(MAX_LOG_ENTRIES + 50) {
+        diagnostics.record_update(&UpdateEvent::CheckFailed);
+    }
+    assert!(
+        diagnostics.log().len() <= MAX_LOG_ENTRIES,
+        "the log stays bounded"
+    );
+}
+
+#[test]
+fn the_last_command_line_apply_is_reported_redacted() {
+    let mut diagnostics = Diagnostics::new("/home/alice/.local/state/made/log/integration.log");
+    let integration = IntegrationState::new(
+        Some(PathBuf::from("/workspace")),
+        PathBuf::from("/workspace"),
+    );
+    let text = diagnostics
+        .snapshot(&integration, None, None, None)
+        .to_text();
+    assert!(text.contains("last command-line apply: none"), "{text}");
+    diagnostics.set_update_apply_outcome(Some("installed Made 0.3.0".to_owned()));
+    let view = diagnostics.snapshot(&integration, None, None, None);
+    assert_eq!(view.update_apply.as_deref(), Some("installed Made 0.3.0"));
+    assert!(view
+        .to_text()
+        .contains("last command-line apply: installed Made 0.3.0"));
+    for hostile in [
+        "installed Made /home/alice/0.3.0".to_owned(),
+        format!("installed {}", "0123456789abcdef".repeat(8)),
+        "installed Made 0.3.0\nforged: line".to_owned(),
+    ] {
+        diagnostics.set_update_apply_outcome(Some(hostile.clone()));
+        let text = diagnostics
+            .snapshot(&integration, None, None, None)
+            .to_text();
+        assert!(
+            text.contains("last command-line apply: none"),
+            "{hostile:?} must be dropped: {text}"
+        );
+    }
 }

@@ -808,6 +808,17 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(5));
     }
+    // A loaded host can start a shell or tick a tab later than the fixed
+    // window above; wait on the condition, bounded, before asserting it.
+    let settled = Instant::now() + Duration::from_secs(10);
+    while ids.iter().any(|id| {
+        let workbench = model.workspace(*id).unwrap();
+        !workbench.terminal().unwrap().is_running() || workbench.tick_count() <= 1
+    }) && Instant::now() < settled
+    {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
     for id in &ids {
         let workbench = model.workspace(*id).unwrap();
         assert!(workbench.terminal().unwrap().is_running());
@@ -868,6 +879,21 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         open(&mut model, &root);
     }
     let ids: Vec<_> = model.workspace_ids().collect();
+    let ctx = egui::Context::default();
+    // Bounded wait until every shell has drawn its first output (its prompt),
+    // so the commands below are typed into a started shell on slow runners.
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < ready_deadline
+        && !ids.iter().all(|id| {
+            model
+                .workspace(*id)
+                .and_then(|workspace| workspace.terminal())
+                .is_some_and(|terminal| terminal.output_bytes() > 0)
+        })
+    {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     for id in &ids {
         type_command(
             model.workspace_mut(*id).unwrap(),
@@ -878,7 +904,6 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         model.workspace_mut(ids[0]).unwrap(),
         &format!("cd '{}'", target.display()),
     );
-    let ctx = egui::Context::default();
     // Hosted macOS arm64 runners can take longer to drain the 2000-line shell
     // command. The assertion still requires every hidden tab to produce the
     // output; only the observation window grows.
@@ -2905,6 +2930,8 @@ sleep 30\n",
         made_platform::PLUGIN_DIR_ENV,
         plugins.package("opencode-made"),
     );
+    // The shipped grok-made package is the staged copy beside the install root.
+    support::stage_shipped_grok_plugin();
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -3098,7 +3125,7 @@ fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let no_grok_capabilities = Capabilities {
         grok: false,
@@ -3222,7 +3249,7 @@ fn grok_install_consent_is_explicit_bounded_and_withdrawable() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let id = model
@@ -3358,7 +3385,7 @@ fn grok_install_approval_is_gated_until_the_companion_is_provisioned() {
                 shell_cwd: false,
                 helper_version: "probe".to_owned(),
                 grok: true,
-                python3: true,
+                python3: false,
             }),
         )
         .expect("probe result records");
@@ -3406,7 +3433,7 @@ fn grok_install_attempts_stay_independent_across_servers() {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: true,
-        python3: true,
+        python3: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let server_a = model

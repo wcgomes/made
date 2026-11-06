@@ -4,6 +4,7 @@ members = [
     "crates/made-app",
     "crates/made-bridge",
     "crates/made-explorer",
+    "crates/made-grok-hook",
     "crates/made-platform",
     "crates/made-remote",
     "crates/made-terminal",
@@ -12,4 +13,5 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false

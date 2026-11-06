@@ -25,6 +25,30 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **About and diagnostics** — open About from the MADE wordmark for the app identity and version, then reveal workspace, cwd capability, effective root, integration state, logs, and metrics on demand without routine status chrome.
 - **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Mica may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
 
+## Install
+
+Download Made from the [latest GitHub Release](https://github.com/wcgomes/made/releases/latest). Nothing else needs to be installed first; OpenCode, Grok Build, OpenSSH and git stay optional. Made installs for your user account only and never needs administrator rights.
+
+| System | Download |
+|---|---|
+| Windows 10 (1809 or later) and Windows 11, x64 | `made-<version>-windows-x64-setup.exe` |
+| macOS 12 or later, Apple silicon / Intel | `made-<version>-macos-arm64.pkg` / `made-<version>-macos-x64.pkg` (installer), or the `.zip` portable app |
+| Linux x64 with glibc 2.35 or later (Ubuntu 22.04, Ubuntu 24.04, current Fedora) | `made-<version>-linux-x64.AppImage` |
+
+Releases are not signed, so Windows SmartScreen and macOS Gatekeeper warn on first run. Open Made anyway for this app only, never by turning a protection off for the whole computer. The same warning can appear again after Made updates itself; the same steps apply.
+
+- **Windows:** run the setup; at "Windows protected your PC" choose **More info**, then **Run anyway**. Made installs for your user, appears in the Start menu, and is removed from **Settings › Apps › Installed apps**.
+- **macOS:** open the `.pkg` and choose **Install for me only**, or move the app from the `.zip` to the Applications folder in your home folder. On first open with macOS 15 or later, choose **Done**, then **System Settings › Privacy & Security › Open Anyway**, confirm **Open Anyway** and enter your login password. On macOS 12 to 14, Control-click Made, choose **Open**, then **Open**. The `.pkg` itself may need the same steps.
+- **Linux:** mark the AppImage executable (file **Properties › Permissions**, or `chmod +x made-<version>-linux-x64.AppImage`) and double-click it. No FUSE package is needed.
+
+### Updates
+
+Made checks GitHub Releases at launch and once a day, downloads a newer release in the background and verifies it, then shows a small dot on the MADE wordmark. Open **About** and choose **Restart to update** when convenient; restarting closes every open workspace. To stop automatic checks, turn off **Check for updates automatically** in About; **Check for updates** still checks once when you ask. Builds run from source (`cargo run`) or development artifacts never update themselves. Because macOS builds are only ad-hoc signed, macOS may ask again for privacy permissions you granted Made (for example Files and Folders access) after an update; grant them again the same way.
+
+Each release lists the SHA-256 of every file in `SHA256SUMS`. A matching digest shows a download is not corrupted; it does not prove who published it.
+
+Maintainers: the bump-and-release procedure is in [`wiki/operations/release-ci.md`](wiki/operations/release-ci.md).
+
 ## Quick start
 
 ### Prerequisites
@@ -127,7 +151,7 @@ Made is an **initial UX validation build**, not a production-ready release.
 
 Automated tests and smoke checks pass in CI across the supported targets, and development artifacts are produced. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, and launching the packaged artifacts. Native macOS vibrancy and Windows 11 Mica have not been validated interactively.
 
-The file preview is read-only: no editing, saving, LSP, or diff view. Builds are unsigned; there are no installers, signing, notarization, or auto-update channels.
+The file preview is read-only: no editing, saving, LSP, or diff view. Releases are installable and update themselves, but they are not signed or notarized.
 
 ## Supported targets
 

@@ -74,6 +74,7 @@ fn diagnostics_snapshot_and_copy_path_are_sanitized() {
         opencode_version: Some("2.1.4\u{202e}".to_owned()),
         protocol_version: Some(1),
         app_version: "0.1.0".to_owned(),
+        update_apply: None,
         last_revision: Some(3),
         last_heartbeat: Some(Duration::from_millis(10)),
         tabs_enabled: true,

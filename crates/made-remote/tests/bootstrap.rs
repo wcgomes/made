@@ -45,7 +45,7 @@ mod legacy_stage {
         process::{Command, Output, Stdio},
     };
 
-    pub const ARTIFACTS: [&str; 11] = [
+    pub const ARTIFACTS: [&str; 10] = [
         "made-remote",
         "plugins/opencode-made/package.json",
         "plugins/opencode-made/tui.ts",
@@ -55,8 +55,7 @@ mod legacy_stage {
         "plugins/grok-made/plugin.json",
         "plugins/grok-made/README.md",
         "plugins/grok-made/hooks/hooks.json",
-        "plugins/grok-made/hooks/status_test.py",
-        "plugins/grok-made/hooks/bin/status.py",
+        "plugins/grok-made/hooks/bin/made-grok-status",
     ];
     pub const UPDATE_REQUIRED: &str = "MADE-STAGE-UPDATE-REQUIRED";
 
@@ -371,7 +370,7 @@ fn legacy_approved_update_swaps_cleans_keeps_the_old_process_and_future_paths() 
         0o700
     );
     assert_eq!(
-        fs::metadata(destination.join("plugins/grok-made/hooks/bin/status.py"))
+        fs::metadata(destination.join("plugins/grok-made/hooks/bin/made-grok-status"))
             .unwrap()
             .permissions()
             .mode()

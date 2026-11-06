@@ -380,14 +380,19 @@ fn reset_discards_late_correlated_replies_but_keeps_attach_snapshot() {
             None,
         )
         .unwrap();
-    fake.lock().unwrap().received.push_back(SshEvent::Data(
-        encode(&WireEnvelope::new(
-            client.identity(),
-            attach_id,
-            Operation::Attached,
-        ))
-        .unwrap(),
-    ));
+    // Encode before taking the fake stream's lock: `client.identity()` takes
+    // the client state lock, which the I/O worker holds while it polls this
+    // stream, so the opposite order deadlocks.
+    let attached_frame = encode(&WireEnvelope::new(
+        client.identity(),
+        attach_id,
+        Operation::Attached,
+    ))
+    .unwrap();
+    fake.lock()
+        .unwrap()
+        .received
+        .push_back(SshEvent::Data(attached_frame));
     let mut attached = false;
     wait(|| {
         while let Some(reply) = client.poll_reply() {

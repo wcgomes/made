@@ -1,0 +1,344 @@
+name: Release
+
+# Tag-triggered release (REL-01). A pushed `v<version>` tag is gated, built
+# with the release profile for all four targets, packed with Velopack,
+# installed and smoke-tested per target, then published to one GitHub Release
+# only after every target passed, and finally upgrade-checked from the previous
+# published release. Nothing here runs for branch pushes or pull requests.
+#
+# Release jobs restore no build cache and pin every third-party action to a
+# commit. Only the publish job can write, and it runs in the protected
+# `release` environment (maintainer approval; see wiki/operations/release-ci.md).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  VPK_VERSION: "1.2.161"
+  # FUSE-less AppImage runtime (probe 1.4, fallback A), pinned by digest.
+  URUNTIME_URL: https://github.com/VHSgunzo/uruntime/releases/download/v0.8.1/uruntime-appimage-squashfs-x86_64
+  URUNTIME_SHA256: 2153e68d63f570c7ebe3d1f38df0fa16814f34d839c5cce2ee42667e327708e8
+
+jobs:
+  gate:
+    name: Version gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse the tag before anything is built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+
+  companions:
+    name: SSH companions
+    needs: gate
+    uses: ./.github/workflows/ci-ssh-remote.yml
+    with:
+      release: true
+
+  build:
+    name: Build and pack (${{ matrix.channel }})
+    needs: [gate, companions]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            channel: win-x64
+            exe: ".exe"
+          - os: macos-15
+            target: aarch64-apple-darwin
+            channel: osx-arm64
+            exe: ""
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            channel: osx-x64
+            exe: ""
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            channel: linux-x64
+            exe: ""
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      TARGET: ${{ matrix.target }}
+      CHANNEL: ${{ matrix.channel }}
+      EXE: ${{ matrix.exe }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libegl1-mesa-dev \
+            libgl1-mesa-dev libvulkan-dev squashfs-tools binutils
+
+      - name: Install .NET for vpk
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install vpk
+        shell: bash
+        run: |
+          dotnet tool install -g vpk --version "$VPK_VERSION"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Read the release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          echo "PY=$py" >> "$GITHUB_ENV"
+          version="$("$py" -c 'import importlib.util, pathlib; s = importlib.util.spec_from_file_location("c", ".github/scripts/check-versions.py"); m = importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.workspace_version(pathlib.Path(".")))')"
+          test "v$version" = "$GITHUB_REF_NAME"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build the release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p made-app --target "$TARGET"
+          cargo build --release --locked -p made-grok-hook --target "$TARGET"
+          PROFILE=release bash .github/scripts/stage-askpass.sh
+
+      - name: Check the Linux baseline (glibc 2.35, NEEDED allowlist)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bins=("target/$TARGET/release/made-app" "target/$TARGET/release/made-grok-status" "dist/ssh-askpass-$TARGET/made-askpass")
+          for bin in "${bins[@]}"; do bash .github/scripts/check-glibc-max.sh "$bin" 2.35; done
+          "$PY" .github/scripts/check-linux-deps.py "${bins[@]}"
+
+      - name: Check the macOS minimum OS (12.0)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          "$PY" .github/scripts/check-macos-minos.py "target/$TARGET/release/made-app" \
+            "target/$TARGET/release/made-grok-status" "dist/ssh-askpass-$TARGET/made-askpass"
+
+      - name: Check the Windows imports (static CRT)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -Last 1).FullName
+          New-Item -ItemType Directory -Force -Path dist\imports | Out-Null
+          $bins = @("target\$env:TARGET\release\made-app.exe", "target\$env:TARGET\release\made-grok-status.exe", "dist\ssh-askpass-$env:TARGET\made-askpass.exe")
+          $outputs = @()
+          foreach ($bin in $bins) {
+            $out = "dist\imports\$([IO.Path]::GetFileName($bin)).txt"
+            & $dumpbin /dependents $bin | Out-File -Encoding utf8 $out
+            $outputs += $out
+          }
+          & $env:PY .github/scripts/check-windows-imports.py --dumpbin @outputs
+          exit $LASTEXITCODE
+
+      - name: Stage the release tree
+        shell: bash
+        run: |
+          "$PY" .github/scripts/stage-desktop-package.py --profile release --target "$TARGET" \
+            --app "target/$TARGET/release/made-app$EXE" \
+            --hook "target/$TARGET/release/made-grok-status$EXE" \
+            --stage dist/stage
+
+      - name: Download the companions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: ssh-companion-*
+          path: companion-artifacts
+
+      - name: Assemble companions and askpass
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            mv "companion-artifacts/ssh-companion-$target" "companion-artifacts/$target"
+          done
+          "$PY" .github/scripts/assemble-desktop-package.py --stage dist/stage \
+            --companions companion-artifacts \
+            --askpass "dist/ssh-askpass-$TARGET/made-askpass$EXE" \
+            --askpass-manifest "dist/ssh-askpass-$TARGET/manifest.json" \
+            --desktop-target "$TARGET"
+
+      - name: Compose the macOS bundle
+        if: runner.os == 'macOS'
+        run: python3 .github/scripts/compose-macos-bundle.py --stage dist/stage --bundle dist/Made.app --version "$VERSION"
+
+      - name: Pack with Velopack
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(pack --packId Made --packVersion "$VERSION" --packTitle Made --packAuthors Made
+                --mainExe "made-app$EXE" --channel "$CHANNEL" --outputDir dist/vpk --delta None --yes)
+          case "$RUNNER_OS" in
+            macOS) args+=(--packDir dist/Made.app --signAppIdentity -) ;;
+            Windows) args+=(--packDir dist/stage --noPortable) ;;
+            Linux) args+=(--packDir dist/stage --categories Development) ;;
+          esac
+          vpk "${args[@]}"
+
+      - name: Replace the AppImage runtime with the FUSE-less runtime
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/uruntime" "$URUNTIME_URL"
+          echo "$URUNTIME_SHA256  $RUNNER_TEMP/uruntime" | sha256sum -c -
+          python3 .github/scripts/linux-appimage-runtime.py --out dist/vpk --channel "$CHANNEL" --runtime "$RUNNER_TEMP/uruntime" --version "$VERSION"
+
+      - name: Finish the release assets
+        shell: bash
+        run: '"$PY" .github/scripts/release-assets.py finish --out dist/vpk --version "$VERSION" --channel "$CHANNEL" --dest dist/release'
+
+      - name: Upload the target's release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.channel }}
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: Installed smoke (${{ matrix.channel }} ${{ matrix.form }} on ${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025, channel: win-x64, form: setup }
+          - { os: macos-15, channel: osx-arm64, form: pkg }
+          - { os: macos-15, channel: osx-arm64, form: zip }
+          - { os: macos-15-intel, channel: osx-x64, form: pkg }
+          - { os: macos-15-intel, channel: osx-x64, form: zip }
+          - { os: ubuntu-22.04, channel: linux-x64, form: appimage }
+          - { os: ubuntu-24.04, channel: linux-x64, form: appimage }
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the target's release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-${{ matrix.channel }}
+          path: assets
+
+      - name: Install the display stack for the Linux smoke
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb libxkbcommon-x11-0 libegl1 libgl1 \
+            libgl1-mesa-dri mesa-vulkan-drivers libvulkan1
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+
+      - name: Install per-user and smoke-test the installed layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" .github/scripts/smoke-installed.py --form "${{ matrix.form }}" --assets assets --version "${GITHUB_REF_NAME#v}"
+
+  publish:
+    name: Publish the release
+    needs: [gate, build, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    # One publish at a time across every tag, so the publish-time gate below
+    # cannot race another release becoming latest.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download every target's release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist/release
+          merge-multiple: true
+
+      - name: Write and check SHA256SUMS
+        run: |
+          python3 .github/scripts/release-assets.py sums --dir dist/release
+          python3 .github/scripts/release-assets.py check-sums --dir dist/release
+          ls -l dist/release
+
+      - name: Remove a stale draft left by a failed run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --delete-drafts
+
+      - name: Create the draft and upload every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sed "s/{{VERSION}}/$version/g" .github/release-notes.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Made $version" --notes-file "$RUNNER_TEMP/notes.md" dist/release/*
+
+      - name: Re-run the version gate immediately before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish as the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          id="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\" and .draft) | .id")"
+          test -n "$id"
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -F prerelease=false -f make_latest=true
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets \
+            --jq '{isDraft, isPrerelease, assets: (.assets | length)}'
+
+      - name: Confirm the published release is the newest and latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          test "$latest" = "$GITHUB_REF_NAME" || { echo "latest release is $latest, not $GITHUB_REF_NAME" >&2; exit 1; }
+          python3 .github/scripts/release-gate.py --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --check-newest
+
+  upgrade-check:
+    name: Post-publish upgrade check
+    needs: publish
+    permissions:
+      contents: read
+    uses: ./.github/workflows/upgrade-check.yml

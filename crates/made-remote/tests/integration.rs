@@ -1,13 +1,22 @@
 use made_bridge::{config_guard::ConfigSnapshot, security::Token};
 use made_remote::integration::{resolve_config, Integration};
-use made_remote::protocol::{ErrorCode, Operation};
-use serde_json::{json, Value};
+use made_remote::protocol::ErrorCode;
+use serde_json::Value;
 use std::{
     fs,
-    net::TcpStream,
     path::{Path, PathBuf},
+};
+// POSIX-only: these serve the bridge relay tests and helpers gated to Unix.
+#[cfg(unix)]
+use made_remote::protocol::Operation;
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
+use std::{
+    net::TcpStream,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
 use tungstenite::{client::IntoClientRequest, http::header, Error as WsError, Message, WebSocket};
 fn plugin_fixture(root: &Path, name: &str) -> PathBuf {
     let plugin = root.join(name);
@@ -27,6 +36,7 @@ fn user_config(root: &Path) -> PathBuf {
     config
 }
 
+#[cfg(unix)]
 fn session(id: &str, active: bool, directory: &str) -> Value {
     json!({
         "sessionID": id,
@@ -36,6 +46,7 @@ fn session(id: &str, active: bool, directory: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn state(revision: u64, active: Option<&str>, sessions: Vec<Value>) -> Value {
     json!({
         "type": "state",
@@ -46,10 +57,12 @@ fn state(revision: u64, active: Option<&str>, sessions: Vec<Value>) -> Value {
     })
 }
 
+#[cfg(unix)]
 struct FakePlugin {
     socket: WebSocket<TcpStream>,
 }
 
+#[cfg(unix)]
 fn hello(token: &Token, pane: &str) -> Value {
     json!({
         "type": "hello",
@@ -63,6 +76,7 @@ fn hello(token: &Token, pane: &str) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn bridge_details(service: &Integration) -> (String, Token, String) {
     let (_, content) = service.environment();
     let value: Value = serde_json::from_str(content).unwrap();
@@ -76,6 +90,7 @@ fn bridge_details(service: &Integration) -> (String, Token, String) {
 /// Perform the WebSocket upgrade with a generous timeout and an optional Host
 /// override. The bridge must reject a non-authority Host before disclosing any
 /// handshake state.
+#[cfg(unix)]
 fn connect_socket(url: &str, host: Option<&str>) -> Result<WebSocket<TcpStream>, String> {
     use tungstenite::http::HeaderValue;
 
@@ -103,6 +118,7 @@ fn connect_socket(url: &str, host: Option<&str>) -> Result<WebSocket<TcpStream>,
         .map_err(|error| error.to_string())
 }
 
+#[cfg(unix)]
 impl FakePlugin {
     fn connect(service: &Integration) -> Self {
         let (url, token, pane) = bridge_details(service);
@@ -127,33 +143,40 @@ impl FakePlugin {
             .unwrap();
     }
 
+    /// One text message if it arrives within a short read, else `None`.
+    fn try_next_json(&mut self) -> Option<Value> {
+        match self.socket.read() {
+            Ok(Message::Text(text)) => Some(serde_json::from_str(text.as_str()).unwrap()),
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
+                let _ = self.socket.flush();
+                None
+            }
+            Ok(Message::Binary(_)) => panic!("bridge sent binary data"),
+            Ok(Message::Close(frame)) => panic!("bridge closed: {frame:?}"),
+            Err(WsError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("bridge read failed: {error}"),
+        }
+    }
+
     fn next_json(&mut self) -> Value {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            match self.socket.read() {
-                Ok(Message::Text(text)) => {
-                    return serde_json::from_str(text.as_str()).unwrap();
-                }
-                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
-                    let _ = self.socket.flush();
-                }
-                Ok(Message::Binary(_)) => panic!("bridge sent binary data"),
-                Ok(Message::Close(frame)) => panic!("bridge closed: {frame:?}"),
-                Err(WsError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    assert!(
-                        Instant::now() < deadline,
-                        "timed out waiting for a bridge message"
-                    );
-                }
-                Err(error) => panic!("bridge read failed: {error}"),
+            if let Some(value) = self.try_next_json() {
+                return value;
             }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a bridge message"
+            );
         }
     }
 
@@ -165,8 +188,32 @@ impl FakePlugin {
             }
         }
     }
+
+    /// Read until a message of `kind` arrives while driving the service. The
+    /// bridge queues its connection event after the welcome, and the service
+    /// only acts on it (requesting state) when polled, so a plain blocking read
+    /// can wait for a message that only a later poll triggers.
+    fn read_until_polling(&mut self, service: &mut Integration, kind: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                service.poll().is_empty(),
+                "unexpected relay event while waiting for {kind}"
+            );
+            if let Some(value) = self.try_next_json() {
+                if value["type"] == kind {
+                    return value;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for bridge message {kind}"
+            );
+        }
+    }
 }
 
+#[cfg(unix)]
 fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -196,6 +243,7 @@ fn read_close_code(socket: &mut WebSocket<TcpStream>) -> Option<u16> {
     }
 }
 
+#[cfg(unix)]
 fn poll_until(
     service: &mut Integration,
     timeout: Duration,
@@ -216,6 +264,7 @@ fn poll_until(
     }
 }
 
+#[cfg(unix)]
 fn quiet_for(service: &mut Integration, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -227,6 +276,9 @@ fn quiet_for(service: &mut Integration, timeout: Duration) {
     }
 }
 
+// POSIX-only: the relayed session state uses POSIX remote paths, which the bridge
+// rejects on a Windows host (the relay never arrives).
+#[cfg(unix)]
 #[test]
 fn unauthorized_host_and_token_handshakes_never_disclose_state() {
     let temp = tempfile::tempdir().unwrap();
@@ -264,11 +316,7 @@ fn unauthorized_host_and_token_handshakes_never_disclose_state() {
 
     // Positive control: only the authorized plugin can cause a disclosure.
     let mut plugin = FakePlugin::connect(&service);
-    assert!(
-        service.poll().is_empty(),
-        "only connection lifecycle so far"
-    );
-    plugin.read_until("request_state");
+    plugin.read_until_polling(&mut service, "request_state");
     plugin.send(&state(
         7,
         Some("session-a"),
@@ -306,6 +354,9 @@ fn bridge_is_actual_remote_loopback_and_launch_config_is_immutable() {
     assert!(service.verify_config().unwrap().is_unchanged());
 }
 
+// POSIX-only: the relayed session state uses POSIX remote paths, which the bridge
+// rejects on a Windows host (the relay never arrives).
+#[cfg(unix)]
 #[test]
 fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
     let temp = tempfile::tempdir().unwrap();
@@ -321,11 +372,7 @@ fn focus_state_and_attachment_epochs_relay_through_the_real_bridge() {
     );
 
     let mut plugin = FakePlugin::connect(&service);
-    assert!(
-        service.poll().is_empty(),
-        "only connection lifecycle so far"
-    );
-    plugin.read_until("request_state");
+    plugin.read_until_polling(&mut service, "request_state");
     plugin.send(&state(
         1,
         Some("session-a"),

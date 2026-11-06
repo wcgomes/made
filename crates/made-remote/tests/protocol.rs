@@ -881,7 +881,15 @@ fn grok_capabilities_are_backward_safe_and_session_snapshot_is_not_overloaded() 
     )
     .unwrap();
     assert!(caps.grok);
+    // `python3` is frozen in major 1 like `tmux`: an older peer's true value
+    // still decodes, no consumer reads it, and the companion encodes false.
     assert!(caps.python3);
+    let encoded = serde_json::to_string(&Capabilities {
+        python3: false,
+        ..caps
+    })
+    .unwrap();
+    assert!(encoded.contains(r#""python3":false"#), "{encoded}");
     assert!(serde_json::from_str::<Capabilities>(
         r#"{"target":"LinuxX64","tmux":false,"opencode":true,"shell_cwd":false,"helper_version":"1","codex":true}"#
     )

@@ -43,6 +43,9 @@ jobs:
       - name: Run PTY/ConPTY contract tests
         run: cargo test -p made-terminal --test pty --locked
 
+      - name: Run the native Grok hook tests
+        run: cargo test -p made-grok-hook --locked
+
       - name: Install Node.js 24
         uses: actions/setup-node@v7
         with:

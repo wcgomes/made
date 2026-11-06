@@ -73,15 +73,16 @@ jobs:
       - name: Build the workspace
         run: cargo build --workspace --locked --target ${{ matrix.target }}
 
-      - name: Install Node.js 24
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
+      # The shipped hook is the release build for the host target, staged
+      # below into plugins/grok-made; no interpreter runs it.
+      - name: Build the native Grok hook
+        run: cargo build -p made-grok-hook --locked --release --target ${{ matrix.target }}
 
       # Development artifacts only: debug binaries, the app-owned OpenCode
-      # plugin package, the shipped Grok plugin package, README, and version
-      # metadata. Companions and the native askpass are added after this step;
-      # they do not replace it.
+      # plugin package, the shipped Grok plugin package (staged by
+      # stage-grok-plugin.sh), README, LICENSE, and version metadata, through
+      # the staging script shared with releases. Companions and the native
+      # askpass are added after this step; they do not replace it.
       # No signing, notarization, installer, or auto-update payload is produced.
       - name: Stage the development artifact
         shell: bash
@@ -90,75 +91,14 @@ jobs:
           EXE: ${{ matrix.exe }}
         run: |
           set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+          "$py" .github/scripts/stage-desktop-package.py --profile debug --target "$TARGET" \
+            --app "target/${TARGET}/debug/made-app${EXE}" \
+            --hook "target/${TARGET}/release/made-grok-status${EXE}" \
+            --stage "dist/made-development-${TARGET}"
           stage="dist/made-development-${TARGET}"
-          mkdir -p "$stage/plugins"
-          cp "target/${TARGET}/debug/made-app${EXE}" "$stage/"
-          cp README.md Cargo.toml Cargo.lock rust-toolchain.toml "$stage/"
-          # Release AppPaths resolves the app-owned plugin at
-          # <install_root>/plugins/opencode-made, so the artifact root must
-          # contain plugins/opencode-made rather than plugin/opencode-made.
-          cp -R plugins/opencode-made "$stage/plugins/opencode-made"
-          rm -rf "$stage/plugins/opencode-made/node_modules"
-          test -f "$stage/plugins/opencode-made/package.json"
-          # The shipped grok-made package rides in every desktop package so
-          # both the local install and the staged remote copy never download.
-          cp -R plugins/grok-made "$stage/plugins/grok-made"
-          test -f "$stage/plugins/grok-made/plugin.json"
-          test -f "$stage/plugins/grok-made/hooks/hooks.json"
-          test -f "$stage/plugins/grok-made/hooks/bin/status.py"
-          # The hook runs bin/status.py directly; keep the shipped executable
-          # bit regardless of the runner umask.
-          chmod 755 "$stage/plugins/grok-made/hooks/bin/status.py"
-          test ! -e "$stage/plugin"
-
-          node - "$stage" <<'NODE'
-          const fs = require("node:fs");
-          const path = require("node:path");
-          const { execSync } = require("node:child_process");
-
-          const stage = process.argv[2];
-          const root = process.cwd();
-          const workspace = fs.readFileSync(path.join(root, "Cargo.toml"), "utf8");
-          const version = /\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"/.exec(workspace);
-          const plugin = JSON.parse(
-            fs.readFileSync(path.join(root, "plugins", "opencode-made", "package.json"), "utf8"),
-          );
-
-          const metadata = {
-            name: "made",
-            version: version ? version[1] : "unknown",
-            profile: "debug",
-            target: process.env.TARGET,
-            runner_os: process.env.RUNNER_OS,
-            runner_arch: process.env.RUNNER_ARCH,
-            commit: process.env.GITHUB_SHA,
-            ref: process.env.GITHUB_REF_NAME,
-            rustc: execSync("rustc --version", { encoding: "utf8" }).trim(),
-            cargo: execSync("cargo --version", { encoding: "utf8" }).trim(),
-            plugin: { name: plugin.name, version: plugin.version },
-            signing: "none",
-            notarization: "none",
-            installer: "none",
-            auto_update: "none",
-            companions: {
-              layout: "remote/<target>/made-remote",
-              targets: [
-                "x86_64-unknown-linux-gnu",
-                "aarch64-unknown-linux-gnu",
-                "x86_64-apple-darwin",
-                "aarch64-apple-darwin",
-              ],
-              askpass: process.env.EXE ? "made-askpass.exe" : "made-askpass",
-              runtime_download: "none",
-            },
-          };
-          fs.writeFileSync(
-            path.join(stage, "version.json"),
-            `${JSON.stringify(metadata, null, 2)}\n`,
-          );
-          NODE
-
-          find "$stage" -maxdepth 3 -type f -print | sort
+          test -x "$stage/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          test -f "$stage/LICENSE"
 
       - name: Download Linux x64 companion
         uses: actions/download-artifact@v7
@@ -212,6 +152,38 @@ jobs:
             --askpass-manifest askpass-artifact/manifest.json \
             --desktop-target "$TARGET"
           find "dist/made-development-${TARGET}" -type f -print | sort
+
+      # The packaged-layout test: the staged hook, from the desktop package,
+      # run as Grok runs it (one event, stdin left open) with every PATH entry
+      # that provides python or python3 removed. The test binary is built
+      # first with the full PATH because linking needs the system toolchain.
+      - name: Run the packaged Grok hook with Python removed from PATH
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" --no-run
+          hook="$PWD/dist/made-development-${TARGET}/plugins/grok-made/hooks/bin/made-grok-status${EXE}"
+          test -x "$hook"
+          clean=""
+          IFS=':' read -r -a entries <<< "$PATH"
+          for entry in "${entries[@]}"; do
+            [ -n "$entry" ] || continue
+            if [ -e "$entry/python" ] || [ -e "$entry/python3" ] \
+              || [ -e "$entry/python.exe" ] || [ -e "$entry/python3.exe" ]; then
+              echo "removing from PATH: $entry"
+              continue
+            fi
+            clean="${clean:+$clean:}$entry"
+          done
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            hook="$(cygpath -w "$hook")"
+          fi
+          PATH="$clean" "$BASH" -c 'command -v python python3 >/dev/null 2>&1 && { echo "python is still on PATH" >&2; exit 1; }; exit 0'
+          MADE_PACKAGED_HOOK="$hook" PATH="$clean" \
+            cargo test -p made-grok-hook --test packaged --locked --target "$TARGET" -- --nocapture
 
       - name: Upload the development artifact
         uses: actions/upload-artifact@v7

@@ -1,6 +1,6 @@
 # Release and CI
 
-Made produces **unsigned development builds**, not a production release. There is no signing, notarization, installer, package repository, or auto-update path. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. All five workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -11,6 +11,8 @@ Made produces **unsigned development builds**, not a production release. There i
 | [`ci-linux-display.yml`](../../.github/workflows/ci-linux-display.yml) | Push/PR/manual | `made-app --smoke-test` under Xvfb X11 and headless Weston Wayland; uploads logs. |
 | [`ci-macos.yml`](../../.github/workflows/ci-macos.yml) | Push/PR/manual | macOS arm64/x64 build, platform contract tests, app smoke, attempted native OpenCode install; TUI interaction manual. |
 | [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) | Push/PR/manual | Windows build, platform/PTY contract tests, app smoke, attempted native OpenCode install; TUI interaction manual. |
+| [`release.yml`](../../.github/workflows/release.yml) | `v*` tag push | Gate, release build and Velopack pack per target, installed smoke, publish (protected `release` environment), post-publish upgrade check. |
+| [`upgrade-check.yml`](../../.github/workflows/upgrade-check.yml) | Manual, called by `release.yml` | Installs the previous published release per target/form and updates it in place to the latest. |
 
 CI jobs deliberately record “manual validation required” instead of claiming native behavior they cannot exercise.
 
@@ -27,8 +29,8 @@ The development artifact stages the plugin at `<artifact_root>/plugins/opencode-
 
 ## Release limits
 
-- Artifacts are unsigned; a local macOS build may be quarantined by Gatekeeper.
-- No notarization, installer, package repository, or auto-update payload.
+- Artifacts and releases are unsigned (macOS bundles are ad-hoc signed only); Gatekeeper and SmartScreen warn on first run. Because the ad-hoc signature changes with every build, macOS may re-request privacy permissions (TCC) after an update.
+- No notarization or package repository; GitHub Releases is the only channel.
 - The packaged/staged layout has **not been launched end-to-end**.
 - CI is observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; artifacts are assembled but remain unlaunched, and green CI is not native UX evidence.
 - CI does not validate native window managers/compositors, native input/IME/clipboard, native shell hooks, Windows Job Object cleanup, native OpenCode TUI interaction, native macOS/Windows backdrop rendering, or hardware-GPU pacing.
@@ -43,6 +45,34 @@ MADE_NATIVE_BACKDROP=off \
 DISPLAY=127.0.0.1:99 LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
   target/debug/made-app --smoke-test 2500 /path/to/workspace
 ```
+
+## Releases
+
+Releases are produced only by pushing a `v<major>.<minor>.<patch>` tag; branch pushes and pull requests never create or modify a release. `[workspace.package].version` in `Cargo.toml` is the single version source, and `ci.yml` fails on any drift of the other sites.
+
+### Bump and release
+
+`main` accepts changes only through pull requests, so a release bump is a pull request too:
+
+1. Create a branch from `main` and run `scripts/bump-version.sh X.Y.Z` (stable versions only). It rewrites the workspace version, `plugins/opencode-made/package.json` and `package-lock.json` (through `npm version`), the plugin's `PLUGIN_VERSION`, `plugins/grok-made/plugin.json` and the README `appVersion` example, refreshes `Cargo.lock` through cargo and runs `.github/scripts/check-versions.py`.
+2. Commit, push the branch and open a pull request against `main`; merge it once its checks are green.
+3. On the updated `main`, tag the merge commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. CI then runs, in order: the version gate (`release-gate.py`: refuses prerelease or build tags, a version not greater than the newest published stable release, an already published tag, or any version-site disagreement); the SSH companions and the release build and Velopack pack for Windows x64, macOS arm64, macOS x64 and Linux x64 with the glibc 2.35, `NEEDED`, import and minimum-OS checks; the installed-layout smoke of every target and macOS form; then the publish job waits for approval in the `release` environment.
+5. Approve the pending `release` deployment (the run's **Review deployments** button). Publish then removes any stale draft, creates the draft with every asset and `SHA256SUMS` and notes from `.github/release-notes.md`, publishes it with `make_latest=true`, and runs the post-publish upgrade check from the previous release. A failure before publish leaves at most an unpublished draft.
+6. A failed upgrade check is remedied by publishing a fixed, newer release. The failing release is never modified or replaced.
+
+If the gate refuses the tag, read its message, fix the sites with the bump script (through a pull request) or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
+
+### Repository settings
+
+- The `release` environment requires approval by the maintainer (`wcgomes`) and accepts deployments only from `v*` tags. It is configured before the `v0.1.0` release.
+- Configured at rollout end, after `v0.1.0` is published: a ruleset on `main` allowing changes only through pull requests, and a ruleset on `v*` tags restricting creating, updating and deleting them to a maintainer bypass list. Rulesets cannot key on release state, so never re-tagging a published version stays a procedure.
+
+Optional, manual: GitHub immutable releases (**Settings › General › Releases**). Enable it only after the `v0.1.0` release is published.
+
+### Rollout cleanup (done)
+
+The temporary iteration releases cut during implementation (`v0.1.0` to `v0.1.9`) and their tags were deleted, and `v0.1.0` was released again from the final `main`. Machines that installed an iteration release need Made uninstalled first (`0.1.0` is lower than the installed version), `grok plugin uninstall grok-made --confirm` run locally and on each SSH server where Made installed it, and Made's staged remote version directories removed on each SSH server.
 
 ## Release-blocking boundary
 

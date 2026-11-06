@@ -1,0 +1,5 @@
+# REL-04: Windows binaries link the MSVC C runtime statically, so no Visual C++
+# Redistributable is needed (probe 1.6). This covers made-app, made-askpass and
+# the made-grok-status hook alike.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

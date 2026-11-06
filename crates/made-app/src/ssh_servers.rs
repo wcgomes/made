@@ -511,8 +511,9 @@ impl ServerStorage for PrivateMetadataStorage {
 
 /// Parse the fixed OpenSSH probe script. This is not a TUI launch and it does
 /// not look for tmux. `Capabilities.tmux` is encoded false and must be ignored.
-/// Grok and python3 are metadata-only PATH detections reported by the same
-/// probe; absence keeps the honest inventory tier.
+/// Grok is a metadata-only PATH detection reported by the same probe; absence
+/// keeps the honest inventory tier. No interpreter is probed or parsed, and the
+/// frozen `Capabilities.python3` field is encoded false.
 pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let text = std::str::from_utf8(bytes).map_err(|_| ErrorCode::InvalidRequest)?;
     let mut lines = text.split('\n');
@@ -523,7 +524,6 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
     let arch = lines.next().unwrap_or("").trim();
     let opencode = lines.next().unwrap_or("").trim();
     let grok = lines.next().unwrap_or("").trim();
-    let python3 = lines.next().unwrap_or("").trim();
     if os.chars().any(char::is_control) || arch.chars().any(char::is_control) {
         return Err(ErrorCode::InvalidRequest);
     }
@@ -546,7 +546,7 @@ pub fn parse_probe_output(bytes: &[u8]) -> Result<Capabilities, ErrorCode> {
         shell_cwd: false,
         helper_version: "probe".to_owned(),
         grok: detected(grok),
-        python3: detected(python3),
+        python3: false,
     })
 }
 
@@ -1487,12 +1487,31 @@ mod stage_tests {
             .mode(0o600)
             .open(&known_hosts)
             .unwrap();
+        // The fixture executables are written by a child process, never through
+        // a write descriptor in this test process: another test thread forking
+        // while such a descriptor is open would make exec fail with ETXTBSY.
+        let write_executable = |path: &std::path::Path, content: &str| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat > \"$1\" && chmod 700 \"$1\"")
+                .arg("sh")
+                .arg(path)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(content.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+        };
         let ssh = root.join("ssh");
-        std::fs::write(&ssh, script).unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&ssh, script);
         let askpass = root.join("askpass");
-        std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&askpass, "#!/bin/sh\nexit 0\n");
         SshProcess::spawn(SshOptions {
             executable: ssh,
             askpass_executable: askpass,

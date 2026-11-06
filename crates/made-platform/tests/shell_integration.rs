@@ -362,6 +362,23 @@ fn real_installed_shells_preserve_startup_files_and_emit_local_reports() {
             request.env.retain(|(k, _)| k != key);
             request.env.push((key.into(), value.into_os_string()));
         }
+        if shell.contains("pwsh") || shell == "powershell" {
+            // PowerShell's first start in a fresh HOME builds its caches and
+            // can outlast the product's bounded policy preflight; start it
+            // once to completion in this HOME so the preflight sees a normal
+            // start.
+            let _ = std::process::Command::new(shell)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "exit",
+                ])
+                .env_clear()
+                .envs(request.env.iter().cloned())
+                .output();
+        }
         let plan = ShellLaunchPlan::new(request);
         assert!(
             plan.capability().is_supported(),
@@ -586,7 +603,12 @@ fn real_zsh_zdotdir_unset_and_reassignment_follow_user_startup_files() {
             .unwrap();
         writer.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && !home.join("final.txt").is_file() {
+        // `>` creates the file before zsh writes the line: wait for the whole
+        // newline-terminated report, not just for the file to exist.
+        let reported = || {
+            std::fs::read_to_string(home.join("final.txt")).is_ok_and(|text| text.ends_with('\n'))
+        };
+        while Instant::now() < deadline && !reported() {
             // Keep draining the bounded reader channel: zsh's per-keystroke
             // echo can otherwise fill it and block the child before the
             // command runs.

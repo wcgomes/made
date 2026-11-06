@@ -6017,6 +6017,9 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_CACHE_HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
         ];
         let _env = EnvGuard(
             keys.iter()
@@ -6024,12 +6027,17 @@ mod tests {
                 .collect(),
         );
         std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
+        std::env::set_var("LOCALAPPDATA", home.join("AppData").join("Local"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::set_var("XDG_STATE_HOME", home.join(".local/state"));
         std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
         let mut registry = crate::ssh_servers::ServerRegistry::load(
-            crate::ssh_servers::PrivateMetadataStorage::new(&directory),
+            // A Windows registry directory must carry the protected owner-only
+            // DACL, which the store applies when it creates the directory.
+            crate::ssh_servers::PrivateMetadataStorage::new(directory.join("registry")),
         )
         .unwrap();
         let authority = registry
@@ -8089,7 +8097,6 @@ mod tests {
             for row in [
                 GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED,
                 GrokDiagnosticsRow::REMOTE_INSTALL_PENDING,
-                GrokDiagnosticsRow::REMOTE_PYTHON3_MISSING,
                 GrokDiagnosticsRow::REMOTE_INSTALL_FAILED,
             ] {
                 bench.workbench.set_grok_diagnostics(row.clone());

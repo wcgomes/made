@@ -7,7 +7,10 @@ publish.workspace = true
 
 [features]
 default = ["desktop"]
-desktop = ["dep:arboard", "dep:image", "dep:raw-window-handle", "dep:objc2", "dep:objc2-app-kit", "dep:window-vibrancy"]
+desktop = ["dep:arboard", "dep:image", "dep:raw-window-handle", "dep:objc2", "dep:objc2-app-kit", "dep:window-vibrancy", "dep:velopack", "dep:ureq", "dep:semver", "dep:url", "dep:sha2", "dep:serde", "dep:serde_json"]
+# Test-only: exposes the injectable update transport used by the tamper,
+# redirect and allowlist tests. Never enabled by a release build.
+update-test-seam = ["desktop"]
 
 [dependencies]
 # Text and RGBA image clipboard. X11 is used when available;
@@ -26,6 +29,19 @@ portable-pty = "0.9"
 libc = "0.2"
 # Narrow window-handle contract used by the optional native backdrop.
 raw-window-handle = { version = "0.6", optional = true }
+# In-app updates (REL-06 to REL-12): Velopack's locator, startup hook,
+# package reader and updater. public-utils exposes the package reader and the
+# Windows process wait used by the apply helper. Pinned to the version the
+# probes confirmed; vpk in the release workflow uses the same version.
+velopack = { version = "=1.2.161", features = ["public-utils"], optional = true }
+# HTTPS-only client for Made's own update source (rustls, webpki roots); the
+# same major version Velopack already uses.
+ureq = { version = "3.4", optional = true }
+semver = { version = "1", optional = true }
+url = { version = "2.5", optional = true }
+sha2 = { version = "0.10", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Optional NSVisualEffectView vibrancy; the in-app glass remains the fallback.
@@ -51,6 +67,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
@@ -61,3 +78,5 @@ path = "src/bin/made-askpass.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds fake update packages for the update capability tests.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

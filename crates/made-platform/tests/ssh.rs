@@ -11,6 +11,29 @@ fn host_private(name: &str) -> PathBuf {
     }
 }
 
+/// Write a fixture executable through a child process. A write descriptor
+/// held by this multi-threaded test process can be inherited by another test
+/// thread's fork, which makes exec of the fixture fail with ETXTBSY.
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$1\" && chmod 700 \"$1\"")
+        .arg("sh")
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(content.as_ref())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
 fn options() -> SshOptions {
     SshOptions {
         executable: if cfg!(windows) {
@@ -160,8 +183,8 @@ fn probe_fixture_uname(dir: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 #[cfg(unix)]
-fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
-    use std::{os::unix::fs::PermissionsExt, process::Command};
+fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3() {
+    use std::process::Command;
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -172,19 +195,16 @@ fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
     let executed = temp.path().join("probe-executed");
     for name in ["grok", "python3"] {
         let path = bin.join(name);
-        std::fs::write(
+        write_executable(
             &path,
             format!("#!/bin/sh\nprintf x >> '{}'\nexit 4\n", executed.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
     }
     // A relative PATH entry must stay invisible to detection.
     let relative = temp.path().join("rel-bin");
     std::fs::create_dir_all(&relative).unwrap();
     let impostor = relative.join("grok");
-    std::fs::write(&impostor, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&impostor, "#!/bin/sh\nexit 0\n");
     let tools = temp.path().join("tools");
     std::fs::create_dir_all(&tools).unwrap();
     let tools = probe_fixture_uname(&tools);
@@ -215,7 +235,14 @@ fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
     );
     assert_eq!(lines[3], "", "the fixture has no opencode");
     assert_eq!(lines[4], format!("{}/grok", bin.display()));
-    assert_eq!(lines[5], format!("{}/python3", bin.display()));
+    // Grok is the last probe line: python3 sits on the same PATH and is never
+    // looked up, reported or executed.
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines[5], "");
+    assert!(
+        !SshCommand::Probe.script().contains("python3"),
+        "the fixed probe must not mention python3"
+    );
     assert!(
         !executed.exists(),
         "detection must never spawn grok or check a version"
@@ -228,10 +255,6 @@ fn probe_reports_grok_and_python3_with_metadata_only_path_lookup() {
         .map(str::to_owned)
         .collect();
     assert_eq!(lines[4], "", "relative PATH entries must not be detected");
-    assert!(
-        !lines[5].contains("rel-bin"),
-        "relative PATH entries must not be detected for python3"
-    );
 }
 
 #[test]
@@ -257,16 +280,14 @@ fn grok_plugin_install_command_runs_only_the_staged_companion_in_install_mode() 
     let marker = temp.path().join("install-argv");
     let stdin_record = temp.path().join("install-stdin");
     let companion = staged.join("made-remote");
-    std::fs::write(
+    write_executable(
         &companion,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncat > '{}'\n",
             marker.display(),
             stdin_record.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     // The fixed SSH command itself must never invoke grok; the consented
     // companion install mode owns the official installer call.
     let tools = temp.path().join("tools");
@@ -353,15 +374,13 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     std::fs::create_dir(&bin).unwrap();
     let tmux_marker = home.join("tmux-ran");
     let tmux = bin.join("tmux");
-    std::fs::write(
+    write_executable(
         &tmux,
         format!(
             "#!/bin/sh\necho executed > '{}'\nexit 99\n",
             tmux_marker.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
@@ -377,7 +396,7 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     std::fs::write(&grok_config, b"existing = true\n").unwrap();
     let hash = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
     let mut input = staging_header(true, "1.0", target).unwrap();
-    for _ in 0..11 {
+    for _ in 0..10 {
         input.extend_from_slice(format!("1\n{hash}\nx").as_bytes());
     }
     let mut child = Command::new("/bin/sh")
@@ -423,12 +442,7 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     // The complete shipped grok-made package is staged beside opencode-made
     // with private permissions and the executable hook bit.
     let grok_plugin = destination.join("plugins/grok-made");
-    for name in [
-        "plugin.json",
-        "README.md",
-        "hooks/hooks.json",
-        "hooks/status_test.py",
-    ] {
+    for name in ["plugin.json", "README.md", "hooks/hooks.json"] {
         assert_eq!(std::fs::read(grok_plugin.join(name)).unwrap(), b"x");
         assert_eq!(
             std::fs::metadata(grok_plugin.join(name))
@@ -440,11 +454,11 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
         );
     }
     assert_eq!(
-        std::fs::read(grok_plugin.join("hooks/bin/status.py")).unwrap(),
+        std::fs::read(grok_plugin.join("hooks/bin/made-grok-status")).unwrap(),
         b"x"
     );
     assert_eq!(
-        std::fs::metadata(grok_plugin.join("hooks/bin/status.py"))
+        std::fs::metadata(grok_plugin.join("hooks/bin/made-grok-status"))
             .unwrap()
             .permissions()
             .mode()
@@ -480,7 +494,7 @@ mod fixed_staging {
         process::{Child, Command, Output, Stdio},
     };
 
-    pub const ARTIFACTS: [&str; 11] = [
+    pub const ARTIFACTS: [&str; 10] = [
         "made-remote",
         "plugins/opencode-made/package.json",
         "plugins/opencode-made/tui.ts",
@@ -490,8 +504,7 @@ mod fixed_staging {
         "plugins/grok-made/plugin.json",
         "plugins/grok-made/README.md",
         "plugins/grok-made/hooks/hooks.json",
-        "plugins/grok-made/hooks/status_test.py",
-        "plugins/grok-made/hooks/bin/status.py",
+        "plugins/grok-made/hooks/bin/made-grok-status",
     ];
     pub const UPDATE_REQUIRED: &str = "MADE-STAGE-UPDATE-REQUIRED";
     pub const RECOVERY_REQUIRED: &str = "MADE-STAGE-RECOVERY-REQUIRED";
@@ -599,8 +612,11 @@ mod fixed_staging {
     /// simulate an uncatchable SIGKILL of the whole attempt (EXIT traps do not
     /// run) without leaving fixture children behind.
     pub fn spawn_with_path(home: &Path, payload: &[u8], path: &Path) -> Child {
+        // The fixed script is itself `sh -c '...'`. bash execs a last command
+        // in place but dash forks it, which would make the killed pid differ
+        // from the lock owner's `$$`; `exec` pins the same pid on every host.
         let mut child = Command::new("/bin/sh")
-            .args(["-c", SshCommand::Stage.script()])
+            .args(["-c", &format!("exec {}", SshCommand::Stage.script())])
             .env_clear()
             .env("HOME", home)
             .env("XDG_DATA_HOME", home.join("data"))
@@ -619,7 +635,9 @@ mod fixed_staging {
         // The child was started in a fresh process group whose id is its PID,
         // so the negative target names only this fixture's group.
         let _ = Command::new("/bin/kill")
-            .args(["-9", &format!("-{}", child.id())])
+            // `--` keeps procps kill from reading the negative group id as a
+            // signal name; macOS kill accepts it too.
+            .args(["-9", "--", &format!("-{}", child.id())])
             .status();
         let _ = child.wait();
     }
@@ -1674,18 +1692,12 @@ fn cancel_kills_the_process_group_not_only_the_direct_child() {
         .unwrap();
     let child_pid = temp.path().join("child.pid");
     let fake = temp.path().join("ssh");
-    std::fs::write(
-        &fake,
-        format!(
+    write_executable(&fake, format!(
             "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_8.4p1\\n' >&2; exit 0; fi\nsleep 30 &\necho $! > '{}'\nwait\n",
             child_pid.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ),);
     let askpass = temp.path().join("askpass");
-    std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
     let mut options = options();
     options.executable = fake;
     options.askpass_executable = askpass;
@@ -1839,15 +1851,9 @@ fn stage_update_required_exit_is_not_generic_io_and_keeps_no_stderr() {
         .open(&known_hosts)
         .unwrap();
     let fake = root.join("ssh");
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nprintf 'MADE-STAGE-UPDATE-REQUIRED\\nhash=deadbeef\\n' >&2\nexit 74\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&fake, "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nprintf 'MADE-STAGE-UPDATE-REQUIRED\\nhash=deadbeef\\n' >&2\nexit 74\n",);
     let askpass = root.join("askpass");
-    std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
     let mut options = options();
     options.executable = fake;
     options.askpass_executable = askpass;
@@ -1892,15 +1898,9 @@ fn terminal_exit_sets_finished_and_later_polls_report_none() {
         .open(&known_hosts)
         .unwrap();
     let fake = root.join("ssh");
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nexit 73\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&fake, "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nexit 73\n",);
     let askpass = root.join("askpass");
-    std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
     let mut options = options();
     options.executable = fake;
     options.askpass_executable = askpass;
@@ -1947,15 +1947,9 @@ fn changed_host_key_exit_is_not_generic_io_and_does_not_keep_stderr() {
         .open(&known_hosts)
         .unwrap();
     let fake = root.join("ssh");
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nprintf 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\\npassword=hunter2\\n' >&2\nexit 255\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&fake, "#!/bin/sh\nif [ \"$1\" = -V ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nprintf 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\\npassword=hunter2\\n' >&2\nexit 255\n",);
     let askpass = root.join("askpass");
-    std::fs::write(&askpass, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
     let mut options = options();
     options.executable = fake;
     options.askpass_executable = askpass;
