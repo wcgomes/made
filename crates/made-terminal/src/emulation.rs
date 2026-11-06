@@ -309,6 +309,7 @@ pub struct TerminalCore {
     damage: TerminalDamage,
     osc: OscScanner,
     cwd: Option<PathBuf>,
+    cwd_reports: u64,
     protocol_events: Vec<ProtocolEvent>,
 }
 
@@ -341,6 +342,7 @@ impl TerminalCore {
             damage: TerminalDamage::default(),
             osc: OscScanner::default(),
             cwd: None,
+            cwd_reports: 0,
             protocol_events: Vec::new(),
         };
         core.collect_damage();
@@ -368,6 +370,7 @@ impl TerminalCore {
         }
         if let Some(cwd) = self.osc.take_cwd() {
             self.cwd = Some(cwd);
+            self.cwd_reports = self.cwd_reports.wrapping_add(1);
         }
         let events = self.osc.take_events();
         if !events.is_empty() {
@@ -552,6 +555,12 @@ impl TerminalCore {
     /// Current shell working directory reported by OSC 7.
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// How many data chunks carried an OSC 7 report, including reports that
+    /// repeat the current directory. A shell prompt hook sends one per prompt.
+    pub fn cwd_report_count(&self) -> u64 {
+        self.cwd_reports
     }
 
     /// Whether the alternate screen is active.

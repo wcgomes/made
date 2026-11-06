@@ -11,6 +11,7 @@
 
 pub mod app;
 mod cell_glyphs;
+pub mod claude_follow;
 pub mod cli;
 mod credential_cache;
 pub mod diagnostics;

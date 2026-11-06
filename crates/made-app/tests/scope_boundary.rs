@@ -36,7 +36,9 @@ fn there_is_no_chat_ui_or_other_agent_integration() {
     const { assert!(!V1_SCOPE.chat_ui) };
     for source in CORE_SOURCES {
         let lower = source.to_ascii_lowercase();
-        for forbidden in ["claude", "codex", "acp", "chat ui"] {
+        // Claude Code is the third catalog row (V1 Scope Boundary), so core
+        // follow code names it. Task 8.2 finishes this test.
+        for forbidden in ["codex", "acp", "chat ui"] {
             assert!(
                 !lower.contains(forbidden),
                 "core source mentions forbidden agent/chat surface {forbidden:?}"

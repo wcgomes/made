@@ -13,6 +13,8 @@ AppImage marked executable), then fails on any miss:
   `update_repo=wcgomes/made` and no test-only update seam;
 - the four `remote/<target>` trees match `remote/manifest.json` hashes;
 - `plugins/grok-made` holds an executable `made-grok-status` and no Python file;
+- `plugins/claude-code-made` resolves from the install root with its manifest,
+  hooks.json, README and an executable `made-claude-status`;
 - executables keep their executable bit on Unix.
 
 The Linux smoke runs under `xvfb-run` with software rendering.
@@ -125,6 +127,10 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
     grok = install_root / "plugins/grok-made"
     check((grok / "hooks/bin" / hook).is_file(), "plugins/grok-made carries made-grok-status")
     check(not list(grok.rglob("*.py")), "plugins/grok-made contains no Python file")
+    claude_hook_name = "made-claude-status.exe" if os.name == "nt" else "made-claude-status"
+    claude = install_root / "plugins/claude-code-made"
+    for relative in (".claude-plugin/plugin.json", "README.md", "hooks/hooks.json", f"bin/{claude_hook_name}"):
+        check((claude / relative).is_file(), f"plugins/claude-code-made/{relative} resolves from the install root")
     check((install_root / "LICENSE").is_file(), "LICENSE is installed")
     check((exe_dir / askpass).is_file(), "made-askpass sits beside made-app")
     manifest_path = exe_dir / "remote" / "manifest.json"
@@ -138,7 +144,7 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
                 path = exe_dir / "remote" / target / record["name"]
                 check(path.is_file() and sha256(path) == record["sha256"], f"{target}/{record['name']} matches the manifest")
     if os.name != "nt":
-        executables = [exe_dir / "made-app", exe_dir / askpass, grok / "hooks/bin" / hook]
+        executables = [exe_dir / "made-app", exe_dir / askpass, grok / "hooks/bin" / hook, claude / "bin" / claude_hook_name]
         executables += [exe_dir / "remote" / t / "made-remote" for t in TARGETS]
         executables += [exe_dir / "remote" / t / "plugins/grok-made/hooks/bin/made-grok-status" for t in TARGETS]
         for path in executables:

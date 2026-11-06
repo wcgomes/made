@@ -171,6 +171,8 @@ pub struct TerminalPane {
     input_echo: Option<InputEcho>,
     recent_typed_text: String,
     cwd_changed_at: Option<Instant>,
+    /// OSC 7 report count already handed to [`TerminalPane::take_cwd_report`].
+    cwd_reports_seen: u64,
     pending_input: PendingInput,
     input_notice: Option<String>,
     native_image_paste_hint_shown: bool,
@@ -238,6 +240,7 @@ impl TerminalPane {
             input_echo: None,
             recent_typed_text: String::new(),
             cwd_changed_at: None,
+            cwd_reports_seen: 0,
             pending_input: PendingInput::default(),
             input_notice: None,
             native_image_paste_hint_shown: false,
@@ -299,6 +302,7 @@ impl TerminalPane {
             input_echo: None,
             recent_typed_text: String::new(),
             cwd_changed_at: None,
+            cwd_reports_seen: 0,
             pending_input: PendingInput::default(),
             input_notice: None,
             native_image_paste_hint_shown: false,
@@ -443,6 +447,19 @@ impl TerminalPane {
     pub fn take_cwd_change(&mut self) -> Option<(PathBuf, Instant)> {
         let reported_at = self.cwd_changed_at.take()?;
         self.cwd.clone().map(|cwd| (cwd, reported_at))
+    }
+
+    /// Whether an OSC 7 report arrived since the last call, including one that
+    /// repeats the current directory. The launch-local shell integration sends
+    /// one each time the shell is back at its prompt.
+    pub fn take_cwd_report(&mut self) -> bool {
+        let count = self.core.cwd_report_count();
+        std::mem::replace(&mut self.cwd_reports_seen, count) != count
+    }
+
+    /// Take the Program Status Protocol events received since the last call.
+    pub fn take_protocol_events(&mut self) -> Vec<made_terminal::ProtocolEvent> {
+        self.core.take_protocol_events()
     }
 
     /// Shell cwd support and fallback reason for Diagnostics.
@@ -1150,6 +1167,7 @@ impl TerminalPane {
         self.input_echo = None;
         self.recent_typed_text.clear();
         self.cwd_changed_at = None;
+        self.cwd_reports_seen = 0;
         self.focus_on_next_frame = true;
         self.title = None;
         self.cwd = None;
@@ -3021,6 +3039,7 @@ mod tests {
             plugin_root: root.join("plugin"),
             plugin_dir: root.join("plugin").join("opencode-made"),
             grok_plugin_dir: None,
+            claude_plugin_dir: None,
             plugin_source: PluginDirSource::DevelopmentRepository,
             opencode_config_path: root.join("config").join("opencode").join("cli.json"),
             log_dir: root.join("log"),

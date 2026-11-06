@@ -151,6 +151,26 @@ def copy_tree(source: Path, destination: Path) -> None:
     hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def claude_plugin_files(stage: Path, desktop_target: str) -> list[Path]:
+    hook = "made-claude-status.exe" if desktop_target.endswith("-windows-msvc") else "made-claude-status"
+    root = stage / "plugins" / "claude-code-made"
+    return [
+        root / ".claude-plugin" / "plugin.json",
+        root / "README.md",
+        root / "hooks" / "hooks.json",
+        root / "bin" / hook,
+    ]
+
+
+def require_claude_plugin(stage: Path, desktop_target: str, when: str) -> None:
+    files = claude_plugin_files(stage, desktop_target)
+    for path in files:
+        if not path.is_file() or path.stat().st_size <= 0:
+            fail(f"{when}: plugins/claude-code-made file missing or empty: {path.relative_to(stage).as_posix()}")
+    if not desktop_target.endswith("-windows-msvc") and not files[-1].stat().st_mode & stat.S_IXUSR:
+        fail(f"{when}: plugins/claude-code-made hook is not executable")
+
+
 def verify_askpass(path: Path, manifest_path: Path, expected_target: str) -> dict:
     if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
         fail(f"native askpass missing or empty: {path}")
@@ -198,6 +218,7 @@ def main() -> None:
     grok_plugin = stage / "plugins" / "grok-made" / "plugin.json"
     if not grok_plugin.is_file() or grok_plugin.stat().st_size <= 0:
         fail("desktop stage is missing plugins/grok-made")
+    require_claude_plugin(stage, args.desktop_target, "desktop stage")
     if (stage / "plugin").exists():
         fail("desktop stage contains the obsolete plugin/ path")
 
@@ -248,6 +269,7 @@ def main() -> None:
         fail("assembly removed the desktop plugin")
     if not grok_plugin.is_file():
         fail("assembly removed the shipped grok-made plugin")
+    require_claude_plugin(stage, args.desktop_target, "assembly removed the shipped plugin")
     print(f"assembled companions and {askpass['name']} into {stage}")
 
 

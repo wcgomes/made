@@ -4,12 +4,29 @@
 //! can instead start a compatible TUI directly as the PTY child, without a
 //! shell in between.
 
-use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 
-use made_platform::{find_executable_on_path, CompatibleTui};
+use made_platform::{
+    claude_plugin_dirs_separator, compose_claude_plugin_dirs, find_executable_on_path,
+    CompatibleTui, PlatformFamily, CLAUDE_CODE_PLUGIN_DIRS_ENV,
+};
 use made_remote::protocol::AuthorityId;
 use made_terminal::PtyOptions;
+
+/// Environment variable naming a tab's Claude Code hook spool.
+pub const CLAUDE_SPOOL_ENV: &str = "MADE_CLAUDE_SPOOL";
+
+/// The Claude Code environment a tab's terminal child receives.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaudeLaunchEnv {
+    /// Variables to set on the PTY child. Empty when the target gets none.
+    pub env: Vec<(OsString, OsString)>,
+    /// A target that loads the plugin could not: the shipped plugin is missing
+    /// or unreadable, or the tab has no spool. Session-status hooks are then
+    /// unavailable for that tab.
+    pub hooks_unavailable: bool,
+}
 
 /// Which child process a workspace terminal starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +51,8 @@ impl TerminalTarget {
     /// [`TerminalTarget::Shell`] leaves shell resolution to the platform.
     /// [`TerminalTarget::Tui`] resolves the program against `path` with the
     /// same lookup as detection, then spawns that absolute path with no shell
-    /// in between. Grok's only argument is `dashboard`. OpenCode gets none.
+    /// in between. Grok's only argument is `dashboard`. OpenCode and Claude Code
+    /// get none.
     /// It returns `None` when the program is not found there, so nothing is
     /// spawned.
     pub fn pty_options(self, cwd: impl Into<PathBuf>, path: &OsStr) -> Option<PtyOptions> {
@@ -46,13 +64,60 @@ impl TerminalTarget {
                 let options = options.with_shell(program.into_os_string());
                 Some(match tui {
                     CompatibleTui::Grok => options.with_args(["dashboard"]),
-                    CompatibleTui::OpenCode => options,
+                    CompatibleTui::OpenCode | CompatibleTui::ClaudeCode => options,
                 })
             }
             // Remote launches must not resolve a host executable or host cwd.
             Self::RemoteShell { .. } | Self::RemoteOpenCode { .. } | Self::RemoteGrok { .. } => {
                 None
             }
+        }
+    }
+
+    /// Whether Made's session-only Claude Code plugin loads in this target's
+    /// environment: local shell tabs and directly launched Claude Code tabs.
+    pub fn loads_claude_plugin(self) -> bool {
+        matches!(self, Self::Shell | Self::Tui(CompatibleTui::ClaudeCode))
+    }
+
+    /// The `CLAUDE_CODE_PLUGIN_DIRS` entry and per-tab spool path for this
+    /// target.
+    ///
+    /// `existing` is the inherited `CLAUDE_CODE_PLUGIN_DIRS` value; its entries
+    /// keep their order and Made's `shipped` entry is appended once. Targets
+    /// that do not load the plugin get an empty result. With no `shipped`
+    /// directory no entry or spool binding is added and hooks are reported
+    /// unavailable. Without a `spool` the entry is still added, but no spool
+    /// binding is set and hooks are reported unavailable.
+    pub fn claude_launch_env(
+        self,
+        shipped: Option<&Path>,
+        existing: Option<&OsStr>,
+        spool: Option<&Path>,
+    ) -> ClaudeLaunchEnv {
+        if !self.loads_claude_plugin() {
+            return ClaudeLaunchEnv::default();
+        }
+        let Some(shipped) = shipped else {
+            return ClaudeLaunchEnv {
+                env: Vec::new(),
+                hooks_unavailable: true,
+            };
+        };
+        let separator = claude_plugin_dirs_separator(PlatformFamily::current());
+        let mut env = vec![(
+            OsString::from(CLAUDE_CODE_PLUGIN_DIRS_ENV),
+            compose_claude_plugin_dirs(existing, shipped, separator),
+        )];
+        if let Some(spool) = spool {
+            env.push((
+                OsString::from(CLAUDE_SPOOL_ENV),
+                spool.as_os_str().to_owned(),
+            ));
+        }
+        ClaudeLaunchEnv {
+            env,
+            hooks_unavailable: spool.is_none(),
         }
     }
 

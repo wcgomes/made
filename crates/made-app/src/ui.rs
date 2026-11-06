@@ -2082,6 +2082,10 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                         }
                                     }
                                     CompatibleTui::Grok => grok_mark(),
+                                    // The official mark is Phase 5; reuse the terminal glyph.
+                                    CompatibleTui::ClaudeCode => {
+                                        theme::MenuLeading::Glyph(theme::IconGlyph::Terminal)
+                                    }
                                 };
                                 if new_tab_menu_item(
                                     ui,

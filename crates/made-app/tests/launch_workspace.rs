@@ -314,6 +314,387 @@ fn workspace_source_labels_are_stable_for_diagnostics() {
     assert_eq!(WorkspaceSource::Picker.label(), "picker");
 }
 
+// ---- Claude Code launch target and session-only plugin environment ----------
+
+use std::ffi::{OsStr as ClaudeOsStr, OsString};
+
+use made_app::{CompatibleTui, TerminalTarget};
+
+const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+const SPOOL: &str = "MADE_CLAUDE_SPOOL";
+
+fn env_of(env: &[(OsString, OsString)], key: &str) -> Option<OsString> {
+    env.iter()
+        .rev()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.clone())
+}
+
+#[test]
+fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    let spool = Path::new("/run/user/1/made-1/claude/10-abc/tab.jsonl");
+    for target in [
+        TerminalTarget::Shell,
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+    ] {
+        let launch = target.claude_launch_env(
+            Some(shipped),
+            Some(ClaudeOsStr::new("/user/one:/user/two")),
+            Some(spool),
+        );
+        assert!(!launch.hooks_unavailable, "{target:?}");
+        assert_eq!(
+            env_of(&launch.env, PLUGIN_DIRS),
+            Some(OsString::from(
+                "/user/one:/user/two:/opt/made/plugins/claude-code-made"
+            )),
+            "user entries keep their order and Made's entry comes last: {target:?}"
+        );
+        assert_eq!(
+            env_of(&launch.env, SPOOL),
+            Some(spool.as_os_str().to_owned())
+        );
+    }
+    let bare = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, Some(spool));
+    assert_eq!(
+        env_of(&bare.env, PLUGIN_DIRS),
+        Some(shipped.as_os_str().to_owned())
+    );
+    let again = TerminalTarget::Shell.claude_launch_env(
+        Some(shipped),
+        Some(shipped.as_os_str()),
+        Some(spool),
+    );
+    assert_eq!(
+        env_of(&again.env, PLUGIN_DIRS),
+        Some(shipped.as_os_str().to_owned()),
+        "Made's entry is never added twice"
+    );
+}
+
+#[test]
+fn other_launches_get_no_claude_environment() {
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
+    let authority = made_remote::protocol::AuthorityId([7; 16]);
+    for target in [
+        TerminalTarget::Tui(CompatibleTui::OpenCode),
+        TerminalTarget::Tui(CompatibleTui::Grok),
+        TerminalTarget::RemoteShell { authority },
+        TerminalTarget::RemoteOpenCode { authority },
+        TerminalTarget::RemoteGrok { authority },
+    ] {
+        let launch = target.claude_launch_env(
+            Some(shipped),
+            Some(ClaudeOsStr::new("/user/one")),
+            Some(spool),
+        );
+        assert!(
+            launch.env.is_empty(),
+            "{target:?} must not be given {launch:?}"
+        );
+        assert!(!launch.hooks_unavailable, "{target:?}");
+    }
+}
+
+#[test]
+fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
+    let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
+    for target in [
+        TerminalTarget::Shell,
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+    ] {
+        let launch =
+            target.claude_launch_env(None, Some(ClaudeOsStr::new("/user/one")), Some(spool));
+        assert!(
+            launch.env.is_empty(),
+            "no entry, no spool binding: {launch:?}"
+        );
+        assert!(launch.hooks_unavailable);
+    }
+    let shipped = Path::new("/opt/made/plugins/claude-code-made");
+    let unwritable = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, None);
+    assert!(unwritable.hooks_unavailable, "no spool means no hooks");
+    assert!(env_of(&unwritable.env, SPOOL).is_none());
+}
+
+#[cfg(unix)]
+fn fake_executable(directory: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = directory.join(name);
+    fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn the_claude_code_target_starts_the_detected_absolute_path_with_no_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let claude = fake_executable(root.path(), "claude");
+    fake_executable(root.path(), "grok");
+    let path = std::env::join_paths([root.path()]).unwrap();
+
+    let options = TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+        .pty_options("/tmp", &path)
+        .expect("a detected claude resolves");
+    assert_eq!(options.shell.as_deref(), Some(claude.as_os_str()));
+    assert!(options.args.is_empty(), "Made adds no argument to claude");
+    assert!(
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+            .pty_options("/tmp", ClaudeOsStr::new(""))
+            .is_none(),
+        "nothing is spawned when claude is not on PATH"
+    );
+    let grok = TerminalTarget::Tui(CompatibleTui::Grok)
+        .pty_options("/tmp", &path)
+        .unwrap();
+    assert_eq!(grok.args, vec![OsString::from("dashboard")]);
+    assert_eq!(
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode).program_label(),
+        "Claude Code"
+    );
+}
+
+/// Re-run `name` in a child process with an isolated home and a fake `claude`,
+/// `grok` and `opencode` first on PATH, and with the shipped plugin staged
+/// beside the test executable. Returns `true` in the parent.
+#[cfg(unix)]
+fn isolated_claude_launch(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if std::env::var_os("MADE_CLAUDE_LAUNCH_CHILD").is_some() {
+        return false;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for program in ["claude", "grok", "opencode"] {
+        let path = bin.join(program);
+        fs::write(&path, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tmp = home.path().join("tmp");
+    let runtime = home.path().join("runtime");
+    let roaming = home.path().join("AppData").join("Roaming");
+    let local = home.path().join("AppData").join("Local");
+    for directory in [&tmp, &runtime, &roaming, &local] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let shipped = made_platform::install_root_from_current_executable(PlatformFamily::current())
+        .expect("test executable install root")
+        .join("plugins")
+        .join("claude-code-made");
+    fs::create_dir_all(&shipped).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin).chain(std::env::split_paths(&path));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("MADE_CLAUDE_LAUNCH_CHILD", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("TMPDIR", &tmp)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("APPDATA", &roaming)
+        .env("LOCALAPPDATA", &local)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", "/bin/bash")
+        .env(PLUGIN_DIRS, "/user/one:/user/two")
+        .env_remove(SPOOL)
+        .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
+        .env_remove(made_platform::SHELL_ENV)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[cfg(unix)]
+#[test]
+fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code() {
+    if isolated_claude_launch(
+        "real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let home = host_platform().home_dir().expect("test home");
+    let shipped = made_platform::install_root_from_current_executable(PlatformFamily::current())
+        .unwrap()
+        .join("plugins")
+        .join("claude-code-made");
+    let expected = format!("/user/one:/user/two:{}", shipped.display());
+    let start =
+        |target| made_app::Workbench::start(None, None, home.clone(), target, Instant::now());
+
+    let mut claude = start(TerminalTarget::Tui(CompatibleTui::ClaudeCode));
+    let options = claude.terminal().expect("claude child").options().clone();
+    let program = options.shell.clone().expect("explicit program");
+    assert!(
+        Path::new(&program).is_absolute() && Path::new(&program).ends_with("claude"),
+        "{program:?}"
+    );
+    assert!(options.args.is_empty());
+    assert_eq!(
+        env_of(&options.env, PLUGIN_DIRS),
+        Some(OsString::from(&expected))
+    );
+    assert!(
+        env_of(&options.env, made_bridge::config::CONFIG_CONTENT_ENV).is_none(),
+        "OpenCode's plugin environment is not added to the Claude launch"
+    );
+    let spool = PathBuf::from(env_of(&options.env, SPOOL).expect("per-tab spool binding"));
+    assert!(spool.is_absolute() && spool.is_file(), "{spool:?}");
+    assert_eq!(
+        fs::metadata(&spool).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(spool.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    let mut shell = start(TerminalTarget::Shell);
+    let shell_options = shell.terminal().expect("shell").options().clone();
+    assert_eq!(
+        env_of(&shell_options.env, PLUGIN_DIRS),
+        Some(OsString::from(&expected))
+    );
+    let shell_spool = PathBuf::from(env_of(&shell_options.env, SPOOL).unwrap());
+    assert_ne!(shell_spool, spool, "each tab has its own spool");
+
+    for target in [
+        TerminalTarget::Tui(CompatibleTui::Grok),
+        TerminalTarget::Tui(CompatibleTui::OpenCode),
+    ] {
+        let mut other = start(target);
+        let options = other.terminal().expect("child").options().clone();
+        assert!(env_of(&options.env, PLUGIN_DIRS).is_none(), "{target:?}");
+        assert!(env_of(&options.env, SPOOL).is_none(), "{target:?}");
+        if target == TerminalTarget::Tui(CompatibleTui::Grok) {
+            assert_eq!(options.args, vec![OsString::from("dashboard")]);
+            assert!(env_of(&options.env, made_bridge::config::CONFIG_CONTENT_ENV).is_none());
+        }
+        other.shutdown();
+    }
+
+    claude.shutdown();
+    drop(claude);
+    assert!(!spool.exists(), "closing the tab deletes its spool");
+    assert!(shell_spool.exists(), "other tabs' spools are unchanged");
+    shell.shutdown();
+    drop(shell);
+    assert!(!shell_spool.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
+    if isolated_claude_launch("spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not")
+    {
+        return;
+    }
+    use std::io::Write;
+    use std::time::Instant;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mk = |name: &str| {
+        let path = workspace.path().join(name);
+        fs::create_dir_all(&path).unwrap();
+        path.canonicalize().unwrap()
+    };
+    let (root, session, foreign, worktree) =
+        (mk("root"), mk("session"), mk("foreign"), mk("worktree"));
+    let plan = LaunchPlan::open(&root, WorkspaceSource::Picker).unwrap();
+    let mut workbench = made_app::Workbench::start(
+        Some(plan),
+        None,
+        root.clone(),
+        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+        Instant::now(),
+    );
+    let pane_pid = workbench
+        .terminal()
+        .and_then(made_app::TerminalPane::pid)
+        .unwrap();
+    let spool = PathBuf::from(
+        env_of(&workbench.terminal().unwrap().options().env, SPOOL).expect("spool binding"),
+    );
+    let ctx = eframe::egui::Context::default();
+    let append = |cwd: &Path, event: &str, pids: &[u32]| {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        let line = format!(
+            "{{\"at\":\"t\",\"sessionId\":\"s\",\"cwd\":{},\"event\":\"{event}\",\"notification\":\"\",\"status\":\"idle\",\"title\":\"\",\"pids\":[{}]}}\n",
+            serde_json::to_string(&cwd.display().to_string()).unwrap(),
+            pids.join(",")
+        );
+        let mut file = fs::OpenOptions::new().append(true).open(&spool).unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+    };
+    let tick_until = |workbench: &mut made_app::Workbench, expected: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while workbench.explorer_root() != Some(expected) && Instant::now() < deadline {
+            workbench.tick(&ctx);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        workbench.explorer_root().map(Path::to_path_buf)
+    };
+
+    assert!(
+        workbench.claude_tab().unwrap().present(),
+        "a direct tab is Claude Code while its child runs"
+    );
+    // A record whose ancestry never reaches this tab's terminal is not owned.
+    append(&foreign, "SessionStart", &[4_000_000, 4_000_001]);
+    for _ in 0..30 {
+        workbench.tick(&ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(workbench.explorer_root(), Some(root.as_path()));
+    assert!(workbench.claude_tab().unwrap().dots().is_empty());
+
+    // The hook shell (already exited) then the terminal child: owned.
+    append(&session, "SessionStart", &[4_000_000, pane_pid]);
+    assert_eq!(
+        tick_until(&mut workbench, &session).as_deref(),
+        Some(session.as_path()),
+        "an owned record moves the explorer"
+    );
+    append(&worktree, "CwdChanged", &[4_000_000, pane_pid]);
+    assert_eq!(
+        tick_until(&mut workbench, &worktree).as_deref(),
+        Some(worktree.as_path()),
+        "a later record of any event follows"
+    );
+    append(&root.join("missing"), "Stop", &[4_000_000, pane_pid]);
+    for _ in 0..30 {
+        workbench.tick(&ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        workbench.explorer_root(),
+        Some(worktree.as_path()),
+        "a missing directory does not move the explorer"
+    );
+    workbench.shutdown();
+}
+
 fn quote_posix(path: &Path) -> String {
     let text = path.to_string_lossy();
     format!("'{}'", text.replace('\'', "'\\''"))

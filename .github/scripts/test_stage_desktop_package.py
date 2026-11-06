@@ -8,8 +8,10 @@ import json
 import os
 import re
 import stat
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -19,6 +21,7 @@ stage_desktop = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(stage_desktop)
 
 GROK_FILES = ["README.md", "hooks/bin/made-grok-status", "hooks/hooks.json", "plugin.json"]
+CLAUDE_FILES = [".claude-plugin/plugin.json", "README.md", "bin/made-claude-status", "hooks/hooks.json"]
 
 
 def workspace_version() -> str:
@@ -31,9 +34,11 @@ class StageDesktopPackageTest(unittest.TestCase):
         self.tmp = Path(self._dir.name)
         self.app = self.tmp / "build" / "made-app"
         self.hook = self.tmp / "build" / "made-grok-status"
+        self.claude_hook = self.tmp / "build" / "made-claude-status"
         self.app.parent.mkdir()
         self.app.write_bytes(b"\x7fELF fake app")
         self.hook.write_bytes(b"\x7fELF fake hook")
+        self.claude_hook.write_bytes(b"\x7fELF fake claude hook")
         # A plugin source whose version differs proves the stamped version.
         source = self.tmp / "grok-source"
         (source / "hooks").mkdir(parents=True)
@@ -42,6 +47,15 @@ class StageDesktopPackageTest(unittest.TestCase):
         (source / "hooks/hooks.json").write_text('{"command": "bin/made-grok-status"}\n')
         (source / "hooks/stale.py").write_text("print('never shipped')\n")
         os.environ["MADE_GROK_PLUGIN_SOURCE"] = str(source)
+        self.claude_source = self.tmp / "claude-source"
+        (self.claude_source / ".claude-plugin").mkdir(parents=True)
+        (self.claude_source / "hooks").mkdir()
+        (self.claude_source / ".claude-plugin/plugin.json").write_text(
+            '{\n  "name": "claude-code-made",\n  "version": "9.9.9"\n}\n'
+        )
+        (self.claude_source / "README.md").write_text("fixture\n")
+        (self.claude_source / "hooks/hooks.json").write_text('{"command": "bin/made-claude-status"}\n')
+        os.environ["MADE_CLAUDE_PLUGIN_SOURCE"] = str(self.claude_source)
         node_modules = REPO / "plugins/opencode-made/node_modules"
         self.made_node_modules = not node_modules.exists()
         if self.made_node_modules:
@@ -49,6 +63,7 @@ class StageDesktopPackageTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         os.environ.pop("MADE_GROK_PLUGIN_SOURCE", None)
+        os.environ.pop("MADE_CLAUDE_PLUGIN_SOURCE", None)
         if self.made_node_modules:
             import shutil
 
@@ -60,7 +75,7 @@ class StageDesktopPackageTest(unittest.TestCase):
         stage_desktop.stage(
             stage_desktop.parse(
                 ["--profile", profile, "--target", "x86_64-unknown-linux-gnu", "--app", str(self.app),
-                 "--hook", str(self.hook), "--stage", str(out)]
+                 "--hook", str(self.hook), "--claude-hook", str(self.claude_hook), "--stage", str(out)]
             )
         )
         return out
@@ -80,14 +95,57 @@ class StageDesktopPackageTest(unittest.TestCase):
                 manifest = json.loads((grok / "plugin.json").read_text())
                 self.assertEqual(manifest["version"], workspace_version())
                 self.assertEqual((grok / "hooks/bin/made-grok-status").read_bytes(), self.hook.read_bytes())
+                claude = out / "plugins/claude-code-made"
+                files = sorted(p.relative_to(claude).as_posix() for p in claude.rglob("*") if p.is_file())
+                self.assertEqual(files, CLAUDE_FILES)
+                manifest = json.loads((claude / ".claude-plugin/plugin.json").read_text())
+                self.assertEqual(manifest["version"], workspace_version())
+                self.assertEqual((claude / "bin/made-claude-status").read_bytes(), self.claude_hook.read_bytes())
                 self.assertFalse((out / "plugin").exists())
 
     def test_executable_bits_on_unix(self) -> None:
         if os.name == "nt":
             self.skipTest("no executable bit on Windows")
         out = self.staged("release")
-        for path in (out / "made-app", out / "plugins/grok-made/hooks/bin/made-grok-status"):
+        for path in (
+            out / "made-app",
+            out / "plugins/grok-made/hooks/bin/made-grok-status",
+            out / "plugins/claude-code-made/bin/made-claude-status",
+        ):
             self.assertTrue(path.stat().st_mode & stat.S_IXUSR, path)
+
+    def test_fails_when_a_claude_plugin_source_file_is_missing(self) -> None:
+        for name in (".claude-plugin/plugin.json", "README.md", "hooks/hooks.json"):
+            with self.subTest(missing=name):
+                (self.claude_source / name).rename(self.claude_source / (name + ".off"))
+                with self.assertRaises((SystemExit, subprocess.CalledProcessError)):
+                    self.staged(name.replace("/", "-"))
+                (self.claude_source / (name + ".off")).rename(self.claude_source / name)
+
+    def test_fails_when_the_claude_hook_is_missing_or_empty(self) -> None:
+        for label, content in (("missing", None), ("empty", b"")):
+            with self.subTest(hook=label):
+                if content is None:
+                    self.claude_hook.unlink()
+                else:
+                    self.claude_hook.write_bytes(content)
+                with self.assertRaises((SystemExit, subprocess.CalledProcessError)):
+                    self.staged(label)
+
+    def test_fails_when_the_claude_hook_lacks_its_executable_bit(self) -> None:
+        if os.name == "nt":
+            self.skipTest("no executable bit on Windows")
+        real_run = subprocess.run
+
+        def strip_bit(command, *args, **kwargs):
+            result = real_run(command, *args, **kwargs)
+            if "stage-claude-plugin.sh" in str(command[1]):
+                (Path(command[-1]) / "bin/made-claude-status").chmod(0o644)
+            return result
+
+        with mock.patch.object(stage_desktop.subprocess, "run", strip_bit):
+            with self.assertRaises(SystemExit):
+                self.staged("release")
 
     def test_release_metadata(self) -> None:
         out = self.staged("release")

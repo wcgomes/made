@@ -27,6 +27,7 @@ use made_platform::{
     PtySize,
 };
 
+use crate::claude_follow::{shared_instance, ClaudeTab, TabSpool};
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
     DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
@@ -42,7 +43,7 @@ use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
 use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
-use crate::tui::TerminalTarget;
+use crate::tui::{ClaudeLaunchEnv, TerminalTarget, CLAUDE_SPOOL_ENV};
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
 use crate::worktree::{
     GitRunner, GitStatusRead, GitStatusSnapshot, MetadataStatus, WorktreeMetadata,
@@ -69,6 +70,20 @@ const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
+
+/// Claude Code state of one local tab: the joined hook and protocol channels,
+/// and the tab's spool.
+struct ClaudeRuntime {
+    tab: ClaudeTab,
+    /// `None` when the spool could not be created; hooks are then unavailable.
+    spool: Option<TabSpool>,
+    liveness_checked_at: Instant,
+    /// Directory last handed to the follow coordinator.
+    applied_directory: Option<PathBuf>,
+}
+
+/// How often owned Claude Code processes are checked for exit.
+const CLAUDE_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One Grok session open in this terminal, with the latest hook status.
 #[derive(Debug, Clone)]
@@ -559,6 +574,11 @@ pub struct Workbench {
     /// `None` while a provisional move is active means the shell owned the root.
     grok_restore_root: Option<PathBuf>,
     grok_file_newest_id: Option<String>,
+    /// Present for local shell and direct Claude Code tabs.
+    claude: Option<ClaudeRuntime>,
+    /// Session-status hooks cannot report for this tab: the shipped plugin is
+    /// missing or unreadable, or the tab's spool could not be created.
+    claude_hooks_unavailable: bool,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -821,6 +841,8 @@ impl Workbench {
             grok_provisional_cwd: None,
             grok_restore_root: None,
             grok_file_newest_id: None,
+            claude: None,
+            claude_hooks_unavailable: false,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -1102,10 +1124,11 @@ impl Workbench {
     }
 
     fn start_terminal(&mut self, composed_content: Option<String>) {
-        // Grok is started as-is. OpenCode and the shell keep the composed
-        // plugin environment; Grok must not receive it or a written config.
+        // Grok and Claude Code are started as-is. OpenCode and the shell keep
+        // the composed plugin environment; Grok and Claude Code must not
+        // receive it or a written config.
         let composed_content = match self.terminal_target {
-            TerminalTarget::Tui(CompatibleTui::Grok) => None,
+            TerminalTarget::Tui(CompatibleTui::Grok | CompatibleTui::ClaudeCode) => None,
             TerminalTarget::Shell | TerminalTarget::Tui(CompatibleTui::OpenCode) => {
                 composed_content
             }
@@ -1130,6 +1153,9 @@ impl Workbench {
             self.terminal_error = Some(detail);
             return;
         };
+        // Local shell and direct Claude Code tabs load Made's session-only
+        // plugin and report to this tab's own spool.
+        let (mut claude_spool, claude_launch) = self.prepare_claude_launch();
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1142,6 +1168,7 @@ impl Workbench {
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");
+        options = with_claude_launch_env(options, self.terminal_target, &claude_launch);
 
         if let Some(content) = &composed_content {
             options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
@@ -1159,6 +1186,7 @@ impl Workbench {
                         ),
                     );
                 }
+                self.install_claude(pane.pid(), claude_spool.take());
                 self.terminal = Some(pane);
                 self.terminal_error = None;
                 if composed_content.is_none() {
@@ -1183,6 +1211,7 @@ impl Workbench {
                             .without_env("SHELLOPTS")
                             .without_env("BASH_ENV")
                             .without_env("ENV");
+                        retry = with_claude_launch_env(retry, self.terminal_target, &claude_launch);
                         if let Some(content) = &composed_content {
                             retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }
@@ -1200,6 +1229,7 @@ impl Workbench {
                             if let Some(follow) = self.follow.as_mut() {
                                 follow.set_terminal_cwd(&self.terminal_cwd);
                             }
+                            self.install_claude(pane.pid(), claude_spool.take());
                             self.terminal = Some(pane);
                             self.terminal_error = None;
                             return;
@@ -1214,6 +1244,81 @@ impl Workbench {
                 self.terminal_error = Some(detail);
             }
         }
+    }
+
+    /// Create this tab's spool and compose its Claude Code environment. Only
+    /// local shell and direct Claude Code tabs get one.
+    fn prepare_claude_launch(&mut self) -> (Option<TabSpool>, ClaudeLaunchEnv) {
+        if !self.terminal_target.loads_claude_plugin() {
+            return (None, ClaudeLaunchEnv::default());
+        }
+        let shipped = self
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.shipped_claude_plugin_dir())
+            .map(Path::to_path_buf);
+        let spool = if shipped.is_some() {
+            self.open_claude_spool()
+        } else {
+            None
+        };
+        let existing = std::env::var_os(made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV);
+        let launch = self.terminal_target.claude_launch_env(
+            shipped.as_deref(),
+            existing.as_deref(),
+            spool.as_ref().map(TabSpool::path),
+        );
+        if launch.hooks_unavailable {
+            self.claude_hooks_unavailable = true;
+            self.diag.log_mut().record(
+                LogLevel::Warn,
+                "Claude Code session-status hooks are unavailable for this tab",
+            );
+        }
+        (spool, launch)
+    }
+
+    fn open_claude_spool(&mut self) -> Option<TabSpool> {
+        let temp_dir = self.paths.as_ref()?.temp_dir.clone();
+        let opened =
+            shared_instance(&temp_dir).and_then(|instance| TabSpool::open(instance, &self.pane_id));
+        match opened {
+            Ok(spool) => Some(spool),
+            Err(error) => {
+                self.diag.log_mut().record(
+                    LogLevel::Warn,
+                    format!("Claude Code spool could not be created: {error}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn install_claude(&mut self, pid: Option<u32>, spool: Option<TabSpool>) {
+        if !self.terminal_target.loads_claude_plugin() {
+            return;
+        }
+        let direct = self.terminal_target == TerminalTarget::Tui(CompatibleTui::ClaudeCode);
+        let mut tab = ClaudeTab::new(pid.unwrap_or(0), direct);
+        tab.set_child_running(true);
+        self.claude = Some(ClaudeRuntime {
+            tab,
+            spool,
+            liveness_checked_at: Instant::now(),
+            applied_directory: None,
+        });
+    }
+
+    /// Claude Code state of this tab: presence, dots and title inputs. `None`
+    /// for tabs that do not load Made's Claude Code plugin.
+    pub fn claude_tab(&self) -> Option<&ClaudeTab> {
+        self.claude.as_ref().map(|runtime| &runtime.tab)
+    }
+
+    /// Whether session-status hooks cannot report for this tab because the
+    /// shipped plugin or the tab's spool is unavailable.
+    pub fn claude_hooks_unavailable(&self) -> bool {
+        self.claude_hooks_unavailable
     }
 
     fn log_launch_context(&mut self) {
@@ -3772,6 +3877,7 @@ impl Workbench {
         self.maybe_schedule_shell_root_revalidation(now);
         self.poll_grok_hooks(now);
         self.poll_grok_directory(now);
+        self.poll_claude(now);
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -4125,6 +4231,61 @@ impl Workbench {
                 self.follow_grok_path(None);
             }
             _ => {}
+        }
+    }
+
+    /// Apply this tab's Claude Code channels: terminal protocol events and the
+    /// shell-prompt report, spool records read off the UI thread, the
+    /// one-second liveness check and the session directory.
+    fn poll_claude(&mut self, now: Instant) {
+        let Some(runtime) = self.claude.as_mut() else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        if let Some(pid) = terminal.pid() {
+            runtime.tab.set_root(pid);
+        }
+        // A prompt report from before a status emission must not end it, so it
+        // is applied first.
+        if terminal.take_cwd_report() {
+            runtime.tab.note_shell_prompt();
+        }
+        for event in terminal.take_protocol_events() {
+            runtime.tab.note_protocol(event);
+        }
+        runtime.tab.set_child_running(terminal.is_running());
+        let records = runtime
+            .spool
+            .as_ref()
+            .map(TabSpool::drain)
+            .unwrap_or_default();
+        if !records.is_empty() {
+            runtime.tab.ingest(records, made_platform::process_parent);
+        }
+        if now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL {
+            runtime.liveness_checked_at = now;
+            runtime.tab.check_liveness(made_platform::process_parent);
+        }
+        let directory = runtime.tab.directory().map(PathBuf::from);
+        if directory == runtime.applied_directory {
+            return;
+        }
+        runtime.applied_directory.clone_from(&directory);
+        self.follow_claude_path(directory.as_deref());
+    }
+
+    fn follow_claude_path(&mut self, directory: Option<&Path>) {
+        let Some(outcome) = self
+            .follow
+            .as_mut()
+            .map(|follow| follow.follow_claude_directory(directory))
+        else {
+            return;
+        };
+        if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+            self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
         }
     }
 
@@ -4892,6 +5053,8 @@ impl Workbench {
         if let Some(mut terminal) = self.terminal.take() {
             terminal.terminate(self.diag.log_mut());
         }
+        // Closing the tab deletes its spool.
+        self.claude = None;
         if let Some(bridge) = self.bridge.take() {
             if let Err(error) = bridge.shutdown() {
                 self.diag
@@ -5452,6 +5615,27 @@ impl Drop for ShellRootWorker {
     }
 }
 
+/// Add a tab's Claude Code environment to its PTY options. A launch with no
+/// spool binding also removes an inherited one, so a copied variable can never
+/// point a tab at another tab's spool.
+fn with_claude_launch_env(
+    mut options: made_terminal::PtyOptions,
+    target: TerminalTarget,
+    launch: &ClaudeLaunchEnv,
+) -> made_terminal::PtyOptions {
+    if !target.loads_claude_plugin() {
+        return options;
+    }
+    let binds_spool = launch.env.iter().any(|(key, _)| key == CLAUDE_SPOOL_ENV);
+    for (key, value) in &launch.env {
+        options = options.with_env(key.clone(), value.clone());
+    }
+    if !binds_spool {
+        options = options.without_env(CLAUDE_SPOOL_ENV);
+    }
+    options
+}
+
 fn diagnostics_log_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
     // If app paths are unavailable, fail closed. A shared $TMPDIR path would be
     // predictable and symlink-attackable.
@@ -5831,6 +6015,8 @@ mod tests {
             grok_provisional_cwd: None,
             grok_restore_root: None,
             grok_file_newest_id: None,
+            claude: None,
+            claude_hooks_unavailable: false,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),
             visible: false,
