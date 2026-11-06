@@ -489,10 +489,26 @@ mod live {
         mut want: impl FnMut(&Operation) -> Option<T>,
     ) -> T {
         let limit = deadline();
+        let mut trail: Vec<String> = Vec::new();
         loop {
-            assert!(Instant::now() < limit, "deadline waiting for a frame");
+            assert!(
+                Instant::now() < limit,
+                "deadline waiting for a frame; frames seen: {trail:?}"
+            );
             match read_envelope(stream) {
                 Ok(frame) => {
+                    trail.push(match &frame.operation {
+                        Operation::TerminalOutput { data, done } => {
+                            format!(
+                                "output(done={done}) {:?}",
+                                String::from_utf8_lossy(data.as_bytes())
+                            )
+                        }
+                        Operation::ShellCwd { path } => {
+                            format!("cwd {:?}", String::from_utf8_lossy(path.as_bytes()))
+                        }
+                        _ => "other".into(),
+                    });
                     if let Some(found) = want(&frame.operation) {
                         return found;
                     }
