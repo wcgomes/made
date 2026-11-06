@@ -40,7 +40,8 @@ v0.1.0 on Windows 11 rendered fully opaque, and the product goal is a macOS-like
 - Now: Acrylic uses the documented `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)`, applied after `DWMWA_USE_IMMERSIVE_DARK_MODE=1`. The undocumented path is not used and the `window-vibrancy` crate was removed.
 - Gate: Windows 11 22H2, build 22621 or newer, read through `RtlGetVersion`. Older builds, including Windows 10, fall back to in-app glass with `applied=false` and a reason naming the build.
 - The `DxgiFromVisual` swapchain and `DwmExtendFrameIntoClientArea(-1)` remain required. `NativeBackdropKind::WindowsMica` is now `WindowsAcrylic`, labelled "Windows Acrylic".
-- Alpha tokens are unchanged pending a native legibility judgment. Native Windows rendering and resize/drag performance are unverified; if the documented path still lags, revisit this amendment.
+- DWM system backdrops, including `DWMSBT_TRANSIENTWINDOW`, render a solid fallback when the window is inactive, when Windows "Transparency effects" is off, or in energy saver, while the status still reads `applied=true`.
+- Alpha tokens are unchanged pending a native legibility judgment. Native Windows rendering and resize/drag performance are unverified, as are focus-loss appearance and resize/drag smoothness on native Windows 11; if the documented path still lags, revisit this amendment.
 
 ## Evidence
 

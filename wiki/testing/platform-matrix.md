@@ -11,7 +11,7 @@ Automated coverage was observed green on **Linux x64, macOS arm64/x64, and Windo
 | Linux x64 native Wayland | CI green 2026-10-28 (build/test); headless Weston smoke | Weston smoke only | **PENDING native UX** | Native compositor input/IME/clipboard and real OpenCode TUI. |
 | macOS arm64 | CI green 2026-10-28 (build/contract/app smoke) | Manual native check 2026-10-28: window/UI rendered, HudWindow vibrancy applied and visible; windowed/resized/fullscreen. Clipboard image paste user-confirmed 2026-11-01. | **PENDING native UX** | Rendering/vibrancy and clipboard image paste checked; native home, terminal, tabs, cwd, preview, IME/mouse/full clipboard, full UX pass pending. |
 | macOS x64 | CI green 2026-10-28 (build/contract/app smoke) | CI smoke only | **PENDING native UX** | No native run; native backdrop and UI remain compile-checked only. |
-| Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Acrylic, IME/clipboard. WSL is not a substitute. |
+| Windows x64 native/ConPTY | CI green 2026-10-28 (build/contract/PTY/app smoke) | CI smoke only | **PENDING native UX** | Native OpenCode, ConPTY resize, Job Object cleanup, Acrylic (focus-loss solid fallback, resize/drag smoothness), IME/clipboard. WSL is not a substitute. |
 
 ## Shell support
 
@@ -54,7 +54,7 @@ The v0.1.0 field-issue fixes (Windows GUI subsystem, DX12 visual swapchain/Acryl
 
 - Native Linux X11/Wayland with real desktop input.
 - macOS arm64 full native UX pass; macOS x64 native run, including HudWindow vibrancy.
-- Windows x64 native/ConPTY, including Acrylic, Job Object cleanup, and native OpenCode.
+- Windows x64 native/ConPTY, including Acrylic (focus-loss appearance, resize/drag smoothness; DWM shows a solid fallback when inactive, with Transparency effects off, or in energy saver, while status stays `applied=true`), Job Object cleanup, and native OpenCode.
 - Real zsh/fish/PowerShell cwd runs.
 - Live real-OpenCode switching, worktree removal/indicator, and native session-map focus.
 - Native IME/clipboard/mouse/paste/title/focus (macOS clipboard image paste user-confirmed 2026-11-01; Linux and Windows not yet tested; no known defect).

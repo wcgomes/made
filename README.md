@@ -23,7 +23,7 @@ A native, terminal-first desktop workspace for developers: one window, independe
 - **Clipboard image paste** — Cmd/Ctrl+V forwards the paste so agent TUIs read the image natively; Cmd/Ctrl+Shift+V saves it as a private PNG (7-day/64-file retention) and pastes the path as a fallback.
 - **Home startup and inline folder picker** — no argument opens your home workspace; `--picker` browses an inline expandable folder tree; an explicit path wins over both.
 - **About and diagnostics** — open About from the MADE wordmark for the app identity and version, then reveal workspace, cwd capability, effective root, integration state, logs, and metrics on demand without routine status chrome.
-- **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Mica may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
+- **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Acrylic (22H2, build 22621, or newer; older builds use the in-app glass) may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
 
 ## Install
 
@@ -99,7 +99,7 @@ No extra system libraries are needed: Metal, CoreText, and the clipboard come fr
 
 #### Windows (x64)
 
-Build the Windows target natively, or run the Linux build under WSL2 (see [Linux](#linux-x64-x11-or-wayland)) — WSL2 is a Linux host and does not exercise the Windows-specific paths: ConPTY, Mica, native clipboard, and IME.
+Build the Windows target natively, or run the Linux build under WSL2 (see [Linux](#linux-x64-x11-or-wayland)) — WSL2 is a Linux host and does not exercise the Windows-specific paths: ConPTY, Acrylic, native clipboard, and IME.
 
 Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload; the MSVC linker is required because `x86_64-pc-windows-msvc` is the only supported Windows target.
 
@@ -149,7 +149,7 @@ npm run typecheck
 
 Made is an **initial UX validation build**, not a production-ready release.
 
-Automated tests and smoke checks pass in CI across the supported targets, and development artifacts are produced. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, and launching the packaged artifacts. Native macOS vibrancy and Windows 11 Mica have not been validated interactively.
+Automated tests and smoke checks pass in CI across the supported targets, and development artifacts are produced. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, and launching the packaged artifacts. Native macOS vibrancy and Windows 11 Acrylic (22H2+, build 22621) have not been validated interactively.
 
 The file preview is read-only: no editing, saving, LSP, or diff view. Releases are installable and update themselves, but they are not signed or notarized.
 
