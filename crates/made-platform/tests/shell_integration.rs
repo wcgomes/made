@@ -711,6 +711,22 @@ fn unsafe_modes_and_unknown_shells_are_unchanged() {
 }
 
 #[test]
+#[cfg(not(windows))]
+fn a_non_windows_program_named_cmd_is_not_reported_as_cwd_supported() {
+    let dir = std::env::temp_dir().join(format!("made-cmd-unix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("cmd");
+    std::fs::write(&program, b"").unwrap();
+    let mut request = PtyRequest::new(&program, std::env::temp_dir());
+    request.env = vec![("PATH".into(), "".into())];
+    let plan = ShellLaunchPlan::new(request.clone());
+    assert!(!plan.capability().is_supported());
+    assert_eq!(plan.request(), &request);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
 fn cmd_launch_plan_emits_osc7_from_a_launch_local_prompt() {
     let dir = std::env::temp_dir().join(format!("made-cmd-plan-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

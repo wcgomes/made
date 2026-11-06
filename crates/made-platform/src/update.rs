@@ -1033,8 +1033,7 @@ fn spawn_updater(
     update_exe: &Path,
     args: Vec<OsString>,
 ) -> Result<std::process::Child, UpdateError> {
-    std::process::Command::new(update_exe)
-        .args(args)
+    crate::hide_console_window(std::process::Command::new(update_exe).args(args))
         .spawn()
         .map_err(|error| UpdateError::Local(format!("cannot start the updater: {error}")))
 }

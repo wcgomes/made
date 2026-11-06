@@ -63,6 +63,7 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     }
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     if Backends::from_env().is_none() {
+        // Vulkan is intentionally dropped here: DX12 first, GL as the fallback.
         setup.instance_descriptor.backends = Backends::DX12 | Backends::GL;
     }
     setup

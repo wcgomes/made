@@ -136,7 +136,7 @@ impl ShellLaunchPlan {
             "zsh" => &["-i", "-l", "--login"],
             "fish" => &["-i", "--interactive", "-l", "--login"],
             "pwsh" | "powershell" => &["-NoLogo", "-NoProfile", "-NoExit"],
-            "cmd" => &["/d"],
+            "cmd" if cfg!(windows) => &["/d"],
             _ => return plan,
         };
         if plan.cwd_sink.is_some()
@@ -674,10 +674,13 @@ fn powershell_allows_bootstrap(request: &PtyRequest) -> bool {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    let child = Command::new(&request.program)
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Write([string]$ExecutionContext.SessionState.LanguageMode + ':' + [string](Get-ExecutionPolicy))"])
-        .env_clear().envs(request.env.iter().cloned())
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+    let child = crate::hide_console_window(
+        Command::new(&request.program)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Write([string]$ExecutionContext.SessionState.LanguageMode + ':' + [string](Get-ExecutionPolicy))"])
+            .env_clear().envs(request.env.iter().cloned())
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()),
+    )
+    .spawn();
     let Ok(mut child) = child else {
         return false;
     };

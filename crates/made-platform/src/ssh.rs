@@ -745,15 +745,17 @@ pub fn forget_known_host(
     } else {
         format!("[{host}]:{port}")
     };
-    let mut child = Command::new(ssh_keygen)
-        .arg("-R")
-        .arg(&target)
-        .arg("-f")
-        .arg(known_hosts)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = crate::hide_console_window(
+        Command::new(ssh_keygen)
+            .arg("-R")
+            .arg(&target)
+            .arg("-f")
+            .arg(known_hosts)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait()? {

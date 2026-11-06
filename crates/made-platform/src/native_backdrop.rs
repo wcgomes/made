@@ -117,6 +117,14 @@ impl NativeBackdropStatus {
         }
     }
 
+    /// Append a note to the reason when the applied effect cannot be seen
+    /// because the window surface has no alpha. The status stays applied.
+    pub fn note_surface_caveat(&mut self, caveat: Option<&str>) {
+        if let (true, Some(caveat)) = (self.applied, caveat) {
+            self.reason = format!("{}; {caveat}", self.reason);
+        }
+    }
+
     fn fallback(reason: impl Into<String>) -> Self {
         Self {
             kind: NativeBackdropKind::InAppGlass,
@@ -160,6 +168,38 @@ impl RequestedMode {
 /// alpha. Other platforms need nothing special.
 pub const fn requires_composition_swapchain() -> bool {
     cfg!(target_os = "windows")
+}
+
+/// Why the window surface probably carries no alpha although the native
+/// backdrop was applied, or `None` when nothing is known to be wrong.
+///
+/// `dx12_backend` is whether wgpu ended up on DX12. Only meaningful where
+/// [`requires_composition_swapchain`] is true.
+pub fn opaque_surface_caveat(dx12_backend: bool) -> Option<&'static str> {
+    surface_caveat(
+        requires_composition_swapchain(),
+        dx12_backend,
+        env::var("WGPU_DX12_PRESENTATION_SYSTEM").ok().as_deref(),
+    )
+}
+
+fn surface_caveat(
+    required: bool,
+    dx12_backend: bool,
+    presentation_system: Option<&str>,
+) -> Option<&'static str> {
+    if !required {
+        return None;
+    }
+    if !dx12_backend {
+        return Some("GPU backend is not DX12, so the surface is probably opaque");
+    }
+    match presentation_system.map(str::to_ascii_lowercase).as_deref() {
+        Some("dxgifromhwnd" | "hwnd") => Some(
+            "WGPU_DX12_PRESENTATION_SYSTEM selects an opaque HWND swapchain, so the surface is opaque",
+        ),
+        _ => None,
+    }
 }
 
 /// Attempt to apply a native backdrop to `window`, once, at startup.
@@ -367,6 +407,29 @@ mod tests {
         let default = NativeBackdropStatus::default();
         assert!(!default.is_applied());
         assert!(!default.reason().is_empty());
+    }
+
+    #[test]
+    fn surface_caveat_is_honest_about_opaque_surfaces() {
+        assert_eq!(surface_caveat(false, false, Some("hwnd")), None);
+        assert_eq!(surface_caveat(true, true, None), None);
+        assert_eq!(surface_caveat(true, true, Some("DxgiFromVisual")), None);
+        assert!(surface_caveat(true, false, None)
+            .unwrap()
+            .contains("not DX12"));
+        for value in ["hwnd", "DxgiFromHwnd"] {
+            assert!(surface_caveat(true, true, Some(value))
+                .unwrap()
+                .contains("opaque HWND"));
+        }
+        let mut status =
+            NativeBackdropStatus::applied(NativeBackdropKind::WindowsMica, "Mica applied");
+        status.note_surface_caveat(Some("surface is opaque"));
+        assert!(status.is_applied());
+        assert_eq!(status.reason(), "Mica applied; surface is opaque");
+        let mut fallback = NativeBackdropStatus::fallback("none");
+        fallback.note_surface_caveat(Some("ignored"));
+        assert_eq!(fallback.reason(), "none");
     }
 
     #[test]

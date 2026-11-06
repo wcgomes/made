@@ -100,6 +100,19 @@ pub fn attach_parent_console() {
     }
 }
 
+/// Leave the launching console so a normal GUI session cannot be ended by it.
+///
+/// After [`attach_parent_console`] a GUI launch would still share the parent's
+/// console, and Ctrl+C or closing that console would send the process a control
+/// event that ends Made and every session in it. Redirected stdio (pipes,
+/// files) is unaffected.
+pub fn detach_console() {
+    // SAFETY: FreeConsole has no arguments and only detaches this process.
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
 /// Windows backend implementing [`Platform`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsPlatform;

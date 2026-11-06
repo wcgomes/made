@@ -202,6 +202,11 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
         (None, _) => {}
     }
 
+    // A normal GUI session must not share the launching console: its Ctrl+C or
+    // close would end Made. CLI actions and smoke runs keep it for their output.
+    if smoke.is_none() {
+        made_platform::detach_console();
+    }
     let result = eframe::run_native(
         "Made",
         made_app::app::native_options(),
@@ -235,7 +240,11 @@ impl eframe::App for NativeApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if !self.native_backdrop_checked {
             self.native_backdrop_checked = true;
-            let status = made_platform::native_backdrop::apply(&*frame);
+            let mut status = made_platform::native_backdrop::apply(&*frame);
+            let dx12 = frame.wgpu_render_state().is_some_and(|state| {
+                state.adapter.get_info().backend == eframe::wgpu::Backend::Dx12
+            });
+            status.note_surface_caveat(made_platform::native_backdrop::opaque_surface_caveat(dx12));
             eprintln!(
                 "made: native backdrop: {} applied={} reason={}",
                 status.label(),

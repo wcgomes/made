@@ -170,6 +170,27 @@ pub fn attach_parent_console() {
     windows::attach_parent_console();
 }
 
+/// Release the console attached by [`attach_parent_console`] before the GUI
+/// session starts, so the launching terminal's Ctrl+C or close cannot end
+/// Made. Does nothing on other platforms.
+pub fn detach_console() {
+    #[cfg(target_os = "windows")]
+    windows::detach_console();
+}
+
+/// Keep a non-PTY console child (probes, `ssh-keygen`, plugin installers,
+/// `Update.exe`) from opening a console window when Made has no console of its
+/// own. Never apply this to a shell started on a pseudo-terminal. Replaces any
+/// other creation flags. Does nothing on other platforms.
+pub fn hide_console_window(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Environment variable that overrides the app-owned plugin directory.
 ///
 /// Development builds may point this at any staged plugin package. Release
