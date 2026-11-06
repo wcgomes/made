@@ -373,10 +373,11 @@ fn run_local(layout: Layout, cwd: &Path) -> String {
         let mut pairs = vec![
             (bin.to_string_lossy().into_owned(), "<bin>"),
             (root.to_string_lossy().into_owned(), "<install>"),
-            // The home as the process sees it and as the filesystem names it
-            // (they differ below a symlinked temporary directory).
-            (raw_home(), "<home>"),
+            // The home as the filesystem names it and as the process was given
+            // it (they differ below a symlinked temporary directory); the
+            // longer spelling goes first.
             (home_dir().to_string_lossy().into_owned(), "<home>"),
+            (raw_home(), "<home>"),
         ];
         if let Some(spool) = spool {
             assert!(Path::new(&spool).is_absolute() && Path::new(&spool).is_file());
