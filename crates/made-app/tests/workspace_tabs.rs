@@ -2094,7 +2094,7 @@ fn oversized_user_config_is_skipped_without_blocking_workspace_start() {
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
         &config,
-        vec![b'{'; made_app::workbench::MAX_USER_CONFIG_BYTES as usize + 1],
+        vec![b'{'; made_app::integrations::opencode::MAX_USER_CONFIG_BYTES as usize + 1],
     )
     .unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -3768,7 +3768,10 @@ fn same_version_update_waits_for_separate_approval_and_reports_the_real_reason()
     // failure would clear install readiness, so publish the diagnostics
     // snapshot without ticking the remote tab: that reads this tab's
     // post-stage provisioning while the attach result is still queued.
-    model.hold_grok_diagnostics(made_app::app::GrokDiagnosticsHold::NotOnPath);
+    made_app::integrations::grok::hold_diagnostics(
+        &mut model,
+        made_app::integrations::grok::GrokDiagnosticsHold::NotOnPath,
+    );
     assert!(
         model.remote_grok_install_ready(authority),
         "a successful matching update stage makes the current path install-ready"
@@ -4234,7 +4237,7 @@ mod tab_presentation_characterization {
         lite.pump_until("claude present", |model| {
             model
                 .workspace(id)
-                .and_then(made_app::Workbench::claude_tab)
+                .and_then(made_app::integrations::claude_code::tab)
                 .is_some_and(|tab| tab.present())
         });
     }

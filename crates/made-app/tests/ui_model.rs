@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use made_app::app::{AppModel, AppOptions, GrokDiagnosticsHold, GrokRunningHold, WorkspaceId};
+use made_app::app::{AppModel, AppOptions, WorkspaceId};
 use made_app::cli::LaunchArgs;
 use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
+use made_app::integrations::claude_code;
+use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
 use made_app::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE};
 use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
@@ -11487,7 +11489,7 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
         ),
     ];
     for (hold, sentence, pill, tone, tint) in states {
-        headless.model.hold_grok_diagnostics(hold);
+        grok::hold_diagnostics(&mut headless.model, hold);
         let output = headless.render();
         assert_revealed_grok_row(
             &output,
@@ -11614,13 +11616,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         GrokDiagnosticsHold::Installed,
         GrokDiagnosticsHold::AlreadyCurrent,
     ] {
-        headless.model.hold_grok_diagnostics(hold);
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+        grok::hold_diagnostics(&mut headless.model, hold);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::NotRunning);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11631,12 +11629,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
             inactive.2,
         );
 
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::NotRunning);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::NotRunning);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::LivingTarget);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11647,12 +11641,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
             ready.2,
         );
 
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::OpenSession);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11695,9 +11685,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         ),
     ];
     for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
-        headless.model.hold_workspace_grok_running(here_id, running);
+        grok::hold_workspace_running(&mut headless.model, here_id, running);
         for (hold, sentence, pill, tone, tint) in unchanged {
-            headless.model.hold_grok_diagnostics(hold);
+            grok::hold_diagnostics(&mut headless.model, hold);
             expect_revealed_grok_row(
                 &mut headless,
                 here_id,
@@ -11710,12 +11700,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         }
     }
 
-    headless
-        .model
-        .hold_grok_diagnostics(GrokDiagnosticsHold::Installed);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
+    grok::hold_diagnostics(&mut headless.model, GrokDiagnosticsHold::Installed);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::LivingTarget);
     headless.model.hold_workspace_opencode_label(here_id);
     expect_revealed_grok_row(
         &mut headless,
@@ -11736,12 +11722,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         "OpenCode must own the tab label while Grok is running"
     );
 
-    headless
-        .model
-        .hold_grok_diagnostics(GrokDiagnosticsHold::AlreadyCurrent);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+    grok::hold_diagnostics(&mut headless.model, GrokDiagnosticsHold::AlreadyCurrent);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::OpenSession);
     expect_revealed_grok_row(
         &mut headless,
         here_id,
@@ -11752,12 +11734,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         ready.2,
     );
 
-    headless
-        .model
-        .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+    grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::NotRunning);
     expect_revealed_grok_row(
         &mut headless,
         here_id,
@@ -11776,8 +11754,7 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
     let menu_id = open_workspace(&mut menu_model, &menu_root);
     let mut menu = Headless::new(menu_model, 1280.0, 800.0);
     wait_explorer_ready(&mut menu, menu_id);
-    menu.model
-        .hold_workspace_grok_running(menu_id, GrokRunningHold::LivingTarget);
+    grok::hold_workspace_running(&mut menu.model, menu_id, GrokRunningHold::LivingTarget);
     assert!(
         menu.model
             .workspace(menu_id)
@@ -11806,7 +11783,7 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
 
     open_about_diagnostics(&mut menu, menu_id);
     for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
-        menu.model.hold_workspace_grok_running(menu_id, running);
+        grok::hold_workspace_running(&mut menu.model, menu_id, running);
         expect_revealed_grok_row(
             &mut menu,
             menu_id,
@@ -13879,7 +13856,7 @@ fn opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present() {
             .headless
             .model
             .workspace(id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_some_and(|tab| tab.present()),
         "Claude Code is not present before any source"
     );
@@ -13905,7 +13882,7 @@ fn opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present() {
             .headless
             .model
             .workspace(id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_some_and(|tab| tab.present());
         if present {
             break;
@@ -13968,7 +13945,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "the OpenCode plugin configuration is still injected"
     );
     for key in [
-        made_app::tui::CLAUDE_CODE_PLUGIN_DIRS_ENV,
+        claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV,
         "MADE_CLAUDE_SPOOL",
     ] {
         assert!(
@@ -13984,7 +13961,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "an inherited spool binding is stripped"
     );
     assert!(
-        workbench.claude_tab().is_none(),
+        claude_code::tab(&workbench).is_none(),
         "an OpenCode tab carries no Claude Code state"
     );
     let report = workbench.sanitized_diagnostics_text();
