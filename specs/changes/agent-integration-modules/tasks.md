@@ -204,43 +204,43 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [ ] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; One module per integration (Claude Code, Grok Build); No cross-integration dependency; Grok ignores an unusable directory silently; Grok is ignored under OpenCode; Grok retains under Claude Code; Branch table preserved; Launch environment matrix; Grok arguments; Rows before detection; Report order follows the list; Green after each step; Revert of the latest step
 
 ## 3. Step 3: OpenCode channel code and shim removal (step 3 PR)
-- [ ] 3.1 Extend the neutrality deny-list with OpenCode legacy identifiers (`workspace_opencode_active`, `opencode_icon`, `remember_opencode_missing`, `note_opencode_`), still exempting transitional-shim regions; confirm failing locally, commit with 3.8 (path: crates/made-app/tests/integration_modules.rs)
-- [ ] 3.2 OpenCode composed-config contribution under `CONFIG_CONTENT_ENV` (path: crates/made-app/src/integrations/opencode/launch.rs)
-- [ ] 3.3 Relocate the bridge-start wiring and user-config capture functions (`workbench.rs` ~1030-1160, 5265-5300, 5862-5885) into the OpenCode tab module (path: crates/made-app/src/integrations/opencode/tab.rs)
-- [ ] 3.4 Remove the relocated OpenCode functions (path: crates/made-app/src/workbench.rs)
-- [ ] 3.5 Move `SUPPORTED_OPENCODE_MAJOR`, `note_opencode_*`, `is_supported_opencode_version` (path: crates/made-app/src/integrations/opencode/diagnostics.rs)
-- [ ] 3.6 Remove the moved items, keeping `IntegrationState` and `ReasonCode` for the session channel (path: crates/made-app/src/integration_status.rs)
-- [ ] 3.7 `opencode_icon` and the active predicate in the OpenCode module (path: crates/made-app/src/integrations/opencode/mod.rs)
-- [ ] 3.8 Remove `workspace_opencode_active` and `opencode_icon` (path: crates/made-app/src/ui.rs)
-- [ ] 3.9 Session channel bound to the list's `SessionChannel` entry, no OpenCode name in the coordinator (path: crates/made-app/src/session_follow.rs)
-- [ ] 3.10 Path-only import and accessor update to the modules' paths and typed helpers while the shims still exist (green), separate commit [P] (path: crates/made-app/tests/ui_model.rs)
-- [ ] 3.11 Path-only update [P] (path: crates/made-app/tests/workspace_tabs.rs)
-- [ ] 3.12 Path-only update [P] (path: crates/made-app/tests/launch_workspace.rs)
-- [ ] 3.13 Path-only update [P] (path: crates/made-app/tests/session_follow.rs)
-- [ ] 3.14 Path-only update [P] (path: crates/made-app/tests/diagnostics.rs)
-- [ ] 3.15 Path-only update [P] (path: crates/made-app/tests/degraded.rs)
-- [ ] 3.16 Path-only update [P] (path: crates/made-app/tests/remote_workspace.rs)
-- [ ] 3.17 Path-only update [P] (path: crates/made-app/tests/grok_plugin_install.rs)
-- [ ] 3.18 Path-only update [P] (path: crates/made-app/tests/claude_follow.rs)
-- [ ] 3.19 Path-only update [P] (path: crates/made-app/tests/claude_live.rs)
-- [ ] 3.20 Path-only update [P] (path: crates/made-app/tests/claude_privacy.rs)
-- [ ] 3.21 Path-only update [P] (path: crates/made-app/tests/claude_spool.rs)
-- [ ] 3.22 Path-only update [P] (path: crates/made-app/tests/claude_launch.rs)
-- [ ] 3.23 Path-only update [P] (path: crates/made-app/tests/opencode_tui.rs)
-- [ ] 3.24 Path-only update [P] (path: crates/made-app/tests/ssh_servers.rs)
-- [ ] 3.25 Adapter-block update if the block uses a re-export removed in 3.27 to 3.35, done while it still exists (green) [P] (path: crates/made-app/tests/follow_characterization.rs)
-- [ ] 3.26 Adapter-block update if the block uses a re-export removed in 3.27 to 3.35, done while it still exists (green) [P] (path: crates/made-app/tests/launch_env_characterization.rs)
-- [ ] 3.27 Remove the transitional `claude_tab` and `note_opencode_missing` accessors (tests already switched to the modules' paths and typed helpers in 3.10 to 3.26) (path: crates/made-app/src/workbench.rs)
-- [ ] 3.28 Remove every remaining `pub use` re-export shim (path: crates/made-app/src/lib.rs)
-- [ ] 3.29 Delete the shim file (path: crates/made-app/src/claude_follow.rs)
-- [ ] 3.30 Delete the shim file (already deleted in step 2, see 2.3; nothing to do) (path: crates/made-app/src/grok_follow.rs)
-- [ ] 3.31 Delete the shim file (already deleted in step 2, see 2.5; nothing to do) (path: crates/made-app/src/grok_plugin.rs)
-- [ ] 3.32 Remove the Claude Code diagnostics re-export (path: crates/made-app/src/integration_status.rs)
-- [ ] 3.33 Remove the Grok phase re-export and the transitional `hold_grok_diagnostics` and `hold_workspace_grok_running` accessors (path: crates/made-app/src/app.rs)
-- [ ] 3.34 Remove the Grok row re-export (path: crates/made-app/src/diagnostics.rs)
-- [ ] 3.35 Remove the Claude Code env re-export (path: crates/made-app/src/tui.rs)
-- [ ] 3.36 Confirm the fake integration tests are unchanged since step 1 and pass, and that no core file of design.md "Seam inventory" names the fake (path: crates/made-app/tests/fake_integration.rs)
-- [ ] 3.37 Scan asserting no `transitional-shim (AIA-11)` marker remains under `crates/made-app/src` (path: crates/made-app/tests/integration_modules.rs)
+- [x] 3.1 Extend the neutrality deny-list with OpenCode legacy identifiers (`workspace_opencode_active`, `opencode_icon`, `remember_opencode_missing`, `note_opencode_`), still exempting transitional-shim regions; confirm failing locally, commit with 3.8 (path: crates/made-app/tests/integration_modules.rs) Done: the deny-list names `workspace_opencode_active`, `opencode_icon`, `remember_opencode_missing` and `note_opencode_`; the import scan now covers all three module paths (it failed on the `integrations::opencode` imports of `app.rs` and `workbench.rs` before 3.3 to 3.8).
+- [x] 3.2 OpenCode composed-config contribution under `CONFIG_CONTENT_ENV` (path: crates/made-app/src/integrations/opencode/launch.rs) Done: `launch::contribution` and `launch::composes`; the "started with the original environment" check asks `Integration::configures_launch` (n4 of the step 1 review) instead of naming `CONFIG_CONTENT_ENV` in `workbench.rs`.
+- [x] 3.3 Relocate the bridge-start wiring and user-config capture functions (`workbench.rs` ~1030-1160, 5265-5300, 5862-5885) into the OpenCode tab module (path: crates/made-app/src/integrations/opencode/tab.rs) Done as `TabState::start` (bridge start, user-configuration capture and composition) and `TabState::shutdown` / `after_shutdown` (bridge stop, capture verification, credential release); the bridge-event drain stays at the session-channel tick position in the core.
+- [x] 3.4 Remove the relocated OpenCode functions (path: crates/made-app/src/workbench.rs)
+- [x] 3.5 Move `SUPPORTED_OPENCODE_MAJOR`, `note_opencode_*`, `is_supported_opencode_version` (path: crates/made-app/src/integrations/opencode/diagnostics.rs)
+- [x] 3.6 Remove the moved items, keeping `IntegrationState` and `ReasonCode` for the session channel (path: crates/made-app/src/integration_status.rs)
+- [x] 3.7 `opencode_icon` and the active predicate in the OpenCode module (path: crates/made-app/src/integrations/opencode/mod.rs) Done: the predicate is `opencode::active`; `opencode_icon` no longer exists (the `+` menu mark comes from the descriptor since step 1).
+- [x] 3.8 Remove `workspace_opencode_active` and `opencode_icon` (path: crates/made-app/src/ui.rs)
+- [x] 3.9 Session channel bound to the list's `SessionChannel` entry, no OpenCode name in the coordinator (path: crates/made-app/src/session_follow.rs) Nothing left to change: `session_follow.rs` already finds the owner through `FollowKind::SessionChannel` and names no OpenCode item; the core reaches the owner through `session_channel_state`, `session_bridge`, `session_token` and `session_peer_supported`.
+- [x] 3.10 Path-only import and accessor update to the modules' paths and typed helpers while the shims still exist (green), separate commit [P] (path: crates/made-app/tests/ui_model.rs)
+- [x] 3.11 Path-only update [P] (path: crates/made-app/tests/workspace_tabs.rs)
+- [x] 3.12 Path-only update [P] (path: crates/made-app/tests/launch_workspace.rs)
+- [x] 3.13 Path-only update [P] (path: crates/made-app/tests/session_follow.rs) No change needed: the file imports no shim path.
+- [x] 3.14 Path-only update [P] (path: crates/made-app/tests/diagnostics.rs)
+- [x] 3.15 Path-only update [P] (path: crates/made-app/tests/degraded.rs)
+- [x] 3.16 Path-only update [P] (path: crates/made-app/tests/remote_workspace.rs)
+- [x] 3.17 Path-only update [P] (path: crates/made-app/tests/grok_plugin_install.rs)
+- [x] 3.18 Path-only update [P] (path: crates/made-app/tests/claude_follow.rs)
+- [x] 3.19 Path-only update [P] (path: crates/made-app/tests/claude_live.rs)
+- [x] 3.20 Path-only update [P] (path: crates/made-app/tests/claude_privacy.rs)
+- [x] 3.21 Path-only update [P] (path: crates/made-app/tests/claude_spool.rs)
+- [x] 3.22 Path-only update [P] (path: crates/made-app/tests/claude_launch.rs)
+- [x] 3.23 Path-only update [P] (path: crates/made-app/tests/opencode_tui.rs) No change needed: the file imports no shim path.
+- [x] 3.24 Path-only update [P] (path: crates/made-app/tests/ssh_servers.rs) No change needed: the file imports no shim path.
+- [x] 3.25 Adapter-block update if the block uses a re-export removed in 3.27 to 3.35, done while it still exists (green) [P] (path: crates/made-app/tests/follow_characterization.rs) No change needed: the adapter block imports no shim path.
+- [x] 3.26 Adapter-block update if the block uses a re-export removed in 3.27 to 3.35, done while it still exists (green) [P] (path: crates/made-app/tests/launch_env_characterization.rs) No change needed: the adapter block imports no shim path.
+- [x] 3.27 Remove the transitional `claude_tab` and `note_opencode_missing` accessors (tests already switched to the modules' paths and typed helpers in 3.10 to 3.26) (path: crates/made-app/src/workbench.rs)
+- [x] 3.28 Remove every remaining `pub use` re-export shim (path: crates/made-app/src/lib.rs) Done: the `pub mod claude_follow;` declaration is gone; the other re-exports were removed with their files.
+- [x] 3.29 Delete the shim file (path: crates/made-app/src/claude_follow.rs)
+- [x] 3.30 Delete the shim file (already deleted in step 2, see 2.3; nothing to do) (path: crates/made-app/src/grok_follow.rs) Done in step 2.
+- [x] 3.31 Delete the shim file (already deleted in step 2, see 2.5; nothing to do) (path: crates/made-app/src/grok_plugin.rs) Done in step 2.
+- [x] 3.32 Remove the Claude Code diagnostics re-export (path: crates/made-app/src/integration_status.rs)
+- [x] 3.33 Remove the Grok phase re-export and the transitional `hold_grok_diagnostics` and `hold_workspace_grok_running` accessors (path: crates/made-app/src/app.rs)
+- [x] 3.34 Remove the Grok row re-export (path: crates/made-app/src/diagnostics.rs)
+- [x] 3.35 Remove the Claude Code env re-export (path: crates/made-app/src/tui.rs)
+- [x] 3.36 Confirm the fake integration tests are unchanged since step 1 and pass, and that no core file of design.md "Seam inventory" names the fake (path: crates/made-app/tests/fake_integration.rs)
+- [x] 3.37 Scan asserting no `transitional-shim (AIA-11)` marker remains under `crates/made-app/src` (path: crates/made-app/tests/integration_modules.rs)
 - [ ] 3.38 Revert check of the step 3 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint

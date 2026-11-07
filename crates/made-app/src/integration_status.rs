@@ -856,33 +856,3 @@ fn bounded_detail(detail: &str) -> String {
     bounded.push('…');
     bounded
 }
-
-// BEGIN transitional-shim (AIA-11)
-pub use crate::integrations::claude_code::diagnostics::{
-    claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
-    ClaudeDiagnosticsPhase, CLAUDE_GRACE,
-};
-// END transitional-shim
-
-// BEGIN transitional-shim (AIA-11)
-pub use crate::integrations::opencode::diagnostics::{
-    is_supported_version as is_supported_opencode_version, SUPPORTED_OPENCODE_MAJOR,
-};
-
-impl IntegrationState {
-    /// App-level event: OpenCode is not installed or not on PATH.
-    pub fn note_opencode_missing(&mut self) -> StatusChange {
-        crate::integrations::opencode::diagnostics::note_missing(self)
-    }
-
-    /// Apply the OpenCode major-version gate.
-    pub fn note_opencode_version(&mut self, version: &str) -> StatusChange {
-        crate::integrations::opencode::diagnostics::note_version(self, version)
-    }
-
-    /// App-level event: OpenCode exited normally.
-    pub fn note_opencode_exited(&mut self) -> StatusChange {
-        crate::integrations::opencode::diagnostics::note_exited(self)
-    }
-}
-// END transitional-shim

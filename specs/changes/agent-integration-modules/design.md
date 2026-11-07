@@ -139,6 +139,21 @@ Polls return a `TabReport` (directory report, presence change) instead of callin
 
 Per-tab context the core passes to a poll (`TabIo`) exposes only what integrations use today: terminal pid, `is_running`, `take_protocol_events`, `take_cwd_report`, the process-parent map on demand, the diagnostics log and app paths. This keeps the dependency direction inward: integration modules depend on core services, the core depends only on `integrations/mod.rs`.
 
+### Public test surface (settled in step 3)
+
+The external test crate reaches an integration through its module only; the old core paths (`made_app::claude_follow`, `made_app::tui` launch items, `made_app::integration_status` Claude Code and OpenCode items, `made_app::app::Grok*Hold`, `Workbench::claude_tab`, `Workbench::note_opencode_missing`, `AppModel::hold_*grok*`, `IntegrationState::note_opencode_*`, `workbench::MAX_USER_CONFIG_BYTES`) are gone. `integrations::{claude_code, grok, opencode}` are `pub mod`; everything else in them stays `pub(crate)`.
+
+| Module | Public items used by the tests |
+|---|---|
+| `claude_code::follow` | the channel code that was `claude_follow` (`parse_record`, `ClaudeTab`, `ClaudeActivity`, `SpoolReader`, `SpoolInstance`, `TabSpool`, `shared_instance`, limits), unchanged |
+| `claude_code::launch` | `claude_launch_env` (free function over the target), `ClaudeLaunchEnv`, `CLAUDE_SPOOL_ENV`, `CLAUDE_CODE_PLUGIN_DIRS_ENV`, `claude_plugin_dirs_separator`, `compose_claude_plugin_dirs`, `shipped_claude_plugin_dir` |
+| `claude_code::diagnostics` | `claude_diagnostics_row`, `remote_claude_diagnostics_row`, `ClaudeDiagnosticsInputs`, `ClaudeDiagnosticsPhase`, `CLAUDE_GRACE` |
+| `claude_code` | `#[doc(hidden)] tab(&Workbench) -> Option<&ClaudeTab>` |
+| `grok` | `GrokDiagnosticsHold`, `GrokRunningHold`, `#[doc(hidden)] hold_diagnostics(&mut AppModel, ..)`, `#[doc(hidden)] hold_workspace_running(&mut AppModel, ..)` |
+| `opencode` | `MAX_USER_CONFIG_BYTES`; `opencode::diagnostics::{is_supported_version, note_missing, note_version, note_exited, SUPPORTED_OPENCODE_MAJOR}` over `&mut IntegrationState` |
+
+The core learned only neutral hooks, so it names no integration module (the import scan covers all three): `TabState::{start, shutdown, after_shutdown, bridge, token}` (the bridge start, the user-configuration capture and its verification belong to the session-channel owner's tab state), `AppState::{holds_detection, on_workspace_closed, take_pending_notice, notify_workspace}` with `WorkspaceNotices` (one announcement mechanism for the Grok "hooks unavailable" line and the OpenCode "missing" status), `Integration::{configures_launch, supports_peer_version}`, and the list helpers `session_channel_state`, `session_bridge`, `session_token` and `session_peer_supported`, all bound to the entry whose `follow()` is `SessionChannel`. `session_follow.rs` already found that entry through `FollowKind` and names no integration.
+
 ## Flow
 
 Tick order is preserved exactly (`workbench.rs:3923-4060`):

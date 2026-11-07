@@ -5,20 +5,12 @@
 //! shell in between.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::integrations::IntegrationRef;
 use made_platform::find_executable_on_path;
 use made_remote::protocol::AuthorityId;
 use made_terminal::PtyOptions;
-
-// BEGIN transitional-shim (AIA-11)
-use crate::integrations::claude_code::launch::claude_launch_env;
-pub use crate::integrations::claude_code::launch::{
-    claude_plugin_dirs_separator, compose_claude_plugin_dirs, shipped_claude_plugin_dir,
-    ClaudeLaunchEnv, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV,
-};
-// END transitional-shim
 
 /// Which child process a workspace terminal starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,19 +63,6 @@ impl TerminalTarget {
             // END remote-path
         }
     }
-
-    // BEGIN transitional-shim (AIA-11)
-    /// The Claude Code launch environment for this target; see
-    /// [`claude_launch_env`].
-    pub fn claude_launch_env(
-        self,
-        shipped: Option<&Path>,
-        existing: Option<&OsStr>,
-        spool: Option<&Path>,
-    ) -> ClaudeLaunchEnv {
-        claude_launch_env(self, shipped, existing, spool)
-    }
-    // END transitional-shim
 
     /// Whether this target belongs to a saved SSH authority.
     pub fn is_remote(self) -> bool {
@@ -157,6 +136,7 @@ impl TerminalTarget {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::path::Path;
 
     use super::*;
     use crate::integrations::{CLAUDE_CODE, GROK, OPENCODE};
@@ -202,7 +182,8 @@ mod tests {
         assert_eq!(claude.restart_label(), "Reconnect Claude Code SSH");
         // Remote Claude Code gets no plugin configuration, spool or environment.
         assert!(!CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, claude));
-        let env = claude.claude_launch_env(
+        let env = crate::integrations::claude_code::launch::claude_launch_env(
+            claude,
             Some(Path::new("/shipped")),
             Some(OsStr::new("/user")),
             Some(Path::new("/spool")),

@@ -181,7 +181,7 @@ mod neutrality {
     use made_app::integrations::PRODUCT;
 
     /// Identifiers of the legacy local Claude Code seams. Core files must not
-    /// name them outside the exempt regions.
+    /// name them outside remote-path regions.
     const LEGACY_CLAUDE_CODE: &[&str] = &[
         "claude_root",
         "ClaudeRuntime",
@@ -194,7 +194,7 @@ mod neutrality {
     ];
 
     /// Identifiers of the legacy Grok Build seams. Core files must not name
-    /// them outside the exempt regions.
+    /// them outside remote-path regions.
     const LEGACY_GROK: &[&str] = &[
         "grok_root",
         "GrokLiveSession",
@@ -204,7 +204,7 @@ mod neutrality {
     ];
 
     /// Identifiers of the legacy OpenCode seams. Core files must not name
-    /// them outside the exempt regions.
+    /// them outside remote-path regions.
     const LEGACY_OPENCODE: &[&str] = &[
         "workspace_opencode_active",
         "opencode_icon",
@@ -239,22 +239,17 @@ mod neutrality {
         files
     }
 
-    /// The lines of `source` outside remote-path and transitional-shim
-    /// regions, with their numbers.
+    /// The lines of `source` outside remote-path regions, with their numbers.
     fn scanned_lines(source: &str) -> Vec<(usize, &str)> {
         let mut depth = 0usize;
         let mut lines = Vec::new();
         for (index, line) in source.lines().enumerate() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("// BEGIN remote-path")
-                || trimmed.starts_with("// BEGIN transitional-shim")
-            {
+            if trimmed.starts_with("// BEGIN remote-path") {
                 depth += 1;
                 continue;
             }
-            if trimmed.starts_with("// END remote-path")
-                || trimmed.starts_with("// END transitional-shim")
-            {
+            if trimmed.starts_with("// END remote-path") {
                 depth = depth.saturating_sub(1);
                 continue;
             }
@@ -371,6 +366,29 @@ mod neutrality {
         assert!(
             found.is_empty(),
             "core imports of an integration module:\n{}",
+            found.join("\n")
+        );
+    }
+
+    #[test]
+    fn no_transitional_shim_marker_remains() {
+        // Written in two parts so this file does not carry the marker itself.
+        const MARKER: &str = concat!("transitional", "-shim (AIA-11)");
+        let mut files = Vec::new();
+        module_files(&src_dir(), &mut files);
+        assert!(!files.is_empty(), "the scan read no file");
+        let mut found = Vec::new();
+        for path in files {
+            let source = fs::read_to_string(&path).unwrap();
+            for (index, line) in source.lines().enumerate() {
+                if line.contains(MARKER) {
+                    found.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "transitional shims remain:\n{}",
             found.join("\n")
         );
     }

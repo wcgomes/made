@@ -17,11 +17,6 @@ use made_platform::Platform;
 
 use crate::cli::LaunchArgs;
 
-// BEGIN transitional-shim (AIA-11)
-pub use crate::integrations::grok::diagnostics::{GrokDiagnosticsHold, GrokRunningHold};
-use crate::integrations::grok::{self};
-// END transitional-shim
-
 use crate::integrations::{
     AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, OPENCODE, PRODUCT,
 };
@@ -580,35 +575,6 @@ impl AppModel {
     pub fn compatible_tuis(&self) -> &[IntegrationRef] {
         &self.compatible_tuis
     }
-
-    // BEGIN transitional-shim (AIA-11)
-    /// Hold the Grok Build diagnostics row without a grok process.
-    ///
-    /// The hold replaces detection and install until the model is dropped. It
-    /// does not spawn grok, wait on `PATH`, or start the shipped-plugin install.
-    /// Background detection and install still run when no hold is set.
-    /// [`GrokDiagnosticsHold::Installed`] and [`GrokDiagnosticsHold::AlreadyCurrent`]
-    /// are ready only while that workspace's Grok is running.
-    pub fn hold_grok_diagnostics(&mut self, hold: GrokDiagnosticsHold) {
-        if let Some(state) = grok::app_state_mut(self.integrations, &mut self.app_states) {
-            state.set_hold(hold);
-        }
-        self.push_grok_diagnostics();
-    }
-
-    /// Mark whether Grok is running in one workspace, without a grok process.
-    ///
-    /// The mark stays until replaced. It does not spawn grok, look up `PATH`,
-    /// or install the plugin, and it does not change the tab label. Checking,
-    /// not on PATH, installing, hooks unavailable, and the explicit-catalog
-    /// sentence ignore it.
-    pub fn hold_workspace_grok_running(&mut self, id: WorkspaceId, running: GrokRunningHold) {
-        if let Some(state) = grok::app_state_mut(self.integrations, &mut self.app_states) {
-            state.set_running_hold(id, running);
-        }
-        self.push_grok_diagnostics();
-    }
-    // END transitional-shim
 
     // BEGIN remote-path (AIA-02)
     /// Record a finished probe outcome for one server without an SSH attempt.

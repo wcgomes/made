@@ -27,10 +27,6 @@ use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_log_text};
 use crate::session_follow::FollowedSession;
 use crate::worktree::{MetadataStatus, WorktreeMetadata};
 
-// BEGIN transitional-shim (AIA-11)
-pub(crate) use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
-// END transitional-shim
-
 /// Maximum number of retained log entries.
 pub const MAX_LOG_ENTRIES: usize = 500;
 
@@ -888,6 +884,7 @@ pub struct RemoteOpenCodeReport {
     pub reason: String,
 }
 
+// BEGIN remote-path (AIA-02)
 /// Derive the owning tab's Grok Build row.
 ///
 /// Every value comes from the owning tab's own remote state: its launch
@@ -907,6 +904,7 @@ pub fn remote_grok_row(
     consented: bool,
     running_or_open: bool,
 ) -> RemoteGrokReport {
+    use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
     if let Some(detail) = failed_detail {
         return RemoteGrokReport {
             pill: DiagnosticsPill::Degraded,
@@ -944,6 +942,7 @@ pub fn remote_grok_row(
         _ => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED),
     }
 }
+// END remote-path
 
 /// The owning remote tab's Grok Build tier inputs for [`remote_grok_row`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

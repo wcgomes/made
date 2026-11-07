@@ -25,19 +25,13 @@ use made_platform::{
 
 use crate::app::WorkspaceId;
 use crate::diagnostics::{
-    Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
-    DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
+    Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
+    MAX_LOG_FILE_BYTES,
 };
 use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
 use crate::integration_status::{IntegrationState, IntegrationStatus};
-// BEGIN transitional-shim (AIA-11)
-use crate::claude_follow::ClaudeTab;
-use crate::integrations::claude_code;
-use crate::integrations::grok;
-pub use crate::integrations::opencode::MAX_USER_CONFIG_BYTES;
-// END transitional-shim
 use crate::integrations::{
     apply_contributions, session_bridge, session_token, AppState, DiagnosticsDecl, EnvContribution,
     FollowKind, FollowPort, FollowStep, IntegrationList, LaunchCtx, Presentation, PresentationCtx,
@@ -1297,13 +1291,6 @@ impl Workbench {
             .collect()
     }
 
-    // BEGIN transitional-shim (AIA-11)
-    /// Claude Code state of this tab: presence, dots and title inputs. `None`
-    /// for tabs that do not load Made's Claude Code plugin.
-    pub fn claude_tab(&self) -> Option<&ClaudeTab> {
-        claude_code::tab_state(self.integrations, &self.tab_states).and_then(|state| state.tab())
-    }
-
     // BEGIN remote-path (AIA-02)
     /// Record this remote tab's own `claude` detection: `None` while its probe
     /// is pending. The host PATH is never consulted for a remote tab.
@@ -1311,52 +1298,28 @@ impl Workbench {
         if self.remote.is_none() {
             return;
         }
-        if let Some(state) = claude_code::tab_state_mut(self.integrations, &mut self.tab_states) {
+        if let Some(state) =
+            crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
             state.set_remote_detection(detected);
         }
     }
-    // END remote-path
 
-    /// The Claude Code state of this tab, for tests.
-    #[cfg(test)]
-    fn claude_state_mut(&mut self) -> &mut claude_code::ClaudeTabState {
-        claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
-            .expect("the product list has Claude Code")
-    }
-
-    /// Whether Grok is running in this workspace.
-    #[cfg(test)]
-    pub(crate) fn grok_follow_running(&self) -> bool {
-        let running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
-        grok::tab_state(self.integrations, &self.tab_states)
-            .is_some_and(|state| state.follow_running(self.terminal_target, running))
-    }
-
-    // BEGIN remote-path (AIA-02)
     /// Keep this remote tab's Grok Build diagnostics row for the next
     /// snapshot.
-    pub(crate) fn set_remote_grok_row(&mut self, row: GrokDiagnosticsRow) {
+    pub(crate) fn set_remote_grok_row(
+        &mut self,
+        row: crate::integrations::grok::diagnostics::GrokDiagnosticsRow,
+    ) {
         let remote_hooks_ready =
             self.remote_grok_running() && self.remote_grok_hooks_ready() == Some(true);
-        if let Some(state) = grok::tab_state_mut(self.integrations, &mut self.tab_states) {
+        if let Some(state) =
+            crate::integrations::grok::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
             state.set_diagnostics(row, remote_hooks_ready);
         }
     }
     // END remote-path
-
-    /// Grok Build pill and sentence currently kept for this tab.
-    #[cfg(test)]
-    fn grok_row(&self) -> GrokDiagnosticsRow {
-        grok::tab_state(self.integrations, &self.tab_states).map_or(
-            GrokDiagnosticsRow::NOT_ON_PATH,
-            grok::GrokTabState::diagnostics,
-        )
-    }
-
-    /// Record that OpenCode is not installed or not on PATH.
-    pub fn note_opencode_missing(&mut self) {
-        self.integration.note_opencode_missing();
-    }
 
     /// The tab's bridge, once it started.
     pub(crate) fn bridge(&self) -> Option<&BridgeHandle> {
@@ -1367,14 +1330,6 @@ impl Workbench {
     pub(crate) fn token(&self) -> Option<&Token> {
         session_token(self.integrations, &self.tab_states)
     }
-
-    /// The Grok state of this tab, for tests.
-    #[cfg(test)]
-    fn grok_state_mut(&mut self) -> &mut grok::GrokTabState {
-        grok::tab_state_mut(self.integrations, &mut self.tab_states)
-            .expect("the product list has Grok")
-    }
-    // END transitional-shim
 
     fn log_launch_context(&mut self) {
         let source = self
@@ -2931,7 +2886,9 @@ impl Workbench {
         remote.grok_detected = capabilities.grok;
         // END remote-path
         // BEGIN remote-path (AIA-02)
-        if let Some(state) = claude_code::tab_state_mut(self.integrations, &mut self.tab_states) {
+        if let Some(state) =
+            crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
             state.set_remote_detection(Some(report.claude));
         }
         // END remote-path
@@ -5491,9 +5448,45 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integration_status::ClaudeDiagnosticsPhase;
-    use crate::integrations::{GROK, OPENCODE};
-    use crate::tui::CLAUDE_SPOOL_ENV;
+    use crate::integrations::claude_code::diagnostics::ClaudeDiagnosticsPhase;
+    use crate::integrations::claude_code::launch::{CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV};
+    use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
+    use crate::integrations::{claude_code, grok, GROK, OPENCODE};
+
+    impl Workbench {
+        /// The Claude Code state of this tab.
+        fn claude_state_mut(&mut self) -> &mut claude_code::ClaudeTabState {
+            claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+                .expect("the product list has Claude Code")
+        }
+
+        /// Claude Code state of this tab, `None` for a tab that does not load
+        /// the plugin.
+        fn claude_tab(&self) -> Option<&claude_code::follow::ClaudeTab> {
+            claude_code::tab(self)
+        }
+
+        /// Whether Grok is running in this workspace.
+        fn grok_follow_running(&self) -> bool {
+            let running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+            grok::tab_state(self.integrations, &self.tab_states)
+                .is_some_and(|state| state.follow_running(self.terminal_target, running))
+        }
+
+        /// Grok Build pill and sentence currently kept for this tab.
+        fn grok_row(&self) -> GrokDiagnosticsRow {
+            grok::tab_state(self.integrations, &self.tab_states).map_or(
+                GrokDiagnosticsRow::NOT_ON_PATH,
+                grok::GrokTabState::diagnostics,
+            )
+        }
+
+        /// The Grok state of this tab.
+        fn grok_state_mut(&mut self) -> &mut grok::GrokTabState {
+            grok::tab_state_mut(self.integrations, &mut self.tab_states)
+                .expect("the product list has Grok")
+        }
+    }
 
     #[test]
     fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
@@ -5515,8 +5508,10 @@ mod tests {
                 "{target:?} must not inherit another tab's spool"
             );
             assert!(
-                options.env.iter().all(|(key, _)| key != CLAUDE_SPOOL_ENV
-                    && key != crate::tui::CLAUDE_CODE_PLUGIN_DIRS_ENV),
+                options
+                    .env
+                    .iter()
+                    .all(|(key, _)| key != CLAUDE_SPOOL_ENV && key != CLAUDE_CODE_PLUGIN_DIRS_ENV),
                 "{target:?} receives neither a spool nor the composed plugin list"
             );
         }
@@ -7957,7 +7952,7 @@ mod tests {
 
         #[test]
         fn remote_claude_status_arrives_through_the_remote_terminal_only() {
-            use crate::claude_follow::ClaudeActivity;
+            use crate::integrations::claude_code::follow::ClaudeActivity;
 
             let (mut bench, attach) = remote_claude_bench();
             bench.take_written();
@@ -8230,7 +8225,7 @@ mod tests {
             );
             // A probe alone, past the grace period: protocol unavailable.
             bench.workbench.claude_state_mut().set_present_since(Some(
-                Instant::now() - crate::integration_status::CLAUDE_GRACE * 2,
+                Instant::now() - crate::integrations::claude_code::diagnostics::CLAUDE_GRACE * 2,
             ));
             assert_eq!(
                 row(&bench),

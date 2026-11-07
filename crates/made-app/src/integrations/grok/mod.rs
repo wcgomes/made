@@ -116,14 +116,6 @@ pub(crate) fn tab_state_mut(
     super::tab_state_mut::<GrokTabState>(list, slots, GROK)
 }
 
-/// The Grok state of an app model built over `list`, mutably.
-pub(crate) fn app_state_mut(
-    list: IntegrationList,
-    slots: &mut Slots<Box<dyn AppState>>,
-) -> Option<&mut GrokAppState> {
-    super::app_state_mut::<GrokAppState>(list, slots, GROK)
-}
-
 /// Hold the Grok Build diagnostics row without a grok process.
 ///
 /// The hold replaces detection and install until the model is dropped. It
