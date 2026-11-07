@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_app::app::{AppModel, AppOptions};
+use made_app::integrations::claude_code;
 use made_app::integrations::GROK;
 use made_app::workspace::{LaunchPlan, WorkspaceLaunch, WorkspaceSource};
 use made_app::{ExplorerPane, Workbench};
@@ -305,7 +306,7 @@ fn expect_install(installed: Option<&str>) {
     // composed into the Grok launch, and an inherited binding is stripped.
     assert!(
         terminal.options().env.iter().all(|(key, _)| {
-            key != made_app::tui::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
+            key != claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
         }),
         "the Grok launch environment has no Made Claude Code plugin entry"
     );
@@ -320,7 +321,7 @@ fn expect_install(installed: Option<&str>) {
     assert!(
         model
             .workspace(grok_id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_none(),
         "a Grok tab carries no Claude Code state"
     );
