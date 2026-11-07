@@ -385,7 +385,7 @@ fn events(records: &[Value]) -> Vec<String> {
 }
 
 fn session_ready(workbench: &Workbench) -> bool {
-    claude_code::tab(&workbench).is_some_and(|tab| tab.session_count() == 1)
+    claude_code::tab(workbench).is_some_and(|tab| tab.session_count() == 1)
 }
 
 fn snapshot_unchanged(before: &[(PathBuf, Option<Vec<u8>>)]) {
@@ -422,7 +422,7 @@ fn live_shell_typed_and_menu_launched_sessions_load_the_plugin_once() {
             live.run_in_shell(&mut workbench, "");
         }
         let ready = live.pump_until(&mut workbench, SESSION_WAIT, |wb| {
-            session_ready(wb) && claude_code::tab(&wb).is_some_and(|tab| tab.protocol_status_seen())
+            session_ready(wb) && claude_code::tab(wb).is_some_and(|tab| tab.protocol_status_seen())
         });
         if !ready {
             verdict = unverified(format!(
@@ -612,7 +612,7 @@ fn live_bare_mode_keeps_protocol_status_only() {
     let mut workbench = live.start(TerminalTarget::Shell);
     live.run_in_shell(&mut workbench, "--bare");
     let seen = live.pump_until(&mut workbench, SESSION_WAIT, |wb| {
-        claude_code::tab(&wb).is_some_and(|tab| tab.protocol_status_seen())
+        claude_code::tab(wb).is_some_and(|tab| tab.protocol_status_seen())
     });
     if !seen {
         workbench.shutdown();
