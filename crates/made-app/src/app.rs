@@ -16,8 +16,13 @@ use made_platform::native_backdrop::NativeBackdropStatus;
 use made_platform::Platform;
 
 use crate::cli::LaunchArgs;
-use crate::diagnostics::GrokDiagnosticsRow;
-use crate::integrations::grok::{self, diagnostics::GrokAppState};
+
+// BEGIN transitional-shim (AIA-11)
+use crate::integrations::grok::diagnostics::{GrokAppState, GrokDiagnosticsRow};
+pub use crate::integrations::grok::diagnostics::{GrokDiagnosticsHold, GrokRunningHold};
+use crate::integrations::grok::{self};
+// END transitional-shim
+
 use crate::integrations::opencode::{self, diagnostics::OpenCodeAppState};
 use crate::integrations::{
     AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, OPENCODE, PRODUCT,
@@ -150,109 +155,7 @@ impl Default for AppOptions {
     }
 }
 
-/// Grok Build row while PATH detection and the shipped-plugin install run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GrokDiagnosticsPhase {
-    /// Background PATH detection has not finished.
-    Detecting,
-    /// Detection finished without grok, or the catalog omits Grok.
-    NotOnPath,
-    /// grok was detected and the install worker has not finished.
-    Installing,
-    /// Install succeeded, or the installed version was already current.
-    Ready,
-    /// The install failed.
-    Unavailable,
-    /// An explicit catalog includes Grok and detection did not run.
-    NotInstalledForLaunch,
-}
-
-impl GrokDiagnosticsPhase {
-    const fn row(self) -> GrokDiagnosticsRow {
-        match self {
-            Self::Detecting => GrokDiagnosticsRow::CHECKING,
-            Self::NotOnPath => GrokDiagnosticsRow::NOT_ON_PATH,
-            Self::Installing => GrokDiagnosticsRow::INSTALLING,
-            // Callers with a workspace use [`grok_row_for`]. This arm is only
-            // the success sentence; a quiet workspace uses `NOT_RUNNING`.
-            Self::Ready => GrokDiagnosticsRow::READY,
-            Self::Unavailable => GrokDiagnosticsRow::HOOKS_UNAVAILABLE,
-            Self::NotInstalledForLaunch => GrokDiagnosticsRow::NOT_INSTALLED,
-        }
-    }
-}
-
-/// Test-only hold for the Grok Build diagnostics row.
-///
-/// Applying a hold does not spawn grok, look up `PATH`, or install the plugin.
-/// Product startup leaves it unset and keeps background detection and install.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrokDiagnosticsHold {
-    /// PATH detection is still running.
-    Detecting,
-    /// Detection finished and grok is not on PATH.
-    NotOnPath,
-    /// grok was detected and the shipped-plugin install is still running.
-    Installing,
-    /// The install command succeeded.
-    Installed,
-    /// The installed version is already current.
-    AlreadyCurrent,
-    /// The install failed.
-    InstallFailed,
-}
-
-impl GrokDiagnosticsHold {
-    pub(crate) const fn phase(self) -> GrokDiagnosticsPhase {
-        match self {
-            Self::Detecting => GrokDiagnosticsPhase::Detecting,
-            Self::NotOnPath => GrokDiagnosticsPhase::NotOnPath,
-            Self::Installing => GrokDiagnosticsPhase::Installing,
-            Self::Installed | Self::AlreadyCurrent => GrokDiagnosticsPhase::Ready,
-            Self::InstallFailed => GrokDiagnosticsPhase::Unavailable,
-        }
-    }
-}
-
-/// Test-only running mark for one workspace's Grok Build row.
-///
-/// Applying a mark does not spawn grok, look up `PATH`, or install the plugin.
-/// Product startup leaves every workspace unmarked and reads that workspace's
-/// terminal target and open Grok sessions. The tab label is not a mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrokRunningHold {
-    /// This workspace's terminal target is Grok and that process is still alive.
-    LivingTarget,
-    /// This workspace's shell has at least one open Grok session.
-    ///
-    /// The target is not a living Grok process.
-    OpenSession,
-    /// Neither a living Grok target nor an open Grok session.
-    NotRunning,
-}
-
-/// Row for one workspace. Install success is ready only while Grok is running
-/// there, as the workspace's own state (`running`) or a test mark says.
-pub(crate) fn grok_row_for(
-    phase: GrokDiagnosticsPhase,
-    mark: Option<GrokRunningHold>,
-    running: bool,
-) -> GrokDiagnosticsRow {
-    if phase != GrokDiagnosticsPhase::Ready {
-        return phase.row();
-    }
-    let running = match mark {
-        Some(GrokRunningHold::LivingTarget | GrokRunningHold::OpenSession) => true,
-        Some(GrokRunningHold::NotRunning) => false,
-        None => running,
-    };
-    if running {
-        GrokDiagnosticsRow::READY
-    } else {
-        GrokDiagnosticsRow::NOT_RUNNING
-    }
-}
-
+// BEGIN remote-path (AIA-02)
 /// The owning remote tab's Grok Build row from resolved per-server state plus
 /// the tab's own remote state. The host detection phase never applies.
 fn remote_grok_row_for(
@@ -274,6 +177,7 @@ fn remote_grok_row_for(
         sentence: report.sentence.into(),
     }
 }
+// END remote-path
 
 /// Recorded outcome of one server's consented remote Grok plugin install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2040,9 +1944,7 @@ impl AppModel {
         if let Some(watch) = workbench.take_remote_close() {
             self.remote_closes.push(watch);
         }
-        if let Some(state) = grok::app_state_mut(self.integrations, &mut self.app_states) {
-            state.forget_workspace(id);
-        }
+        self.forget_grok_workspace(id);
         workbench.shutdown();
         if self.active == Some(id) {
             self.reset_ui_focus = true;
@@ -2099,9 +2001,7 @@ impl AppModel {
                 workbench.publish_app_state(id, state.as_ref());
             }
         }
-        if grok::app_state(self.integrations, &self.app_states)
-            .is_some_and(GrokAppState::hooks_unavailable)
-        {
+        if self.grok_hooks_unavailable() {
             workbench.note_grok_session_hooks_unavailable();
         }
         if opencode::app_state(self.integrations, &self.app_states)
@@ -2418,6 +2318,19 @@ impl AppModel {
     /// then also holds back every integration's detection.
     fn grok_hold_active(&self) -> bool {
         grok::app_state(self.integrations, &self.app_states).is_some_and(GrokAppState::hold_active)
+    }
+
+    /// Forget the Grok running mark of a closed workspace.
+    fn forget_grok_workspace(&mut self, id: WorkspaceId) {
+        if let Some(state) = grok::app_state_mut(self.integrations, &mut self.app_states) {
+            state.forget_workspace(id);
+        }
+    }
+
+    /// Whether the shipped Grok plugin could not be installed.
+    fn grok_hooks_unavailable(&self) -> bool {
+        grok::app_state(self.integrations, &self.app_states)
+            .is_some_and(GrokAppState::hooks_unavailable)
     }
 
     /// Record a failed shipped-plugin install on every live workspace, once.

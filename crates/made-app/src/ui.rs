@@ -982,27 +982,6 @@ pub(crate) fn workspace_opencode_active(
     connected || (target == TerminalTarget::Tui(OPENCODE) && running)
 }
 
-/// Whether a non-OpenCode tab shows the Grok Build label and mark.
-///
-/// A directly launched Grok TUI counts while its process is alive, even
-/// before a session exists. A shell tab counts while that terminal still has
-/// open Grok sessions. A remote tab counts the same way from its own server
-/// state: a directly launched remote grok (`TerminalTarget::RemoteGrok`) or
-/// any owned open Grok session in the tab's projection. An active OpenCode
-/// tab never does: its label, icon, and dots stay OpenCode's.
-pub(crate) fn workspace_grok_branded(
-    opencode: bool,
-    target: TerminalTarget,
-    running: bool,
-    open_grok_sessions: usize,
-) -> bool {
-    !opencode
-        && (open_grok_sessions > 0
-            || ((target == TerminalTarget::Tui(GROK)
-                || matches!(target, TerminalTarget::RemoteGrok { .. }))
-                && running))
-}
-
 /// Claude Code brands a tab while it is present, unless OpenCode owns the tab
 /// or a remote tab already presents Grok Build under SSH-10.
 fn workspace_claude_branded(opencode: bool, remote_grok_branded: bool, present: bool) -> bool {
@@ -1042,11 +1021,6 @@ fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
         parts.push(format!("{idle} idle"));
     }
     Some(format!("Sessions: {}", parts.join(", ")))
-}
-
-/// Official Grok mark from `assets/grok.svg`, outside the Material icon inventory.
-fn grok_mark() -> theme::MenuLeading {
-    mark_leading(GROK.descriptor().mark)
 }
 
 /// Official Claude mark from `assets/claude-code.svg`, outside the Material
@@ -1196,7 +1170,7 @@ fn remote_tab_brand(
     let opencode = list.contains(&OPENCODE) && workbench.remote_opencode_active();
     let grok_dots = workbench.remote_grok_activities();
     let remote_grok = list.contains(&GROK)
-        && workspace_grok_branded(
+        && crate::integrations::grok::workspace_grok_branded(
             opencode,
             workbench.terminal_target(),
             workbench.remote_grok_running(),
@@ -2286,7 +2260,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                                 "ssh-grok-{}",
                                                 authority_key(server.id())
                                             )),
-                                            grok_mark(),
+                                            mark_leading(crate::integrations::grok::mark()),
                                             &grok_label,
                                             layout.button_height,
                                         ) {
@@ -5169,6 +5143,7 @@ pub fn unread_label(unread: bool, prompt_pulse: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::grok::workspace_grok_branded;
     use crate::session_map::SessionRow;
     use std::ffi::OsString;
     use std::sync::MutexGuard;

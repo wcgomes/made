@@ -27,6 +27,10 @@ use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_log_text};
 use crate::session_follow::FollowedSession;
 use crate::worktree::{MetadataStatus, WorktreeMetadata};
 
+// BEGIN transitional-shim (AIA-11)
+pub(crate) use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
+// END transitional-shim
+
 /// Maximum number of retained log entries.
 pub const MAX_LOG_ENTRIES: usize = 500;
 
@@ -778,73 +782,6 @@ impl ClaudeDiagnosticsReport {
     }
 }
 
-/// Current Grok Build pill and the one sentence shown beside it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct GrokDiagnosticsRow {
-    pub(crate) pill: DiagnosticsPill,
-    /// Fixed product wording, or the owning tab's bounded failure detail.
-    pub(crate) sentence: Cow<'static, str>,
-}
-
-impl GrokDiagnosticsRow {
-    pub(crate) const CHECKING: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Checking for Grok Build."),
-    };
-    pub(crate) const NOT_ON_PATH: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Grok Build is not on PATH."),
-    };
-    pub(crate) const INSTALLING: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Installing the Grok Build plugin."),
-    };
-    pub(crate) const READY: Self = Self {
-        pill: DiagnosticsPill::Ready,
-        sentence: Cow::Borrowed("Grok Build session follow is ready."),
-    };
-    pub(crate) const NOT_RUNNING: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Grok Build is not running."),
-    };
-    pub(crate) const HOOKS_UNAVAILABLE: Self = Self {
-        pill: DiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed("Grok Build session-status hooks are unavailable."),
-    };
-    pub(crate) const NOT_INSTALLED: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Grok Build plugin was not installed for this launch."),
-    };
-    pub(crate) const REMOTE_NOT_DETECTED: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Grok Build is not detected on this server."),
-    };
-    pub(crate) const REMOTE_INSTALLING: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("Installing the Grok Build plugin on this server."),
-    };
-    pub(crate) const REMOTE_HOOKS_NOT_APPROVED: Self = Self {
-        pill: DiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install was not approved."),
-    };
-    pub(crate) const REMOTE_INSTALL_PENDING: Self = Self {
-        pill: DiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install has not run on this server yet."),
-    };
-    pub(crate) const REMOTE_INSTALL_FAILED: Self = Self {
-        pill: DiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
-    };
-    pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
-        pill: DiagnosticsPill::Degraded,
-        sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
-    };
-    pub(crate) const REMOTE_UNKNOWN: Self = Self {
-        pill: DiagnosticsPill::Inactive,
-        sentence: Cow::Borrowed("The remote Grok Build state is not known yet."),
-    };
-}
-
 /// Immutable diagnostics data consumed by the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsSnapshot {
@@ -1041,24 +978,6 @@ impl From<RemoteGrokReport> for RowReport {
         Self {
             pill: report.pill,
             sentence: Cow::Owned(report.sentence),
-        }
-    }
-}
-
-impl From<GrokDiagnosticsRow> for RowReport {
-    fn from(row: GrokDiagnosticsRow) -> Self {
-        Self {
-            pill: row.pill,
-            sentence: row.sentence,
-        }
-    }
-}
-
-impl From<GrokDiagnosticsRow> for RemoteGrokReport {
-    fn from(row: GrokDiagnosticsRow) -> Self {
-        Self {
-            pill: row.pill,
-            sentence: row.sentence.into_owned(),
         }
     }
 }

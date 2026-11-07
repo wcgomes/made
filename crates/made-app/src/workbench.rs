@@ -37,8 +37,8 @@ use crate::integration_status::{IntegrationState, IntegrationStatus};
 // BEGIN transitional-shim (AIA-11)
 use crate::claude_follow::ClaudeTab;
 use crate::integrations::claude_code;
-// END transitional-shim
 use crate::integrations::grok;
+// END transitional-shim
 use crate::integrations::opencode::{self, OpenCodeTabState};
 use crate::integrations::{
     apply_contributions, AppState, DiagnosticsDecl, EnvContribution, FollowKind, FollowPort,

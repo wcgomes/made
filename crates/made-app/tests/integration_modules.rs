@@ -193,6 +193,16 @@ mod neutrality {
         "ClaudeTab",
     ];
 
+    /// Identifiers of the legacy Grok Build seams. Core files must not name
+    /// them outside the exempt regions.
+    const LEGACY_GROK: &[&str] = &[
+        "grok_root",
+        "GrokLiveSession",
+        "poll_grok_",
+        "GrokDiagnosticsPhase",
+        "grok_row_for",
+    ];
+
     /// Whole files that are remote paths.
     const REMOTE_FILES: &[&str] = &["ssh_servers.rs", "remote_workspace.rs", "remote_session.rs"];
 
@@ -287,7 +297,7 @@ mod neutrality {
     }
 
     #[test]
-    fn core_files_do_not_import_the_claude_code_module() {
+    fn core_files_do_not_name_the_legacy_grok_seams() {
         let mut found = Vec::new();
         for path in core_files() {
             let source = fs::read_to_string(&path).unwrap();
@@ -295,16 +305,40 @@ mod neutrality {
                 if is_comment(line) {
                     continue;
                 }
-                // Grok Build and OpenCode state is still reached from the core
-                // until their steps relocate it; the deny-list grows then.
-                if line.contains("integrations::claude_code") {
+                for name in LEGACY_GROK {
+                    if line.contains(name) {
+                        found.push(format!("{}:{number}: {name}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "legacy Grok seams in core files:\n{}",
+            found.join("\n")
+        );
+    }
+
+    #[test]
+    fn core_files_do_not_import_the_claude_code_or_grok_module() {
+        let mut found = Vec::new();
+        for path in core_files() {
+            let source = fs::read_to_string(&path).unwrap();
+            for (number, line) in scanned_lines(&production_part(&source)) {
+                if is_comment(line) {
+                    continue;
+                }
+                // OpenCode state is still reached from the core until its step
+                // relocates it; the deny-list grows then.
+                if line.contains("integrations::claude_code") || line.contains("integrations::grok")
+                {
                     found.push(format!("{}:{number}", path.display()));
                 }
             }
         }
         assert!(
             found.is_empty(),
-            "core imports of the Claude Code module:\n{}",
+            "core imports of the Claude Code or Grok Build module:\n{}",
             found.join("\n")
         );
     }

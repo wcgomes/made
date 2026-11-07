@@ -1,6 +1,8 @@
 //! Grok Build integration.
 
 pub(crate) mod diagnostics;
+pub(crate) mod follow;
+pub(crate) mod plugin;
 pub(crate) mod tab;
 
 use super::{
@@ -8,9 +10,8 @@ use super::{
     IntegrationList, Mark, OnUnusable, Rank, RowDecl, Slots, TabInit, TabState, WhileOutranked,
     GROK,
 };
-use crate::diagnostics::GrokDiagnosticsRow;
 use crate::tui::TerminalTarget;
-use diagnostics::GrokAppState;
+use diagnostics::{GrokAppState, GrokDiagnosticsRow};
 pub(crate) use tab::GrokTabState;
 
 /// Grok Build, started directly as `grok dashboard`.
@@ -67,6 +68,33 @@ impl Integration for Grok {
             initial: GrokDiagnosticsRow::NOT_ON_PATH.into(),
         })
     }
+}
+
+/// Whether a non-OpenCode tab shows the Grok Build label and mark.
+///
+/// A directly launched Grok TUI counts while its process is alive, even
+/// before a session exists. A shell tab counts while that terminal still has
+/// open Grok sessions. A remote tab counts the same way from its own server
+/// state: a directly launched remote grok (`TerminalTarget::RemoteGrok`) or
+/// any owned open Grok session in the tab's projection. An active OpenCode
+/// tab never does: its label, icon, and dots stay OpenCode's.
+pub(crate) fn workspace_grok_branded(
+    opencode: bool,
+    target: TerminalTarget,
+    running: bool,
+    open_grok_sessions: usize,
+) -> bool {
+    !opencode
+        && (open_grok_sessions > 0
+            || ((target == TerminalTarget::Tui(GROK)
+                || matches!(target, TerminalTarget::RemoteGrok { .. }))
+                && running))
+}
+
+/// Official Grok mark from `assets/grok.svg`, outside the Material icon
+/// inventory.
+pub(crate) fn mark() -> Mark {
+    DESCRIPTOR.mark
 }
 
 /// The Grok state of a tab built over `list`.

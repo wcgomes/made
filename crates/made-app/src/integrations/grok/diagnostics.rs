@@ -2,13 +2,13 @@
 //! the test holds for the diagnostics row.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use crate::app::{
-    grok_row_for, GrokDiagnosticsHold, GrokDiagnosticsPhase, GrokRunningHold, WorkspaceId,
-};
-use crate::grok_plugin::{self, EnsureOutcome};
-use crate::integrations::{AppCtx, AppInit, AppState, WorkspaceTabs, GROK};
+use super::plugin::{self, EnsureOutcome};
+use crate::app::WorkspaceId;
+use crate::diagnostics::{DiagnosticsPill, RemoteGrokReport};
+use crate::integrations::{AppCtx, AppInit, AppState, RowReport, WorkspaceTabs, GROK};
 use made_platform::AppPaths;
 
 /// Grok Build detection, install and hold state for every workspace's row.
@@ -118,7 +118,7 @@ fn initial_grok_phase(
 impl AppState for GrokAppState {
     fn on_detection(&mut self, detected: bool, _ctx: &mut AppCtx) {
         if detected {
-            self.plugin_receiver = grok_plugin::spawn_ensure();
+            self.plugin_receiver = plugin::spawn_ensure();
             // `None` means this process already owns the worker. This
             // launch must not claim an install is running or ready.
             self.phase = if self.plugin_receiver.is_some() {
@@ -198,5 +198,193 @@ impl AppState for GrokAppState {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// Grok Build row while PATH detection and the shipped-plugin install run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrokDiagnosticsPhase {
+    /// Background PATH detection has not finished.
+    Detecting,
+    /// Detection finished without grok, or the catalog omits Grok.
+    NotOnPath,
+    /// grok was detected and the install worker has not finished.
+    Installing,
+    /// Install succeeded, or the installed version was already current.
+    Ready,
+    /// The install failed.
+    Unavailable,
+    /// An explicit catalog includes Grok and detection did not run.
+    NotInstalledForLaunch,
+}
+
+impl GrokDiagnosticsPhase {
+    const fn row(self) -> GrokDiagnosticsRow {
+        match self {
+            Self::Detecting => GrokDiagnosticsRow::CHECKING,
+            Self::NotOnPath => GrokDiagnosticsRow::NOT_ON_PATH,
+            Self::Installing => GrokDiagnosticsRow::INSTALLING,
+            // Callers with a workspace use [`grok_row_for`]. This arm is only
+            // the success sentence; a quiet workspace uses `NOT_RUNNING`.
+            Self::Ready => GrokDiagnosticsRow::READY,
+            Self::Unavailable => GrokDiagnosticsRow::HOOKS_UNAVAILABLE,
+            Self::NotInstalledForLaunch => GrokDiagnosticsRow::NOT_INSTALLED,
+        }
+    }
+}
+
+/// Test-only hold for the Grok Build diagnostics row.
+///
+/// Applying a hold does not spawn grok, look up `PATH`, or install the plugin.
+/// Product startup leaves it unset and keeps background detection and install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokDiagnosticsHold {
+    /// PATH detection is still running.
+    Detecting,
+    /// Detection finished and grok is not on PATH.
+    NotOnPath,
+    /// grok was detected and the shipped-plugin install is still running.
+    Installing,
+    /// The install command succeeded.
+    Installed,
+    /// The installed version is already current.
+    AlreadyCurrent,
+    /// The install failed.
+    InstallFailed,
+}
+
+impl GrokDiagnosticsHold {
+    pub(crate) const fn phase(self) -> GrokDiagnosticsPhase {
+        match self {
+            Self::Detecting => GrokDiagnosticsPhase::Detecting,
+            Self::NotOnPath => GrokDiagnosticsPhase::NotOnPath,
+            Self::Installing => GrokDiagnosticsPhase::Installing,
+            Self::Installed | Self::AlreadyCurrent => GrokDiagnosticsPhase::Ready,
+            Self::InstallFailed => GrokDiagnosticsPhase::Unavailable,
+        }
+    }
+}
+
+/// Test-only running mark for one workspace's Grok Build row.
+///
+/// Applying a mark does not spawn grok, look up `PATH`, or install the plugin.
+/// Product startup leaves every workspace unmarked and reads that workspace's
+/// terminal target and open Grok sessions. The tab label is not a mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrokRunningHold {
+    /// This workspace's terminal target is Grok and that process is still alive.
+    LivingTarget,
+    /// This workspace's shell has at least one open Grok session.
+    ///
+    /// The target is not a living Grok process.
+    OpenSession,
+    /// Neither a living Grok target nor an open Grok session.
+    NotRunning,
+}
+
+/// Row for one workspace. Install success is ready only while Grok is running
+/// there, as the workspace's own state (`running`) or a test mark says.
+pub(crate) fn grok_row_for(
+    phase: GrokDiagnosticsPhase,
+    mark: Option<GrokRunningHold>,
+    running: bool,
+) -> GrokDiagnosticsRow {
+    if phase != GrokDiagnosticsPhase::Ready {
+        return phase.row();
+    }
+    let running = match mark {
+        Some(GrokRunningHold::LivingTarget | GrokRunningHold::OpenSession) => true,
+        Some(GrokRunningHold::NotRunning) => false,
+        None => running,
+    };
+    if running {
+        GrokDiagnosticsRow::READY
+    } else {
+        GrokDiagnosticsRow::NOT_RUNNING
+    }
+}
+
+/// Current Grok Build pill and the one sentence shown beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GrokDiagnosticsRow {
+    pub(crate) pill: DiagnosticsPill,
+    /// Fixed product wording, or the owning tab's bounded failure detail.
+    pub(crate) sentence: Cow<'static, str>,
+}
+
+impl GrokDiagnosticsRow {
+    pub(crate) const CHECKING: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Checking for Grok Build."),
+    };
+    pub(crate) const NOT_ON_PATH: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Grok Build is not on PATH."),
+    };
+    pub(crate) const INSTALLING: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Installing the Grok Build plugin."),
+    };
+    pub(crate) const READY: Self = Self {
+        pill: DiagnosticsPill::Ready,
+        sentence: Cow::Borrowed("Grok Build session follow is ready."),
+    };
+    pub(crate) const NOT_RUNNING: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Grok Build is not running."),
+    };
+    pub(crate) const HOOKS_UNAVAILABLE: Self = Self {
+        pill: DiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Grok Build session-status hooks are unavailable."),
+    };
+    pub(crate) const NOT_INSTALLED: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Grok Build plugin was not installed for this launch."),
+    };
+    pub(crate) const REMOTE_NOT_DETECTED: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Grok Build is not detected on this server."),
+    };
+    pub(crate) const REMOTE_INSTALLING: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("Installing the Grok Build plugin on this server."),
+    };
+    pub(crate) const REMOTE_HOOKS_NOT_APPROVED: Self = Self {
+        pill: DiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install was not approved."),
+    };
+    pub(crate) const REMOTE_INSTALL_PENDING: Self = Self {
+        pill: DiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install has not run on this server yet."),
+    };
+    pub(crate) const REMOTE_INSTALL_FAILED: Self = Self {
+        pill: DiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
+    };
+    pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
+        pill: DiagnosticsPill::Degraded,
+        sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
+    };
+    pub(crate) const REMOTE_UNKNOWN: Self = Self {
+        pill: DiagnosticsPill::Inactive,
+        sentence: Cow::Borrowed("The remote Grok Build state is not known yet."),
+    };
+}
+
+impl From<GrokDiagnosticsRow> for RowReport {
+    fn from(row: GrokDiagnosticsRow) -> Self {
+        Self {
+            pill: row.pill,
+            sentence: row.sentence,
+        }
+    }
+}
+
+impl From<GrokDiagnosticsRow> for RemoteGrokReport {
+    fn from(row: GrokDiagnosticsRow) -> Self {
+        Self {
+            pill: row.pill,
+            sentence: row.sentence.into_owned(),
+        }
     }
 }

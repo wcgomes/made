@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::diagnostics::GrokDiagnosticsRow;
+use super::diagnostics::GrokDiagnosticsRow;
 use crate::integrations::{
     Presentation, PresentationCtx, RowReport, TabIo, TabReport, TabState, GROK,
 };
@@ -114,7 +114,7 @@ impl GrokTabState {
 
     /// Apply hook lines as soon as they are appended.
     fn poll_hooks(&mut self, now: Instant, io: &mut TabIo<'_>) {
-        let (offset, events) = crate::grok_follow::read_hook_events(self.log_offset);
+        let (offset, events) = super::follow::read_hook_events(self.log_offset);
         self.log_offset = offset;
         for event in events {
             let moves_explorer = matches!(
@@ -139,7 +139,7 @@ impl GrokTabState {
             // The log is global. Re-read inventory before moving so a session
             // this tab owns is not delayed, and a foreign pid is not followed.
             let ownership = Self::hook_session_ownership(io, &event.session_id);
-            if ownership == crate::grok_follow::SessionOwnership::Foreign {
+            if ownership == super::follow::SessionOwnership::Foreign {
                 let id = event.session_id.clone();
                 let was_provisional = self.provisional_id.as_deref() == Some(id.as_str());
                 self.sessions.retain(|session| session.id != id);
@@ -175,7 +175,7 @@ impl GrokTabState {
                 });
             }
             if moves_explorer && cwd.is_absolute() {
-                if ownership == crate::grok_follow::SessionOwnership::Owned {
+                if ownership == super::follow::SessionOwnership::Owned {
                     // A prompt in a session this tab owns replaces any earlier
                     // provisional move, including one for a different session.
                     self.clear_provisional_slot();
@@ -188,14 +188,11 @@ impl GrokTabState {
         }
     }
 
-    fn hook_session_ownership(
-        io: &TabIo<'_>,
-        session_id: &str,
-    ) -> crate::grok_follow::SessionOwnership {
+    fn hook_session_ownership(io: &TabIo<'_>, session_id: &str) -> super::follow::SessionOwnership {
         let Some(pid) = io.terminal.as_deref().and_then(TerminalPane::pid) else {
-            return crate::grok_follow::SessionOwnership::Unknown;
+            return super::follow::SessionOwnership::Unknown;
         };
-        crate::grok_follow::session_ownership(pid, session_id)
+        super::follow::session_ownership(pid, session_id)
     }
 
     /// Remember the directory this tab was following, then follow `cwd` until
@@ -245,7 +242,7 @@ impl GrokTabState {
         let Some(pid) = io.terminal.as_deref().and_then(TerminalPane::pid) else {
             return;
         };
-        let open = crate::grok_follow::open_sessions(pid);
+        let open = super::follow::open_sessions(pid);
         let open_ids: Vec<&str> = open.iter().map(|row| row.session_id.as_str()).collect();
         self.closed.retain(|id| open_ids.contains(&id.as_str()));
         for row in &open {
@@ -325,7 +322,7 @@ impl TabState for GrokTabState {
             return None;
         }
         let dots = self.tab_activities();
-        crate::ui::workspace_grok_branded(false, ctx.target, ctx.terminal_running, dots.len())
+        super::workspace_grok_branded(false, ctx.target, ctx.terminal_running, dots.len())
             .then_some(Presentation { dots, title: None })
     }
 
