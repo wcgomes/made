@@ -26,7 +26,7 @@ use crate::session_follow::SessionFollowOutcome;
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
-mod claude_code;
+pub(crate) mod claude_code;
 mod grok;
 mod opencode;
 

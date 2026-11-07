@@ -1,8 +1,16 @@
 //! Claude Code integration.
 
+pub(crate) mod diagnostics;
+pub(crate) mod tab;
+
 use super::{
-    Descriptor, FollowKind, FollowPolicy, Integration, Mark, OnUnusable, Rank, WhileOutranked,
+    AppInit, AppState, Descriptor, EnvPolicy, FollowKind, FollowPolicy, Integration,
+    IntegrationList, Mark, OnUnusable, Rank, Slots, TabInit, TabState, WhileOutranked, CLAUDE_CODE,
 };
+use crate::integration_status::ClaudeDiagnosticsPhase;
+use crate::tui::{TerminalTarget, CLAUDE_SPOOL_ENV};
+use diagnostics::ClaudeAppState;
+pub(crate) use tab::ClaudeTabState;
 
 /// Claude Code, started directly with no arguments.
 pub(super) struct ClaudeCode;
@@ -34,4 +42,52 @@ impl Integration for ClaudeCode {
             under_higher_directory: WhileOutranked::Retain,
         })
     }
+
+    fn env_policy(&self) -> EnvPolicy {
+        EnvPolicy {
+            shell: true,
+            own_direct: true,
+            strip: &[CLAUDE_SPOOL_ENV],
+        }
+    }
+
+    fn new_app_state(&self, init: &AppInit<'_>) -> Option<Box<dyn AppState>> {
+        Some(Box::new(ClaudeAppState::new(init)))
+    }
+
+    fn new_tab_state(
+        &self,
+        _target: TerminalTarget,
+        init: &TabInit<'_>,
+    ) -> Option<Box<dyn TabState>> {
+        Some(Box::new(ClaudeTabState::new(init)))
+    }
+
+    fn polls_remote_tabs(&self) -> bool {
+        true
+    }
+}
+
+/// The Claude Code state of a tab built over `list`.
+pub(crate) fn tab_state(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn TabState>>,
+) -> Option<&ClaudeTabState> {
+    super::tab_state::<ClaudeTabState>(list, slots, CLAUDE_CODE)
+}
+
+/// The Claude Code state of a tab built over `list`, mutably.
+pub(crate) fn tab_state_mut(
+    list: IntegrationList,
+    slots: &mut Slots<Box<dyn TabState>>,
+) -> Option<&mut ClaudeTabState> {
+    super::tab_state_mut::<ClaudeTabState>(list, slots, CLAUDE_CODE)
+}
+
+/// The Claude Code detection state of an app model built over `list`.
+pub(crate) fn app_phase(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn AppState>>,
+) -> Option<ClaudeDiagnosticsPhase> {
+    super::app_state::<ClaudeAppState>(list, slots, CLAUDE_CODE).map(ClaudeAppState::phase)
 }

@@ -81,12 +81,6 @@ impl TerminalTarget {
         }
     }
 
-    /// Whether Made's session-only Claude Code plugin loads in this target's
-    /// environment: local shell tabs and directly launched Claude Code tabs.
-    pub fn loads_claude_plugin(self) -> bool {
-        self == Self::Shell || self == Self::Tui(CLAUDE_CODE)
-    }
-
     /// The `CLAUDE_CODE_PLUGIN_DIRS` entry and per-tab spool path for this
     /// target.
     ///
@@ -103,7 +97,7 @@ impl TerminalTarget {
         existing: Option<&OsStr>,
         spool: Option<&Path>,
     ) -> ClaudeLaunchEnv {
-        if !self.loads_claude_plugin() {
+        if !CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, self) {
             return ClaudeLaunchEnv::default();
         }
         let Some(shipped) = shipped else {
@@ -251,7 +245,7 @@ mod tests {
         assert_eq!(claude.log_label(), "claude-ssh");
         assert_eq!(claude.restart_label(), "Reconnect Claude Code SSH");
         // Remote Claude Code gets no plugin configuration, spool or environment.
-        assert!(!claude.loads_claude_plugin());
+        assert!(!CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, claude));
         let env = claude.claude_launch_env(
             Some(Path::new("/shipped")),
             Some(OsStr::new("/user")),
