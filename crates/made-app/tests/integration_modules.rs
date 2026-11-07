@@ -171,3 +171,265 @@ fn a_session_channel_owner_must_be_the_lowest_ranked() {
     const ACCEPTED: IntegrationList = &[&PROBE_FIRST_OWNER, &PROBE_SECOND];
     assert_eq!(validate(ACCEPTED), Ok(()));
 }
+
+// ---- Neutrality and structure scans (AIA-03, AIA-04, AIA-09) ----
+
+mod neutrality {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use made_app::integrations::PRODUCT;
+
+    /// Identifiers of the legacy local Claude Code seams. Core files must not
+    /// name them outside the exempt regions.
+    const LEGACY_CLAUDE_CODE: &[&str] = &[
+        "claude_root",
+        "ClaudeRuntime",
+        "loads_claude_plugin",
+        "poll_claude",
+        "prepare_claude_launch",
+        "self.claude",
+    ];
+
+    /// Whole files that are remote paths.
+    const REMOTE_FILES: &[&str] = &["ssh_servers.rs", "remote_workspace.rs", "remote_session.rs"];
+
+    const MODULES: [&str; 3] = ["claude_code", "grok", "opencode"];
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// The core sources: every file of `src` outside `integrations/`, except
+    /// the whole-file remote paths.
+    fn core_files() -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = fs::read_dir(src_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .filter(|path| {
+                !REMOTE_FILES
+                    .iter()
+                    .any(|name| path.file_name().is_some_and(|file| file == *name))
+            })
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "the scan read no core file");
+        files
+    }
+
+    /// The lines of `source` outside remote-path and transitional-shim
+    /// regions, with their numbers.
+    fn scanned_lines(source: &str) -> Vec<(usize, &str)> {
+        let mut depth = 0usize;
+        let mut lines = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("// BEGIN remote-path")
+                || trimmed.starts_with("// BEGIN transitional-shim")
+            {
+                depth += 1;
+                continue;
+            }
+            if trimmed.starts_with("// END remote-path")
+                || trimmed.starts_with("// END transitional-shim")
+            {
+                depth = depth.saturating_sub(1);
+                continue;
+            }
+            if depth == 0 {
+                lines.push((index + 1, line));
+            }
+        }
+        lines
+    }
+
+    /// The part of a core file the scans read: everything before its unit
+    /// tests.
+    fn production_part(source: &str) -> &str {
+        source
+            .find("#[cfg(test)]\nmod tests")
+            .map_or(source, |end| &source[..end])
+    }
+
+    fn is_comment(line: &str) -> bool {
+        line.trim_start().starts_with("//")
+    }
+
+    #[test]
+    fn core_files_do_not_name_the_legacy_claude_code_seams() {
+        let mut found = Vec::new();
+        for path in core_files() {
+            // The Claude Code channel file is the integration's own code until
+            // the relocation task moves it.
+            if path
+                .file_name()
+                .is_some_and(|name| name == "claude_follow.rs")
+            {
+                continue;
+            }
+            let source = fs::read_to_string(&path).unwrap();
+            for (number, line) in scanned_lines(production_part(&source)) {
+                if is_comment(line) {
+                    continue;
+                }
+                for name in LEGACY_CLAUDE_CODE {
+                    if line.contains(name) {
+                        found.push(format!("{}:{number}: {name}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "legacy seams in core files:\n{}",
+            found.join("\n")
+        );
+    }
+
+    #[test]
+    fn core_files_do_not_import_the_claude_code_module() {
+        let mut found = Vec::new();
+        for path in core_files() {
+            let source = fs::read_to_string(&path).unwrap();
+            for (number, line) in scanned_lines(production_part(&source)) {
+                if is_comment(line) {
+                    continue;
+                }
+                // Grok Build and OpenCode state is still reached from the core
+                // until their steps relocate it; the deny-list grows then.
+                if line.contains("integrations::claude_code") {
+                    found.push(format!("{}:{number}", path.display()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "core imports of the Claude Code module:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// Every file of a directory, read by a recursive walk.
+    fn module_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                module_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn no_integration_folder_references_another() {
+        let root = src_dir().join("integrations");
+        let mut checked = 0;
+        for folder in MODULES {
+            let mut files = Vec::new();
+            module_files(&root.join(folder), &mut files);
+            assert!(!files.is_empty(), "{folder} has no file");
+            for path in files {
+                let source = fs::read_to_string(&path).unwrap();
+                checked += 1;
+                for other in MODULES {
+                    if other == folder {
+                        continue;
+                    }
+                    for line in source.lines().filter(|line| !is_comment(line)) {
+                        assert!(
+                            !line.contains(&format!("integrations::{other}"))
+                                && !line.contains(&format!("super::{other}")),
+                            "{} references the {other} module: {line}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn new_identifiers_contain_no_forbidden_surface() {
+        // The substrings the scope boundary forbids in core sources.
+        const FORBIDDEN: &[&str] = &["codex", "gemini", "copilot", "aider", "acp", "chat ui"];
+        const KEYWORDS: [&str; 7] = [
+            "fn ", "struct ", "enum ", "trait ", "const ", "static ", "type ",
+        ];
+        let mut files = Vec::new();
+        module_files(&src_dir().join("integrations"), &mut files);
+        assert!(!files.is_empty(), "the scan read no file");
+        for path in files {
+            let source = fs::read_to_string(&path).unwrap();
+            for line in source.lines() {
+                let declares = KEYWORDS
+                    .iter()
+                    .any(|keyword| line.trim_start().contains(keyword));
+                if !declares || is_comment(line) {
+                    continue;
+                }
+                let lowered = line.to_ascii_lowercase();
+                for forbidden in FORBIDDEN {
+                    assert!(
+                        !lowered.contains(forbidden),
+                        "{} declares a forbidden surface `{forbidden}`: {line}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_dynamic_loading_crate_is_a_direct_dependency_of_the_workspace() {
+        const LOADERS: &[&str] = &[
+            "libloading",
+            "dlopen",
+            "wasmtime",
+            "wasmer",
+            "wasmi",
+            "mlua",
+            "rhai",
+            "rquickjs",
+            "deno_core",
+            "pyo3",
+        ];
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut manifests = vec![workspace.join("Cargo.toml")];
+        for entry in fs::read_dir(workspace.join("crates")).unwrap() {
+            let manifest = entry.unwrap().path().join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.push(manifest);
+            }
+        }
+        assert!(manifests.len() > 1, "the scan read no crate manifest");
+        for manifest in manifests {
+            let text = fs::read_to_string(&manifest).unwrap();
+            for line in text.lines() {
+                let name = line.split('=').next().unwrap_or("").trim();
+                assert!(
+                    !LOADERS.contains(&name),
+                    "{} depends on {name}",
+                    manifest.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_integration_set_is_a_compile_time_list() {
+        let keys = |list: made_app::integrations::IntegrationList| -> Vec<&'static str> {
+            list.iter().map(|entry| entry.descriptor().key).collect()
+        };
+        let before = keys(PRODUCT);
+        // Naming another agent program in the environment adds nothing: the
+        // set is read from no file, variable or directory.
+        std::env::set_var("MADE_TEST_AGENT_PROGRAM", "other-agent");
+        let after = keys(PRODUCT);
+        std::env::remove_var("MADE_TEST_AGENT_PROGRAM");
+        assert_eq!(before, after);
+        assert_eq!(after, ["opencode", "grok", "claude-code"]);
+    }
+}

@@ -35,13 +35,15 @@ use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
 use crate::integration_status::{IntegrationState, IntegrationStatus};
+// BEGIN transitional-shim (AIA-11)
 use crate::integrations::claude_code;
+// END transitional-shim
 use crate::integrations::grok;
 use crate::integrations::opencode::{self, OpenCodeTabState};
 use crate::integrations::{
-    AppState, DiagnosticsDecl, EnvContribution, FollowKind, FollowPort, FollowStep,
-    IntegrationList, LaunchCtx, Presentation, PresentationCtx, RowReport, Slots, TabInit, TabIo,
-    TabState, WorkspaceTabs, PRODUCT,
+    apply_contributions, AppState, DiagnosticsDecl, EnvContribution, FollowKind, FollowPort,
+    FollowStep, IntegrationList, LaunchCtx, Presentation, PresentationCtx, RowReport, Slots,
+    TabInit, TabIo, TabState, WorkspaceTabs, PRODUCT,
 };
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -1188,12 +1190,7 @@ impl Workbench {
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");
-        // Applied last to first: the order in which the variables reach the
-        // child is pinned by the launch characterization, and the composed
-        // configuration (the first entry) has always been set after the rest.
-        for contribution in contributions.iter().rev() {
-            options = contribution.apply(options);
-        }
+        options = apply_contributions(&contributions, options);
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
             Ok(pane) => {
@@ -1232,9 +1229,7 @@ impl Workbench {
                             .without_env("SHELLOPTS")
                             .without_env("BASH_ENV")
                             .without_env("ENV");
-                        for contribution in contributions.iter().rev() {
-                            retry = contribution.apply(retry);
-                        }
+                        retry = apply_contributions(&contributions, retry);
                         if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
                             let pane = pane.with_target(self.terminal_target);
                             self.diag.log_mut().record(

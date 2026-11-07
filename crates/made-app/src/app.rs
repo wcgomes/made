@@ -354,12 +354,11 @@ struct PendingStart {
     source: WorkspaceSource,
 }
 
-/// Look up which of the product's integrations have their program on `PATH`,
-/// in catalog order. Metadata only; nothing is spawned.
-fn detect_integrations() -> Vec<IntegrationRef> {
-    let found = made_platform::detect_programs(PRODUCT.iter().map(|tui| tui.descriptor().program));
-    PRODUCT
-        .iter()
+/// Look up which integrations of `list` have their program on `PATH`, in list
+/// order. Metadata only; nothing is spawned.
+fn detect_integrations(list: IntegrationList) -> Vec<IntegrationRef> {
+    let found = made_platform::detect_programs(list.iter().map(|tui| tui.descriptor().program));
+    list.iter()
         .copied()
         .filter(|tui| found.contains(&tui.descriptor().program))
         .collect()
@@ -369,12 +368,12 @@ fn detect_integrations() -> Vec<IntegrationRef> {
 ///
 /// The receiver is polled by [`AppModel::logic`]; a failure to spawn a thread
 /// leaves the menu in its no-TUI state rather than blocking startup.
-fn spawn_compatible_tui_detection() -> Option<Receiver<Vec<IntegrationRef>>> {
+fn spawn_compatible_tui_detection(list: IntegrationList) -> Option<Receiver<Vec<IntegrationRef>>> {
     let (sender, receiver) = mpsc::channel();
     match thread::Builder::new()
         .name("made-tui-detection".to_owned())
         .spawn(move || {
-            let _ = sender.send(detect_integrations());
+            let _ = sender.send(detect_integrations(list));
         }) {
         Ok(_) => Some(receiver),
         Err(error) => {
@@ -533,7 +532,7 @@ impl AppModel {
         });
         let start_pending = launch.surfaces().has_terminal();
         let compatible_tui_receiver = if options.detect_compatible_tuis {
-            spawn_compatible_tui_detection()
+            spawn_compatible_tui_detection(PRODUCT)
         } else {
             None
         };
@@ -601,6 +600,11 @@ impl AppModel {
     pub fn with_integrations(mut self, list: IntegrationList) -> Self {
         // A live worker has not answered yet; a model without one is not
         // detecting.
+        let detecting = self.compatible_tui_receiver.is_some();
+        // The lookup is over the list's programs, so a pending one restarts.
+        if detecting {
+            self.compatible_tui_receiver = spawn_compatible_tui_detection(list);
+        }
         let detecting = self.compatible_tui_receiver.is_some();
         self.app_states = Slots::from_list(list, |entry| {
             entry.new_app_state(&AppInit {

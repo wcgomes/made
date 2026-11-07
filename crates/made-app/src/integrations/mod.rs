@@ -355,6 +355,21 @@ impl EnvContribution {
     }
 }
 
+/// Apply the contributions of a launch, one per list entry in list order, to
+/// PTY options.
+///
+/// They apply from the last list entry to the first, so when more than one
+/// integration sets the same variable the entry earliest in the list sets it
+/// last and wins. The order is part of the launch contract: the variables of
+/// distinct integrations do not interact, and a variable set by two is decided
+/// here, never by an integration's identity.
+pub fn apply_contributions(contributions: &[EnvContribution], options: PtyOptions) -> PtyOptions {
+    contributions
+        .iter()
+        .rev()
+        .fold(options, |options, contribution| contribution.apply(options))
+}
+
 /// What a tab poll asks the core to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TabReport {
