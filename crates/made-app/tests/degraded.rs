@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use made_app::integration_status::{
-    is_supported_opencode_version, IntegrationState, IntegrationStatus, ReasonCode, V1_SCOPE,
+use made_app::integration_status::{IntegrationState, IntegrationStatus, ReasonCode, V1_SCOPE};
+use made_app::integrations::opencode::diagnostics::{
+    is_supported_version, note_exited, note_missing, note_version,
 };
 use made_bridge::server::{
     BridgeEvent, ConnectionInfo, DisconnectedInfo, Goodbye, HeartbeatTimeout, ProtocolError,
@@ -345,7 +346,7 @@ fn opencode_exits_normally_and_keeps_the_shell_usable() {
     );
     assert!(state.connection().is_none());
 
-    let direct = state.note_opencode_exited();
+    let direct = note_exited(&mut state);
     assert_eq!(direct.current, IntegrationStatus::Inactive);
     assert_eq!(direct.reason.code, ReasonCode::OpenCodeExited);
 }
@@ -353,22 +354,22 @@ fn opencode_exits_normally_and_keeps_the_shell_usable() {
 #[test]
 fn opencode_missing_or_older_than_v2_is_unsupported() {
     let mut state = state();
-    let missing = state.note_opencode_missing();
+    let missing = note_missing(&mut state);
     assert_eq!(missing.current, IntegrationStatus::Unsupported);
     assert_eq!(missing.reason.code, ReasonCode::OpenCodeMissing);
 
-    let old = state.note_opencode_version("1.9.0");
+    let old = note_version(&mut state, "1.9.0");
     assert_eq!(old.current, IntegrationStatus::Unsupported);
     assert_eq!(old.reason.code, ReasonCode::OpenCodeTooOld);
 
-    let compatible = state.note_opencode_version("2.1.4");
+    let compatible = note_version(&mut state, "2.1.4");
     assert_eq!(compatible.current, IntegrationStatus::Inactive);
     assert_eq!(compatible.reason.code, ReasonCode::Inactive);
 
-    assert!(is_supported_opencode_version("2.0.0"));
-    assert!(is_supported_opencode_version("2.1.4"));
-    assert!(!is_supported_opencode_version("1.99.0"));
-    assert!(!is_supported_opencode_version("unknown"));
+    assert!(is_supported_version("2.0.0"));
+    assert!(is_supported_version("2.1.4"));
+    assert!(!is_supported_version("1.99.0"));
+    assert!(!is_supported_version("unknown"));
 }
 
 #[test]
