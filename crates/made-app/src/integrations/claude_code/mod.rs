@@ -1,6 +1,8 @@
 //! Claude Code integration.
 
 pub(crate) mod diagnostics;
+pub mod follow;
+pub mod launch;
 pub(crate) mod tab;
 
 use super::{
@@ -9,8 +11,9 @@ use super::{
     TabState, WhileOutranked, CLAUDE_CODE,
 };
 use crate::diagnostics::DiagnosticsPill;
-use crate::tui::{TerminalTarget, CLAUDE_SPOOL_ENV};
+use crate::tui::TerminalTarget;
 use diagnostics::ClaudeAppState;
+use launch::CLAUDE_SPOOL_ENV;
 pub(crate) use tab::ClaudeTabState;
 
 /// Claude Code, started directly with no arguments.

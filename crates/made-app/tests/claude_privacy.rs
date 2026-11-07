@@ -119,20 +119,50 @@ fn window_title_text_never_drives_status_identity_or_directory() {
     }
 }
 
+/// Every `.rs` file under `dir`, found by a recursive directory walk, as
+/// (path relative to `root`, contents).
+fn read_sources(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            read_sources(root, &path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            out.push((format!("claude_code/{name}"), source));
+        }
+    }
+}
+
 #[test]
 fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
-    let sources = [
-        ("claude_follow.rs", include_str!("../src/claude_follow.rs")),
-        (
-            "made-claude-hook/src/lib.rs",
-            include_str!("../../made-claude-hook/src/lib.rs"),
-        ),
-        (
-            "made-claude-hook/src/main.rs",
-            include_str!("../../made-claude-hook/src/main.rs"),
-        ),
-    ];
-    for (name, source) in sources {
+    let mut sources = Vec::new();
+    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("integrations")
+        .join("claude_code");
+    read_sources(&module_dir, &module_dir, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "no Claude Code module source file was read from {}",
+        module_dir.display()
+    );
+    sources.push((
+        "made-claude-hook/src/lib.rs".to_owned(),
+        include_str!("../../made-claude-hook/src/lib.rs").to_owned(),
+    ));
+    sources.push((
+        "made-claude-hook/src/main.rs".to_owned(),
+        include_str!("../../made-claude-hook/src/main.rs").to_owned(),
+    ));
+    for (name, source) in &sources {
         let lower = source.to_ascii_lowercase();
         for forbidden in [
             "tcplistener",
@@ -159,7 +189,7 @@ fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
         }
     }
     // Transcripts are named only to say they are ignored.
-    for (name, source) in sources {
+    for (name, source) in &sources {
         for line in source.lines() {
             let lower = line.to_ascii_lowercase();
             if lower.contains("transcript") {

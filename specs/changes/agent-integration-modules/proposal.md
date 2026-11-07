@@ -56,6 +56,8 @@ Conflicts and overlaps flagged, not resolved here:
 - **Exceptions to "no core edits":** the central secret-redaction key list (`is_sensitive_env_key`) stays central as a security review point and needs an edit only if a new integration's variable carries a secret not matched by its generic patterns; remote/SSH code, packaging and CI scripts, and spec contract changes are outside the guarantee (AIA-04).
 - **Naming cleanup:** one neutral pill type replaces `GrokDiagnosticsPill` and the `ClaudeDiagnosticsPill` alias; `push_grok_diagnostics`, `grok_status_pill_ui` and `opencode_sessions_summary` get neutral names; `claude_follow` stops importing `grok_follow::process_belongs_to_with`, which moves to a shared process-ancestry module.
 - **ADR 0009:** `wiki/decisions/0009-static-integration-modules.md` records the static trait-object list, ranks, declared follow policy, compile-time only (not a plugin system) and the AIA-04 exceptions including remote; linked from the new adding-an-integration page.
+- **Env contribution order declared:** contributions apply from the last list entry to the first, so the earliest entry wins on a shared variable; pinned by `contributions_apply_last_entry_first_so_the_earliest_entry_wins` (design.md launch flow).
+- **Dynamic-loading scope narrowed:** AIA-03 forbids dynamic loading only as a direct dependency of any workspace crate; transitive platform or graphics dependencies (for example `libloading` through the graphics stack) are out of scope.
 - **design.md created:** overflow rule met (interface and module design, seam inventory, follow-policy table, migration order, alternatives).
 
 ## Evidence

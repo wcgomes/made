@@ -260,14 +260,6 @@ mod neutrality {
     fn core_files_do_not_name_the_legacy_claude_code_seams() {
         let mut found = Vec::new();
         for path in core_files() {
-            // The Claude Code channel file is the integration's own code until
-            // the relocation task moves it.
-            if path
-                .file_name()
-                .is_some_and(|name| name == "claude_follow.rs")
-            {
-                continue;
-            }
             let source = fs::read_to_string(&path).unwrap();
             for (number, line) in scanned_lines(production_part(&source)) {
                 if is_comment(line) {

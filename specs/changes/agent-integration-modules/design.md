@@ -168,7 +168,7 @@ start_terminal(target):
   on failure: retry in fallback dir with the same contributions; on_spawned on success
 ```
 
-OpenCode's composed configuration is produced when the tab starts its bridge, before `start_terminal` (`workbench.rs:~1030-1161`); its `prepare_launch` only returns the stored content for targets its policy covers, so the bridge start and its log lines keep their position. Applying contributions in list order sets OpenCode's variable after Claude Code's in code order instead of before; the variables are distinct, so the resulting environment is identical, and the only order-sensitive output, the log lines, stays where `prepare_launch` and spawn emit them today (the launch-environment and log-order characterization tests pin this).
+OpenCode's composed configuration is produced when the tab starts its bridge, before `start_terminal` (`workbench.rs:~1030-1161`); its `prepare_launch` only returns the stored content for targets its policy covers, so the bridge start and its log lines keep their position. Contributions apply from the last list entry to the first, so the earliest entry wins on a shared variable (pinned by `contributions_apply_last_entry_first_so_the_earliest_entry_wins`); the integrations' variables are distinct, so the resulting environment is identical, and the only order-sensitive output, the log lines, stays where `prepare_launch` and spawn emit them today (the launch-environment and log-order characterization tests pin this).
 
 ## Significant decisions
 

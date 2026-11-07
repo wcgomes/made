@@ -6,18 +6,22 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::claude_follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
-use crate::diagnostics::{ClaudeDiagnosticsReport, LogLevel};
-use crate::integration_status::{
+use super::diagnostics::{
     claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
     ClaudeDiagnosticsPhase,
 };
+use super::follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
+use super::launch::{
+    claude_launch_env, shipped_claude_plugin_dir, ClaudeLaunchEnv, CLAUDE_CODE_PLUGIN_DIRS_ENV,
+    CLAUDE_SPOOL_ENV,
+};
+use crate::diagnostics::{ClaudeDiagnosticsReport, LogLevel};
 use crate::integrations::{
     EnvContribution, LaunchCtx, Presentation, PresentationCtx, RowReport, TabInit, TabIo,
     TabReport, TabState, CLAUDE_CODE,
 };
 use crate::session_follow::{SessionFollowOutcome, SessionFollowUpdate};
-use crate::tui::{ClaudeLaunchEnv, TerminalTarget, CLAUDE_SPOOL_ENV};
+use crate::tui::TerminalTarget;
 
 /// How often owned Claude Code processes are checked for exit.
 const CLAUDE_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
@@ -67,7 +71,7 @@ impl ClaudeTabState {
     pub(crate) fn new(init: &TabInit<'_>) -> Self {
         Self {
             plugin: init.paths.and_then(|paths| {
-                ready_claude_plugin_dir(paths.shipped_claude_plugin_dir().as_deref())
+                ready_claude_plugin_dir(shipped_claude_plugin_dir(paths).as_deref())
             }),
             phase: ClaudeDiagnosticsPhase::NotOnPath,
             remote_detected: None,
@@ -216,17 +220,18 @@ impl TabState for ClaudeTabState {
         if !CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, target) {
             return launch_contribution(target, &ClaudeLaunchEnv::default());
         }
-        self.plugin = ctx.paths.and_then(|paths| {
-            ready_claude_plugin_dir(paths.shipped_claude_plugin_dir().as_deref())
-        });
+        self.plugin = ctx
+            .paths
+            .and_then(|paths| ready_claude_plugin_dir(shipped_claude_plugin_dir(paths).as_deref()));
         let shipped = self.plugin.clone();
         let spool = if shipped.is_some() {
             Self::open_spool(ctx)
         } else {
             None
         };
-        let existing = std::env::var_os(made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV);
-        let launch = target.claude_launch_env(
+        let existing = std::env::var_os(CLAUDE_CODE_PLUGIN_DIRS_ENV);
+        let launch = claude_launch_env(
+            target,
             shipped.as_deref(),
             existing.as_deref(),
             spool.as_ref().map(TabSpool::path),

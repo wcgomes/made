@@ -4,30 +4,18 @@
 //! can instead start a compatible TUI directly as the PTY child, without a
 //! shell in between.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::integrations::{IntegrationRef, CLAUDE_CODE};
-use made_platform::{
-    claude_plugin_dirs_separator, compose_claude_plugin_dirs, find_executable_on_path,
-    PlatformFamily, CLAUDE_CODE_PLUGIN_DIRS_ENV,
-};
+use crate::integrations::IntegrationRef;
+use made_platform::find_executable_on_path;
 use made_remote::protocol::AuthorityId;
 use made_terminal::PtyOptions;
 
-/// Environment variable naming a tab's Claude Code hook spool.
-pub const CLAUDE_SPOOL_ENV: &str = "MADE_CLAUDE_SPOOL";
-
-/// The Claude Code environment a tab's terminal child receives.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ClaudeLaunchEnv {
-    /// Variables to set on the PTY child. Empty when the target gets none.
-    pub env: Vec<(OsString, OsString)>,
-    /// A target that loads the plugin could not: the shipped plugin is missing
-    /// or unreadable, or the tab has no spool. Session-status hooks are then
-    /// unavailable for that tab.
-    pub hooks_unavailable: bool,
-}
+// BEGIN transitional-shim (AIA-11)
+use crate::integrations::claude_code::launch::claude_launch_env;
+pub use crate::integrations::claude_code::launch::{ClaudeLaunchEnv, CLAUDE_SPOOL_ENV};
+// END transitional-shim
 
 /// Which child process a workspace terminal starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,53 +69,18 @@ impl TerminalTarget {
         }
     }
 
-    /// The `CLAUDE_CODE_PLUGIN_DIRS` entry and per-tab spool path for this
-    /// target.
-    ///
-    /// `existing` is the inherited `CLAUDE_CODE_PLUGIN_DIRS` value; its entries
-    /// keep their order and Made's `shipped` entry is appended once. Targets
-    /// that do not load the plugin get an empty result. With no `shipped`
-    /// directory, or one whose path cannot be written into the list safely, no
-    /// entry or spool binding is added and hooks are reported unavailable.
-    /// Without a `spool` the entry is still added, but no spool binding is set
-    /// and hooks are reported unavailable.
+    // BEGIN transitional-shim (AIA-11)
+    /// The Claude Code launch environment for this target; see
+    /// [`claude_launch_env`].
     pub fn claude_launch_env(
         self,
         shipped: Option<&Path>,
         existing: Option<&OsStr>,
         spool: Option<&Path>,
     ) -> ClaudeLaunchEnv {
-        if !CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, self) {
-            return ClaudeLaunchEnv::default();
-        }
-        let Some(shipped) = shipped else {
-            return ClaudeLaunchEnv {
-                env: Vec::new(),
-                hooks_unavailable: true,
-            };
-        };
-        let separator = claude_plugin_dirs_separator(PlatformFamily::current());
-        let composed = compose_claude_plugin_dirs(existing, shipped, separator);
-        // An unsafe shipped path composes to nothing. An empty plugin list is
-        // never set: it would only hide the user's own.
-        if composed.is_empty() {
-            return ClaudeLaunchEnv {
-                env: Vec::new(),
-                hooks_unavailable: true,
-            };
-        }
-        let mut env = vec![(OsString::from(CLAUDE_CODE_PLUGIN_DIRS_ENV), composed)];
-        if let Some(spool) = spool {
-            env.push((
-                OsString::from(CLAUDE_SPOOL_ENV),
-                spool.as_os_str().to_owned(),
-            ));
-        }
-        ClaudeLaunchEnv {
-            env,
-            hooks_unavailable: spool.is_none(),
-        }
+        claude_launch_env(self, shipped, existing, spool)
     }
+    // END transitional-shim
 
     /// Whether this target belongs to a saved SSH authority.
     pub fn is_remote(self) -> bool {
@@ -203,7 +156,7 @@ mod tests {
     use std::ffi::OsStr;
 
     use super::*;
-    use crate::integrations::{GROK, OPENCODE};
+    use crate::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 
     #[test]
     fn remote_targets_do_not_resolve_a_host_executable_or_cwd() {

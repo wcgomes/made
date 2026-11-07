@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::integrations::shared::process_ancestry::{process_belongs_to, process_belongs_to_with};
+
 #[derive(Debug)]
 pub(crate) struct OpenSession {
     pub pid: u32,
@@ -189,30 +191,6 @@ fn sessions_file() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".grok")))?;
     Some(home.join("active_sessions.json"))
-}
-
-fn process_belongs_to(pid: u32, root: u32) -> bool {
-    process_belongs_to_with(pid, root, made_platform::process_parent)
-}
-
-pub(crate) fn process_belongs_to_with(
-    mut pid: u32,
-    root: u32,
-    mut parent_of: impl FnMut(u32) -> Option<u32>,
-) -> bool {
-    for _ in 0..32 {
-        let Some(parent) = parent_of(pid) else {
-            return false;
-        };
-        if parent == root {
-            return true;
-        }
-        if parent <= 1 || parent == pid {
-            return false;
-        }
-        pid = parent;
-    }
-    false
 }
 
 #[cfg(test)]

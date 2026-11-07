@@ -5700,7 +5700,8 @@ mod tests {
             );
             assert!(
                 options.env.iter().all(|(key, _)| key != CLAUDE_SPOOL_ENV
-                    && key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV),
+                    && key
+                        != crate::integrations::claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV),
                 "{target:?} receives neither a spool nor the composed plugin list"
             );
         }

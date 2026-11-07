@@ -29,9 +29,10 @@ use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
-pub(crate) mod claude_code;
+pub mod claude_code;
 pub(crate) mod grok;
 pub(crate) mod opencode;
+pub(crate) mod shared;
 
 /// A static reference to one integration. Two references are equal when their
 /// descriptors have the same key.
