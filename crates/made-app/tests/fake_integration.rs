@@ -5,7 +5,9 @@
 //! production code edit: menu rows, detection reaction, launch arguments and
 //! variables, app-wide and per-tab state, polling and teardown, follow ranking,
 //! tab presentation, diagnostics rows, About rows, copied report lines and
-//! smoke markers. A second variant ranks above Claude Code. The list-variation
+//! smoke markers. A second variant ranks above Claude Code. The fake holds the
+//! explorer root and brands a tab from a directory its tab state reports
+//! through a real tab. The list-variation
 //! tests run the same seams over the product list, the product list plus the
 //! fake, and the product list without Claude Code, and show that the output of
 //! each seam is exactly the list's entries.
@@ -19,11 +21,13 @@ mod support;
 
 use std::any::Any;
 use std::fs;
+use std::io::Write;
+use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -33,8 +37,8 @@ use made_app::integrations::{
     apply_contributions, validate, AppCtx, AppInit, AppState, Descriptor, DiagnosticsDecl,
     EnvContribution, EnvPolicy, FollowKind, FollowPolicy, Integration, IntegrationList,
     IntegrationRef, LaunchCtx, Mark, OnUnusable, Presentation, PresentationCtx, Rank, RowDecl,
-    RowReport, TabInit, TabState, WhileOutranked, WorkspaceTabs, CLAUDE_CODE, GROK, OPENCODE,
-    PRODUCT,
+    RowReport, TabInit, TabIo, TabReport, TabState, WhileOutranked, WorkspaceTabs, CLAUDE_CODE,
+    GROK, OPENCODE, PRODUCT,
 };
 use made_app::session_follow::{RootSource, SessionFollowCoordinator};
 use made_app::session_map::SessionActivity;
@@ -44,14 +48,21 @@ use made_app::ui::{
 use made_app::workspace::{LaunchPlan, WorkspaceSource};
 use made_app::{TerminalTarget, Workbench};
 use made_terminal::PtyOptions;
+use serde_json::{json, Value};
+use tungstenite::{Message, WebSocket};
 
 // ---- The fake ----
 
 /// What the fake recorded, in order, in this process.
 static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// While set, the fake brands every local tab.
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The directory the fakes that report one hand to the follow coordinator.
+/// `None` releases it.
+static FAKE_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn set_fake_directory(directory: Option<&Path>) {
+    *FAKE_DIR.lock().unwrap() = directory.map(Path::to_path_buf);
+}
 
 fn record(event: impl Into<String>) {
     EVENTS.lock().unwrap().push(event.into());
@@ -108,31 +119,41 @@ static SECOND_DESCRIPTOR: Descriptor = Descriptor {
 
 /// A test-only integration.
 struct FakeAgent {
+    /// This fake as a list entry.
+    this: &'static FakeAgent,
     descriptor: &'static Descriptor,
     status_key: &'static str,
     sentence_key: &'static str,
     marker: &'static str,
+    /// Whether the tab state reports [`FAKE_DIR`] to the follow coordinator.
+    reports_directory: bool,
 }
 
 static FAKE: FakeAgent = FakeAgent {
+    this: &FAKE,
     descriptor: &FAKE_DESCRIPTOR,
     status_key: "fake status",
     sentence_key: "fake",
     marker: "fake_status",
+    reports_directory: true,
 };
 
 static ABOVE: FakeAgent = FakeAgent {
+    this: &ABOVE,
     descriptor: &ABOVE_DESCRIPTOR,
     status_key: "fake status",
     sentence_key: "fake",
     marker: "fake_status",
+    reports_directory: true,
 };
 
 static SECOND: FakeAgent = FakeAgent {
+    this: &SECOND,
     descriptor: &SECOND_DESCRIPTOR,
     status_key: "second status",
     sentence_key: "second",
     marker: "second_status",
+    reports_directory: false,
 };
 
 const FAKE_ENV: &str = "FAKE_AGENT_VAR";
@@ -157,7 +178,7 @@ impl Integration for FakeAgent {
 
     fn env_policy(&self) -> EnvPolicy {
         EnvPolicy {
-            shell: false,
+            shell: true,
             own_direct: true,
             strip: &[FAKE_STRIP],
         }
@@ -181,8 +202,12 @@ impl Integration for FakeAgent {
         }
         record(format!("tab-state:{}:{target:?}", self.descriptor.key));
         Some(Box::new(FakeTab {
-            descriptor: self.descriptor,
+            entry: self.this,
+            reports_directory: self.reports_directory,
             row: None,
+            held: false,
+            reported: None,
+            seen_root: None,
         }))
     }
 
@@ -243,23 +268,35 @@ impl AppState for FakeApp {
 }
 
 struct FakeTab {
-    descriptor: &'static Descriptor,
+    entry: IntegrationRef,
+    reports_directory: bool,
     row: Option<RowReport>,
+    /// The fake holds the explorer root, as the last poll saw it.
+    held: bool,
+    /// The directory the last poll reported.
+    reported: Option<PathBuf>,
+    /// The explorer root the last poll saw.
+    seen_root: Option<PathBuf>,
+}
+
+impl FakeTab {
+    fn key(&self) -> &'static str {
+        self.entry.descriptor().key
+    }
 }
 
 impl TabState for FakeTab {
+    /// The core decides coverage from the declared policy and passes it in; the
+    /// fake only supplies the variable of a covered launch.
     fn prepare_launch(
         &mut self,
         target: TerminalTarget,
+        covered: bool,
         _ctx: &mut LaunchCtx<'_>,
     ) -> EnvContribution {
-        let covered = matches!(
-            target,
-            TerminalTarget::Tui(entry) if entry.descriptor().key == self.descriptor.key
-        );
         record(format!(
             "prepare:{}:{target:?}:covered={covered}",
-            self.descriptor.key
+            self.key()
         ));
         EnvContribution {
             set: if covered {
@@ -267,29 +304,47 @@ impl TabState for FakeTab {
             } else {
                 Vec::new()
             },
-            strip: vec![FAKE_STRIP],
+            strip: Vec::new(),
         }
     }
 
-    fn poll(
-        &mut self,
-        _now: Instant,
-        _io: &mut made_app::integrations::TabIo<'_>,
-    ) -> made_app::integrations::TabReport {
-        record(format!("poll:{}", self.descriptor.key));
-        made_app::integrations::TabReport::default()
+    fn poll(&mut self, _now: Instant, io: &mut TabIo<'_>) -> TabReport {
+        record(format!("poll:{}", self.key()));
+        let root = io.follow.explorer_root().map(Path::to_path_buf);
+        if root != self.seen_root {
+            let name = root
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            record(format!("saw:{}:{name}", self.key()));
+            self.seen_root = root;
+        }
+        self.held = io.follow.root_held_by(self.entry).is_some();
+        if !self.reports_directory {
+            return TabReport::default();
+        }
+        let wanted = FAKE_DIR.lock().unwrap().clone();
+        if wanted == self.reported {
+            return TabReport::default();
+        }
+        self.reported.clone_from(&wanted);
+        TabReport {
+            directory: Some(wanted),
+        }
     }
 
     fn teardown(&mut self) {
-        record(format!("teardown:{}", self.descriptor.key));
+        record(format!("teardown:{}", self.key()));
     }
 
     fn row(&self, _remote: bool) -> Option<RowReport> {
         self.row.clone()
     }
 
+    /// The fake brands a local tab while it holds the explorer root.
     fn presentation(&self, ctx: &PresentationCtx<'_>) -> Option<Presentation> {
-        (ACTIVE.load(Ordering::SeqCst) && !ctx.remote).then(|| Presentation {
+        (self.held && !ctx.remote).then(|| Presentation {
             dots: vec![SessionActivity::Busy],
             title: Some("Fake session".to_owned()),
         })
@@ -312,6 +367,8 @@ const WITH_ABOVE: IntegrationList = &[OPENCODE, GROK, CLAUDE_CODE, &ABOVE];
 const WITHOUT_CLAUDE: IntegrationList = &[OPENCODE, GROK];
 /// The product plus two fakes, to show polling order.
 const PRODUCT_AND_TWO: IntegrationList = &[OPENCODE, GROK, CLAUDE_CODE, &FAKE, &SECOND];
+/// A fake before Claude Code and one after it, to show polling order.
+const FAKES_AROUND_CLAUDE: IntegrationList = &[OPENCODE, GROK, &FAKE, CLAUDE_CODE, &SECOND];
 /// Two fakes, to show list order.
 const TWO_FAKES: IntegrationList = &[&FAKE, &SECOND];
 
@@ -342,9 +399,25 @@ fn isolated(name: &str) -> bool {
     }
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     // Programs that stay alive. The fake records its environment and arguments.
-    for program in ["opencode", "grok", "claude"] {
+    for program in ["opencode", "grok"] {
         executable(&bin.join(program), "#!/bin/sh\nsleep 30\n");
     }
+    // Claude Code records its process id and environment, then stays alive
+    // until the test asks it to exit.
+    executable(
+        &bin.join("claude"),
+        "#!/bin/sh\necho $$ > \"$HOME/claude-pid\"\nenv > \"$HOME/claude-env.txt\"\nwhile [ ! -e \"$HOME/claude-exit\" ]; do sleep 0.1; done\n",
+    );
+    // The shipped Claude Code hook, so a Claude Code tab binds a spool.
+    let shipped = made_platform::install_root_from_current_executable(
+        made_platform::PlatformFamily::current(),
+    )
+    .expect("test executable install root")
+    .join("plugins")
+    .join("claude-code-made")
+    .join("bin");
+    fs::create_dir_all(&shipped).unwrap();
+    executable(&shipped.join("made-claude-status"), "#!/bin/sh\nexit 0\n");
     executable(
         &bin.join("made-fake-agent"),
         "#!/bin/sh\nenv > \"$HOME/fake-env.txt\"\necho \"$@\" > \"$HOME/fake-args.txt\"\nsleep 30\n",
@@ -399,7 +472,11 @@ fn drive(model: &mut AppModel, mut done: impl FnMut(&mut AppModel) -> bool) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("the condition did not hold in time; events: {:?}", events());
+    let milestones: Vec<String> = events()
+        .into_iter()
+        .filter(|event| !event.starts_with("poll:"))
+        .collect();
+    panic!("the condition did not hold in time; events: {milestones:?}");
 }
 
 fn empty_model(list: IntegrationList) -> AppModel {
@@ -434,6 +511,199 @@ fn open_shell(model: &mut AppModel, root: &Path) -> made_app::WorkspaceId {
     model.open_plan(LaunchPlan::open(root, WorkspaceSource::Picker).unwrap());
     model.ensure_workbench();
     model.active_workspace_id().expect("active workspace")
+}
+
+/// Run the model's frame logic until the active tab's label is `label`.
+fn drive_to_label(model: &mut AppModel, label: &str) {
+    drive(model, |model| tab(model).label == label);
+}
+
+/// Run the model's frame logic until the active workbench's explorer root
+/// is held by `source` at `root`.
+fn drive_to_root(model: &mut AppModel, source: &str, root: &Path) {
+    drive(model, |model| {
+        let workbench = model.workbench().expect("a workbench");
+        workbench.root_source() == source && workbench.explorer_root() == Some(root)
+    });
+}
+
+/// A directory that stays until the test ends, canonical so it compares equal
+/// to the root the coordinator reports.
+fn directory(parent: &Path, name: &str) -> PathBuf {
+    let path = parent.join(name);
+    fs::create_dir_all(&path).unwrap();
+    path.canonicalize().unwrap()
+}
+
+/// The text of a file the fake programs write under the home, once written.
+fn home_file(name: &str) -> String {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = fs::read_to_string(home.join(name)) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+        assert!(Instant::now() < deadline, "{name} was never written");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The terminal options of the active workbench.
+fn options_of(model: &AppModel) -> &PtyOptions {
+    model
+        .workbench()
+        .and_then(Workbench::terminal)
+        .expect("a terminal")
+        .options()
+}
+
+fn sets(options: &PtyOptions, name: &str) -> bool {
+    options.env.iter().any(|(key, _)| key == name)
+}
+
+fn removes(options: &PtyOptions, name: &str) -> bool {
+    options.env_remove.iter().any(|key| key == name)
+}
+
+/// A hook record of one Claude Code session in a direct Claude Code tab.
+fn claude_record(session: &str, directory: &Path, pid: &str) -> String {
+    format!(
+        "{{\"at\":\"2026-01-01T00:00:00Z\",\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"event\":\"SessionStart\",\"notification\":\"\",\"status\":\"idle\",\"title\":\"\",\"pids\":[{pid}]}}\n",
+        directory.display()
+    )
+}
+
+/// Make the Claude Code program of the isolated home report a session whose
+/// directory is `directory`, and return once it did.
+fn report_claude_session(directory: &Path) {
+    let pid = home_file("claude-pid").trim().to_owned();
+    let env = home_file("claude-env.txt");
+    let spool = env
+        .lines()
+        .find_map(|line| line.strip_prefix("MADE_CLAUDE_SPOOL="))
+        .expect("the Claude Code tab bound a spool")
+        .to_owned();
+    let mut file = fs::OpenOptions::new().append(true).open(spool).unwrap();
+    file.write_all(claude_record("fake-test", directory, &pid).as_bytes())
+        .unwrap();
+}
+
+/// Ask the Claude Code program of the isolated home to exit.
+fn exit_claude() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    fs::write(home.join("claude-exit"), "").unwrap();
+}
+
+/// A fake plugin connected to the bridge of the active OpenCode tab.
+struct Plugin {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Plugin {
+    /// Connect with the options the tab composed into its launch, report one
+    /// active session in `directory` and keep answering pings.
+    fn connect(model: &AppModel, directory: &Path) -> Self {
+        let content = options_of(model)
+            .env
+            .iter()
+            .find(|(key, _)| key == made_bridge::config::CONFIG_CONTENT_ENV)
+            .and_then(|(_, value)| value.to_str().map(str::to_owned))
+            .expect("the OpenCode tab composed its configuration");
+        let config: Value = serde_json::from_str(&content).unwrap();
+        let options = config["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|entry| entry.get("options")?.get("made").cloned())
+            .expect("the composed configuration names the Made plugin");
+        let url = options["bridgeUrl"].as_str().unwrap();
+        let address = url
+            .strip_prefix("ws://")
+            .unwrap()
+            .strip_suffix("/made")
+            .unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (mut socket, _) = tungstenite::client(url, stream).unwrap();
+        let send = |socket: &mut WebSocket<TcpStream>, value: Value| {
+            socket
+                .send(Message::Text(value.to_string().into()))
+                .unwrap();
+        };
+        send(
+            &mut socket,
+            json!({"type":"hello", "protocolVersion":1, "token":options["token"], "paneId":options["paneId"], "pluginVersion":"test", "opencodeVersion":"2.1.4", "pid":123, "cwd":"/"}),
+        );
+        loop {
+            if let Message::Text(text) = socket.read().unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "welcome" {
+                    break;
+                }
+            }
+        }
+        send(
+            &mut socket,
+            json!({"type":"state", "revision":1, "activeSessionID":"fake-test", "tabsEnabled":true,
+            "sessions":[{"sessionID":"fake-test", "title":"Owned session", "active":true, "busy":false, "attention":false, "unread":false,
+            "promptPulse":0, "renaming":false, "directory":directory, "subpath":null, "projectID":null}]}),
+        );
+        socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut socket = socket;
+            while !flag.load(Ordering::SeqCst) {
+                match socket.read() {
+                    Ok(Message::Text(text)) => {
+                        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        if value["type"] == "ping" {
+                            let reply = json!({"type":"pong", "nonce":value["nonce"]});
+                            if socket
+                                .send(Message::Text(reply.to_string().into()))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+            let _ = socket.close(None);
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Close the connection.
+    fn disconnect(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
 }
 
 fn tab(model: &AppModel) -> TabSummary {
@@ -543,27 +813,31 @@ fn detection_reaction_is_recorded_once_in_list_order() {
         made_app::workspace::WorkspaceLaunch::waiting_for_picker(),
         AppOptions::new().with_compatible_tui_detection(),
     )
-    .with_integrations(TWO_FAKES);
+    .with_integrations(PRODUCT_AND_TWO);
     drive(&mut model, |model| !model.compatible_tuis().is_empty());
     // Another frame must not repeat the reaction.
     drive(&mut model, |_| true);
-    // `made-fake-agent` is on PATH, `made-second-agent` is not.
+    // `made-fake-agent` is on PATH, `made-second-agent` is not. The product
+    // programs are on PATH, so the product entries react in the same pass and
+    // the fakes' reactions come in list order after them.
     assert_eq!(
         events_with("detected:"),
         ["detected:fake:true", "detected:second:false"]
     );
-    assert_eq!(model.compatible_tuis(), [FAKE_ENTRY]);
+    assert_eq!(
+        model.compatible_tuis(),
+        [OPENCODE, GROK, CLAUDE_CODE, FAKE_ENTRY]
+    );
+    assert_eq!(new_tab_menu_entries(&model), model.compatible_tuis());
 }
 
 // ---- Launch ----
 
 #[test]
 fn launch_arguments_come_from_the_list_entry() {
-    let path = std::env::var_os("PATH").unwrap_or_default();
     let temp = tempfile::tempdir().unwrap();
     executable(&temp.path().join("made-fake-agent"), "#!/bin/sh\n");
     let bin = std::env::join_paths([temp.path()]).unwrap();
-    let _ = path;
     let options = TerminalTarget::Tui(FAKE_ENTRY)
         .pty_options(temp.path(), &bin)
         .expect("the program is on PATH");
@@ -576,39 +850,46 @@ fn launch_arguments_come_from_the_list_entry() {
 }
 
 #[test]
-fn launch_variables_apply_to_the_fakes_own_target_and_not_to_the_shell() {
-    if isolated("launch_variables_apply_to_the_fakes_own_target_and_not_to_the_shell") {
+fn launch_variables_follow_the_declared_policy_on_every_local_target() {
+    if isolated("launch_variables_follow_the_declared_policy_on_every_local_target") {
         return;
     }
-    let model = model_with_tab(WITH_FAKE, Some(FAKE_ENTRY));
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let env = loop {
-        if let Ok(text) = fs::read_to_string(home.join("fake-env.txt")) {
-            if !text.is_empty() {
-                break text;
-            }
-        }
-        assert!(Instant::now() < deadline, "the fake program never ran");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(env.lines().any(|line| line == "FAKE_AGENT_VAR=1"));
-    assert!(
-        env.lines()
-            .all(|line| !line.starts_with("FAKE_AGENT_STRIP=")),
-        "the inherited variable the fake strips reached the child"
-    );
-    assert_eq!(
-        fs::read_to_string(home.join("fake-args.txt"))
-            .unwrap()
-            .trim(),
-        "--fake"
-    );
-    assert!(events().contains(&"prepare:fake:Tui(Integration(\"fake\")):covered=true".to_owned()));
-    drop(model);
+    // The fake's own tab: the program receives the variable and the argument.
+    let fake = model_with_tab(WITH_FAKE, Some(FAKE_ENTRY));
+    assert!(home_file("fake-env.txt")
+        .lines()
+        .any(|line| line == "FAKE_AGENT_VAR=1"));
+    assert_eq!(home_file("fake-args.txt").trim(), "--fake");
+    assert!(sets(options_of(&fake), FAKE_ENV));
+    drop(fake);
 
-    let _shell = model_with_tab(WITH_FAKE, None);
-    assert!(events().contains(&"prepare:fake:Shell:covered=false".to_owned()));
+    // A shell tab: the fake declares `shell: true`.
+    let shell = model_with_tab(WITH_FAKE, None);
+    assert!(sets(options_of(&shell), FAKE_ENV));
+    drop(shell);
+
+    // The other integrations' tabs are not covered: no variable, and the core
+    // removes the variable the policy strips.
+    for entry in [OPENCODE, GROK] {
+        let other = model_with_tab(WITH_FAKE, Some(entry));
+        let options = options_of(&other);
+        assert!(!sets(options, FAKE_ENV), "{}", entry.descriptor().key);
+        assert!(removes(options, FAKE_STRIP), "{}", entry.descriptor().key);
+        drop(other);
+    }
+
+    let prepared = events_with("prepare:");
+    for expected in [
+        "prepare:fake:Tui(Integration(\"fake\")):covered=true",
+        "prepare:fake:Shell:covered=true",
+        "prepare:fake:Tui(Integration(\"opencode\")):covered=false",
+        "prepare:fake:Tui(Integration(\"grok\")):covered=false",
+    ] {
+        assert!(
+            prepared.contains(&expected.to_owned()),
+            "{expected}: {prepared:?}"
+        );
+    }
 }
 
 #[test]
@@ -658,6 +939,35 @@ fn tab_state_is_created_polled_in_list_order_and_torn_down_once() {
         events_with("teardown:"),
         ["teardown:fake", "teardown:second"]
     );
+}
+
+#[test]
+fn a_fake_polls_after_the_product_entries_that_precede_it_in_the_list() {
+    if isolated("a_fake_polls_after_the_product_entries_that_precede_it_in_the_list") {
+        return;
+    }
+    // [OpenCode, Grok Build, fake, Claude Code, second]: both fakes watch the
+    // explorer root. The directory Claude Code reports is applied before the
+    // entry after it polls, so the second fake sees it in the same pass and
+    // the fake before Claude Code only in the next.
+    let temp = tempfile::tempdir().unwrap();
+    let claude_dir = directory(temp.path(), "claude-dir");
+    let mut model = model_with_tab(FAKES_AROUND_CLAUDE, Some(CLAUDE_CODE));
+    report_claude_session(&claude_dir);
+    drive_to_root(&mut model, "claude-code", &claude_dir);
+    // One more pass lets the fake before Claude Code see the new root too.
+    drive(&mut model, |_| {
+        events_with("saw:")
+            .iter()
+            .filter(|event| event.ends_with(":claude-dir"))
+            .count()
+            == 2
+    });
+    let saw: Vec<String> = events_with("saw:")
+        .into_iter()
+        .filter(|event| event.ends_with(":claude-dir"))
+        .collect();
+    assert_eq!(saw, ["saw:second:claude-dir", "saw:fake:claude-dir"]);
 }
 
 // ---- Follow ----
@@ -734,19 +1044,48 @@ fn a_fake_at_rank_150_owns_the_root_over_claude_code_and_grok() {
 // ---- Presentation ----
 
 #[test]
+fn the_fake_holds_the_root_through_a_real_tab_until_opencode_connects() {
+    if isolated("the_fake_holds_the_root_through_a_real_tab_until_opencode_connects") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let fake_dir = directory(temp.path(), "fake-dir");
+    let opencode_dir = directory(temp.path(), "opencode-dir");
+    set_fake_directory(Some(&fake_dir));
+    let mut model = model_with_tab(WITH_FAKE, Some(OPENCODE));
+    // The fake's tab state reported a directory: the workbench's coordinator
+    // was built over the injected list, so the fake holds the root.
+    drive_to_root(&mut model, "fake", &fake_dir);
+
+    // OpenCode connects with an active session: the session channel outranks
+    // the fake.
+    let plugin = Plugin::connect(&model, &opencode_dir);
+    drive_to_root(&mut model, "opencode", &opencode_dir);
+
+    // It disconnects: the fake keeps the directory it reported.
+    plugin.disconnect();
+    drive_to_root(&mut model, "fake", &fake_dir);
+}
+
+#[test]
 fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude() {
     if isolated("a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude") {
         return;
     }
-    // Grok Build runs in the tab; the fake is inactive: Grok Build brands it.
-    ACTIVE.store(false, Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let fake_dir = directory(temp.path(), "fake-dir");
+    let claude_dir = directory(temp.path(), "claude-dir");
+
+    // Grok Build runs in the tab; the fake reports nothing: Grok Build brands it.
+    set_fake_directory(None);
     let mut model = model_with_tab(WITH_FAKE, Some(GROK));
     assert_eq!(tab(&model).label, "Grok Build");
 
-    // The fake becomes active: rank 250 outranks Grok Build at 300.
-    ACTIVE.store(true, Ordering::SeqCst);
+    // The fake reports a directory and holds the root: rank 250 outranks
+    // Grok Build at 300.
+    set_fake_directory(Some(&fake_dir));
+    drive_to_label(&mut model, "Fake Agent");
     let summary = tab(&model);
-    assert_eq!(summary.label, "Fake Agent");
     assert_eq!(summary.mark, Some(FAKE_DESCRIPTOR.mark));
     assert_eq!(summary.dots, [SessionActivity::Busy]);
     assert_eq!(
@@ -761,12 +1100,25 @@ fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude()
     assert_eq!(tab(&model).label, "OpenCode");
     drop(model);
 
-    // Claude Code live outranks the fake at 250.
-    let model = model_with_tab(WITH_FAKE, Some(CLAUDE_CODE));
+    // Claude Code live outranks the fake at 250 and takes the root.
+    let mut model = model_with_tab(WITH_FAKE, Some(CLAUDE_CODE));
+    drive_to_root(&mut model, "fake", &fake_dir);
+    assert_eq!(
+        tab(&model).label,
+        "Claude Code",
+        "present Claude Code brands"
+    );
+    report_claude_session(&claude_dir);
+    drive_to_root(&mut model, "claude-code", &claude_dir);
     assert_eq!(tab(&model).label, "Claude Code");
-    // Claude Code exits: the fake brands the tab again.
-    drop(model);
-    ACTIVE.store(false, Ordering::SeqCst);
+
+    // Claude Code exits: the root returns to the fake and it brands the tab
+    // again.
+    exit_claude();
+    drive_to_root(&mut model, "fake", &fake_dir);
+    drive_to_label(&mut model, "Fake Agent");
+    assert_eq!(tab(&model).mark, Some(FAKE_DESCRIPTOR.mark));
+    set_fake_directory(None);
 }
 
 #[test]
@@ -774,14 +1126,17 @@ fn a_fake_at_rank_150_brands_a_tab_over_claude_code() {
     if isolated("a_fake_at_rank_150_brands_a_tab_over_claude_code") {
         return;
     }
-    ACTIVE.store(true, Ordering::SeqCst);
+    let temp = tempfile::tempdir().unwrap();
+    let fake_dir = directory(temp.path(), "fake-dir");
+    set_fake_directory(Some(&fake_dir));
     let mut model = model_with_tab(WITH_ABOVE, Some(CLAUDE_CODE));
-    assert_eq!(tab(&model).label, "Fake Agent");
+    drive_to_label(&mut model, "Fake Agent");
     assert_eq!(tab(&model).mark, Some(ABOVE_DESCRIPTOR.mark));
     let id = model.active_workspace_id().unwrap();
     model.hold_workspace_opencode_label(id);
     assert_eq!(tab(&model).label, "OpenCode", "OpenCode keeps rank 100");
-    ACTIVE.store(false, Ordering::SeqCst);
+    drop(model);
+    set_fake_directory(None);
     let model = model_with_tab(WITH_ABOVE, Some(CLAUDE_CODE));
     assert_eq!(tab(&model).label, "Claude Code");
 }
@@ -891,10 +1246,7 @@ fn launch_state_exists_only_for_the_lists_entries() {
     assert!(events_with("tab-state:").is_empty());
     let _with_fake = model_with_tab(WITH_FAKE, None);
     assert_eq!(events_with("tab-state:"), ["tab-state:fake:Shell"]);
-    assert_eq!(
-        events_with("prepare:"),
-        ["prepare:fake:Shell:covered=false"]
-    );
+    assert_eq!(events_with("prepare:"), ["prepare:fake:Shell:covered=true"]);
 }
 
 #[test]
@@ -914,15 +1266,17 @@ fn presentation_is_exactly_the_lists_entries() {
     if isolated("presentation_is_exactly_the_lists_entries") {
         return;
     }
-    ACTIVE.store(true, Ordering::SeqCst);
-    // The fake is not in the product list: an active fake brands nothing.
+    let temp = tempfile::tempdir().unwrap();
+    set_fake_directory(Some(&directory(temp.path(), "fake-dir")));
+    // The fake is not in the product list: a fake with a directory brands
+    // nothing.
     let product = model_with_tab(PRODUCT, Some(GROK));
     assert_eq!(tab(&product).label, "Grok Build");
     drop(product);
     // A list without Claude Code: a Claude Code tab is not branded as it.
     let without = model_with_tab(WITHOUT_CLAUDE, None);
     assert_ne!(tab(&without).label, "Claude Code");
-    ACTIVE.store(false, Ordering::SeqCst);
+    set_fake_directory(None);
 }
 
 #[test]

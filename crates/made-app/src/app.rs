@@ -436,6 +436,7 @@ pub struct AppModel {
     native_backdrop: NativeBackdropStatus,
     compatible_tuis: Vec<IntegrationRef>,
     compatible_tui_receiver: Option<Receiver<Vec<IntegrationRef>>>,
+    // BEGIN remote-path (AIA-02)
     /// Per-server remote Grok plugin install outcome, from the bounded
     /// consented attempt or a test hold.
     remote_grok_installs: Vec<(made_remote::protocol::AuthorityId, RemoteGrokInstallState)>,
@@ -455,6 +456,7 @@ pub struct AppModel {
     /// Servers whose install was refused this session. Refusal is the absence
     /// of consent and is never persisted as approval.
     remote_grok_install_refusals: Vec<made_remote::protocol::AuthorityId>,
+    // END remote-path
     /// The integrations this model was built with, in catalog order.
     integrations: IntegrationList,
     /// App-wide integration state, parallel to `integrations`.
@@ -564,11 +566,13 @@ impl AppModel {
             compatible_tui_receiver,
             integrations: PRODUCT,
             app_states,
+            // BEGIN remote-path (AIA-02)
             remote_grok_installs: Vec::new(),
             remote_grok_install_attempts: Vec::new(),
             remote_grok_provisioned: Vec::new(),
             remote_grok_prompt_authority: None,
             remote_grok_install_refusals: Vec::new(),
+            // END remote-path
             terminal_target: TerminalTarget::Shell,
             smoke,
             ssh: load_ssh_registry(),
@@ -598,6 +602,7 @@ impl AppModel {
     /// every workspace started afterwards is built over `list`.
     #[doc(hidden)]
     pub fn with_integrations(mut self, list: IntegrationList) -> Self {
+        debug_assert_eq!(crate::integrations::validate(list), Ok(()));
         // A live worker has not answered yet; a model without one is not
         // detecting.
         let detecting = self.compatible_tui_receiver.is_some();
@@ -703,6 +708,7 @@ impl AppModel {
     }
     // END transitional-shim
 
+    // BEGIN remote-path (AIA-02)
     /// Record a finished probe outcome for one server without an SSH attempt.
     ///
     /// Test-only seam: the product flow arrives through [`Self::poll_ssh_probe`]
@@ -1048,6 +1054,7 @@ impl AppModel {
             self.push_grok_diagnostics();
         }
     }
+    // END remote-path
 
     /// Give this workspace the OpenCode tab label without a bridge.
     ///

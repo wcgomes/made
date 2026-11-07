@@ -29,7 +29,7 @@ use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
-pub mod claude_code;
+pub(crate) mod claude_code;
 pub(crate) mod grok;
 pub(crate) mod opencode;
 pub(crate) mod shared;
@@ -331,6 +331,15 @@ impl EnvPolicy {
             _ => false,
         }
     }
+
+    /// What the core applies for an integration whose policy does not cover
+    /// the target: nothing set, the policy's variables removed.
+    pub fn uncovered_contribution(&self) -> EnvContribution {
+        EnvContribution {
+            set: Vec::new(),
+            strip: self.strip.to_vec(),
+        }
+    }
 }
 
 /// What one integration adds to a launch: variables to set, then variables to
@@ -589,9 +598,13 @@ pub struct Presentation {
 /// a worker thread, so the state is `Send`.
 pub trait TabState: Any + Send {
     /// Prepare a launch of `target`: the variables to set and remove.
+    /// `covered` is whether the integration's declared [`EnvPolicy`] covers
+    /// the target. On an uncovered target the core discards what is returned
+    /// and applies the policy's removals itself.
     fn prepare_launch(
         &mut self,
         _target: TerminalTarget,
+        _covered: bool,
         _ctx: &mut LaunchCtx<'_>,
     ) -> EnvContribution {
         EnvContribution::default()
@@ -614,6 +627,7 @@ pub trait TabState: Any + Send {
     fn on_follow_outcome(&mut self, _outcome: Option<&SessionFollowOutcome>) {}
 
     /// The tab closes or its terminal is replaced: drop per-terminal state.
+    /// The core may call it more than once, so it must be idempotent.
     fn teardown(&mut self) {}
 
     /// The integration's diagnostics row for this tab, `remote` when the tab is
@@ -685,14 +699,23 @@ pub fn position(list: IntegrationList, entry: IntegrationRef) -> Option<usize> {
     list.iter().position(|candidate| *candidate == entry)
 }
 
-/// The tab state of `entry` as its concrete type.
+/// The tab state of `entry` as its concrete type. `None` when the entry has no
+/// state; a state of another type is a bug in the owning module and fails a
+/// debug build.
 pub fn tab_state<S: TabState>(
     list: IntegrationList,
     slots: &Slots<Box<dyn TabState>>,
     entry: IntegrationRef,
 ) -> Option<&S> {
     let state = slots.get(position(list, entry)?)?;
-    state.as_any().downcast_ref::<S>()
+    let typed = state.as_any().downcast_ref::<S>();
+    debug_assert!(
+        typed.is_some(),
+        "the state of {} is not a {}",
+        entry.descriptor().key,
+        std::any::type_name::<S>()
+    );
+    typed
 }
 
 /// The tab state of `entry` as its concrete type, mutably.
@@ -702,7 +725,14 @@ pub fn tab_state_mut<S: TabState>(
     entry: IntegrationRef,
 ) -> Option<&mut S> {
     let state = slots.get_mut(position(list, entry)?)?;
-    state.as_any_mut().downcast_mut::<S>()
+    let typed = state.as_any_mut().downcast_mut::<S>();
+    debug_assert!(
+        typed.is_some(),
+        "the state of {} is not a {}",
+        entry.descriptor().key,
+        std::any::type_name::<S>()
+    );
+    typed
 }
 
 /// The app state of `entry` as its concrete type.
@@ -712,7 +742,14 @@ pub fn app_state<S: AppState>(
     entry: IntegrationRef,
 ) -> Option<&S> {
     let state = slots.get(position(list, entry)?)?;
-    state.as_any().downcast_ref::<S>()
+    let typed = state.as_any().downcast_ref::<S>();
+    debug_assert!(
+        typed.is_some(),
+        "the state of {} is not a {}",
+        entry.descriptor().key,
+        std::any::type_name::<S>()
+    );
+    typed
 }
 
 /// The app state of `entry` as its concrete type, mutably.
@@ -722,5 +759,43 @@ pub fn app_state_mut<S: AppState>(
     entry: IntegrationRef,
 ) -> Option<&mut S> {
     let state = slots.get_mut(position(list, entry)?)?;
-    state.as_any_mut().downcast_mut::<S>()
+    let typed = state.as_any_mut().downcast_mut::<S>();
+    debug_assert!(
+        typed.is_some(),
+        "the state of {} is not a {}",
+        entry.descriptor().key,
+        std::any::type_name::<S>()
+    );
+    typed
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    /// A state of a type no product module expects.
+    struct Stranger;
+
+    impl TabState for Stranger {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a")]
+    fn a_filled_slot_of_the_wrong_type_fails_a_debug_build() {
+        let slots = Slots::from_list(PRODUCT, |_| Some(Box::new(Stranger) as Box<dyn TabState>));
+        let _ = tab_state::<opencode::OpenCodeTabState>(PRODUCT, &slots, OPENCODE);
+    }
+
+    #[test]
+    fn an_empty_slot_is_none() {
+        let slots = Slots::<Box<dyn TabState>>::from_list(PRODUCT, |_| None);
+        assert!(tab_state::<opencode::OpenCodeTabState>(PRODUCT, &slots, OPENCODE).is_none());
+    }
 }

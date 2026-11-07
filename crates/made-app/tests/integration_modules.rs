@@ -189,6 +189,8 @@ mod neutrality {
         "poll_claude",
         "prepare_claude_launch",
         "self.claude",
+        "claude_follow::",
+        "ClaudeTab",
     ];
 
     /// Whole files that are remote paths.
@@ -246,10 +248,15 @@ mod neutrality {
 
     /// The part of a core file the scans read: everything before its unit
     /// tests.
-    fn production_part(source: &str) -> &str {
-        source
-            .find("#[cfg(test)]\nmod tests")
-            .map_or(source, |end| &source[..end])
+    fn production_part(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = lines
+            .windows(2)
+            .position(|pair| {
+                pair[0].trim_end() == "#[cfg(test)]" && pair[1].starts_with("mod tests")
+            })
+            .unwrap_or(lines.len());
+        lines[..end].join("\n")
     }
 
     fn is_comment(line: &str) -> bool {
@@ -261,7 +268,7 @@ mod neutrality {
         let mut found = Vec::new();
         for path in core_files() {
             let source = fs::read_to_string(&path).unwrap();
-            for (number, line) in scanned_lines(production_part(&source)) {
+            for (number, line) in scanned_lines(&production_part(&source)) {
                 if is_comment(line) {
                     continue;
                 }
@@ -284,7 +291,7 @@ mod neutrality {
         let mut found = Vec::new();
         for path in core_files() {
             let source = fs::read_to_string(&path).unwrap();
-            for (number, line) in scanned_lines(production_part(&source)) {
+            for (number, line) in scanned_lines(&production_part(&source)) {
                 if is_comment(line) {
                     continue;
                 }

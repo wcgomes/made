@@ -169,21 +169,12 @@ impl ClaudeTabState {
     }
 }
 
-/// What a Claude Code launch adds to a terminal child's environment. A launch
-/// with no spool binding, including every target that does not load the
-/// plugin, also removes an inherited one, so a copied variable can never point
-/// a tab at another tab's spool.
-pub(crate) fn launch_contribution(
-    target: TerminalTarget,
-    launch: &ClaudeLaunchEnv,
-) -> EnvContribution {
+/// What a covered Claude Code launch adds to a terminal child's environment. A
+/// launch with no spool binding also removes an inherited one, so a copied
+/// variable can never point a tab at another tab's spool. The core removes it
+/// from every target the policy does not cover.
+fn launch_contribution(launch: &ClaudeLaunchEnv) -> EnvContribution {
     let policy = CLAUDE_CODE.env_policy();
-    if !policy.covers(CLAUDE_CODE, target) {
-        return EnvContribution {
-            set: Vec::new(),
-            strip: policy.strip.to_vec(),
-        };
-    }
     let binds_spool = launch.env.iter().any(|(key, _)| key == CLAUDE_SPOOL_ENV);
     EnvContribution {
         set: launch.env.clone(),
@@ -215,10 +206,11 @@ impl TabState for ClaudeTabState {
     fn prepare_launch(
         &mut self,
         target: TerminalTarget,
+        covered: bool,
         ctx: &mut LaunchCtx<'_>,
     ) -> EnvContribution {
-        if !CLAUDE_CODE.env_policy().covers(CLAUDE_CODE, target) {
-            return launch_contribution(target, &ClaudeLaunchEnv::default());
+        if !covered {
+            return EnvContribution::default();
         }
         self.plugin = ctx
             .paths
@@ -246,7 +238,7 @@ impl TabState for ClaudeTabState {
             direct: target == TerminalTarget::Tui(CLAUDE_CODE),
             spool,
         });
-        launch_contribution(target, &launch)
+        launch_contribution(&launch)
     }
 
     fn on_spawned(&mut self, pid: Option<u32>) {

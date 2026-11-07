@@ -12,9 +12,7 @@ use made_bridge::config_guard::ConfigGuard;
 use made_bridge::security::Token;
 use made_bridge::server::BridgeHandle;
 
-use crate::integrations::{
-    EnvContribution, LaunchCtx, Presentation, PresentationCtx, TabState, OPENCODE,
-};
+use crate::integrations::{EnvContribution, LaunchCtx, Presentation, PresentationCtx, TabState};
 use crate::session_map::SessionRow;
 use crate::tui::TerminalTarget;
 
@@ -68,9 +66,10 @@ impl OpenCodeTabState {
         self.config_guard.take()
     }
 
-    /// Forget the credential.
+    /// Forget the credential and the composed configuration that carries it.
     pub(crate) fn clear_token(&mut self) {
         self.token = None;
+        self.composed = None;
     }
 }
 
@@ -99,17 +98,24 @@ impl TabState for OpenCodeTabState {
     /// content is handed over once.
     fn prepare_launch(
         &mut self,
-        target: TerminalTarget,
+        _target: TerminalTarget,
+        covered: bool,
         _ctx: &mut LaunchCtx<'_>,
     ) -> EnvContribution {
         let composed = self.composed.take();
         match composed {
-            Some(content) if OPENCODE.env_policy().covers(OPENCODE, target) => EnvContribution {
+            Some(content) if covered => EnvContribution {
                 set: vec![(CONFIG_CONTENT_ENV.into(), content.into())],
                 strip: Vec::new(),
             },
             _ => EnvContribution::default(),
         }
+    }
+
+    /// The composed configuration holds the bridge credential, so a tab that
+    /// closes without launching does not keep it.
+    fn teardown(&mut self) {
+        self.composed = None;
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -118,5 +124,30 @@ impl TabState for OpenCodeTabState {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_drops_the_composed_configuration_that_holds_the_credential() {
+        let mut state = OpenCodeTabState::new();
+        state.composed = Some("{\"token\":\"secret\"}".to_owned());
+        state.teardown();
+        assert!(state.composed.is_none());
+        // Idempotent.
+        state.teardown();
+        assert!(state.composed.is_none());
+    }
+
+    #[test]
+    fn clearing_the_token_drops_the_composed_configuration_too() {
+        let mut state = OpenCodeTabState::new();
+        state.composed = Some("{\"token\":\"secret\"}".to_owned());
+        state.clear_token();
+        assert!(state.composed.is_none());
+        assert!(state.token().is_none());
     }
 }

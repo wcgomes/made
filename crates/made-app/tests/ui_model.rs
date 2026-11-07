@@ -13968,7 +13968,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "the OpenCode plugin configuration is still injected"
     );
     for key in [
-        made_app::integrations::claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV,
+        made_app::tui::CLAUDE_CODE_PLUGIN_DIRS_ENV,
         "MADE_CLAUDE_SPOOL",
     ] {
         assert!(

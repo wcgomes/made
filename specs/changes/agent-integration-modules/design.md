@@ -156,14 +156,16 @@ tick_remote(remote tab):
   for entry in list where polls_remote_tabs: lazily create tab state, poll   # Claude Code only today
 ```
 
-Today Grok polls before Claude Code (`poll_grok_hooks`, `poll_grok_directory`, `poll_claude` at `workbench.rs:4043-4045`), which is list order, so iterating the list keeps it. Launch (`workbench.rs:1164-1286`):
+Today Grok polls before Claude Code (`poll_grok_hooks`, `poll_grok_directory`, `poll_claude` at `workbench.rs:4043-4045`), which is list order, so iterating the list keeps it. The `contributions` line below is the order in which they are gathered, not the order in which they apply. Launch (`workbench.rs:1164-1286`):
 
 ```
 start_terminal(target):
   remote target -> return (unchanged)
   options = target.pty_options(cwd, PATH)            # program from descriptor, args from launch_args
-  contributions = for entry in list: slot.prepare_launch(target, ctx)   # Claude: spool + compose; logs as today
-  options = apply core strips (SHELLOPTS, BASH_ENV, ENV), then contributions in list order
+  contributions = for entry in list (gathering order): covered = entry.env_policy().covers(entry, target)
+                    c = slot.prepare_launch(target, covered, ctx)           # Claude: spool + compose; logs as today
+                    c = c if covered else policy.strip only                  # the core applies the declared strip
+  options = apply core strips (SHELLOPTS, BASH_ENV, ENV), then contributions from the last list entry to the first (earliest entry wins)
   spawn; on success: for entry in list: slot.on_spawned(pid)
   on failure: retry in fallback dir with the same contributions; on_spawned on success
 ```

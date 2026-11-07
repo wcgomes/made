@@ -178,7 +178,7 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.87 Remove the moved items; `pub use` re-export inside transitional-shim markers for test paths (path: crates/made-app/src/integration_status.rs)
 - [x] 1.88 Privacy scan reads every file under `src/integrations/claude_code/` by a recursive `std::fs::read_dir` walk plus the two hook sources, and fails if the walk reads no file; forbidden-term list unchanged (path: crates/made-app/tests/claude_privacy.rs)
 - [x] 1.89 Module declarations updated (path: crates/made-app/src/lib.rs)
-- [ ] 1.90 Revert check of the step 1 merge on a scratch branch, gates pass (path: n/a (PR description))
+- [x] 1.90 Revert check of the step 1 merge on a scratch branch, gates pass (path: n/a (PR description))
 
 ## Checkpoint
 - [ ] gates pass; phase 0 tests differ only inside adapter blocks; other test diffs path-only or AIA-09; PR CI green (merge gate)

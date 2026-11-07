@@ -305,8 +305,7 @@ fn expect_install(installed: Option<&str>) {
     // composed into the Grok launch, and an inherited binding is stripped.
     assert!(
         terminal.options().env.iter().all(|(key, _)| {
-            key != made_app::integrations::claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV
-                && key != "MADE_CLAUDE_SPOOL"
+            key != made_app::tui::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
         }),
         "the Grok launch environment has no Made Claude Code plugin entry"
     );

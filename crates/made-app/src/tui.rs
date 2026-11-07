@@ -15,6 +15,7 @@ use made_terminal::PtyOptions;
 // BEGIN transitional-shim (AIA-11)
 use crate::integrations::claude_code::launch::claude_launch_env;
 pub use crate::integrations::claude_code::launch::{
+    claude_plugin_dirs_separator, compose_claude_plugin_dirs, shipped_claude_plugin_dir,
     ClaudeLaunchEnv, CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV,
 };
 // END transitional-shim

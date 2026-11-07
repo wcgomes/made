@@ -26,7 +26,6 @@ use made_platform::{
 };
 
 use crate::app::WorkspaceId;
-use crate::claude_follow::ClaudeTab;
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
     DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
@@ -36,6 +35,7 @@ use crate::explorer_view::{
 };
 use crate::integration_status::{IntegrationState, IntegrationStatus};
 // BEGIN transitional-shim (AIA-11)
+use crate::claude_follow::ClaudeTab;
 use crate::integrations::claude_code;
 // END transitional-shim
 use crate::integrations::grok;
@@ -261,9 +261,11 @@ struct RemoteTab {
     update_approved: bool,
     /// The approved update attempt itself failed; Retry stays actionable.
     update_failed: bool,
+    // BEGIN remote-path (AIA-02)
     /// What the tab's own launch probe detected. Absence is undetected; the
     /// host PATH is never consulted for a remote tab.
     grok_detected: bool,
+    // END remote-path
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
     client_rx: Option<
@@ -336,7 +338,9 @@ impl RemoteTab {
             update_target: None,
             update_approved: false,
             update_failed: false,
+            // BEGIN remote-path (AIA-02)
             grok_detected: false,
+            // END remote-path
             probe: None,
             stage: None,
             client_rx: None,
@@ -646,6 +650,7 @@ impl Workbench {
         terminal_target: TerminalTarget,
         started_at: Instant,
     ) -> Self {
+        debug_assert_eq!(crate::integrations::validate(integrations), Ok(()));
         Self::start_with(
             integrations,
             plan,
@@ -683,7 +688,9 @@ impl Workbench {
         remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
         remote.grok = matches!(target, TerminalTarget::RemoteGrok { .. });
         remote.claude = matches!(target, TerminalTarget::RemoteClaude { .. });
+        // BEGIN remote-path (AIA-02)
         remote.grok_detected = false;
+        // END remote-path
         remote.probe = Some(crate::ssh_servers::spawn_probe(
             crate::ssh_servers::ProbeRequest {
                 ticket: crate::ssh_servers::ProbeTicket {
@@ -726,7 +733,9 @@ impl Workbench {
             update_target: None,
             update_approved: false,
             update_failed: false,
+            // BEGIN remote-path (AIA-02)
             grok_detected: false,
+            // END remote-path
             probe: None,
             stage: None,
             client_rx: None,
@@ -822,7 +831,8 @@ impl Workbench {
         let integration = IntegrationState::new(launch_root.clone(), terminal_cwd.clone());
         let follow = plan
             .as_ref()
-            .and_then(|plan| SessionFollowCoordinator::from_launch_plan(plan).ok());
+            .and_then(|plan| SessionFollowCoordinator::from_launch_plan(plan).ok())
+            .map(|coordinator| coordinator.with_integrations(integrations));
         if plan.is_some() && follow.is_none() {
             let error = WorkspaceError::new(
                 crate::workspace::WorkspaceErrorKind::Unreadable,
@@ -1273,10 +1283,21 @@ impl Workbench {
             pane_id: &self.pane_id,
             log: self.diag.log_mut(),
         };
-        self.tab_states
-            .iter_mut()
-            .map(|state| state.prepare_launch(target, &mut ctx))
-            .collect()
+        let mut contributions = Vec::new();
+        for (index, entry) in self.integrations.iter().enumerate() {
+            let Some(state) = self.tab_states.get_mut(index) else {
+                continue;
+            };
+            let policy = entry.env_policy();
+            let covered = policy.covers(*entry, target);
+            let contribution = state.prepare_launch(target, covered, &mut ctx);
+            contributions.push(if covered {
+                contribution
+            } else {
+                policy.uncovered_contribution()
+            });
+        }
+        contributions
     }
 
     /// Tell every integration state that the terminal child started.
@@ -2508,6 +2529,7 @@ impl Workbench {
             .and_then(|remote| remote.workspace.grok_hooks_ready())
     }
 
+    // BEGIN remote-path (AIA-02)
     /// The owning tab's own launch-probe Grok detection. The host PATH is
     /// never consulted; a tab without a finished probe reports undetected.
     pub(crate) fn remote_grok_detected(&self) -> bool {
@@ -2515,6 +2537,7 @@ impl Workbench {
             .as_ref()
             .is_some_and(|remote| remote.grok_detected)
     }
+    // END remote-path
 
     /// Record the tab's own remote detection after its launch probe finishes.
     /// Test-only seam: record the resolved remote target without a live probe.
@@ -2525,11 +2548,13 @@ impl Workbench {
         }
     }
 
+    // BEGIN remote-path (AIA-02)
     pub(crate) fn set_remote_grok_detection(&mut self, detected: bool) {
         if let Some(remote) = self.remote.as_mut() {
             remote.grok_detected = detected;
         }
     }
+    // END remote-path
 
     /// Whether the tab's SSH transport is down: the attempt failed or the
     /// attached session is disconnected. Transport failure outranks every
@@ -3046,8 +3071,10 @@ impl Workbench {
                 .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
+        // BEGIN remote-path (AIA-02)
         // The owning tab's own detection feeds its Grok Build diagnostics row.
         remote.grok_detected = capabilities.grok;
+        // END remote-path
         // BEGIN remote-path (AIA-02)
         if let Some(state) = claude_code::tab_state_mut(self.integrations, &mut self.tab_states) {
             state.set_remote_detection(Some(report.claude));
@@ -5678,12 +5705,11 @@ mod tests {
     use super::*;
     use crate::integration_status::ClaudeDiagnosticsPhase;
     use crate::integrations::{GROK, OPENCODE};
-    use crate::tui::{ClaudeLaunchEnv, CLAUDE_SPOOL_ENV};
+    use crate::tui::CLAUDE_SPOOL_ENV;
 
     #[test]
     fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
         let authority = made_remote::protocol::AuthorityId([3; 16]);
-        let launch = ClaudeLaunchEnv::default();
         for target in [
             TerminalTarget::Tui(OPENCODE),
             TerminalTarget::Tui(GROK),
@@ -5692,8 +5718,10 @@ mod tests {
             TerminalTarget::RemoteGrok { authority },
             TerminalTarget::RemoteClaude { authority },
         ] {
-            let options = claude_code::tab::launch_contribution(target, &launch)
-                .apply(made_terminal::PtyOptions::new(std::env::temp_dir()));
+            let options = apply_contributions(
+                &idle_workbench(target, None).prepare_launches(),
+                made_terminal::PtyOptions::new(std::env::temp_dir()),
+            );
             assert!(
                 options.env_remove.iter().any(|key| key == CLAUDE_SPOOL_ENV),
                 "{target:?} must not inherit another tab's spool"

@@ -12,7 +12,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, RichText, Sense, Stroke, StrokeKind, Ui,
@@ -1055,12 +1055,27 @@ fn claude_mark() -> theme::MenuLeading {
     mark_leading(CLAUDE_CODE.descriptor().mark)
 }
 
+/// The vendored icon of a mark name, resolved once per name.
+fn vendored_mark(name: &'static str) -> crate::explorer_icons::IconId {
+    static RESOLVED: Mutex<Vec<(&'static str, crate::explorer_icons::IconId)>> =
+        Mutex::new(Vec::new());
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, icon)) = resolved.iter().find(|(known, _)| *known == name) {
+        return *icon;
+    }
+    let icon = crate::explorer_icons::icon_by_file_name(name)
+        .expect("a vendored mark is part of the explorer icons");
+    resolved.push((name, icon));
+    icon
+}
+
 /// The menu leading image of an integration's declared mark.
 fn mark_leading(mark: Mark) -> theme::MenuLeading {
     match mark {
         Mark::Vendored(name) => {
-            let icon = crate::explorer_icons::icon_by_file_name(name)
-                .expect("a vendored mark is part of the explorer icons");
+            let icon = vendored_mark(name);
             theme::MenuLeading::Image {
                 uri: icon.uri(),
                 bytes: icon.bytes(),
@@ -2246,6 +2261,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                         launch_remote = Some((server.id(), false));
                                         ui.close();
                                     }
+                                    // BEGIN remote-path (AIA-02)
                                     if registry.can_launch_opencode(server.id()) {
                                         let opencode_label = format!("OpenCode SSH — {name}");
                                         if new_tab_menu_item(
@@ -2262,7 +2278,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                             ui.close();
                                         }
                                     }
-                                    // BEGIN remote-path (AIA-02)
                                     if registry.can_launch_grok(server.id()) {
                                         let grok_label = format!("Grok SSH — {name}");
                                         if new_tab_menu_item(
@@ -2346,6 +2361,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     if let Some(tui) = launch_tui {
         model.begin_tui_workspace(tui);
     }
+    // BEGIN remote-path (AIA-02)
     if let Some((id, opencode)) = launch_remote {
         if let Err(error) = model.begin_remote_choice(id, opencode) {
             model.set_ssh_notice(error);
@@ -2364,6 +2380,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             model.set_ssh_open(true);
         }
     }
+    // END remote-path
     if toggle_ssh {
         model.toggle_ssh();
     }
@@ -5154,9 +5171,26 @@ mod tests {
     use super::*;
     use crate::session_map::SessionRow;
     use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     static APP_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn every_vendored_mark_of_the_product_resolves() {
+        let mut vendored = 0;
+        for entry in crate::integrations::PRODUCT {
+            if let Mark::Vendored(name) = entry.descriptor().mark {
+                vendored += 1;
+                assert!(
+                    crate::explorer_icons::icon_by_file_name(name).is_some(),
+                    "{name} is not an explorer icon"
+                );
+                // Resolution is cached: the second lookup returns the same icon.
+                assert_eq!(vendored_mark(name), vendored_mark(name));
+            }
+        }
+        assert!(vendored > 0, "no product integration has a vendored mark");
+    }
 
     /// Serializes and restores app-path environment variables for unit tests
     /// that must construct a real `Workbench`. `Drop` restores every variable

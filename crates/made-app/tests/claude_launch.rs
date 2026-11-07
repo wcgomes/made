@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use made_app::integrations::claude_code::launch::{
+use made_app::tui::{
     claude_plugin_dirs_separator, compose_claude_plugin_dirs, shipped_claude_plugin_dir,
     CLAUDE_CODE_PLUGIN_DIRS_ENV,
 };
