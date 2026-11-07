@@ -15,20 +15,20 @@ use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use made_platform::AppPaths;
 use made_terminal::PtyOptions;
 
 use crate::diagnostics::DiagnosticLog;
-use crate::session_follow::SessionFollowOutcome;
+use crate::session_follow::{RootSource, SessionFollowCoordinator, SessionFollowOutcome};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
 pub(crate) mod claude_code;
-mod grok;
-mod opencode;
+pub(crate) mod grok;
+pub(crate) mod opencode;
 
 /// A static reference to one integration. Two references are equal when their
 /// descriptors have the same key.
@@ -340,6 +340,73 @@ pub struct LaunchCtx<'a> {
     pub log: &'a mut DiagnosticLog,
 }
 
+/// One effect of a poll that follows directories itself, in the order it
+/// happened.
+#[derive(Debug)]
+pub enum FollowStep {
+    /// The coordinator answered a directory the state followed.
+    Outcome(Box<SessionFollowOutcome>),
+    /// The poll saw activity worth keeping the frame loop awake for.
+    Activity,
+}
+
+/// The follow coordinator as a poll sees it: directories are followed at once,
+/// so the state reads the answer before its next step, and the core applies
+/// the resulting effects, in order, once the poll returns.
+pub struct FollowPort<'a> {
+    coordinator: Option<&'a mut SessionFollowCoordinator>,
+    plan_root: Option<&'a Path>,
+    steps: Vec<FollowStep>,
+}
+
+impl<'a> FollowPort<'a> {
+    /// A port over the tab's coordinator, with the launch plan's explorer root
+    /// as the root of a tab that has none.
+    pub fn new(
+        coordinator: Option<&'a mut SessionFollowCoordinator>,
+        plan_root: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            coordinator,
+            plan_root,
+            steps: Vec::new(),
+        }
+    }
+
+    /// Follow `directory` for `entry`. A tab without a coordinator ignores it.
+    pub fn follow_directory(&mut self, entry: IntegrationRef, directory: Option<&Path>) {
+        if let Some(coordinator) = self.coordinator.as_deref_mut() {
+            let outcome = coordinator.follow_directory(entry, directory);
+            self.steps.push(FollowStep::Outcome(Box::new(outcome)));
+        }
+    }
+
+    /// Record that the poll saw activity.
+    pub fn note_activity(&mut self) {
+        self.steps.push(FollowStep::Activity);
+    }
+
+    /// The explorer root now.
+    pub fn explorer_root(&self) -> Option<&Path> {
+        self.coordinator
+            .as_deref()
+            .map(SessionFollowCoordinator::current_root)
+            .or(self.plan_root)
+    }
+
+    /// The directory of the root when `entry` holds it.
+    pub fn root_held_by(&self, entry: IntegrationRef) -> Option<PathBuf> {
+        let coordinator = self.coordinator.as_deref()?;
+        (coordinator.effective_root_source() == RootSource::Agent(entry))
+            .then(|| coordinator.current_root().to_path_buf())
+    }
+
+    /// The effects recorded so far, in order.
+    pub fn into_steps(self) -> Vec<FollowStep> {
+        self.steps
+    }
+}
+
 /// What the core lends to a tab poll.
 pub struct TabIo<'a> {
     /// The tab's terminal, once it exists.
@@ -348,12 +415,15 @@ pub struct TabIo<'a> {
     pub target: TerminalTarget,
     /// The tab is a remote tab.
     pub remote: bool,
+    /// The tab's follow coordinator, for a state that follows as it polls.
+    pub follow: FollowPort<'a>,
 }
 
 /// What the core lends to app-wide state.
 #[derive(Debug, Default)]
 pub struct AppCtx {
     diagnostics_changed: bool,
+    repaint_after: Option<Duration>,
 }
 
 impl AppCtx {
@@ -365,6 +435,16 @@ impl AppCtx {
     /// Whether a state asked for a diagnostics push.
     pub fn diagnostics_changed(&self) -> bool {
         self.diagnostics_changed
+    }
+
+    /// Ask the core for another frame after `delay`.
+    pub fn request_repaint_after(&mut self, delay: Duration) {
+        self.repaint_after = Some(delay);
+    }
+
+    /// The delay a state asked for another frame after, if any.
+    pub fn repaint_after(&self) -> Option<Duration> {
+        self.repaint_after
     }
 }
 

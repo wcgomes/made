@@ -1,8 +1,15 @@
 //! Grok Build integration.
 
+pub(crate) mod diagnostics;
+pub(crate) mod tab;
+
 use super::{
-    Descriptor, FollowKind, FollowPolicy, Integration, Mark, OnUnusable, Rank, WhileOutranked,
+    AppInit, AppState, Descriptor, FollowKind, FollowPolicy, Integration, IntegrationList, Mark,
+    OnUnusable, Rank, Slots, TabInit, TabState, WhileOutranked, GROK,
 };
+use crate::tui::TerminalTarget;
+use diagnostics::GrokAppState;
+pub(crate) use tab::GrokTabState;
 
 /// Grok Build, started directly as `grok dashboard`.
 pub(super) struct Grok;
@@ -38,4 +45,48 @@ impl Integration for Grok {
     fn launch_args(&self) -> &'static [&'static str] {
         &["dashboard"]
     }
+
+    fn new_app_state(&self, init: &AppInit<'_>) -> Option<Box<dyn AppState>> {
+        Some(Box::new(GrokAppState::new(init)))
+    }
+
+    fn new_tab_state(
+        &self,
+        _target: TerminalTarget,
+        _init: &TabInit<'_>,
+    ) -> Option<Box<dyn TabState>> {
+        Some(Box::new(GrokTabState::new()))
+    }
+}
+
+/// The Grok state of a tab built over `list`.
+pub(crate) fn tab_state(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn TabState>>,
+) -> Option<&GrokTabState> {
+    super::tab_state::<GrokTabState>(list, slots, GROK)
+}
+
+/// The Grok state of a tab built over `list`, mutably.
+pub(crate) fn tab_state_mut(
+    list: IntegrationList,
+    slots: &mut Slots<Box<dyn TabState>>,
+) -> Option<&mut GrokTabState> {
+    super::tab_state_mut::<GrokTabState>(list, slots, GROK)
+}
+
+/// The Grok state of an app model built over `list`.
+pub(crate) fn app_state(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn AppState>>,
+) -> Option<&GrokAppState> {
+    super::app_state::<GrokAppState>(list, slots, GROK)
+}
+
+/// The Grok state of an app model built over `list`, mutably.
+pub(crate) fn app_state_mut(
+    list: IntegrationList,
+    slots: &mut Slots<Box<dyn AppState>>,
+) -> Option<&mut GrokAppState> {
+    super::app_state_mut::<GrokAppState>(list, slots, GROK)
 }
