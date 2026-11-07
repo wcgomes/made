@@ -34,6 +34,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "made-claude-hook",
     "made-explorer",
     "made-grok-hook",
+    "made-hook-common",
     "made-platform",
     "made-remote",
     "made-terminal",
@@ -228,10 +229,11 @@ fn platform_specific_code_lives_only_in_made_platform() {
 
     // The hooks are dependency-light leaf executables: they cannot link
     // made-platform, so their per-OS process and file calls live in their own
-    // `main.rs` and target-specific manifest tables.
+    // `main.rs`, in `made-hook-common` and in target-specific manifest tables.
     let hook_dirs = [
         root.join("crates/made-grok-hook"),
         root.join("crates/made-claude-hook"),
+        root.join("crates/made-hook-common"),
     ];
 
     for crate_dir in crate_dirs(&root) {

@@ -6,6 +6,7 @@ members = [
     "crates/made-claude-hook",
     "crates/made-explorer",
     "crates/made-grok-hook",
+    "crates/made-hook-common",
     "crates/made-platform",
     "crates/made-remote",
     "crates/made-terminal",

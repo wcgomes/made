@@ -1846,6 +1846,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "made-hook-common"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "made-platform"
 version = "0.1.0"
 dependencies = [
