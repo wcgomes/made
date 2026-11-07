@@ -1822,9 +1822,9 @@ name = "made-claude-hook"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "made-hook-common",
  "serde_json",
  "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1840,9 +1840,9 @@ dependencies = [
 name = "made-grok-hook"
 version = "0.1.0"
 dependencies = [
+ "made-hook-common",
  "serde_json",
  "tempfile",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

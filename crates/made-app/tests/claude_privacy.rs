@@ -162,6 +162,10 @@ fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
         "made-claude-hook/src/main.rs".to_owned(),
         include_str!("../../made-claude-hook/src/main.rs").to_owned(),
     ));
+    sources.push((
+        "made-hook-common/src/lib.rs".to_owned(),
+        include_str!("../../made-hook-common/src/lib.rs").to_owned(),
+    ));
     for (name, source) in &sources {
         let lower = source.to_ascii_lowercase();
         for forbidden in [

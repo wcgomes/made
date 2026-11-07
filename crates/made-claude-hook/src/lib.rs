@@ -11,14 +11,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-/// The most time the hook spends waiting for the first complete JSON value.
-pub const READ_DEADLINE: Duration = Duration::from_secs(2);
+pub use made_hook_common::{format_timestamp, Chunk, READ_DEADLINE};
+use made_hook_common::{json_string, text_of, POLL_SLICE};
 
 /// Most bytes of standard input the hook accepts before giving up.
 pub const MAX_INPUT: usize = 8 * 1024 * 1024;
-
-/// Longest single wait for a chunk, so the deadline is checked regularly.
-const POLL_SLICE: Duration = Duration::from_millis(200);
 
 /// Largest record, newline included, the hook writes.
 pub const MAX_RECORD: usize = 4 * 1024;
@@ -31,17 +28,6 @@ pub const MAX_PIDS: usize = 32;
 
 /// Longest recorded session title, in characters.
 pub const MAX_TITLE_CHARS: usize = 120;
-
-/// What one read attempt on standard input produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Chunk {
-    /// Bytes that arrived.
-    Data(Vec<u8>),
-    /// Standard input ended.
-    Eof,
-    /// Neither bytes nor end of input arrived within the wait.
-    Idle,
-}
 
 /// Read one JSON object. `read_chunk` gets the longest time it may wait.
 ///
@@ -90,23 +76,6 @@ where
             None => continue,
         }
     }
-}
-
-/// A field's text: its value when that is a string, else empty.
-fn field_text<'a>(event: &'a Map<String, Value>, key: &str) -> &'a str {
-    match event.get(key) {
-        Some(Value::String(value)) => value,
-        _ => "",
-    }
-}
-
-/// The text of the first named field with non-empty text, else empty.
-fn text_of(event: &Map<String, Value>, keys: &[&str]) -> String {
-    keys.iter()
-        .map(|key| field_text(event, key))
-        .find(|value| !value.is_empty())
-        .unwrap_or("")
-        .to_string()
 }
 
 /// The only payload fields the hook keeps.
@@ -185,38 +154,6 @@ pub fn sanitize_title(raw: &str) -> String {
         })
         .take(MAX_TITLE_CHARS)
         .collect()
-}
-
-/// UTC `YYYY-MM-DDTHH:MM:SSZ` for a Unix time in seconds.
-pub fn format_timestamp(unix_seconds: u64) -> String {
-    let days = (unix_seconds / 86_400) as i64;
-    let seconds = unix_seconds % 86_400;
-    // Civil date from days since 1970-01-01 (proleptic Gregorian calendar).
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        seconds / 3_600,
-        seconds % 3_600 / 60,
-        seconds % 60
-    )
-}
-
-fn json_string(text: &str) -> String {
-    // Serializing a string cannot fail.
-    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 /// The record line, newline included, or `None` when it would exceed

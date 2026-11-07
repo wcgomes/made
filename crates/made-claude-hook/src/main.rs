@@ -7,7 +7,7 @@
 //! status 0, so it never denies a tool or a prompt.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,15 +15,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use made_claude_hook::{
     build_record, read_event_with, status_of, Chunk, Input, MAX_PIDS, MAX_SPOOL, READ_DEADLINE,
 };
+use made_hook_common::{run_silently, spawn_stdin_reader};
 
 /// How long the hook waits for the reader's lock before dropping the record.
 const LOCK_WAIT: Duration = Duration::from_millis(300);
 
 fn main() {
-    // A panic must stay silent: standard error is part of the empty-output contract.
-    std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(run);
-    std::process::exit(0);
+    run_silently(run);
 }
 
 fn run() {
@@ -119,27 +117,6 @@ fn append(path: &Path, line: &[u8]) {
     // One write call: with O_APPEND, concurrent runs on a local filesystem
     // never interleave partial lines.
     let _ = file.write_all(line);
-}
-
-/// Feed standard input to the decoder from a thread, because a blocking read
-/// cannot be given a deadline on every platform.
-fn spawn_stdin_reader() -> mpsc::Receiver<Chunk> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = vec![0_u8; 65_536];
-        loop {
-            let chunk = match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => Chunk::Eof,
-                Ok(count) => Chunk::Data(buffer[..count].to_vec()),
-            };
-            let done = chunk == Chunk::Eof;
-            if sender.send(chunk).is_err() || done {
-                break;
-            }
-        }
-    });
-    receiver
 }
 
 /// Whether `directory` is a real (not symlinked) directory that only the
@@ -252,31 +229,8 @@ fn parent_of(_pid: u32) -> Option<u32> {
 /// The ancestor pids from one process snapshot, nearest first.
 #[cfg(windows)]
 fn pid_chain() -> Vec<u32> {
-    use std::collections::HashMap;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-
-    let mut parents: HashMap<u32, u32> = HashMap::new();
-    // SAFETY: plain Win32 calls; `entry` is a zeroed POD struct whose `dwSize`
-    // is set before use, and the snapshot handle is closed on every path.
-    let own = unsafe {
-        let own = GetCurrentProcessId();
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Vec::new();
-        }
-        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-        let mut more = Process32First(snapshot, &mut entry);
-        while more != 0 {
-            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-            more = Process32Next(snapshot, &mut entry);
-        }
-        CloseHandle(snapshot);
-        own
+    let Some((own, parents)) = made_hook_common::process_parents() else {
+        return Vec::new();
     };
     let mut chain = Vec::new();
     let mut pid = parents.get(&own).copied().unwrap_or(0);
