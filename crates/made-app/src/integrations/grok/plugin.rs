@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use crate::integrations::GROK;
 use made_bridge::config::CONFIG_CONTENT_ENV;
-use made_platform::{find_executable_on_path, host_platform, CompatibleTui, Platform};
+use made_platform::{find_executable_on_path, host_platform, Platform};
 
 /// Outcome of the one-shot ensure worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,14 +77,14 @@ fn ensure_shipped_grok_plugin() -> EnsureOutcome {
 
 fn detected_grok() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    find_executable_on_path(OsStr::new(CompatibleTui::Grok.program()), &path)
+    find_executable_on_path(OsStr::new(GROK.descriptor().program), &path)
 }
 
 fn shipped_grok_plugin() -> Option<(PathBuf, Vec<u64>)> {
     // The staged copy beside the install root; a missing one is an install
     // failure, and the repository's source-only package is never a fallback.
     let paths = host_platform().app_paths().ok()?;
-    let directory = std::fs::canonicalize(paths.grok_plugin_dir?).ok()?;
+    let directory = std::fs::canonicalize(paths.plugin_package_dir("grok-made")?).ok()?;
     if !directory.is_dir() {
         return None;
     }

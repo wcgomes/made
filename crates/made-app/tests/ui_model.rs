@@ -9,10 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use made_app::app::{AppModel, AppOptions, GrokDiagnosticsHold, GrokRunningHold, WorkspaceId};
+use made_app::app::{AppModel, AppOptions, WorkspaceId};
 use made_app::cli::LaunchArgs;
 use made_app::explorer_icons;
 use made_app::explorer_view::{ExplorerPane, PreviewAction};
+use made_app::integrations::claude_code;
+use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
+use made_app::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE};
 use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
     diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
@@ -25,7 +28,7 @@ use made_app::workspace::{
     LaunchPlan, Surfaces, WorkspaceLaunch, WorkspaceSelection, WorkspaceSource,
 };
 use made_app::workspace_picker::WorkspacePicker;
-use made_app::{CompatibleTui, TerminalTarget, Workbench};
+use made_app::{TerminalTarget, Workbench};
 use made_platform::native_backdrop::{NativeBackdropKind, NativeBackdropStatus};
 use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
@@ -4320,11 +4323,10 @@ fn background_tui_detection_adopts_the_isolated_opencode() {
         "detection must not block construction"
     );
     let mut headless = Headless::new(model, 1100.0, 700.0);
-    headless.pump_until(|model| model.compatible_tuis().contains(&CompatibleTui::OpenCode));
+    headless.pump_until(|model| model.compatible_tuis().contains(&OPENCODE));
     let detected = headless.model.compatible_tuis();
     assert!(
-        detected == [CompatibleTui::OpenCode]
-            || detected == [CompatibleTui::OpenCode, CompatibleTui::Grok],
+        detected == [OPENCODE] || detected == [OPENCODE, GROK],
         "the background worker must adopt catalog order from the isolated PATH: {detected:?}"
     );
 }
@@ -6042,7 +6044,7 @@ fn header_plus_menu_lists_terminal_before_detected_tuis() {
     let root = fixture_workspace(temp.path(), "menu", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -6087,7 +6089,7 @@ fn new_tab_menu_terminal_item_runs_the_add_workspace_flow() {
     let root = fixture_workspace(temp.path(), "terminal-menu", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -6111,7 +6113,7 @@ fn new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one() {
     let root = fixture_workspace(temp.path(), "current", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -6133,7 +6135,7 @@ fn new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one() {
     );
     assert_eq!(
         headless.model.terminal_target(),
-        TerminalTarget::Tui(CompatibleTui::OpenCode)
+        TerminalTarget::Tui(OPENCODE)
     );
     assert_eq!(
         headless.model.launch().source(),
@@ -6156,7 +6158,7 @@ fn new_tab_menu_items_are_keyboard_reachable_with_visible_focus() {
     let root = fixture_workspace(temp.path(), "keyboard-menu", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -6197,7 +6199,7 @@ fn new_tab_menu_items_paint_leading_icons() {
     let root = fixture_workspace(temp.path(), "menu-icons", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -9991,7 +9993,7 @@ fn assert_large_new_tab_menu_scrolls(width: f32, height: f32) {
     let root = fixture_workspace(temp.path(), "menu-large", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let servers = add_ssh_inventory(&mut model, 80);
@@ -10105,7 +10107,7 @@ fn new_tab_menu_short_inventory_stays_compact() {
     let root = fixture_workspace(temp.path(), "menu-short", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1100.0, 700.0);
@@ -10527,10 +10529,10 @@ fn running_grok_tui_shows_grok_build_before_a_session_and_reverts_on_exit() {
     let root = fixture_workspace(temp.path(), "project-alpha", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+        AppOptions::new().with_compatible_tuis([GROK]),
     );
     let shell_id = open_workspace(&mut model, &root);
-    model.begin_tui_workspace(CompatibleTui::Grok);
+    model.begin_tui_workspace(GROK);
     model.ensure_workbench();
     let grok_id = model.active_workspace_id().expect("grok tab");
     assert_ne!(grok_id, shell_id);
@@ -10743,7 +10745,7 @@ fn an_opencode_tab_keeps_its_dots_and_root_when_grok_events_arrive() {
     );
 }
 
-fn menu_model(root: &Path, tuis: &[CompatibleTui]) -> (Headless, WorkspaceId) {
+fn menu_model(root: &Path, tuis: &[IntegrationRef]) -> (Headless, WorkspaceId) {
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
         AppOptions::new().with_compatible_tuis(tuis.iter().copied()),
@@ -10804,7 +10806,7 @@ fn catalog_menu_lists_terminal_then_opencode_then_grok() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "both", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK]);
     let hovered =
         output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
     assert!(
@@ -10830,7 +10832,7 @@ fn only_grok_omits_opencode_from_the_menu() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "grok-only", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CompatibleTui::Grok]);
+    let (mut headless, _) = menu_model(&root, &[GROK]);
     headless.click(top_action_id("open-folder"));
     let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
     let grok = headless.response(new_tab_menu_item_id("grok")).rect;
@@ -10856,7 +10858,7 @@ fn choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one(
 
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CompatibleTui::Grok]);
+    let (mut headless, id) = menu_model(&root, &[GROK]);
     let home = made_platform::host_platform()
         .home_dir()
         .expect("test home")
@@ -10868,10 +10870,7 @@ fn choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one(
     assert_eq!(headless.model.active_workspace_id(), Some(id));
     assert_eq!(headless.model.workspace_count(), 1);
     assert!(headless.model.start_pending());
-    assert_eq!(
-        headless.model.terminal_target(),
-        TerminalTarget::Tui(CompatibleTui::Grok)
-    );
+    assert_eq!(headless.model.terminal_target(), TerminalTarget::Tui(GROK));
     assert_eq!(
         headless.model.launch().source(),
         WorkspaceSource::DefaultHome
@@ -10891,7 +10890,7 @@ fn terminal_row_still_opens_the_folder_picker_when_grok_is_listed() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "terminal-row", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    let (mut headless, id) = menu_model(&root, &[OPENCODE, GROK]);
     headless.click(top_action_id("open-folder"));
     headless.click(new_tab_menu_item_id("terminal"));
     assert!(headless.model.is_picker());
@@ -10911,7 +10910,7 @@ fn grok_row_paints_the_terminal_glyph_and_opencode_keeps_its_svg() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "glyphs", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::Grok]);
+    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK]);
     headless.ctx.set_pixels_per_point(2.0);
     headless.click(top_action_id("open-folder"));
     headless.advance(0.3);
@@ -11030,9 +11029,7 @@ fn detection_does_not_launch_grok_or_block_shell_startup() {
         TerminalTarget::Shell,
         "detection must not replace a shell tab with Grok"
     );
-    headless.pump_until(|model| {
-        model.compatible_tuis() == [CompatibleTui::OpenCode, CompatibleTui::Grok].as_slice()
-    });
+    headless.pump_until(|model| model.compatible_tuis() == [OPENCODE, GROK].as_slice());
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline {
         headless.model.logic(&headless.ctx);
@@ -11072,7 +11069,7 @@ fn explicit_grok_catalog_does_not_install_the_plugin() {
 
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "catalog", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CompatibleTui::Grok]);
+    let (mut headless, _) = menu_model(&root, &[GROK]);
     headless.click(top_action_id("open-folder"));
     assert!(headless
         .ctx
@@ -11210,11 +11207,7 @@ fn copied_diagnostics(output: &egui::FullOutput) -> String {
 fn opencode_row_for_catalog(
     headless: &Headless,
 ) -> (&'static str, &'static str, egui::Color32, egui::Color32) {
-    if headless
-        .model
-        .compatible_tuis()
-        .contains(&CompatibleTui::OpenCode)
-    {
+    if headless.model.compatible_tuis().contains(&OPENCODE) {
         (
             OPENCODE_DIAGNOSTIC_SENTENCE,
             "○ inactive",
@@ -11394,7 +11387,7 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
     let root = fixture_workspace(temp.path(), "grok-diag", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1280.0, 800.0);
@@ -11496,7 +11489,7 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
         ),
     ];
     for (hold, sentence, pill, tone, tint) in states {
-        headless.model.hold_grok_diagnostics(hold);
+        grok::hold_diagnostics(&mut headless.model, hold);
         let output = headless.render();
         assert_revealed_grok_row(
             &output,
@@ -11514,7 +11507,7 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
     let menu_root = fixture_workspace(temp.path(), "grok-menu", "main.rs");
     let mut menu_model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+        AppOptions::new().with_compatible_tuis([GROK]),
     );
     let menu_id = open_workspace(&mut menu_model, &menu_root);
     let mut menu = Headless::new(menu_model, 1280.0, 800.0);
@@ -11583,7 +11576,7 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
     let there = fixture_workspace(temp.path(), "grok-there", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode]),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let here_id = open_workspace(&mut model, &here);
     let there_id = open_workspace(&mut model, &there);
@@ -11623,13 +11616,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         GrokDiagnosticsHold::Installed,
         GrokDiagnosticsHold::AlreadyCurrent,
     ] {
-        headless.model.hold_grok_diagnostics(hold);
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+        grok::hold_diagnostics(&mut headless.model, hold);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::NotRunning);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11640,12 +11629,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
             inactive.2,
         );
 
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::NotRunning);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::NotRunning);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::LivingTarget);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11656,12 +11641,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
             ready.2,
         );
 
-        headless
-            .model
-            .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-        headless
-            .model
-            .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+        grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+        grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::OpenSession);
         expect_revealed_grok_row(
             &mut headless,
             here_id,
@@ -11704,9 +11685,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         ),
     ];
     for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
-        headless.model.hold_workspace_grok_running(here_id, running);
+        grok::hold_workspace_running(&mut headless.model, here_id, running);
         for (hold, sentence, pill, tone, tint) in unchanged {
-            headless.model.hold_grok_diagnostics(hold);
+            grok::hold_diagnostics(&mut headless.model, hold);
             expect_revealed_grok_row(
                 &mut headless,
                 here_id,
@@ -11719,13 +11700,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         }
     }
 
-    headless
-        .model
-        .hold_grok_diagnostics(GrokDiagnosticsHold::Installed);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::LivingTarget);
-    headless.model.hold_workspace_opencode_label(here_id);
+    grok::hold_diagnostics(&mut headless.model, GrokDiagnosticsHold::Installed);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::LivingTarget);
+    made_app::integrations::opencode::hold_label(&mut headless.model, here_id);
     expect_revealed_grok_row(
         &mut headless,
         here_id,
@@ -11745,12 +11722,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         "OpenCode must own the tab label while Grok is running"
     );
 
-    headless
-        .model
-        .hold_grok_diagnostics(GrokDiagnosticsHold::AlreadyCurrent);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::OpenSession);
+    grok::hold_diagnostics(&mut headless.model, GrokDiagnosticsHold::AlreadyCurrent);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::OpenSession);
     expect_revealed_grok_row(
         &mut headless,
         here_id,
@@ -11761,12 +11734,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         ready.2,
     );
 
-    headless
-        .model
-        .hold_workspace_grok_running(there_id, GrokRunningHold::LivingTarget);
-    headless
-        .model
-        .hold_workspace_grok_running(here_id, GrokRunningHold::NotRunning);
+    grok::hold_workspace_running(&mut headless.model, there_id, GrokRunningHold::LivingTarget);
+    grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::NotRunning);
     expect_revealed_grok_row(
         &mut headless,
         here_id,
@@ -11780,13 +11749,12 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
     let menu_root = fixture_workspace(temp.path(), "grok-other", "main.rs");
     let mut menu_model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+        AppOptions::new().with_compatible_tuis([GROK]),
     );
     let menu_id = open_workspace(&mut menu_model, &menu_root);
     let mut menu = Headless::new(menu_model, 1280.0, 800.0);
     wait_explorer_ready(&mut menu, menu_id);
-    menu.model
-        .hold_workspace_grok_running(menu_id, GrokRunningHold::LivingTarget);
+    grok::hold_workspace_running(&mut menu.model, menu_id, GrokRunningHold::LivingTarget);
     assert!(
         menu.model
             .workspace(menu_id)
@@ -11815,7 +11783,7 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
 
     open_about_diagnostics(&mut menu, menu_id);
     for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
-        menu.model.hold_workspace_grok_running(menu_id, running);
+        grok::hold_workspace_running(&mut menu.model, menu_id, running);
         expect_revealed_grok_row(
             &mut menu,
             menu_id,
@@ -11898,7 +11866,7 @@ fn assert_opencode_diagnostics_row(
     );
     assert_eq!(snapshot.reason_code, reason_code);
     assert_eq!(snapshot.reason, sentence);
-    assert_eq!(snapshot.grok_sentence, grok_sentence);
+    assert_eq!(snapshot.row("grok status").unwrap().sentence, grok_sentence);
 
     let output = headless.render();
     let text = output_text(&output);
@@ -12006,7 +11974,7 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
     let root = fixture_workspace(temp.path(), "opencode-wording", "main.rs");
     let mut model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::OpenCode, CompatibleTui::Grok]),
+        AppOptions::new().with_compatible_tuis([OPENCODE, GROK]),
     );
     let id = open_workspace(&mut model, &root);
     let mut headless = Headless::new(model, 1280.0, 800.0);
@@ -12111,7 +12079,7 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
     let omitted_later = fixture_workspace(temp.path(), "opencode-omitted-later", "main.rs");
     let mut omitted_model = AppModel::from_launch(
         WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([CompatibleTui::Grok]),
+        AppOptions::new().with_compatible_tuis([GROK]),
     );
     let omitted_id = open_workspace(&mut omitted_model, &omitted_root);
     let mut omitted = Headless::new(omitted_model, 1280.0, 800.0);
@@ -12170,7 +12138,10 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
         .diagnostics_snapshot();
     assert_eq!(pending.reason, OPENCODE_DIAGNOSTIC_SENTENCE);
     assert_eq!(pending.status_label, "inactive");
-    assert_eq!(pending.grok_sentence, "Checking for Grok Build.");
+    assert_eq!(
+        pending.row("grok status").unwrap().sentence,
+        "Checking for Grok Build."
+    );
     assert!(
         !pending.reason.contains("not on PATH"),
         "detection still running must not say OpenCode is not on PATH"
@@ -12193,7 +12164,7 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
     detecting.pump_until(|model| {
         let view = model.workspace(detect_id).unwrap().diagnostics_snapshot();
         view.reason == OPENCODE_MISSING_SENTENCE
-            && view.grok_sentence == "Grok Build is not on PATH."
+            && view.row("grok status").unwrap().sentence == "Grok Build is not on PATH."
     });
     wait_explorer_ready(&mut detecting, detect_id);
     assert_opencode_diagnostics_row(
@@ -12321,7 +12292,9 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
             .workspace(remote_id)
             .unwrap()
             .diagnostics_snapshot()
-            .grok_sentence
+            .row("grok status")
+            .unwrap()
+            .sentence
             .to_owned()
     };
     let pill = |headless: &Headless| {
@@ -12330,7 +12303,9 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
             .workspace(remote_id)
             .unwrap()
             .diagnostics_snapshot()
-            .grok_pill
+            .row("grok status")
+            .unwrap()
+            .pill
     };
 
     // Attached, detected, nothing running: the honest row is not running.
@@ -12379,7 +12354,7 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
     );
     assert_eq!(
         pill(&headless),
-        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+        made_app::diagnostics::DiagnosticsPill::Degraded
     );
 
     // The bounded attempt is busy while it runs.
@@ -13120,14 +13095,7 @@ fn catalog_menu_lists_claude_code_after_grok() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "all-three", "main.rs");
-    let (mut headless, _) = menu_model(
-        &root,
-        &[
-            CompatibleTui::OpenCode,
-            CompatibleTui::Grok,
-            CompatibleTui::ClaudeCode,
-        ],
-    );
+    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK, CLAUDE_CODE]);
     let hovered =
         output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
     assert!(
@@ -13157,7 +13125,7 @@ fn only_claude_code_shows_terminal_then_claude_code_with_its_mark() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "claude-only", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    let (mut headless, _) = menu_model(&root, &[CLAUDE_CODE]);
     headless.ctx.set_pixels_per_point(2.0);
     headless.click(top_action_id("open-folder"));
     headless.advance(0.3);
@@ -13190,7 +13158,7 @@ fn choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker() 
 
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    let (mut headless, id) = menu_model(&root, &[CLAUDE_CODE]);
     let home = made_platform::host_platform()
         .home_dir()
         .expect("test home")
@@ -13203,7 +13171,7 @@ fn choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker() 
     assert!(headless.model.start_pending());
     assert_eq!(
         headless.model.terminal_target(),
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+        TerminalTarget::Tui(CLAUDE_CODE)
     );
     assert_eq!(
         headless.model.launch().source(),
@@ -13257,7 +13225,7 @@ impl ClaudeFixture {
         let root = fixture_workspace(temp, "project-alpha", "main.rs");
         let mut model = AppModel::from_launch(
             WorkspaceLaunch::waiting_for_picker(),
-            AppOptions::new().with_compatible_tuis([CompatibleTui::ClaudeCode]),
+            AppOptions::new().with_compatible_tuis([CLAUDE_CODE]),
         );
         let id = open_workspace(&mut model, &root);
         let mut headless = Headless::new(model, 1280.0, 800.0);
@@ -13653,7 +13621,7 @@ fn a_direct_claude_code_tab_is_branded_before_any_status() {
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, first) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    let (mut headless, first) = menu_model(&root, &[CLAUDE_CODE]);
     headless.ctx.enable_accesskit();
     headless.click(top_action_id("open-folder"));
     headless.click(new_tab_menu_item_id("claude"));
@@ -13710,7 +13678,7 @@ fn claude_code_diagnostics_row_stays_hidden_until_revealed() {
     stage_claude_plugin();
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "hidden-row", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CompatibleTui::ClaudeCode]);
+    let (mut headless, id) = menu_model(&root, &[CLAUDE_CODE]);
     headless.click(made_app::theme::wordmark_id());
     let before = output_text(&headless.render());
     assert!(
@@ -13741,7 +13709,7 @@ fn claude_code_row_is_not_on_path_without_a_catalog_entry() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "no-claude", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CompatibleTui::OpenCode]);
+    let (mut headless, id) = menu_model(&root, &[OPENCODE]);
     open_about_diagnostics(&mut headless, id);
     let text = output_text(&headless.render());
     assert!(text.contains("Claude Code is not on PATH."), "{text}");
@@ -13888,7 +13856,7 @@ fn opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present() {
             .headless
             .model
             .workspace(id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_some_and(|tab| tab.present()),
         "Claude Code is not present before any source"
     );
@@ -13914,7 +13882,7 @@ fn opencode_keeps_label_icon_dots_and_root_while_claude_code_is_present() {
             .headless
             .model
             .workspace(id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_some_and(|tab| tab.present());
         if present {
             break;
@@ -13953,9 +13921,8 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, first) =
-        menu_model(&root, &[CompatibleTui::OpenCode, CompatibleTui::ClaudeCode]);
-    headless.model.begin_tui_workspace(CompatibleTui::OpenCode);
+    let (mut headless, first) = menu_model(&root, &[OPENCODE, CLAUDE_CODE]);
+    headless.model.begin_tui_workspace(OPENCODE);
     let mut opened = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while opened.is_none() && Instant::now() < deadline {
@@ -13978,7 +13945,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "the OpenCode plugin configuration is still injected"
     );
     for key in [
-        made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV,
+        claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV,
         "MADE_CLAUDE_SPOOL",
     ] {
         assert!(
@@ -13994,7 +13961,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "an inherited spool binding is stripped"
     );
     assert!(
-        workbench.claude_tab().is_none(),
+        claude_code::tab(workbench).is_none(),
         "an OpenCode tab carries no Claude Code state"
     );
     let report = workbench.sanitized_diagnostics_text();

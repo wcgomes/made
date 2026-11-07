@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use made_app::claude_follow::{SpoolInstance, SpoolReader, MAX_RECORD_BYTES, SPOOL_BOUND};
+use made_app::integrations::claude_code::follow::{
+    SpoolInstance, SpoolReader, MAX_RECORD_BYTES, SPOOL_BOUND,
+};
 
 fn line(session: &str) -> String {
     format!(

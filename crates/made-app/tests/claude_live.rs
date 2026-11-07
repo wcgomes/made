@@ -23,7 +23,7 @@
 //! cannot be produced (Claude Code did not fire the event, no login, a trust
 //! dialog) is `UNVERIFIED`, never claimed as passing; a case whose evidence
 //! contradicts the spec fails. Fixture-record tests for the same behavior live
-//! in `claude_follow.rs` and in `made-claude-hook/tests/status.rs`.
+//! in `integrations/claude_code/follow.rs` and in `made-claude-hook/tests/status.rs`.
 
 use std::ffi::OsString;
 use std::fs;
@@ -34,9 +34,11 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use made_app::claude_follow::{shared_instance, TabSpool};
+use made_app::integrations::claude_code;
+use made_app::integrations::claude_code::follow::{shared_instance, TabSpool};
+use made_app::integrations::CLAUDE_CODE;
 use made_app::workspace::{LaunchPlan, WorkspaceSource};
-use made_app::{CompatibleTui, TerminalPane, TerminalTarget, Workbench};
+use made_app::{TerminalPane, TerminalTarget, Workbench};
 use made_platform::{host_platform, PlatformFamily};
 use made_terminal::{PtyEvent, PtyOptions, PtyProcess};
 use serde_json::Value;
@@ -271,7 +273,7 @@ impl Live {
     }
 
     fn direct() -> TerminalTarget {
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+        TerminalTarget::Tui(CLAUDE_CODE)
     }
 
     fn type_line(workbench: &mut Workbench, text: &str) {
@@ -383,9 +385,7 @@ fn events(records: &[Value]) -> Vec<String> {
 }
 
 fn session_ready(workbench: &Workbench) -> bool {
-    workbench
-        .claude_tab()
-        .is_some_and(|tab| tab.session_count() == 1)
+    claude_code::tab(workbench).is_some_and(|tab| tab.session_count() == 1)
 }
 
 fn snapshot_unchanged(before: &[(PathBuf, Option<Vec<u8>>)]) {
@@ -422,10 +422,7 @@ fn live_shell_typed_and_menu_launched_sessions_load_the_plugin_once() {
             live.run_in_shell(&mut workbench, "");
         }
         let ready = live.pump_until(&mut workbench, SESSION_WAIT, |wb| {
-            session_ready(wb)
-                && wb
-                    .claude_tab()
-                    .is_some_and(|tab| tab.protocol_status_seen())
+            session_ready(wb) && claude_code::tab(wb).is_some_and(|tab| tab.protocol_status_seen())
         });
         if !ready {
             verdict = unverified(format!(
@@ -444,7 +441,7 @@ fn live_shell_typed_and_menu_launched_sessions_load_the_plugin_once() {
             "{name}: the plugin loaded once, one SessionStart"
         );
         assert_eq!(
-            workbench.claude_tab().unwrap().session_count(),
+            claude_code::tab(&workbench).unwrap().session_count(),
             1,
             "{name}: one session, one dot"
         );
@@ -519,7 +516,7 @@ fn live_user_plugins_and_plugin_dirs_entries_are_preserved() {
             "{name}: the user plugin's SessionStart hook ran"
         );
         assert_eq!(
-            workbench.claude_tab().unwrap().session_count(),
+            claude_code::tab(&workbench).unwrap().session_count(),
             1,
             "{name}: Made's plugin ran with the user's"
         );
@@ -615,8 +612,7 @@ fn live_bare_mode_keeps_protocol_status_only() {
     let mut workbench = live.start(TerminalTarget::Shell);
     live.run_in_shell(&mut workbench, "--bare");
     let seen = live.pump_until(&mut workbench, SESSION_WAIT, |wb| {
-        wb.claude_tab()
-            .is_some_and(|tab| tab.protocol_status_seen())
+        claude_code::tab(wb).is_some_and(|tab| tab.protocol_status_seen())
     });
     if !seen {
         workbench.shutdown();
@@ -629,7 +625,7 @@ fn live_bare_mode_keeps_protocol_status_only() {
         return;
     }
     live.pump_for(&mut workbench, Duration::from_secs(4));
-    let tab = workbench.claude_tab().unwrap();
+    let tab = claude_code::tab(&workbench).unwrap();
     assert_eq!(tab.session_count(), 0, "--bare runs no hook");
     assert!(!tab.dots().is_empty(), "protocol status drives a dot");
     assert!(events(&records(&workbench)).is_empty(), "no hook record");
@@ -654,7 +650,7 @@ fn live_disabled_terminal_title_keeps_hooks_only() {
         return;
     }
     live.pump_for(&mut workbench, Duration::from_secs(12));
-    let tab = workbench.claude_tab().unwrap();
+    let tab = claude_code::tab(&workbench).unwrap();
     let protocol = tab.protocol_status_seen();
     workbench.shutdown();
     if protocol {
@@ -688,7 +684,7 @@ fn live_tmux_from_a_made_tab_yields_a_plain_terminal() {
     );
     let started = live.pump_until(&mut workbench, SESSION_WAIT, |wb| !records(wb).is_empty());
     live.pump_for(&mut workbench, Duration::from_secs(3));
-    let tab = workbench.claude_tab().unwrap();
+    let tab = claude_code::tab(&workbench).unwrap();
     let plain = tab.session_count() == 0 && tab.dots().is_empty() && !tab.present();
     let root_unmoved = workbench.explorer_root() == Some(live.cwd.as_path());
     let _ = Command::new("tmux")
@@ -727,12 +723,12 @@ fn live_neither_channel_keeps_direct_launch_branding_only() {
     let mut direct = live.start(Live::direct());
     live.pump_for(&mut shell, Duration::from_secs(15));
     live.pump_for(&mut direct, Duration::from_secs(1));
-    let shell_tab = shell.claude_tab();
+    let shell_tab = claude_code::tab(&shell);
     assert!(
         shell_tab.is_none_or(|tab| !tab.present() && tab.dots().is_empty()),
         "the shell-typed tab stays a plain terminal"
     );
-    let direct_tab = direct.claude_tab().expect("direct tab");
+    let direct_tab = claude_code::tab(&direct).expect("direct tab");
     assert!(direct_tab.present(), "the direct tab keeps its branding");
     assert!(direct_tab.dots().is_empty(), "no dot without a channel");
     assert!(direct.terminal().is_some_and(TerminalPane::is_running));
@@ -769,7 +765,7 @@ fn live_clear_replaces_the_session() {
         distinct_sessions(&records(wb)).len() > first.len()
     });
     live.pump_for(&mut workbench, Duration::from_secs(3));
-    let count = workbench.claude_tab().unwrap().session_count();
+    let count = claude_code::tab(&workbench).unwrap().session_count();
     let root = workbench.explorer_root().map(Path::to_path_buf);
     workbench.shutdown();
     if !replaced {
@@ -824,9 +820,10 @@ fn live_directory_change_moves_the_explorer() {
             if seen.iter().any(|record| record["event"] == "CwdChanged") {
                 break true;
             }
-            if workbench.claude_tab().is_some_and(|tab| {
-                tab.dots()
-                    .contains(&made_app::claude_follow::ClaudeActivity::Attention)
+            if claude_code::tab(&workbench).is_some_and(|tab| {
+                tab.dots().contains(
+                    &made_app::integrations::claude_code::follow::ClaudeActivity::Attention,
+                )
             }) && approvals < 3
             {
                 approvals += 1;
@@ -887,10 +884,10 @@ fn live_stop_failure_marks_attention() {
             ));
         }
         live.pump_for(&mut workbench, Duration::from_secs(2));
-        let dots = workbench.claude_tab().unwrap().dots();
+        let dots = claude_code::tab(&workbench).unwrap().dots();
         assert_eq!(
             dots,
-            vec![made_app::claude_follow::ClaudeActivity::Attention],
+            vec![made_app::integrations::claude_code::follow::ClaudeActivity::Attention],
             "the dot is attention after the failure"
         );
         Verdict::Pass

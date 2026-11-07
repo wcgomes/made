@@ -47,6 +47,11 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - Recursive deletion can fail with a sharing violation while a watcher handle is open even though `notify` uses `FILE_SHARE_DELETE`. The unavailable-root test renames the root on Windows and deletes recursively on Unix; this simulates loss of the watched path without weakening product cleanup.
 - Test: [`workspace_tabs.rs`](../../crates/made-app/tests/workspace_tabs.rs).
 
+## Windows CRLF checkouts
+
+- Windows CI runners check out files with CRLF line endings because the repository has no `.gitattributes`. Tests that scan source text for multi-line literals or `\n`-joined patterns must normalize `\r\n` or match line by line.
+- The integration neutrality scans do the latter through a line-based `production_part`. Source: [`integration_modules.rs`](../../crates/made-app/tests/integration_modules.rs).
+
 ## CI invocation
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.

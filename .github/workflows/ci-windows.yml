@@ -44,7 +44,7 @@ jobs:
         run: cargo test -p made-terminal --test pty --locked
 
       - name: Run the native Grok hook tests
-        run: cargo test -p made-grok-hook --locked
+        run: cargo test -p made-grok-hook -p made-hook-common --locked
 
       - name: Run the native Claude Code hook tests
         run: cargo test -p made-claude-hook --locked

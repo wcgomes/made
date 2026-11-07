@@ -10,7 +10,7 @@
 //! identity or directory; and Made opens no listener or connection and touches
 //! no Claude Code transcript, session, IDE lockfile or configuration path.
 
-use made_app::claude_follow::{parse_record, ClaudeActivity, ClaudeTab};
+use made_app::integrations::claude_code::follow::{parse_record, ClaudeActivity, ClaudeTab};
 
 const MARKERS: [&str; 5] = [
     "MARKER-PROMPT-7f3a",
@@ -119,20 +119,54 @@ fn window_title_text_never_drives_status_identity_or_directory() {
     }
 }
 
+/// Every `.rs` file under `dir`, found by a recursive directory walk, as
+/// (path relative to `root`, contents).
+fn read_sources(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            read_sources(root, &path, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            out.push((format!("claude_code/{name}"), source));
+        }
+    }
+}
+
 #[test]
 fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
-    let sources = [
-        ("claude_follow.rs", include_str!("../src/claude_follow.rs")),
-        (
-            "made-claude-hook/src/lib.rs",
-            include_str!("../../made-claude-hook/src/lib.rs"),
-        ),
-        (
-            "made-claude-hook/src/main.rs",
-            include_str!("../../made-claude-hook/src/main.rs"),
-        ),
-    ];
-    for (name, source) in sources {
+    let mut sources = Vec::new();
+    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("integrations")
+        .join("claude_code");
+    read_sources(&module_dir, &module_dir, &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "no Claude Code module source file was read from {}",
+        module_dir.display()
+    );
+    sources.push((
+        "made-claude-hook/src/lib.rs".to_owned(),
+        include_str!("../../made-claude-hook/src/lib.rs").to_owned(),
+    ));
+    sources.push((
+        "made-claude-hook/src/main.rs".to_owned(),
+        include_str!("../../made-claude-hook/src/main.rs").to_owned(),
+    ));
+    sources.push((
+        "made-hook-common/src/lib.rs".to_owned(),
+        include_str!("../../made-hook-common/src/lib.rs").to_owned(),
+    ));
+    for (name, source) in &sources {
         let lower = source.to_ascii_lowercase();
         for forbidden in [
             "tcplistener",
@@ -159,7 +193,7 @@ fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
         }
     }
     // Transcripts are named only to say they are ignored.
-    for (name, source) in sources {
+    for (name, source) in &sources {
         for line in source.lines() {
             let lower = line.to_ascii_lowercase();
             if lower.contains("transcript") {
@@ -196,8 +230,10 @@ mod running_tab {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use made_app::integrations::claude_code;
+    use made_app::integrations::CLAUDE_CODE;
     use made_app::workspace::{LaunchPlan, WorkspaceSource};
-    use made_app::{CompatibleTui, TerminalTarget, Workbench};
+    use made_app::{TerminalTarget, Workbench};
     use made_platform::{Platform, PlatformFamily};
 
     use super::{assert_no_markers, record_with_markers};
@@ -370,7 +406,7 @@ mod running_tab {
             Some(plan),
             None,
             root.clone(),
-            TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+            TerminalTarget::Tui(CLAUDE_CODE),
             Instant::now(),
         );
         let pane_pid = workbench
@@ -414,7 +450,7 @@ mod running_tab {
             window_title.as_deref().is_some_and(|t| t.contains(TITLE)),
             "the fixture title reached the terminal: {window_title:?}"
         );
-        let tab = workbench.claude_tab().expect("direct tab");
+        let tab = claude_code::tab(&workbench).expect("direct tab");
         assert!(tab.dots().is_empty(), "a title is not a status");
         assert_eq!(tab.directory(), None, "a title is not a directory");
         assert_eq!(
@@ -448,15 +484,13 @@ mod running_tab {
         }
         fs::write(std::env::var_os(TRIGGER).unwrap(), b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !workbench
-            .claude_tab()
-            .is_some_and(|tab| tab.protocol_live())
+        while !claude_code::tab(&workbench).is_some_and(|tab| tab.protocol_live())
             && Instant::now() < deadline
         {
             tick(&mut workbench, 1);
         }
         tick(&mut workbench, 20);
-        let tab = workbench.claude_tab().expect("direct tab");
+        let tab = claude_code::tab(&workbench).expect("direct tab");
         assert!(tab.protocol_live(), "the protocol status went live");
         let window_title = workbench
             .terminal()
@@ -469,7 +503,10 @@ mod running_tab {
         );
 
         // Content markers appear on no surface Made renders or records.
-        assert_no_markers(&format!("{:?}", workbench.claude_tab()), "the tab state");
+        assert_no_markers(
+            &format!("{:?}", claude_code::tab(&workbench)),
+            "the tab state",
+        );
         assert_no_markers(&shown, "the tooltip");
         assert_no_markers(&workbench.sanitized_diagnostics_text(), "the copied report");
         let log: String = workbench

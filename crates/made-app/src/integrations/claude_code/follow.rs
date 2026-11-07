@@ -27,7 +27,7 @@ use std::time::Duration;
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
-use crate::grok_follow::process_belongs_to_with;
+use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
 /// Most parent hops from a Claude Code process to its tab's terminal process.

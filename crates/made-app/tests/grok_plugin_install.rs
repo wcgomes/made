@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_app::app::{AppModel, AppOptions};
+use made_app::integrations::claude_code;
+use made_app::integrations::GROK;
 use made_app::workspace::{LaunchPlan, WorkspaceLaunch, WorkspaceSource};
-use made_app::{CompatibleTui, ExplorerPane, Workbench};
+use made_app::{ExplorerPane, Workbench};
 use made_platform::{AppPaths, PathsInputs, PlatformFamily};
 
 #[test]
@@ -44,7 +46,7 @@ fn development_and_release_builds_resolve_the_staged_grok_plugin_beside_the_inst
         inputs.plugin_override = None;
         let paths = AppPaths::resolve(&inputs).expect("app paths");
         assert_eq!(
-            paths.grok_plugin_dir.as_deref(),
+            paths.plugin_package_dir("grok-made").as_deref(),
             Some(expected.as_path()),
             "development={development}"
         );
@@ -56,14 +58,17 @@ fn development_build_never_falls_back_to_the_repository_grok_plugin() {
     let mut inputs = PathsInputs::from_env(PlatformFamily::current());
     inputs.development = true;
     // No executable-derived install root: only the repository fallback remains.
-    inputs.grok_plugin_dir = None;
+    inputs.shipped_plugins_dir = None;
     inputs.install_root = Some(made_platform::repository_root());
     let paths = AppPaths::resolve(&inputs).expect("app paths");
-    assert_eq!(paths.grok_plugin_dir, None);
+    assert_eq!(paths.plugin_package_dir("grok-made"), None);
     let repository = made_platform::repository_root()
         .join("plugins")
         .join("grok-made");
-    assert_ne!(paths.grok_plugin_dir.as_deref(), Some(repository.as_path()));
+    assert_ne!(
+        paths.plugin_package_dir("grok-made").as_deref(),
+        Some(repository.as_path())
+    );
 }
 
 fn spawn_case(case: &str) {
@@ -256,7 +261,7 @@ fn expect_install(installed: Option<&str>) {
         install.elapsed() < Duration::from_secs(3) && !release_exists(),
         "the install command must be running, not finished, before Grok starts"
     );
-    model.begin_tui_workspace(CompatibleTui::Grok);
+    model.begin_tui_workspace(GROK);
     let grok_startup = Instant::now();
     wait_until(
         Duration::from_secs(6),
@@ -301,7 +306,7 @@ fn expect_install(installed: Option<&str>) {
     // composed into the Grok launch, and an inherited binding is stripped.
     assert!(
         terminal.options().env.iter().all(|(key, _)| {
-            key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
+            key != claude_code::launch::CLAUDE_CODE_PLUGIN_DIRS_ENV && key != "MADE_CLAUDE_SPOOL"
         }),
         "the Grok launch environment has no Made Claude Code plugin entry"
     );
@@ -316,7 +321,7 @@ fn expect_install(installed: Option<&str>) {
     assert!(
         model
             .workspace(grok_id)
-            .and_then(Workbench::claude_tab)
+            .and_then(claude_code::tab)
             .is_none(),
         "a Grok tab carries no Claude Code state"
     );
@@ -425,7 +430,7 @@ fn expect_staged_missing() {
         "shell and explorer must start without the staged copy"
     );
     let shell_id = model.workspace_ids().next().unwrap();
-    model.begin_tui_workspace(CompatibleTui::Grok);
+    model.begin_tui_workspace(GROK);
     wait_until(
         Duration::from_secs(6),
         "Grok must still start without the staged copy",

@@ -2094,7 +2094,7 @@ fn oversized_user_config_is_skipped_without_blocking_workspace_start() {
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
         &config,
-        vec![b'{'; made_app::workbench::MAX_USER_CONFIG_BYTES as usize + 1],
+        vec![b'{'; made_app::integrations::opencode::MAX_USER_CONFIG_BYTES as usize + 1],
     )
     .unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -2186,12 +2186,12 @@ fn tui_terminal_target_spawns_opencode_with_composed_config_in_the_isolated_home
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        TerminalTarget::Tui(made_app::integrations::OPENCODE),
         Instant::now(),
     );
     assert_eq!(
         workbench.terminal_target(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode)
+        TerminalTarget::Tui(made_app::integrations::OPENCODE)
     );
 
     let config = wait_for_capture(&config_capture);
@@ -2764,7 +2764,7 @@ fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::Grok),
+        TerminalTarget::Tui(made_app::integrations::GROK),
         Instant::now(),
     );
     {
@@ -2814,7 +2814,7 @@ fn menu_launched_grok_gets_no_plugin_config_and_opencode_still_does() {
         None,
         None,
         home.clone(),
-        TerminalTarget::Tui(made_app::CompatibleTui::OpenCode),
+        TerminalTarget::Tui(made_app::integrations::OPENCODE),
         Instant::now(),
     );
     assert!(
@@ -2995,7 +2995,7 @@ fn failed_plugin_install_still_starts_grok_and_records_hooks_unavailable() {
         .workspace(shell_id)
         .and_then(made_app::Workbench::terminal)
         .is_some());
-    model.begin_tui_workspace(made_app::CompatibleTui::Grok);
+    model.begin_tui_workspace(made_app::integrations::GROK);
     let grok_deadline = Instant::now() + Duration::from_secs(6);
     let grok_id = loop {
         model.logic(&ctx);
@@ -3768,7 +3768,10 @@ fn same_version_update_waits_for_separate_approval_and_reports_the_real_reason()
     // failure would clear install readiness, so publish the diagnostics
     // snapshot without ticking the remote tab: that reads this tab's
     // post-stage provisioning while the attach result is still queued.
-    model.hold_grok_diagnostics(made_app::app::GrokDiagnosticsHold::NotOnPath);
+    made_app::integrations::grok::hold_diagnostics(
+        &mut model,
+        made_app::integrations::grok::GrokDiagnosticsHold::NotOnPath,
+    );
     assert!(
         model.remote_grok_install_ready(authority),
         "a successful matching update stage makes the current path install-ready"
@@ -4126,4 +4129,770 @@ fn claude_ssh_against_an_out_of_date_companion_requires_the_ssh_06_update() {
         .unwrap()
         .contains("Nothing was written or deleted"));
     assert!(workbench.terminal().is_none());
+}
+
+// ---- Characterization: tab presentation by precedence (agent-integration-modules phase 0) ----
+
+/// Tab presentation (label, mark, dots, tooltip title, accessible name) for
+/// every combination of OpenCode active, Claude Code present and Grok open, in
+/// a local shell tab, and for OpenCode and Grok in a remote shell tab, written
+/// against the code before the integration-module refactor. The expected
+/// records below do not change during the refactor; only the adapter block
+/// does.
+///
+/// Not reachable from an external test: a remote tab that presents Claude Code,
+/// because its presence arrives only through the remote terminal stream. The
+/// remote precedence of Grok Build over Claude Code (SSH-10) is therefore not
+/// pinned here.
+#[cfg(unix)]
+mod tab_presentation_characterization {
+    use std::net::TcpStream;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use eframe::egui;
+    use made_app::app::{AppModel, AppOptions, WorkspaceId};
+    use made_app::ui::workspace_tab_id;
+    use made_app::workspace::WorkspaceLaunch;
+    use serde_json::json;
+    use tungstenite::WebSocket;
+
+    use super::{connect, credentials, isolated, open, state, type_command, write_grok_inventory};
+
+    // BEGIN characterization adapter
+    use made_app::explorer_icons;
+    use made_remote::protocol::{
+        GrokActivity, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, RemotePath,
+        TabCapability, WireEnvelope,
+    };
+
+    /// The marks a tab can show, with the SVG they are painted from.
+    fn marks(ctx: &egui::Context, px: u32) -> Vec<(&'static str, egui::TextureId)> {
+        let opencode = explorer_icons::icon_by_file_name("opencode.svg").expect("vendored icon");
+        ctx.include_bytes(opencode.uri(), opencode.bytes());
+        let hint = egui::load::SizeHint::Size {
+            width: px,
+            height: px,
+            maintain_aspect_ratio: false,
+        };
+        let opencode_texture =
+            match ctx.try_load_texture(opencode.uri(), egui::TextureOptions::default(), hint) {
+                Ok(egui::load::TexturePoll::Ready { texture }) => texture.id,
+                _ => panic!("opencode.svg did not load"),
+            };
+        vec![
+            ("opencode", opencode_texture),
+            (
+                "grok",
+                embedded_svg(
+                    ctx,
+                    "bytes://grok.svg",
+                    include_bytes!("../assets/grok.svg"),
+                    px,
+                ),
+            ),
+            (
+                "claude-code",
+                embedded_svg(
+                    ctx,
+                    "bytes://claude-code.svg",
+                    include_bytes!("../assets/claude-code.svg"),
+                    px,
+                ),
+            ),
+        ]
+    }
+
+    /// Make Claude Code present in the shell tab through the status protocol,
+    /// with a window title. A foreground `tail` child of the shell keeps it
+    /// off its prompt and relays `emit` from its first byte, so the sequences
+    /// are read whether they are appended before or after `tail` opens the
+    /// file. They are appended only once `tail` runs: the shell's prompt
+    /// report, written to the terminal before `tail` started, is drawn in an
+    /// earlier frame and cannot clear the status.
+    fn make_claude_present(lite: &mut Lite, id: WorkspaceId, emit: &Path) {
+        let workbench = lite.model.workspace_mut(id).unwrap();
+        let shell = workbench
+            .terminal()
+            .and_then(made_app::TerminalPane::pid)
+            .expect("shell pid");
+        type_command(workbench, &format!("tail -c +1 -f '{}'", emit.display()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            lite.render();
+            let started = std::process::Command::new("pgrep")
+                .args(["-P", &shell.to_string(), "tail"])
+                .output()
+                .is_ok_and(|out| !out.stdout.is_empty());
+            if started {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tail did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        lite.render();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(emit).unwrap();
+            file.write_all(b"]0;Window title").unwrap();
+            file.write_all(b"]7501;state=working:app=claude-code")
+                .unwrap();
+        }
+        lite.pump_until("claude present", |model| {
+            model
+                .workspace(id)
+                .and_then(made_app::integrations::claude_code::tab)
+                .is_some_and(|tab| tab.present())
+        });
+    }
+
+    /// Open one Grok session owned by the shell tab. Its attachment alone is
+    /// observed, so the dot is idle whatever the hook timing.
+    fn make_grok_open(lite: &mut Lite, id: WorkspaceId, root: &Path) {
+        let pid = lite
+            .model
+            .workspace(id)
+            .and_then(made_app::Workbench::terminal)
+            .and_then(made_app::TerminalPane::pid)
+            .expect("shell pid");
+        write_grok_inventory(&[json!({
+            "pid": pid,
+            "session_id": "grok-session",
+            "cwd": root,
+            "opened_at": "2024-01-01T00:00:01Z",
+        })]);
+    }
+
+    /// Connect OpenCode to the tab's bridge with one idle session.
+    fn make_opencode_active(lite: &mut Lite, id: WorkspaceId, root: &Path) -> WebSocket<TcpStream> {
+        let options = credentials(lite.model.workspace(id).unwrap());
+        let mut socket = connect(&options);
+        state(&mut socket, 1, root);
+        lite.pump_until("opencode connected", |model| {
+            model.workspace(id).unwrap().is_connected()
+        });
+        socket
+    }
+
+    /// A remote shell tab on a saved server.
+    fn remote_tab(lite_model: &mut AppModel, name: &str) -> WorkspaceId {
+        use made_app::remote_workspace::RemoteWorkspace;
+        use made_app::ssh_servers::ServerMetadata;
+        let authority = lite_model
+            .add_ssh_metadata(ServerMetadata {
+                display_name: name.into(),
+                host: name.into(),
+                user: None,
+                port: None,
+                key_file: None,
+                initial_directory: None,
+            })
+            .expect("server metadata saves");
+        lite_model
+            .attach_remote_model(
+                authority,
+                RemoteWorkspace::new(
+                    Identity {
+                        authority,
+                        tab: TabCapability::random().unwrap(),
+                        epoch: 1,
+                        generation: 1,
+                    },
+                    RemotePath::new(b"/project".to_vec()).unwrap(),
+                )
+                .unwrap(),
+                false,
+            )
+            .expect("remote model attaches");
+        lite_model.active_workspace_id().unwrap()
+    }
+
+    /// Open Grok on the remote tab, working.
+    fn remote_grok_open(lite: &mut Lite, id: WorkspaceId) {
+        let workbench = lite.model.workspace_mut(id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_grok_push(WireEnvelope::new(
+                identity,
+                1,
+                Operation::GrokSnapshot {
+                    snapshot: GrokSessionSnapshot {
+                        revision: 1,
+                        running: false,
+                        hooks_ready: false,
+                        sessions: vec![GrokSessionInfo {
+                            session_id: "remote-grok".to_owned(),
+                            cwd: Some(RemotePath::new(b"/project".to_vec()).unwrap()),
+                            opened_at: 1,
+                            activity: GrokActivity::Working,
+                        }],
+                    },
+                },
+            ))
+            .expect("the current-attach Grok snapshot applies");
+    }
+
+    /// Connect OpenCode on the remote tab with one busy session.
+    fn remote_opencode_active(lite: &mut Lite, id: WorkspaceId) {
+        let snapshot: made_bridge::state::SessionSnapshot = serde_json::from_value(json!({
+            "revision": 1,
+            "activeSessionID": "remote-opencode",
+            "tabsEnabled": true,
+            "sessions": [{
+                "sessionID": "remote-opencode",
+                "title": "Remote",
+                "active": true,
+                "busy": true,
+                "directory": "/project"
+            }]
+        }))
+        .unwrap();
+        let workbench = lite.model.workspace_mut(id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        remote
+            .accept_session_event(WireEnvelope::new(
+                identity,
+                1,
+                Operation::SessionSnapshot { snapshot },
+            ))
+            .expect("the current-attach session snapshot applies");
+        lite.pump_until("remote sessions", |model| {
+            model.workspace(id).unwrap().session_map().rows().len() == 1
+        });
+    }
+    // END characterization adapter
+
+    /// Minimal headless frame driver for the tab strip.
+    struct Lite {
+        ctx: egui::Context,
+        model: AppModel,
+        started: Instant,
+        last_time: f64,
+    }
+
+    impl Lite {
+        fn new(model: AppModel) -> Self {
+            let ctx = egui::Context::default();
+            made_app::theme::install(&ctx);
+            ctx.enable_accesskit();
+            ctx.style_mut_of(egui::Theme::Dark, |style| {
+                style.interaction.tooltip_delay = 0.0
+            });
+            Self {
+                ctx,
+                model,
+                started: Instant::now(),
+                last_time: 0.0,
+            }
+        }
+
+        fn render_events(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.model.logic(&self.ctx);
+            let time = self.started.elapsed().as_secs_f64().max(self.last_time);
+            self.last_time = time;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut output = self.ctx.run_ui(raw, |ui| self.model.ui(ui));
+            output.textures_delta.clear();
+            output
+        }
+
+        fn render(&mut self) -> egui::FullOutput {
+            self.render_events(Vec::new())
+        }
+
+        fn pump_until(&mut self, what: &str, mut predicate: impl FnMut(&AppModel) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !predicate(&self.model) && Instant::now() < deadline {
+                self.render();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                predicate(&self.model),
+                "runtime did not reach expected state: {what}"
+            );
+        }
+
+        /// Render until the tab strip paints `label` inside the tab.
+        fn render_until_label(&mut self, id: WorkspaceId, label: &str) -> egui::FullOutput {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let output = self.render();
+                let tab = self.ctx.read_response(workspace_tab_id(id)).map(|r| r.rect);
+                if tab.is_some_and(|tab| {
+                    text_rects(&output, label)
+                        .iter()
+                        .any(|rect| tab.contains_rect(*rect))
+                }) {
+                    return output;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "tab strip did not paint `{label}` within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Hover the tab and return the tooltip lines that appear.
+        fn hover_lines(&mut self, id: WorkspaceId) -> Vec<String> {
+            let corner = egui::pos2(4.0, 796.0);
+            self.render_events(vec![egui::Event::PointerMoved(corner)]);
+            self.render();
+            let before = output_lines(&self.render());
+            let position = self
+                .ctx
+                .read_response(workspace_tab_id(id))
+                .expect("tab")
+                .rect
+                .center();
+            self.render_events(vec![egui::Event::PointerMoved(position)]);
+            self.render_events(vec![egui::Event::PointerMoved(position)]);
+            // Tooltip areas appear a pass or more after hover begins: take the
+            // text once it has been the same for several passes.
+            let mut after = output_lines(&self.render());
+            let mut same = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while after.len() <= before.len() || same < 5 {
+                assert!(
+                    Instant::now() < deadline,
+                    "tooltip did not settle within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                let next = output_lines(&self.render());
+                same = if next == after { same + 1 } else { 0 };
+                after = next;
+            }
+            // Count-aware difference: a line the screen already paints once
+            // (the folder path, for one) can appear a second time as the tooltip.
+            let mut remaining = before;
+            after.retain(
+                |line| match remaining.iter().position(|seen| seen == line) {
+                    Some(index) => {
+                        remaining.remove(index);
+                        false
+                    }
+                    None => true,
+                },
+            );
+            after
+        }
+    }
+
+    impl Drop for Lite {
+        fn drop(&mut self) {
+            self.model.shutdown();
+        }
+    }
+
+    fn embedded_svg(
+        ctx: &egui::Context,
+        uri: &'static str,
+        bytes: &'static [u8],
+        px: u32,
+    ) -> egui::TextureId {
+        ctx.include_bytes(uri, bytes);
+        let hint = egui::load::SizeHint::Size {
+            width: px,
+            height: px,
+            maintain_aspect_ratio: false,
+        };
+        match ctx.try_load_texture(uri, egui::TextureOptions::default(), hint) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => texture.id,
+            _ => panic!("{uri} did not load"),
+        }
+    }
+
+    fn walk(output: &egui::FullOutput, mut visit: impl FnMut(&egui::Shape)) {
+        fn go(shape: &egui::Shape, visit: &mut impl FnMut(&egui::Shape)) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        go(shape, visit);
+                    }
+                }
+                other => visit(other),
+            }
+        }
+        for clipped in &output.shapes {
+            go(&clipped.shape, &mut visit);
+        }
+    }
+
+    fn output_lines(output: &egui::FullOutput) -> Vec<String> {
+        let mut lines = Vec::new();
+        walk(output, |shape| {
+            if let egui::Shape::Text(text) = shape {
+                lines.push(text.galley.job.text.clone());
+            }
+        });
+        lines
+    }
+
+    fn text_rects(output: &egui::FullOutput, needle: &str) -> Vec<egui::Rect> {
+        let mut rects = Vec::new();
+        walk(output, |shape| {
+            if let egui::Shape::Text(text) = shape {
+                if text.pos.y <= 55.0 && text.galley.job.text.contains(needle) {
+                    rects.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+            }
+        });
+        rects
+    }
+
+    /// The tab strip label: the text painted in the tab above the title bar
+    /// line that is not a dot or an icon.
+    fn tab_label(output: &egui::FullOutput, tab: egui::Rect) -> String {
+        let mut labels = Vec::new();
+        walk(output, |shape| {
+            if let egui::Shape::Text(text) = shape {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if text.pos.y <= 55.0 && tab.contains_rect(rect) {
+                    labels.push((text.pos.x, text.galley.job.text.clone()));
+                }
+            }
+        });
+        labels.sort_by(|a, b| a.0.total_cmp(&b.0));
+        labels
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn tab_mark(ctx: &egui::Context, output: &egui::FullOutput, tab: egui::Rect) -> &'static str {
+        let px = (output.pixels_per_point * 16.0).round() as u32;
+        let known = marks(ctx, px);
+        let mut found = "none";
+        walk(output, |shape| {
+            if let egui::Shape::Rect(rect) = shape {
+                let texture = rect.fill_texture_id();
+                if texture != egui::TextureId::default()
+                    && (rect.rect.width() - 16.0).abs() < 0.75
+                    && (rect.rect.height() - 16.0).abs() < 0.75
+                    && tab.contains_rect(rect.rect)
+                {
+                    found = known
+                        .iter()
+                        .find(|(_, id)| *id == texture)
+                        .map_or("unknown", |(name, _)| name);
+                }
+            }
+        });
+        found
+    }
+
+    fn tab_dots(output: &egui::FullOutput, tab: egui::Rect) -> Vec<String> {
+        let corner = egui::pos2(tab.right() - 10.0, tab.center().y);
+        let mut dots = Vec::new();
+        walk(output, |shape| {
+            if let egui::Shape::Circle(circle) = shape {
+                if (circle.radius - 2.0).abs() < 0.1
+                    && (circle.center.y - corner.y).abs() < 0.75
+                    && circle.center.x <= corner.x + 0.75
+                    && circle.center.x >= corner.x - 7.0 * 7.0 - 0.75
+                {
+                    dots.push((circle.center.x, dot_tone(circle.fill)));
+                }
+            }
+        });
+        dots.sort_by(|a, b| a.0.total_cmp(&b.0));
+        dots.into_iter().map(|(_, color)| color).collect()
+    }
+
+    /// The documented tone a status dot is painted with. The busy dot pulses,
+    /// so its exact color varies by a few units between frames.
+    fn dot_tone(fill: egui::Color32) -> String {
+        let near = |tone: egui::Color32| {
+            let [r, g, b, _] = fill.to_srgba_unmultiplied();
+            let [tr, tg, tb, _] = tone.to_srgba_unmultiplied();
+            (i32::from(r) - i32::from(tr)).abs() <= 3
+                && (i32::from(g) - i32::from(tg)).abs() <= 3
+                && (i32::from(b) - i32::from(tb)).abs() <= 3
+        };
+        if near(made_app::theme::ACCENT) {
+            "busy".to_owned()
+        } else if near(made_app::theme::WARNING) {
+            "attention".to_owned()
+        } else if near(made_app::theme::TEXT_TERTIARY) {
+            "idle".to_owned()
+        } else {
+            format!("other {fill:?}")
+        }
+    }
+
+    fn accessible_name(output: &egui::FullOutput, id: WorkspaceId) -> String {
+        let update = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accesskit update was produced");
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == workspace_tab_id(id).accesskit_id())
+            .expect("the tab has an accessible node");
+        format!(
+            "{:?}: {}",
+            node.role(),
+            node.label().unwrap_or("<no label>")
+        )
+    }
+
+    /// One tab's presentation as a record.
+    fn presentation(lite: &mut Lite, id: WorkspaceId, label: &str, root: &str) -> String {
+        let output = lite.render_until_label(id, label);
+        let output = {
+            // One more pass settles geometry after a branding switch.
+            drop(output);
+            lite.render()
+        };
+        let tab = lite
+            .ctx
+            .read_response(workspace_tab_id(id))
+            .expect("tab")
+            .rect;
+        let record = format!(
+            "label={}\nmark={}\ndots={:?}\naccessible={}\n",
+            tab_label(&output, tab),
+            tab_mark(&lite.ctx, &output, tab),
+            tab_dots(&output, tab),
+            accessible_name(&output, id),
+        );
+        let tooltip: Vec<String> = lite
+            .hover_lines(id)
+            .into_iter()
+            .map(|line| line.replace(root, "<root>"))
+            .collect();
+        format!("{record}tooltip={tooltip:?}\n")
+    }
+
+    fn local_record(opencode: bool, claude: bool, grok: bool, claude_first: bool) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("project-alpha");
+        std::fs::create_dir(&root).unwrap();
+        write_grok_inventory(&[]);
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        open(&mut model, &root);
+        let id = model.active_workspace_id().unwrap();
+        let mut lite = Lite::new(model);
+        lite.pump_until("shell pid", |model| {
+            model
+                .workspace(id)
+                .and_then(made_app::Workbench::terminal)
+                .is_some_and(|terminal| terminal.pid().is_some())
+        });
+        let folder = root.file_name().unwrap().to_string_lossy().into_owned();
+        // Grok first so its label is observable, then Claude Code, then
+        // OpenCode; or Claude Code first and Grok second.
+        let emit = temp.path().join("emit.bin");
+        std::fs::write(&emit, b"").unwrap();
+        if claude_first {
+            if claude {
+                make_claude_present(&mut lite, id, &emit);
+            }
+            if grok {
+                make_grok_open(&mut lite, id, &root);
+                // The attachment inventory is read about once a second.
+                let until = Instant::now() + Duration::from_millis(2500);
+                while Instant::now() < until {
+                    lite.render();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        } else {
+            if grok {
+                make_grok_open(&mut lite, id, &root);
+                lite.render_until_label(id, "Grok Build");
+            }
+            if claude {
+                make_claude_present(&mut lite, id, &emit);
+            }
+        }
+        let socket = opencode.then(|| make_opencode_active(&mut lite, id, &root));
+        let expected_label = if opencode {
+            "OpenCode".to_owned()
+        } else if claude {
+            "Claude Code".to_owned()
+        } else if grok {
+            "Grok Build".to_owned()
+        } else {
+            folder
+        };
+        let record = presentation(&mut lite, id, &expected_label, &root.to_string_lossy());
+        drop(socket);
+        record
+    }
+
+    fn remote_record(opencode: bool, grok: bool) -> String {
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let name = "remote-server";
+        let id = remote_tab(&mut model, name);
+        let mut lite = Lite::new(model);
+        lite.render();
+        if grok {
+            remote_grok_open(&mut lite, id);
+        }
+        if opencode {
+            remote_opencode_active(&mut lite, id);
+        }
+        let expected_label = if opencode {
+            "OpenCode"
+        } else if grok {
+            "Grok Build"
+        } else {
+            name
+        };
+        presentation(&mut lite, id, expected_label, "<no host root>")
+    }
+
+    /// The expected record of one tab.
+    fn expect(
+        label: &str,
+        mark: &str,
+        dots: &[&str],
+        accessible: &str,
+        tooltip: &[&str],
+    ) -> String {
+        format!(
+            "label={label}\nmark={mark}\ndots={dots:?}\naccessible={accessible}\ntooltip={tooltip:?}\n"
+        )
+    }
+
+    fn folder() -> String {
+        expect(
+            "project-alpha",
+            "none",
+            &[],
+            "Tab: project-alpha",
+            &["×", "<root>"],
+        )
+    }
+
+    fn grok_local() -> String {
+        expect(
+            "Grok Build",
+            "grok",
+            &["idle"],
+            "Tab: Grok Build — Sessions: 1 idle",
+            &["×", "Sessions: 1 idle"],
+        )
+    }
+
+    fn claude_local() -> String {
+        expect(
+            "Claude Code",
+            "claude-code",
+            &["busy"],
+            "Tab: Claude Code — Sessions: 1 running",
+            &["×", "Window title — Sessions: 1 running"],
+        )
+    }
+
+    fn opencode_local() -> String {
+        expect(
+            "OpenCode",
+            "opencode",
+            &["idle"],
+            "Tab: OpenCode — Sessions: 1 idle",
+            &["×", "Sessions: 1 idle"],
+        )
+    }
+
+    #[test]
+    fn local_tabs_present_the_highest_precedence_integration() {
+        if isolated("tab_presentation_characterization::local_tabs_present_the_highest_precedence_integration") {
+            return;
+        }
+        // (OpenCode active, Claude Code present, Grok open): OpenCode, then
+        // Claude Code, then Grok Build, else the folder.
+        let table: [((bool, bool, bool), String); 8] = [
+            ((false, false, false), folder()),
+            ((false, false, true), grok_local()),
+            ((false, true, false), claude_local()),
+            ((false, true, true), claude_local()),
+            ((true, false, false), opencode_local()),
+            ((true, false, true), opencode_local()),
+            ((true, true, false), opencode_local()),
+            ((true, true, true), opencode_local()),
+        ];
+        for ((opencode, claude, grok), expected) in table {
+            if claude && !cfg!(target_os = "linux") {
+                // Claude Code is made present through a foreground `tail`,
+                // which only Linux relays unbuffered (as for the Claude Code
+                // fixture of `ui_model.rs`).
+                continue;
+            }
+            assert_eq!(
+                local_record(opencode, claude, grok, false),
+                expected,
+                "opencode={opencode} claude={claude} grok={grok}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_code_wins_over_grok_whichever_arrives_first() {
+        if isolated(
+            "tab_presentation_characterization::claude_code_wins_over_grok_whichever_arrives_first",
+        ) {
+            return;
+        }
+        assert_eq!(local_record(false, true, true, false), claude_local());
+        assert_eq!(local_record(false, true, true, true), claude_local());
+    }
+
+    #[test]
+    fn remote_tabs_present_opencode_then_grok_else_the_server_name() {
+        if isolated("tab_presentation_characterization::remote_tabs_present_opencode_then_grok_else_the_server_name") {
+            return;
+        }
+        let server = expect(
+            "remote-server",
+            "none",
+            &[],
+            "Tab: remote-server",
+            &["×", "/project"],
+        );
+        let grok = expect(
+            "Grok Build",
+            "grok",
+            &["busy"],
+            "Tab: Grok Build — Sessions: 1 running",
+            &["×", "Sessions: 1 running"],
+        );
+        let opencode = expect(
+            "OpenCode",
+            "opencode",
+            &["busy"],
+            "Tab: OpenCode — Sessions: 1 running",
+            &["×", "Sessions: 1 running"],
+        );
+        let table: [((bool, bool), &String); 4] = [
+            ((false, false), &server),
+            ((false, true), &grok),
+            ((true, false), &opencode),
+            ((true, true), &opencode),
+        ];
+        for ((opencode_active, grok_open), expected) in table {
+            assert_eq!(
+                &remote_record(opencode_active, grok_open),
+                expected,
+                "remote opencode={opencode_active} grok={grok_open}"
+            );
+        }
+    }
 }

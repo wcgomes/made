@@ -6,7 +6,6 @@
 //! performs synchronous config/PTY setup (including shell policy preflight);
 //! callers must not mistake that remaining launch cost for background work.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
@@ -15,29 +14,28 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use made_bridge::config::{self, ComposeOptions, CONFIG_CONTENT_ENV};
-use made_bridge::config_guard::{ConfigFileState, ConfigGuard, ConfigVerification};
 use made_bridge::security::Token;
-use made_bridge::server::{self, BridgeEvent, BridgeHandle, BridgeOptions};
+use made_bridge::server::{BridgeEvent, BridgeHandle};
 use made_bridge::state::SessionSnapshot;
 use made_explorer::highlight::Highlighter;
 use made_explorer::root_switch::RootGeneration;
 use made_platform::{
-    host_platform, AppPaths, CompatibleTui, LogIssue, LogIssueSeverity, Platform, PlatformFamily,
-    PtySize,
+    host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
 };
 
-use crate::claude_follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
+use crate::app::WorkspaceId;
 use crate::diagnostics::{
-    Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
-    DEFAULT_LOG_FILE, MAX_LOG_FILE_BYTES,
+    Diagnostics, DiagnosticsSnapshot, LogEntry, LogLevel, WorkspaceDiagnostics, DEFAULT_LOG_FILE,
+    MAX_LOG_FILE_BYTES,
 };
 use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
-use crate::integration_status::{
-    claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
-    ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus,
+use crate::integration_status::{IntegrationState, IntegrationStatus};
+use crate::integrations::{
+    apply_contributions, session_bridge, session_token, AppState, DiagnosticsDecl, EnvContribution,
+    FollowKind, FollowPort, FollowStep, IntegrationList, LaunchCtx, Presentation, PresentationCtx,
+    RowReport, Slots, StartCtx, TabInit, TabIo, TabState, WorkspaceNotices, WorkspaceTabs, PRODUCT,
 };
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -46,7 +44,7 @@ use crate::session_follow::{SessionFollowCoordinator, SessionFollowUpdate};
 use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::{TerminalPane, DEFAULT_COLS, DEFAULT_ROWS};
 use crate::theme::EXPLORER_DEFAULT_WIDTH_WIDE;
-use crate::tui::{ClaudeLaunchEnv, TerminalTarget, CLAUDE_SPOOL_ENV};
+use crate::tui::TerminalTarget;
 use crate::workspace::{fallback_terminal_cwd, LaunchPlan, WorkspaceError};
 use crate::worktree::{
     GitRunner, GitStatusRead, GitStatusSnapshot, MetadataStatus, WorktreeMetadata,
@@ -73,34 +71,6 @@ const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
-
-/// Claude Code state of one local tab: the joined hook and protocol channels,
-/// and the tab's spool.
-struct ClaudeRuntime {
-    tab: ClaudeTab,
-    /// `None` when the spool could not be created; hooks are then unavailable.
-    spool: Option<TabSpool>,
-    liveness_checked_at: Instant,
-    /// When Claude Code last became present in this tab.
-    present_since: Option<Instant>,
-    /// Directory last handed to the follow coordinator and accepted by it.
-    applied_directory: Option<PathBuf>,
-    /// Directory the coordinator rejected, retried on the liveness tick.
-    rejected_directory: Option<PathBuf>,
-}
-
-/// How often owned Claude Code processes are checked for exit.
-const CLAUDE_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
-
-/// One Grok session open in this terminal, with the latest hook status.
-#[derive(Debug, Clone)]
-struct GrokLiveSession {
-    id: String,
-    cwd: PathBuf,
-    opened_at: String,
-    activity: SessionActivity,
-    touched: Instant,
-}
 
 /// Which transition created an explorer root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,11 +182,6 @@ pub enum LeftSurface {
     Preview,
 }
 
-/// Maximum size of the user-owned OpenCode config Made is willing to read on
-/// the workspace preparation path. Larger or special files are skipped rather
-/// than read, so opening a workspace cannot stall behind an unbounded read.
-pub const MAX_USER_CONFIG_BYTES: u64 = 1024 * 1024;
-
 /// Worktree metadata state for the header and diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeState {
@@ -269,6 +234,7 @@ struct RemoteTab {
     detail: String,
     prompt: Option<made_platform::ssh_askpass::PromptRequest>,
     prompt_draft: String,
+    // BEGIN remote-path (AIA-02)
     opencode: bool,
     /// Whether the remote launch target is Grok: the first frame opens
     /// `grok dashboard` through LaunchTarget::Grok.
@@ -276,6 +242,7 @@ struct RemoteTab {
     /// Whether the remote launch target is Claude Code: the first frame opens
     /// the companion's direct `LaunchTarget::Claude`.
     claude: bool,
+    // END remote-path
     /// Sanitized target triple for the update card. The version is the shipped
     /// app version; no path or hash is stored here.
     update_target: Option<String>,
@@ -283,12 +250,11 @@ struct RemoteTab {
     update_approved: bool,
     /// The approved update attempt itself failed; Retry stays actionable.
     update_failed: bool,
+    // BEGIN remote-path (AIA-02)
     /// What the tab's own launch probe detected. Absence is undetected; the
     /// host PATH is never consulted for a remote tab.
     grok_detected: bool,
-    /// The same for claude: `None` until a probe finished, then the tab's own
-    /// server detection.
-    claude_detected: Option<bool>,
+    // END remote-path
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
     client_rx: Option<
@@ -355,14 +321,17 @@ impl RemoteTab {
             detail: "Connecting. No local shell was started.".to_owned(),
             prompt: None,
             prompt_draft: String::new(),
+            // BEGIN remote-path (AIA-02)
             opencode: false,
             grok: false,
             claude: false,
+            // END remote-path
             update_target: None,
             update_approved: false,
             update_failed: false,
+            // BEGIN remote-path (AIA-02)
             grok_detected: false,
-            claude_detected: None,
+            // END remote-path
             probe: None,
             stage: None,
             client_rx: None,
@@ -560,9 +529,6 @@ pub struct Workbench {
     pub(crate) terminal_cwd: PathBuf,
     pub(crate) terminal_target: TerminalTarget,
     pub(crate) paths: Option<AppPaths>,
-    pub(crate) token: Option<Token>,
-    pub(crate) bridge: Option<BridgeHandle>,
-    pub(crate) config_guard: Option<ConfigGuard>,
     pub(crate) config_failure: Option<String>,
     pub(crate) diag: Diagnostics,
     pub(crate) metrics: Metrics,
@@ -586,28 +552,10 @@ pub struct Workbench {
     shell_root_check_in_flight: bool,
     shell_root_checked_at: Instant,
     shell_root_check_interval: Duration,
-    grok_checked_at: Instant,
-    grok_log_offset: u64,
-    grok_sessions: Vec<GrokLiveSession>,
-    /// Session ids removed by a session-end hook. Inventory must not put the
-    /// dot back while Grok's file still lists that row.
-    grok_closed: HashSet<String>,
-    /// Hook session moved before the inventory could prove it belongs here.
-    grok_provisional_id: Option<String>,
-    /// Explorer root after that provisional move. A later release restores the
-    /// saved directory only while the explorer is still here.
-    grok_provisional_cwd: Option<PathBuf>,
-    /// Grok directory to restore if that provisional session is not ours.
-    /// `None` while a provisional move is active means the shell owned the root.
-    grok_restore_root: Option<PathBuf>,
-    grok_file_newest_id: Option<String>,
-    /// Present for local shell and direct Claude Code tabs.
-    claude: Option<ClaudeRuntime>,
-    /// The shipped Claude Code plugin when it is usable, looked up once per
-    /// launch so the per-frame diagnostics row never touches the filesystem.
-    claude_plugin: Option<PathBuf>,
-    /// App-wide Claude Code detection state for the diagnostics row.
-    claude_phase: ClaudeDiagnosticsPhase,
+    /// The integrations this tab was built with, in catalog order.
+    integrations: IntegrationList,
+    /// Per-tab integration state, parallel to `integrations`.
+    tab_states: Slots<Box<dyn TabState>>,
     instrumentation: RuntimeInstrumentation,
     pane_id: String,
     visible: bool,
@@ -619,8 +567,6 @@ pub struct Workbench {
     pub(crate) about_diagnostics_visible: bool,
     /// Increments when About opens so its reveal animation starts hidden.
     pub(crate) about_open_generation: u64,
-    /// Grok Build pill and sentence attached to the diagnostics snapshot.
-    grok_diagnostics: GrokDiagnosticsRow,
     tick_count: u64,
     paint_count: u64,
     last_osc7_cwd: Option<PathBuf>,
@@ -675,7 +621,29 @@ impl Workbench {
         terminal_target: TerminalTarget,
         started_at: Instant,
     ) -> Self {
+        Self::start_in(
+            PRODUCT,
+            plan,
+            workspace_error,
+            terminal_cwd,
+            terminal_target,
+            started_at,
+        )
+    }
+
+    /// [`Self::start`] over a given integration list instead of the product's.
+    #[doc(hidden)]
+    pub fn start_in(
+        integrations: IntegrationList,
+        plan: Option<LaunchPlan>,
+        workspace_error: Option<WorkspaceError>,
+        terminal_cwd: PathBuf,
+        terminal_target: TerminalTarget,
+        started_at: Instant,
+    ) -> Self {
+        debug_assert_eq!(crate::integrations::validate(integrations), Ok(()));
         Self::start_with(
+            integrations,
             plan,
             workspace_error,
             terminal_cwd,
@@ -694,11 +662,26 @@ impl Workbench {
         target: TerminalTarget,
         started_at: Instant,
     ) -> Result<Self, String> {
+        Self::start_remote_in(PRODUCT, snapshot, directory, target, started_at)
+    }
+
+    /// [`Self::start_remote`] over a given integration list instead of the
+    /// product's.
+    #[doc(hidden)]
+    pub fn start_remote_in(
+        integrations: IntegrationList,
+        snapshot: crate::ssh_servers::ServerSnapshot,
+        directory: made_remote::protocol::RemotePath,
+        target: TerminalTarget,
+        started_at: Instant,
+    ) -> Result<Self, String> {
         let mut remote = RemoteTab::connecting(snapshot.clone(), directory)?;
+        // BEGIN remote-path (AIA-02)
         remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
         remote.grok = matches!(target, TerminalTarget::RemoteGrok { .. });
         remote.claude = matches!(target, TerminalTarget::RemoteClaude { .. });
         remote.grok_detected = false;
+        // END remote-path
         remote.probe = Some(crate::ssh_servers::spawn_probe(
             crate::ssh_servers::ProbeRequest {
                 ticket: crate::ssh_servers::ProbeTicket {
@@ -709,6 +692,7 @@ impl Workbench {
             },
         ));
         Ok(Self::start_with(
+            integrations,
             None,
             None,
             PathBuf::new(),
@@ -734,14 +718,17 @@ impl Workbench {
             detail: detail.into(),
             prompt: None,
             prompt_draft: String::new(),
+            // BEGIN remote-path (AIA-02)
             opencode: matches!(target, TerminalTarget::RemoteOpenCode { .. }),
             grok: matches!(target, TerminalTarget::RemoteGrok { .. }),
             claude: matches!(target, TerminalTarget::RemoteClaude { .. }),
+            // END remote-path
             update_target: None,
             update_approved: false,
             update_failed: false,
+            // BEGIN remote-path (AIA-02)
             grok_detected: false,
-            claude_detected: None,
+            // END remote-path
             probe: None,
             stage: None,
             client_rx: None,
@@ -770,6 +757,7 @@ impl Workbench {
             next_upload: 1,
         };
         Self::start_with(
+            PRODUCT,
             None,
             None,
             PathBuf::new(),
@@ -780,6 +768,7 @@ impl Workbench {
     }
 
     fn start_with(
+        integrations: IntegrationList,
         plan: Option<LaunchPlan>,
         mut workspace_error: Option<WorkspaceError>,
         terminal_cwd: PathBuf,
@@ -802,9 +791,15 @@ impl Workbench {
             }
             Err(error) => path_error = Some(format!("app paths: {error}")),
         }
-        let claude_plugin = app_paths
-            .as_ref()
-            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
+        let tab_states = Slots::from_list(integrations, |entry| {
+            entry.new_tab_state(
+                terminal_target,
+                &TabInit {
+                    paths: app_paths.as_ref(),
+                    remote: remote.is_some(),
+                },
+            )
+        });
         let log_path = diagnostics_log_path(app_paths.as_ref());
         #[cfg(test)]
         if let Some(path) = &log_path {
@@ -822,13 +817,15 @@ impl Workbench {
             None => Diagnostics::unavailable(
                 "app paths are unavailable; no shared temporary log is used",
             ),
-        };
+        }
+        .with_integrations(integrations);
 
         let launch_root = plan.as_ref().map(|plan| plan.explorer_root.clone());
         let integration = IntegrationState::new(launch_root.clone(), terminal_cwd.clone());
         let follow = plan
             .as_ref()
-            .and_then(|plan| SessionFollowCoordinator::from_launch_plan(plan).ok());
+            .and_then(|plan| SessionFollowCoordinator::from_launch_plan(plan).ok())
+            .map(|coordinator| coordinator.with_integrations(integrations));
         if plan.is_some() && follow.is_none() {
             let error = WorkspaceError::new(
                 crate::workspace::WorkspaceErrorKind::Unreadable,
@@ -845,9 +842,6 @@ impl Workbench {
             terminal_cwd,
             terminal_target,
             paths: app_paths,
-            token: None,
-            bridge: None,
-            config_guard: None,
             config_failure: None,
             diag,
             metrics: Metrics::new(),
@@ -870,17 +864,8 @@ impl Workbench {
             shell_root_unavailable: None,
             shell_root_check_in_flight: false,
             shell_root_checked_at: Instant::now(),
-            grok_checked_at: Instant::now(),
-            grok_log_offset: u64::MAX,
-            grok_sessions: Vec::new(),
-            grok_closed: HashSet::new(),
-            grok_provisional_id: None,
-            grok_provisional_cwd: None,
-            grok_restore_root: None,
-            grok_file_newest_id: None,
-            claude: None,
-            claude_plugin,
-            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
+            integrations,
+            tab_states,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: format!(
@@ -895,7 +880,6 @@ impl Workbench {
             sessions_visible: false,
             about_diagnostics_visible: false,
             about_open_generation: 0,
-            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
             tick_count: 0,
             paint_count: 0,
             last_osc7_cwd: None,
@@ -1006,8 +990,8 @@ impl Workbench {
             );
             return workbench;
         }
-        let composed_content = workbench.start_integration();
-        workbench.start_terminal(composed_content);
+        workbench.start_integration();
+        workbench.start_terminal();
         workbench.refresh_shell_capability();
 
         if let Some(root) = workbench.explorer_root().map(Path::to_path_buf) {
@@ -1022,163 +1006,27 @@ impl Workbench {
         workbench
     }
 
-    /// Start the bridge and compose the per-launch OpenCode configuration.
-    ///
-    /// The user's configuration is read only. A composition failure leaves the
-    /// child environment untouched and reports a degraded status. Returns the
-    /// composed content for the child environment, never persisted.
-    fn start_integration(&mut self) -> Option<String> {
-        let Some(paths) = self.paths.clone() else {
-            self.config_failure = Some("app-owned paths are unavailable".to_owned());
-            self.integration
-                .note_config_composition_failed("app-owned paths are unavailable");
-            self.diag.log_mut().record(
-                LogLevel::Error,
-                "configuration not composed: app-owned paths are unavailable",
-            );
-            return None;
+    /// Let every integration start what its terminal needs before the terminal
+    /// starts, in list order.
+    fn start_integration(&mut self) {
+        let mut ctx = StartCtx {
+            paths: self.paths.as_ref(),
+            pane_id: &self.pane_id,
+            diag: &mut self.diag,
+            session: &mut self.integration,
+            failure: &mut self.config_failure,
         };
-
-        // Inspect the user's config before any read. Only a regular file within
-        // the bounded limit is captured or merged; FIFOs, devices, directories,
-        // and oversized files are skipped so workspace preparation cannot
-        // block on an unbounded or blocking read.
-        let user_config = match bounded_user_config(&paths.opencode_config_path) {
-            Ok(()) => Some(paths.opencode_config_path.clone()),
-            Err(detail) => {
-                self.config_failure = Some(detail.clone());
-                self.integration
-                    .note_config_composition_failed(detail.clone());
-                self.diag.log_mut().record(LogLevel::Error, detail);
-                None
-            }
-        };
-
-        // Capture the user's config before the session, even if composition
-        // later fails. Verification never rewrites the file.
-        self.config_guard = if let Some(path) = user_config.as_deref() {
-            match ConfigGuard::before_session(path) {
-                Ok(guard) => {
-                    let state = guard.before().state();
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!(
-                            "user OpenCode config captured ({})",
-                            match state {
-                                ConfigFileState::Present => "present",
-                                ConfigFileState::Missing => "missing",
-                            }
-                        ),
-                    );
-                    Some(guard)
-                }
-                Err(error) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        format!("could not capture user OpenCode config: {error}"),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let pane_id = self.pane_id.clone();
-        let token = match Token::generate() {
-            Ok(token) => token,
-            Err(error) => {
-                let detail = format!("bridge token generation failed: {error}");
-                self.config_failure = Some(detail.clone());
-                self.integration.note_config_composition_failed(detail);
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Error, "bridge token generation failed");
-                return None;
-            }
-        };
-        self.diag = self
-            .diag
-            .clone()
-            .with_token_fingerprint(token.fingerprint());
-
-        let bridge = match server::start(
-            BridgeOptions::new(token.clone(), pane_id.clone()).with_app_version(APP_VERSION),
-        ) {
-            Ok(bridge) => bridge,
-            Err(error) => {
-                let detail = format!("bridge could not start: {error}");
-                self.integration.note_plugin_unavailable(detail.clone());
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Error, "loopback bridge could not start");
-                self.config_failure = Some(detail);
-                return None;
-            }
-        };
-
-        let options = ComposeOptions {
-            plugin_dir: paths.plugin_dir.clone(),
-            app_owned_root: paths.plugin_root.clone(),
-            user_config_path: user_config,
-            inline_config: None,
-            bridge_url: bridge.url(),
-            token: token.clone(),
-            pane_id: pane_id.clone(),
-            app_version: APP_VERSION.to_owned(),
+        for state in self.tab_states.iter_mut() {
+            state.start(&mut ctx);
         }
-        .with_inline_config_from_env();
-
-        let composed = match config::compose(&options) {
-            Ok(composed) => composed,
-            Err(error) => {
-                let detail = format!("configuration could not be composed: {error}");
-                self.config_failure = Some(detail.clone());
-                self.integration.note_config_composition_failed(detail);
-                self.diag.log_mut().record(
-                    LogLevel::Error,
-                    "configuration could not be composed; launching with the original environment",
-                );
-                let _ = bridge.shutdown();
-                return None;
-            }
-        };
-
-        for warning in &composed.warnings {
-            self.diag
-                .log_mut()
-                .record(LogLevel::Warn, format!("configuration warning: {warning}"));
-        }
-        self.diag.log_mut().record(
-            LogLevel::Info,
-            format!(
-                "integration ready on loopback port {} (pane {pane_id})",
-                bridge.port()
-            ),
-        );
-        self.token = Some(token);
-        self.bridge = Some(bridge);
-        Some(composed.content)
     }
 
-    fn start_terminal(&mut self, composed_content: Option<String>) {
-        // Grok and Claude Code are started as-is. OpenCode and the shell keep
-        // the composed plugin environment; Grok and Claude Code must not
-        // receive it or a written config.
-        let composed_content = match self.terminal_target {
-            TerminalTarget::Tui(CompatibleTui::Grok | CompatibleTui::ClaudeCode) => None,
-            TerminalTarget::Shell | TerminalTarget::Tui(CompatibleTui::OpenCode) => {
-                composed_content
-            }
-            // Remote tabs already return before this function. If it is reached,
-            // do not start a host PTY or inject the local OpenCode plugin.
-            TerminalTarget::RemoteShell { .. }
-            | TerminalTarget::RemoteOpenCode { .. }
-            | TerminalTarget::RemoteGrok { .. }
-            | TerminalTarget::RemoteClaude { .. } => {
-                return;
-            }
-        };
+    fn start_terminal(&mut self) {
+        // Remote tabs already return before this function. If it is reached,
+        // do not start a host PTY or inject the local OpenCode plugin.
+        if self.terminal_target.is_remote() {
+            return;
+        }
         // One PATH snapshot serves the primary spawn and the fallback retry, so
         // a TUI resolves to the same executable for both.
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1192,9 +1040,7 @@ impl Workbench {
             self.terminal_error = Some(detail);
             return;
         };
-        // Local shell and direct Claude Code tabs load Made's session-only
-        // plugin and report to this tab's own spool.
-        let (mut claude_spool, claude_launch) = self.prepare_claude_launch();
+        let (contributions, composed) = self.prepare_launches();
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1207,11 +1053,7 @@ impl Workbench {
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");
-        options = with_claude_launch_env(options, self.terminal_target, &claude_launch);
-
-        if let Some(content) = &composed_content {
-            options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
-        }
+        options = apply_contributions(&contributions, options);
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
             Ok(pane) => {
@@ -1225,10 +1067,10 @@ impl Workbench {
                         ),
                     );
                 }
-                self.install_claude(pane.pid(), claude_spool.take());
+                self.notify_spawned(pane.pid());
                 self.terminal = Some(pane);
                 self.terminal_error = None;
-                if composed_content.is_none() {
+                if !composed {
                     self.diag.log_mut().record(
                         LogLevel::Warn,
                         format!(
@@ -1250,10 +1092,7 @@ impl Workbench {
                             .without_env("SHELLOPTS")
                             .without_env("BASH_ENV")
                             .without_env("ENV");
-                        retry = with_claude_launch_env(retry, self.terminal_target, &claude_launch);
-                        if let Some(content) = &composed_content {
-                            retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
-                        }
+                        retry = apply_contributions(&contributions, retry);
                         if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
                             let pane = pane.with_target(self.terminal_target);
                             self.diag.log_mut().record(
@@ -1268,7 +1107,7 @@ impl Workbench {
                             if let Some(follow) = self.follow.as_mut() {
                                 follow.set_terminal_cwd(&self.terminal_cwd);
                             }
-                            self.install_claude(pane.pid(), claude_spool.take());
+                            self.notify_spawned(pane.pid());
                             self.terminal = Some(pane);
                             self.terminal_error = None;
                             return;
@@ -1281,130 +1120,221 @@ impl Workbench {
                 );
                 self.diag.log_mut().record(LogLevel::Error, detail.clone());
                 self.terminal_error = Some(detail);
+                for state in self.tab_states.iter_mut() {
+                    state.on_launch_failed();
+                }
             }
         }
     }
 
-    /// Create this tab's spool and compose its Claude Code environment. Only
-    /// local shell and direct Claude Code tabs get one.
-    fn prepare_claude_launch(&mut self) -> (Option<TabSpool>, ClaudeLaunchEnv) {
-        if !self.terminal_target.loads_claude_plugin() {
-            return (None, ClaudeLaunchEnv::default());
-        }
-        self.claude_plugin = self
-            .paths
-            .as_ref()
-            .and_then(|paths| ready_claude_plugin_dir(paths.shipped_claude_plugin_dir()));
-        let shipped = self.claude_plugin.clone();
-        let spool = if shipped.is_some() {
-            self.open_claude_spool()
-        } else {
-            None
+    /// Ask every integration state to prepare this tab's launch, in list
+    /// order. Also whether an integration's contribution is the configuration
+    /// the launch needs.
+    fn prepare_launches(&mut self) -> (Vec<EnvContribution>, bool) {
+        let target = self.terminal_target;
+        let mut ctx = LaunchCtx {
+            paths: self.paths.as_ref(),
+            pane_id: &self.pane_id,
+            log: self.diag.log_mut(),
         };
-        let existing = std::env::var_os(made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV);
-        let launch = self.terminal_target.claude_launch_env(
-            shipped.as_deref(),
-            existing.as_deref(),
-            spool.as_ref().map(TabSpool::path),
-        );
-        if launch.hooks_unavailable {
-            self.diag.log_mut().record(
-                LogLevel::Warn,
-                "Claude Code session-status hooks are unavailable for this tab",
-            );
+        let mut contributions = Vec::new();
+        let mut configured = false;
+        for (index, entry) in self.integrations.iter().enumerate() {
+            let Some(state) = self.tab_states.get_mut(index) else {
+                continue;
+            };
+            let policy = entry.env_policy();
+            let covered = policy.covers(*entry, target);
+            let contribution = state.prepare_launch(target, covered, &mut ctx);
+            let contribution = if covered {
+                contribution
+            } else {
+                policy.uncovered_contribution()
+            };
+            configured |= entry.configures_launch(&contribution);
+            contributions.push(contribution);
         }
-        (spool, launch)
+        (contributions, configured)
     }
 
-    fn open_claude_spool(&mut self) -> Option<TabSpool> {
-        let temp_dir = self.paths.as_ref()?.temp_dir.clone();
-        let opened =
-            shared_instance(&temp_dir).and_then(|instance| TabSpool::open(instance, &self.pane_id));
-        match opened {
-            Ok(spool) => Some(spool),
-            Err(error) => {
-                self.diag.log_mut().record(
-                    LogLevel::Warn,
-                    format!("Claude Code spool could not be created: {error}"),
-                );
-                None
+    /// Tell every integration state that the terminal child started.
+    fn notify_spawned(&mut self, pid: Option<u32>) {
+        for state in self.tab_states.iter_mut() {
+            state.on_spawned(pid);
+        }
+    }
+
+    /// Tell every integration state that its terminal is gone.
+    fn teardown_tab_states(&mut self) {
+        for state in self.tab_states.iter_mut() {
+            state.teardown();
+        }
+    }
+
+    /// Poll every integration state whose turn it is: all of them but the
+    /// session-channel owner on a local tab, those that declare it on a remote
+    /// tab. A directory report goes to the follow coordinator and its outcome
+    /// back to the state that reported it.
+    fn poll_integrations(&mut self, now: Instant) {
+        let remote = self.remote.is_some();
+        for index in 0..self.integrations.len() {
+            let entry = self.integrations[index];
+            let polled = if remote {
+                entry.polls_remote_tabs()
+            } else {
+                entry.follow() != FollowKind::SessionChannel
+            };
+            if !polled {
+                continue;
+            }
+            let Some(state) = self.tab_states.get_mut(index) else {
+                continue;
+            };
+            let mut io = TabIo {
+                terminal: self.terminal.as_mut(),
+                target: self.terminal_target,
+                remote,
+                follow: FollowPort::new(
+                    self.follow.as_mut(),
+                    self.plan.as_ref().map(|plan| plan.explorer_root.as_path()),
+                ),
+            };
+            let report = state.poll(now, &mut io);
+            for step in io.follow.into_steps() {
+                match step {
+                    FollowStep::Outcome(outcome) => {
+                        if outcome.root_switched
+                            || self.explorer_generation_mismatch(outcome.generation)
+                        {
+                            self.switch_root(
+                                outcome.root,
+                                outcome.generation,
+                                RootSwitchOrigin::Session,
+                            );
+                        }
+                    }
+                    FollowStep::Activity => self.last_activity = now,
+                }
+            }
+            let Some(directory) = report.directory else {
+                continue;
+            };
+            let outcome = self
+                .follow
+                .as_mut()
+                .map(|follow| follow.follow_directory(entry, directory.as_deref()));
+            if let Some(outcome) = outcome.as_ref() {
+                if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+                    self.switch_root(
+                        outcome.root.clone(),
+                        outcome.generation,
+                        RootSwitchOrigin::Session,
+                    );
+                }
+            }
+            if let Some(state) = self.tab_states.get_mut(index) {
+                state.on_follow_outcome(outcome.as_ref());
             }
         }
     }
 
-    fn install_claude(&mut self, pid: Option<u32>, spool: Option<TabSpool>) {
-        if !self.terminal_target.loads_claude_plugin() {
-            return;
-        }
-        let direct = self.terminal_target == TerminalTarget::Tui(CompatibleTui::ClaudeCode);
-        let mut tab = ClaudeTab::new(pid.unwrap_or(0), direct);
-        tab.set_child_running(true);
-        self.claude = Some(ClaudeRuntime {
-            tab,
-            spool,
-            liveness_checked_at: Instant::now(),
-            present_since: None,
-            applied_directory: None,
-            rejected_directory: None,
+    /// The per-tab integration states, parallel to [`Self::integrations`].
+    pub(crate) fn tab_states(&self) -> &Slots<Box<dyn TabState>> {
+        &self.tab_states
+    }
+
+    /// The integrations this tab was built with, in catalog order.
+    pub(crate) fn integrations(&self) -> IntegrationList {
+        self.integrations
+    }
+
+    /// Hand what one integration's app-wide state knows about this local
+    /// workspace to the tab states.
+    pub(crate) fn publish_app_state(&mut self, id: WorkspaceId, state: &dyn AppState) {
+        let terminal_running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+        state.publish(&mut WorkspaceTabs {
+            id,
+            list: self.integrations,
+            target: self.terminal_target,
+            terminal_running,
+            tab_states: &mut self.tab_states,
         });
     }
 
-    /// Claude Code state of this tab: presence, dots and title inputs. `None`
-    /// for tabs that do not load Made's Claude Code plugin.
-    pub fn claude_tab(&self) -> Option<&ClaudeTab> {
-        self.claude.as_ref().map(|runtime| &runtime.tab)
+    /// How the integration at `index` of this tab's list brands the tab, or
+    /// `None` when it does not.
+    pub(crate) fn presentation_of(&self, index: usize) -> Option<Presentation> {
+        let state = self.tab_states.get(index)?;
+        let terminal = self.terminal.as_ref();
+        state.presentation(&PresentationCtx {
+            target: self.terminal_target,
+            remote: self.remote.is_some(),
+            terminal_running: terminal.is_some_and(TerminalPane::is_running),
+            terminal_title: terminal.and_then(TerminalPane::title),
+            connected: self.is_connected(),
+            session_map: &self.session_map,
+        })
     }
 
+    /// The diagnostics rows of this tab's integrations, in list order, under
+    /// the keys they declared. An integration with no tab state keeps the row
+    /// it declared before detection.
+    pub(crate) fn row_reports(&self) -> Vec<(&'static str, RowReport)> {
+        let remote = self.remote.is_some();
+        self.integrations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let DiagnosticsDecl::Row(decl) = entry.diagnostics() else {
+                    return None;
+                };
+                let report = self
+                    .tab_states
+                    .get(index)
+                    .and_then(|state| state.row(remote))?;
+                Some((decl.status_key, report))
+            })
+            .collect()
+    }
+
+    // BEGIN remote-path (AIA-02)
     /// Record this remote tab's own `claude` detection: `None` while its probe
     /// is pending. The host PATH is never consulted for a remote tab.
     pub fn set_remote_claude_detection(&mut self, detected: Option<bool>) {
-        if let Some(remote) = self.remote.as_mut() {
-            remote.claude_detected = detected;
+        if self.remote.is_none() {
+            return;
+        }
+        if let Some(state) =
+            crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
+            state.set_remote_detection(detected);
         }
     }
 
-    /// Record the app-wide Claude Code detection state for the diagnostics row.
-    pub(crate) fn set_claude_phase(&mut self, phase: ClaudeDiagnosticsPhase) {
-        self.claude_phase = phase;
+    /// Keep this remote tab's Grok Build diagnostics row for the next
+    /// snapshot.
+    pub(crate) fn set_remote_grok_row(
+        &mut self,
+        row: crate::integrations::grok::diagnostics::GrokDiagnosticsRow,
+    ) {
+        let remote_hooks_ready =
+            self.remote_grok_running() && self.remote_grok_hooks_ready() == Some(true);
+        if let Some(state) =
+            crate::integrations::grok::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
+            state.set_diagnostics(row, remote_hooks_ready);
+        }
+    }
+    // END remote-path
+
+    /// The tab's bridge, once it started.
+    pub(crate) fn bridge(&self) -> Option<&BridgeHandle> {
+        session_bridge(self.integrations, &self.tab_states)
     }
 
-    /// The Claude Code diagnostics row for this workspace.
-    pub(crate) fn claude_diagnostics(&self) -> crate::diagnostics::ClaudeDiagnosticsReport {
-        let runtime = self.claude.as_ref();
-        let present = runtime.is_some_and(|runtime| runtime.tab.present());
-        if let Some(remote) = self.remote.as_ref() {
-            // A remote workspace reports its own server's detection and this
-            // tab's presence; the host's plugin and PATH never apply.
-            return remote_claude_diagnostics_row(&ClaudeDiagnosticsInputs {
-                phase: match remote.claude_detected {
-                    None => ClaudeDiagnosticsPhase::Checking,
-                    Some(false) => ClaudeDiagnosticsPhase::NotOnPath,
-                    Some(true) => ClaudeDiagnosticsPhase::Available,
-                },
-                plugin_missing: false,
-                present,
-                present_for: runtime
-                    .and_then(|runtime| runtime.present_since)
-                    .map_or(Duration::ZERO, |since| {
-                        Instant::now().saturating_duration_since(since)
-                    }),
-                live_session: false,
-                protocol_observed: runtime
-                    .is_some_and(|runtime| runtime.tab.protocol_status_seen()),
-            });
-        }
-        claude_diagnostics_row(&ClaudeDiagnosticsInputs {
-            phase: self.claude_phase,
-            plugin_missing: self.claude_plugin.is_none(),
-            present,
-            present_for: runtime
-                .and_then(|runtime| runtime.present_since)
-                .map_or(Duration::ZERO, |since| {
-                    Instant::now().saturating_duration_since(since)
-                }),
-            live_session: runtime.is_some_and(|runtime| runtime.tab.session_count() > 0),
-            protocol_observed: runtime.is_some_and(|runtime| runtime.tab.protocol_status_seen()),
-        })
+    /// The bridge credential, while the tab runs.
+    pub(crate) fn token(&self) -> Option<&Token> {
+        session_token(self.integrations, &self.tab_states)
     }
 
     fn log_launch_context(&mut self) {
@@ -1452,11 +1382,6 @@ impl Workbench {
         &self.integration
     }
 
-    /// Record that OpenCode is not installed or not on PATH.
-    pub fn note_opencode_missing(&mut self) {
-        self.integration.note_opencode_missing();
-    }
-
     /// Session map.
     pub fn session_map(&self) -> &SessionMap {
         &self.session_map
@@ -1477,40 +1402,13 @@ impl Workbench {
         &self.diag
     }
 
-    /// Keep the Grok Build diagnostics row for the next snapshot.
-    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
-        // Consent authorizes Made's installer, not hooks a user installed.
-        // Keep transport, detection, install and not-running rows unchanged.
-        let hooks_ready = self.remote_grok_running()
-            && self.remote_grok_hooks_ready() == Some(true)
-            && (row == GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED
-                || row == GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
-        self.grok_diagnostics = if hooks_ready {
-            GrokDiagnosticsRow::READY
-        } else {
-            row
-        };
-    }
-
-    /// Grok Build pill and sentence currently shown in About.
-    pub(crate) fn grok_diagnostics(&self) -> GrokDiagnosticsRow {
-        self.grok_diagnostics.clone()
-    }
-
-    /// Record that Grok session follow has no status hooks.
-    ///
-    /// Called when the shipped plugin could not be installed. Repeated calls
-    /// keep a single warning.
-    pub(crate) fn note_grok_session_hooks_unavailable(&mut self) {
-        const MESSAGE: &str = "Grok session follow: session-status hooks are unavailable";
-        if self.diag.log().entries().any(|entry| {
-            entry
-                .message
-                .contains("session-status hooks are unavailable")
-        }) {
-            return;
-        }
-        self.diag.log_mut().record(LogLevel::Warn, MESSAGE);
+    /// Record in this workspace what an app-wide integration state knows that
+    /// the workspace has to keep.
+    pub(crate) fn notify_from(&mut self, state: &dyn AppState) {
+        state.notify_workspace(&mut WorkspaceNotices {
+            log: self.diag.log_mut(),
+            session: &mut self.integration,
+        });
     }
 
     /// Terminal pane, when the shell started.
@@ -1899,7 +1797,7 @@ impl Workbench {
 
     /// Set a transient status notice.
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        let notice = sanitize_copy_text(&notice.into(), self.token.as_ref(), 240);
+        let notice = sanitize_copy_text(&notice.into(), self.token(), 240);
         self.pending_notice = Some((notice, Instant::now() + NOTICE_TTL));
     }
 
@@ -1915,7 +1813,7 @@ impl Workbench {
             }
             return;
         }
-        let Some(bridge) = self.bridge.as_ref() else {
+        let Some(bridge) = session_bridge(self.integrations, &self.tab_states) else {
             self.set_notice("Focus is unavailable: the integration is not connected.");
             return;
         };
@@ -2411,6 +2309,7 @@ impl Workbench {
             .map(|remote| remote.workspace.integration())
     }
 
+    // BEGIN remote-path (AIA-02)
     /// Whether this remote tab presents OpenCode: the owning remote
     /// integration is connected through the attached session, or a directly
     /// launched remote OpenCode process is still alive before its first
@@ -2531,6 +2430,7 @@ impl Workbench {
             })
             .collect()
     }
+    // END remote-path
 
     pub fn remote_projection(&self) -> Option<&crate::remote_workspace::WorkspaceProjection> {
         self.remote
@@ -2815,7 +2715,7 @@ impl Workbench {
         self.pump_remote_client();
         self.sync_remote_sessions();
         let terminal_changed = self.pump_remote_terminal();
-        self.poll_claude(Instant::now());
+        self.poll_integrations(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
         // must not drive an immediate repaint of the active local tab: that
@@ -2959,6 +2859,7 @@ impl Workbench {
         let capabilities = report.capabilities;
         // Presence is recorded; the field itself is not a gate.
         let _ = capabilities.tmux;
+        // BEGIN remote-path (AIA-02)
         if remote.opencode && !capabilities.opencode {
             remote.phase = RemotePhase::Failed;
             remote.detail =
@@ -2987,7 +2888,12 @@ impl Workbench {
         }
         // The owning tab's own detection feeds its Grok Build diagnostics row.
         remote.grok_detected = capabilities.grok;
-        remote.claude_detected = Some(report.claude);
+        if let Some(state) =
+            crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+        {
+            state.set_remote_detection(Some(report.claude));
+        }
+        // END remote-path
         let target = match capabilities.target {
             made_remote::protocol::RemoteTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
             made_remote::protocol::RemoteTarget::LinuxArm64 => "aarch64-unknown-linux-gnu",
@@ -3243,6 +3149,7 @@ impl Workbench {
             return;
         };
         let directory = remote.workspace.launch_directory().clone();
+        // BEGIN remote-path (AIA-02)
         let launch = if remote.opencode {
             made_remote::protocol::LaunchTarget::OpenCode
         } else if remote.grok {
@@ -3252,6 +3159,7 @@ impl Workbench {
         } else {
             made_remote::protocol::LaunchTarget::Shell
         };
+        // END remote-path
         let operation = crate::remote_session::first_operation(
             remote.session_open,
             directory,
@@ -3425,6 +3333,7 @@ impl Workbench {
                             LogLevel::Info,
                             format!("remote session reply: {}", operation_name(&reply.operation)),
                         );
+                        // BEGIN remote-path (AIA-02)
                         // The client classifies Grok snapshots and events as
                         // unsolicited pushes riding the current attach id.
                         // They never consume a pending workspace request
@@ -3438,6 +3347,7 @@ impl Workbench {
                             let _ = remote.workspace.accept_grok_push(reply);
                             continue;
                         }
+                        // END remote-path
                         if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
                             let mut reply = reply;
                             reply.request_id = workspace_id;
@@ -3550,7 +3460,7 @@ impl Workbench {
             .log_mut()
             .record(LogLevel::Error, "remote transport disconnected");
         // Remote Claude Code status and title do not outlive the transport.
-        self.claude = None;
+        self.teardown_tab_states();
         if let Some(remote) = self.remote.as_mut() {
             remote.workspace.disconnect();
             remote.phase = RemotePhase::Failed;
@@ -3705,7 +3615,7 @@ impl Workbench {
         pane.attach_remote_transport(Box::new(client.terminal_transport()));
         self.terminal = Some(pane);
         // A new remote terminal waits for its own fresh emission.
-        self.claude = None;
+        self.teardown_tab_states();
         self.terminal_error = None;
         if let Some(remote) = self.remote.as_mut() {
             remote.snapshot_gate = crate::remote_session::SnapshotGate::default();
@@ -4040,9 +3950,7 @@ impl Workbench {
 
         self.poll_shell_root_revalidation(now);
         self.maybe_schedule_shell_root_revalidation(now);
-        self.poll_grok_hooks(now);
-        self.poll_grok_directory(now);
-        self.poll_claude(now);
+        self.poll_integrations(now);
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -4058,14 +3966,12 @@ impl Workbench {
         }
         self.push_git_chrome();
 
-        let bridge_counters = self
-            .bridge
-            .as_ref()
+        let bridge_counters = session_bridge(self.integrations, &self.tab_states)
             .map(|bridge| (bridge.dropped_events(), bridge.coalesced_states()));
         if let Some((dropped, coalesced)) = bridge_counters {
             self.metrics.set_bridge_counters(dropped, coalesced);
         }
-        if let Some(bridge) = self.bridge.as_ref() {
+        if let Some(bridge) = session_bridge(self.integrations, &self.tab_states) {
             let update = self.focus.tick(bridge);
             if update.outcome != FocusOutcome::Idle {
                 self.handle_focus_update(update);
@@ -4102,7 +4008,7 @@ impl Workbench {
 
         if active || recent_activity {
             ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
-        } else if self.bridge.as_ref().is_some_and(BridgeHandle::is_connected) {
+        } else if self.bridge().is_some_and(BridgeHandle::is_connected) {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -4170,348 +4076,6 @@ impl Workbench {
         }
     }
 
-    /// Whether Grok is running in this workspace.
-    ///
-    /// Running means the terminal target is Grok and that process is still
-    /// alive, or the inventory has confirmed at least one open Grok session
-    /// for this terminal. A hook row starts with an empty `opened_at` and does
-    /// not count until that confirmation. The tab label is not part of the
-    /// check: OpenCode can own the label while Grok runs.
-    pub(crate) fn grok_follow_running(&self) -> bool {
-        let living_target = matches!(
-            self.terminal_target,
-            TerminalTarget::Tui(CompatibleTui::Grok)
-        ) && self.terminal.as_ref().is_some_and(TerminalPane::is_running);
-        let confirmed = self
-            .grok_sessions
-            .iter()
-            .any(|session| !session.opened_at.is_empty());
-        living_target || confirmed
-    }
-
-    /// Status dots for Grok sessions open in this terminal.
-    pub(crate) fn grok_tab_activities(&self) -> Vec<SessionActivity> {
-        let mut sessions = self.grok_sessions.clone();
-        sessions.sort_by(|left, right| left.opened_at.cmp(&right.opened_at));
-        sessions
-            .into_iter()
-            .map(|session| session.activity)
-            .collect()
-    }
-
-    /// Apply hook lines as soon as they are appended.
-    fn poll_grok_hooks(&mut self, now: Instant) {
-        let (offset, events) = crate::grok_follow::read_hook_events(self.grok_log_offset);
-        self.grok_log_offset = offset;
-        for event in events {
-            let moves_explorer = matches!(
-                event.event.to_ascii_lowercase().as_str(),
-                "session_start" | "sessionstart" | "user_prompt_submit" | "userpromptsubmit"
-            );
-            if event.event.eq_ignore_ascii_case("session_end")
-                || event.event.eq_ignore_ascii_case("sessionend")
-            {
-                let ended = event.session_id.clone();
-                let was_provisional = self.grok_provisional_id.as_deref() == Some(ended.as_str());
-                self.grok_closed.insert(ended.clone());
-                self.grok_sessions.retain(|session| session.id != ended);
-                if was_provisional {
-                    self.release_provisional_move();
-                } else if self.grok_sessions.is_empty() {
-                    self.grok_file_newest_id = None;
-                    self.follow_grok_path(None);
-                }
-                continue;
-            }
-            // The log is global. Re-read inventory before moving so a session
-            // this tab owns is not delayed, and a foreign pid is not followed.
-            let ownership = self.hook_session_ownership(&event.session_id);
-            if ownership == crate::grok_follow::SessionOwnership::Foreign {
-                let id = event.session_id.clone();
-                let was_provisional = self.grok_provisional_id.as_deref() == Some(id.as_str());
-                self.grok_sessions.retain(|session| session.id != id);
-                if was_provisional {
-                    self.release_provisional_move();
-                }
-                continue;
-            }
-            self.grok_closed.remove(&event.session_id);
-            let activity = match event.status.as_str() {
-                "working" => SessionActivity::Busy,
-                "attention" | "error" => SessionActivity::Attention,
-                _ => SessionActivity::Idle,
-            };
-            let cwd = PathBuf::from(&event.cwd);
-            if let Some(session) = self
-                .grok_sessions
-                .iter_mut()
-                .find(|session| session.id == event.session_id)
-            {
-                session.activity = activity;
-                session.touched = now;
-                if cwd.is_absolute() {
-                    session.cwd = cwd.clone();
-                }
-            } else if !event.session_id.is_empty() {
-                self.grok_sessions.push(GrokLiveSession {
-                    id: event.session_id.clone(),
-                    cwd: cwd.clone(),
-                    opened_at: String::new(),
-                    activity,
-                    touched: now,
-                });
-            }
-            if moves_explorer && cwd.is_absolute() {
-                if ownership == crate::grok_follow::SessionOwnership::Owned {
-                    // A prompt in a session this tab owns replaces any earlier
-                    // provisional move, including one for a different session.
-                    self.clear_provisional_slot();
-                    self.follow_grok_path(Some(cwd.as_path()));
-                } else {
-                    self.begin_provisional_move(&event.session_id, cwd.as_path());
-                }
-            }
-            self.last_activity = now;
-        }
-    }
-
-    fn hook_session_ownership(&self, session_id: &str) -> crate::grok_follow::SessionOwnership {
-        let Some(pid) = self.terminal.as_ref().and_then(TerminalPane::pid) else {
-            return crate::grok_follow::SessionOwnership::Unknown;
-        };
-        crate::grok_follow::session_ownership(pid, session_id)
-    }
-
-    /// Remember the directory this tab was following, then follow `cwd` until
-    /// inventory confirms the session.
-    fn begin_provisional_move(&mut self, session_id: &str, cwd: &Path) {
-        if self.grok_provisional_id.is_none() {
-            self.grok_restore_root = self.follow.as_ref().and_then(|follow| {
-                (follow.effective_root_source() == crate::session_follow::RootSource::Grok)
-                    .then(|| follow.current_root().to_path_buf())
-            });
-        }
-        self.grok_provisional_id = Some(session_id.to_owned());
-        self.follow_grok_path(Some(cwd));
-        self.grok_provisional_cwd = self.explorer_root().map(Path::to_path_buf);
-    }
-
-    fn clear_provisional_slot(&mut self) {
-        self.grok_provisional_id = None;
-        self.grok_provisional_cwd = None;
-        self.grok_restore_root = None;
-    }
-
-    fn release_provisional_move(&mut self) {
-        if self.grok_provisional_id.is_none() {
-            return;
-        }
-        let restore = self.grok_restore_root.take();
-        let provisional_cwd = self.grok_provisional_cwd.take();
-        self.grok_provisional_id = None;
-        // An owned prompt after this move already left the provisional
-        // directory. Restoring would undo that prompt.
-        let still_there = provisional_cwd
-            .as_ref()
-            .is_some_and(|cwd| self.explorer_root() == Some(cwd.as_path()));
-        if !still_there {
-            return;
-        }
-        match restore {
-            Some(path) => self.follow_grok_path(Some(&path)),
-            None => self.follow_grok_path(None),
-        }
-    }
-
-    /// Refresh the open-session inventory and follow a newly attached session.
-    fn poll_grok_directory(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.grok_checked_at) < Duration::from_secs(1) {
-            return;
-        }
-        self.grok_checked_at = now;
-        let Some(pid) = self.terminal.as_ref().and_then(TerminalPane::pid) else {
-            return;
-        };
-        let open = crate::grok_follow::open_sessions(pid);
-        let open_ids: Vec<&str> = open.iter().map(|row| row.session_id.as_str()).collect();
-        self.grok_closed
-            .retain(|id| open_ids.contains(&id.as_str()));
-        for row in &open {
-            if self.grok_closed.contains(&row.session_id) {
-                continue;
-            }
-            let cwd = PathBuf::from(&row.cwd);
-            if let Some(session) = self
-                .grok_sessions
-                .iter_mut()
-                .find(|session| session.id == row.session_id)
-            {
-                session.opened_at = row.opened_at.clone();
-                if cwd.is_absolute() {
-                    session.cwd = cwd;
-                }
-            } else {
-                self.grok_sessions.push(GrokLiveSession {
-                    id: row.session_id.clone(),
-                    cwd,
-                    opened_at: row.opened_at.clone(),
-                    activity: SessionActivity::Idle,
-                    touched: now,
-                });
-            }
-        }
-        let mut reverted_provisional = false;
-        if let Some(id) = self.grok_provisional_id.clone() {
-            let confirmed = open_ids.contains(&id.as_str());
-            if confirmed {
-                self.clear_provisional_slot();
-            } else {
-                // Pid is missing, or the row belongs to another process and was
-                // filtered out. Drop the dot and undo only that session's move.
-                self.grok_sessions.retain(|session| session.id != id);
-                self.release_provisional_move();
-                reverted_provisional = true;
-            }
-        }
-        self.grok_sessions.retain(|session| {
-            !self.grok_closed.contains(&session.id) && open_ids.contains(&session.id.as_str())
-        });
-        if reverted_provisional {
-            return;
-        }
-        let newest = open
-            .iter()
-            .rev()
-            .find(|row| !self.grok_closed.contains(&row.session_id));
-        match newest {
-            Some(row) if self.grok_file_newest_id.as_deref() != Some(row.session_id.as_str()) => {
-                self.grok_file_newest_id = Some(row.session_id.clone());
-                let path = PathBuf::from(&row.cwd);
-                if path.is_absolute() {
-                    self.follow_grok_path(Some(path.as_path()));
-                }
-            }
-            None if open.is_empty() && self.grok_file_newest_id.is_some() => {
-                self.grok_file_newest_id = None;
-                self.follow_grok_path(None);
-            }
-            _ => {}
-        }
-    }
-
-    /// Apply this tab's Claude Code channels: terminal protocol events and the
-    /// shell-prompt report, spool records read off the UI thread, the
-    /// one-second liveness check and the session directory.
-    fn poll_claude(&mut self, now: Instant) {
-        // A remote tab has no spool, no hook sessions and no process anchor: its
-        // runtime exists to carry the status protocol of its remote terminal.
-        if self.claude.is_none() && self.remote.is_some() {
-            let direct = matches!(self.terminal_target, TerminalTarget::RemoteClaude { .. });
-            self.claude = Some(ClaudeRuntime {
-                tab: ClaudeTab::new(0, direct),
-                spool: None,
-                liveness_checked_at: now,
-                present_since: None,
-                applied_directory: None,
-                rejected_directory: None,
-            });
-        }
-        let Some(runtime) = self.claude.as_mut() else {
-            return;
-        };
-        let Some(terminal) = self.terminal.as_mut() else {
-            return;
-        };
-        if let Some(pid) = terminal.pid() {
-            runtime.tab.set_root(pid);
-        }
-        let prompt_reported = terminal.take_cwd_report();
-        runtime
-            .tab
-            .apply_terminal_reports(terminal.take_protocol_events(), prompt_reported);
-        runtime.tab.set_child_running(terminal.is_running());
-        // One process map serves every ancestry and liveness check of this
-        // poll. It is built only when a check needs it, and records stay
-        // queued until the terminal process is known.
-        let tick_due =
-            now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL;
-        let records = if runtime.tab.root_known() {
-            runtime
-                .spool
-                .as_ref()
-                .map(TabSpool::drain)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut parents = None;
-        let mut parent_of = |pid: u32| -> Option<u32> {
-            parents
-                .get_or_insert_with(made_platform::process_parent_map)
-                .get(&pid)
-                .copied()
-        };
-        if !records.is_empty() {
-            runtime.tab.ingest(records, &mut parent_of);
-        }
-        if tick_due {
-            runtime.liveness_checked_at = now;
-            runtime.tab.check_liveness(&mut parent_of);
-        }
-        if runtime.tab.present() {
-            runtime.present_since.get_or_insert(now);
-        } else if runtime.present_since.take().is_some() {
-            runtime.tab.reset_observations();
-        }
-        let directory = runtime.tab.directory().map(PathBuf::from);
-        if directory == runtime.applied_directory {
-            return;
-        }
-        if !tick_due && directory.is_some() && directory == runtime.rejected_directory {
-            return;
-        }
-        let accepted = self.follow_claude_path(directory.as_deref());
-        if let Some(runtime) = self.claude.as_mut() {
-            if accepted {
-                runtime.applied_directory.clone_from(&directory);
-                runtime.rejected_directory = None;
-            } else {
-                runtime.rejected_directory = directory;
-            }
-        }
-    }
-
-    /// Hand the Claude Code directory to the follow coordinator. Returns
-    /// whether it was accepted; a rejected directory is not remembered as
-    /// applied.
-    fn follow_claude_path(&mut self, directory: Option<&Path>) -> bool {
-        let Some(outcome) = self
-            .follow
-            .as_mut()
-            .map(|follow| follow.follow_claude_directory(directory))
-        else {
-            return true;
-        };
-        let accepted = !matches!(outcome.update, SessionFollowUpdate::RejectedSnapshot { .. });
-        if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
-            self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
-        }
-        accepted
-    }
-
-    fn follow_grok_path(&mut self, directory: Option<&Path>) {
-        let Some(outcome) = self
-            .follow
-            .as_mut()
-            .map(|follow| follow.follow_grok_directory(directory))
-        else {
-            return;
-        };
-        if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
-            self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
-        }
-    }
-
     /// Offer a low-frequency check only while the shell owns the root. The
     /// worker has a bounded one-slot queue and never blocks a frame.
     fn maybe_schedule_shell_root_revalidation(&mut self, now: Instant) {
@@ -4540,7 +4104,7 @@ impl Workbench {
     }
 
     fn drain_bridge_events(&mut self) -> bool {
-        let Some(bridge) = self.bridge.as_ref() else {
+        let Some(bridge) = session_bridge(self.integrations, &self.tab_states) else {
             return false;
         };
         let mut events = Vec::new();
@@ -4630,7 +4194,7 @@ impl Workbench {
             }
             BridgeEvent::State(snapshot) => self.handle_state(snapshot),
             BridgeEvent::FocusResult(result) => {
-                if let Some(bridge) = self.bridge.as_ref() {
+                if let Some(bridge) = session_bridge(self.integrations, &self.tab_states) {
                     let update = self.focus.handle_result(bridge, result);
                     self.handle_focus_update(update);
                 }
@@ -5216,7 +4780,7 @@ impl Workbench {
             Some(title) => format!("{title} — {BASE_TITLE}"),
             None => format!("{BASE_TITLE} — {workspace}"),
         };
-        let title = sanitize_copy_text(&title, self.token.as_ref(), 220);
+        let title = sanitize_copy_text(&title, self.token(), 220);
         if self.last_title.as_deref() != Some(title.as_str()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = Some(title);
@@ -5264,41 +4828,9 @@ impl Workbench {
             terminal.terminate(self.diag.log_mut());
         }
         // Closing the tab deletes its spool.
-        self.claude = None;
-        if let Some(bridge) = self.bridge.take() {
-            if let Err(error) = bridge.shutdown() {
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Warn, format!("bridge shutdown failed: {error}"));
-            }
-        }
-        if let Some(guard) = self.config_guard.take() {
-            match guard.after_session() {
-                Ok(ConfigVerification::Unchanged { state, .. }) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!(
-                            "user OpenCode config unchanged ({})",
-                            match state {
-                                ConfigFileState::Present => "present",
-                                ConfigFileState::Missing => "missing",
-                            }
-                        ),
-                    );
-                }
-                Ok(ConfigVerification::Changed { .. }) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        "user OpenCode config changed during the session (Made never writes it)",
-                    );
-                }
-                Err(error) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        format!("could not verify user OpenCode config: {error}"),
-                    );
-                }
-            }
+        self.teardown_tab_states();
+        for state in self.tab_states.iter_mut() {
+            state.shutdown(self.diag.log_mut());
         }
 
         self.diag.log_mut().record(
@@ -5314,7 +4846,9 @@ impl Workbench {
             self.diag.log_mut().record(LogLevel::Info, line);
         }
         self.write_diagnostics_log();
-        self.token = None;
+        for state in self.tab_states.iter_mut() {
+            state.after_shutdown();
+        }
     }
 
     fn write_diagnostics_log(&mut self) {
@@ -5333,7 +4867,7 @@ impl Workbench {
         // Build and scan the exact record that is written; no second render.
         let mut record = format!("--- made diagnostics (unix {timestamp}) ---\n");
         record.push_str(&snapshot.to_text());
-        if let Some(token) = &self.token {
+        if let Some(token) = session_token(self.integrations, &self.tab_states) {
             let secret = token.expose_secret();
             if !secret.is_empty() && record.contains(secret) {
                 let message = "refused to write diagnostics containing the bridge secret";
@@ -5462,14 +4996,18 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
+        // BEGIN remote-path (AIA-02)
         if let Some(report) = self.remote_opencode_diagnostics() {
             snapshot.set_remote_opencode(report);
         }
-        snapshot.set_grok_diagnostics(self.grok_diagnostics.clone());
-        snapshot.set_claude_diagnostics(self.claude_diagnostics());
+        // END remote-path
+        for (key, report) in self.row_reports() {
+            snapshot.set_row(key, report);
+        }
         snapshot
     }
 
+    // BEGIN remote-path (AIA-02)
     /// The owning remote tab's OpenCode integration for the diagnostics pill.
     /// Transport loss and integration loss stay distinguishable; the
     /// host-local integration state is never claimed for a remote tab.
@@ -5488,10 +5026,11 @@ impl Workbench {
             remote.workspace.projection().integration_error,
         ))
     }
+    // END remote-path
 
     /// Sanitized and token-redacted log path for the clipboard.
     pub fn sanitized_log_path(&self) -> String {
-        sanitize_copy_text(self.diag.copyable_log_path(), self.token.as_ref(), 2048)
+        sanitize_copy_text(self.diag.copyable_log_path(), self.token(), 2048)
     }
 
     /// Sanitized and token-redacted full diagnostics text for the clipboard.
@@ -5499,7 +5038,7 @@ impl Workbench {
         let mut text = self.diagnostics_snapshot().to_text();
         text.push_str("performance:\n");
         text.push_str(&self.metrics.report().to_text());
-        sanitize_copy_text(&text, self.token.as_ref(), 1024 * 1024)
+        sanitize_copy_text(&text, self.token(), 1024 * 1024)
     }
 
     /// Whether the integration is connected.
@@ -5826,63 +5365,10 @@ impl Drop for ShellRootWorker {
     }
 }
 
-/// Add a tab's Claude Code environment to its PTY options. A launch with no
-/// spool binding, including every target that does not load the plugin, also
-/// removes an inherited one, so a copied variable can never point a tab at
-/// another tab's spool.
-fn with_claude_launch_env(
-    mut options: made_terminal::PtyOptions,
-    target: TerminalTarget,
-    launch: &ClaudeLaunchEnv,
-) -> made_terminal::PtyOptions {
-    if !target.loads_claude_plugin() {
-        return options.without_env(CLAUDE_SPOOL_ENV);
-    }
-    let binds_spool = launch.env.iter().any(|(key, _)| key == CLAUDE_SPOOL_ENV);
-    for (key, value) in &launch.env {
-        options = options.with_env(key.clone(), value.clone());
-    }
-    if !binds_spool {
-        options = options.without_env(CLAUDE_SPOOL_ENV);
-    }
-    options
-}
-
 fn diagnostics_log_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
     // If app paths are unavailable, fail closed. A shared $TMPDIR path would be
     // predictable and symlink-attackable.
     paths.map(|paths| paths.log_dir.join(DEFAULT_LOG_FILE))
-}
-
-/// Reject special or oversized user config before any read.
-///
-/// Only a regular file at or below [`MAX_USER_CONFIG_BYTES`] is safe to read on
-/// the preparation path. A missing file is valid (composition starts empty).
-fn bounded_user_config(path: &Path) -> Result<(), String> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(format!(
-                    "user OpenCode config {} is not a regular file; skipped without reading",
-                    path.display()
-                ));
-            }
-            if metadata.len() > MAX_USER_CONFIG_BYTES {
-                return Err(format!(
-                    "user OpenCode config {} is {} bytes, above the {} byte limit; skipped without reading",
-                    path.display(),
-                    metadata.len(),
-                    MAX_USER_CONFIG_BYTES
-                ));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "user OpenCode config {} could not be inspected; skipped without reading: {error}",
-            path.display()
-        )),
-    }
 }
 
 fn usable_directory(path: &Path) -> bool {
@@ -5972,31 +5458,70 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::claude_code::diagnostics::ClaudeDiagnosticsPhase;
+    use crate::integrations::claude_code::launch::{CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV};
+    use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
+    use crate::integrations::{claude_code, grok, GROK, OPENCODE};
+
+    impl Workbench {
+        /// The Claude Code state of this tab.
+        fn claude_state_mut(&mut self) -> &mut claude_code::ClaudeTabState {
+            claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
+                .expect("the product list has Claude Code")
+        }
+
+        /// Claude Code state of this tab, `None` for a tab that does not load
+        /// the plugin.
+        fn claude_tab(&self) -> Option<&claude_code::follow::ClaudeTab> {
+            claude_code::tab(self)
+        }
+
+        /// Whether Grok is running in this workspace.
+        fn grok_follow_running(&self) -> bool {
+            let running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+            grok::tab_state(self.integrations, &self.tab_states)
+                .is_some_and(|state| state.follow_running(self.terminal_target, running))
+        }
+
+        /// Grok Build pill and sentence currently kept for this tab.
+        fn grok_row(&self) -> GrokDiagnosticsRow {
+            grok::tab_state(self.integrations, &self.tab_states).map_or(
+                GrokDiagnosticsRow::NOT_ON_PATH,
+                grok::GrokTabState::diagnostics,
+            )
+        }
+
+        /// The Grok state of this tab.
+        fn grok_state_mut(&mut self) -> &mut grok::GrokTabState {
+            grok::tab_state_mut(self.integrations, &mut self.tab_states)
+                .expect("the product list has Grok")
+        }
+    }
 
     #[test]
     fn targets_that_do_not_load_the_plugin_strip_an_inherited_spool_binding() {
         let authority = made_remote::protocol::AuthorityId([3; 16]);
-        let launch = ClaudeLaunchEnv::default();
         for target in [
-            TerminalTarget::Tui(CompatibleTui::OpenCode),
-            TerminalTarget::Tui(CompatibleTui::Grok),
+            TerminalTarget::Tui(OPENCODE),
+            TerminalTarget::Tui(GROK),
             TerminalTarget::RemoteShell { authority },
             TerminalTarget::RemoteOpenCode { authority },
             TerminalTarget::RemoteGrok { authority },
             TerminalTarget::RemoteClaude { authority },
         ] {
-            let options = with_claude_launch_env(
+            let options = apply_contributions(
+                &idle_workbench(target, None).prepare_launches().0,
                 made_terminal::PtyOptions::new(std::env::temp_dir()),
-                target,
-                &launch,
             );
             assert!(
                 options.env_remove.iter().any(|key| key == CLAUDE_SPOOL_ENV),
                 "{target:?} must not inherit another tab's spool"
             );
             assert!(
-                options.env.iter().all(|(key, _)| key != CLAUDE_SPOOL_ENV
-                    && key != made_platform::CLAUDE_CODE_PLUGIN_DIRS_ENV),
+                options
+                    .env
+                    .iter()
+                    .all(|(key, _)| key != CLAUDE_SPOOL_ENV && key != CLAUDE_CODE_PLUGIN_DIRS_ENV),
                 "{target:?} receives neither a spool nor the composed plugin list"
             );
         }
@@ -6005,15 +5530,25 @@ mod tests {
     #[test]
     fn the_diagnostics_row_reads_the_cached_plugin_state_not_the_filesystem() {
         let mut workbench = idle_workbench(TerminalTarget::Shell, None);
-        workbench.set_claude_phase(ClaudeDiagnosticsPhase::Available);
-        let sentence = |workbench: &Workbench| workbench.claude_diagnostics().sentence;
+        workbench
+            .claude_state_mut()
+            .set_phase(ClaudeDiagnosticsPhase::Available);
+        let sentence = |workbench: &Workbench| {
+            workbench
+                .diagnostics_snapshot()
+                .row("claude status")
+                .map(|row| row.sentence.clone())
+                .unwrap()
+        };
 
         assert_eq!(
             sentence(&workbench),
             "Claude Code session-status hooks are unavailable."
         );
         // A path that exists nowhere: only the cached value can say "present".
-        workbench.claude_plugin = Some(PathBuf::from("/nonexistent/made/claude-code-made"));
+        workbench
+            .claude_state_mut()
+            .set_plugin(Some(PathBuf::from("/nonexistent/made/claude-code-made")));
         for _ in 0..3 {
             assert_eq!(sentence(&workbench), "Claude Code is not running.");
         }
@@ -6161,32 +5696,6 @@ mod tests {
         assert!(!integration.status().is_degraded());
     }
 
-    #[test]
-    fn oversized_user_config_is_rejected_before_any_read() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cli.json");
-        std::fs::write(&path, vec![b'{'; (MAX_USER_CONFIG_BYTES + 1) as usize]).unwrap();
-        let error = bounded_user_config(&path).expect_err("oversized config must be skipped");
-        assert!(error.contains("above"), "{error}");
-        assert!(error.contains("skipped without reading"), "{error}");
-    }
-
-    #[test]
-    fn special_user_config_is_rejected_before_any_read() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = bounded_user_config(temp.path()).expect_err("directory is not a file");
-        assert!(error.contains("not a regular file"), "{error}");
-    }
-
-    #[test]
-    fn regular_user_config_within_the_cap_is_accepted() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cli.json");
-        std::fs::write(&path, b"{}").unwrap();
-        assert!(bounded_user_config(&path).is_ok());
-        assert!(bounded_user_config(&temp.path().join("missing.json")).is_ok());
-    }
-
     /// Terminates the stand-in child and skips the diagnostics-log write.
     struct GrokRunningProbe {
         workbench: Workbench,
@@ -6239,9 +5748,6 @@ mod tests {
             terminal_cwd: cwd.clone(),
             terminal_target: target,
             paths: None,
-            token: None,
-            bridge: None,
-            config_guard: None,
             config_failure: None,
             diag: Diagnostics::unavailable("grok running probe"),
             metrics: Metrics::new(),
@@ -6265,17 +5771,16 @@ mod tests {
             shell_root_check_in_flight: false,
             shell_root_checked_at: now,
             shell_root_check_interval: SHELL_ROOT_REVALIDATION_INTERVAL,
-            grok_checked_at: now,
-            grok_log_offset: 0,
-            grok_sessions: Vec::new(),
-            grok_closed: HashSet::new(),
-            grok_provisional_id: None,
-            grok_provisional_cwd: None,
-            grok_restore_root: None,
-            grok_file_newest_id: None,
-            claude: None,
-            claude_plugin: None,
-            claude_phase: ClaudeDiagnosticsPhase::NotOnPath,
+            integrations: PRODUCT,
+            tab_states: Slots::from_list(PRODUCT, |entry| {
+                entry.new_tab_state(
+                    target,
+                    &TabInit {
+                        paths: None,
+                        remote: false,
+                    },
+                )
+            }),
             instrumentation: RuntimeInstrumentation::new(),
             pane_id: "grok-running-probe".to_owned(),
             visible: false,
@@ -6285,7 +5790,6 @@ mod tests {
             sessions_visible: false,
             about_diagnostics_visible: false,
             about_open_generation: 0,
-            grok_diagnostics: GrokDiagnosticsRow::NOT_ON_PATH,
             tick_count: 0,
             paint_count: 0,
             last_osc7_cwd: None,
@@ -6308,8 +5812,11 @@ mod tests {
         }
     }
 
-    fn hook_or_inventory_session(id: &str, opened_at: &str) -> GrokLiveSession {
-        GrokLiveSession {
+    fn hook_or_inventory_session(
+        id: &str,
+        opened_at: &str,
+    ) -> crate::integrations::grok::tab::GrokLiveSession {
+        crate::integrations::grok::tab::GrokLiveSession {
             id: id.to_owned(),
             cwd: PathBuf::from("/tmp/made-grok-other-workspace"),
             opened_at: opened_at.to_owned(),
@@ -6335,7 +5842,7 @@ mod tests {
             "a shell with no Grok session is not running Grok"
         );
 
-        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.terminal_target = TerminalTarget::Tui(GROK);
         probe.last_title = Some("OpenCode".to_owned());
         assert!(
             probe.grok_follow_running(),
@@ -6344,14 +5851,15 @@ mod tests {
 
         probe.terminal_target = TerminalTarget::Shell;
         probe
-            .grok_sessions
+            .grok_state_mut()
+            .sessions_mut()
             .push(hook_or_inventory_session("other-workspace", ""));
         assert!(
             !probe.grok_follow_running(),
             "a hook-only session with an empty opened_at is not confirmed for this terminal"
         );
 
-        probe.grok_sessions.clear();
+        probe.grok_state_mut().sessions_mut().clear();
         if let Some(mut terminal) = probe.terminal.take() {
             terminal.terminate(probe.diag.log_mut());
         }
@@ -6361,25 +5869,30 @@ mod tests {
             .and_then(TerminalPane::pid)
             .is_none());
         probe
-            .grok_sessions
+            .grok_state_mut()
+            .sessions_mut()
             .push(hook_or_inventory_session("recorded-without-pid", ""));
-        probe.terminal_target = TerminalTarget::Tui(CompatibleTui::Grok);
+        probe.terminal_target = TerminalTarget::Tui(GROK);
         assert!(
             !probe.grok_follow_running(),
             "a hook row recorded while this terminal has no pid must not count as running"
         );
 
-        probe.grok_sessions.push(hook_or_inventory_session(
-            "this-terminal",
-            "2024-01-01T00:00:01Z",
-        ));
+        probe
+            .grok_state_mut()
+            .sessions_mut()
+            .push(hook_or_inventory_session(
+                "this-terminal",
+                "2024-01-01T00:00:01Z",
+            ));
         assert!(
             probe.grok_follow_running(),
             "inventory confirmation is a non-empty opened_at on this terminal's session"
         );
 
         probe
-            .grok_sessions
+            .grok_state_mut()
+            .sessions_mut()
             .retain(|session| session.opened_at.is_empty());
         probe.terminal_target = TerminalTarget::Shell;
         assert!(
@@ -8444,16 +7957,16 @@ mod tests {
             }
             // One more pump flushes a reply the output queued for the transport.
             bench.pump();
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
         }
 
         #[test]
         fn remote_claude_status_arrives_through_the_remote_terminal_only() {
-            use crate::claude_follow::ClaudeActivity;
+            use crate::integrations::claude_code::follow::ClaudeActivity;
 
             let (mut bench, attach) = remote_claude_bench();
             bench.take_written();
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
             assert!(
                 !bench
                     .workbench
@@ -8549,8 +8062,61 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
             assert!(!bench.workbench.claude_tab().unwrap().present());
+        }
+
+        #[test]
+        fn a_remote_tab_presents_grok_build_before_claude_code() {
+            // SSH-10 before SSH-11: a remote tab that presents Grok Build
+            // keeps it even though Claude Code ranks ahead of Grok Build.
+            let (mut bench, attach) = remote_claude_bench();
+            let brand = |bench: &RemoteBench| {
+                crate::ui::tab_brand(&bench.workbench).map(|(entry, _)| entry.descriptor().key)
+            };
+            assert_eq!(brand(&bench), None);
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            assert_eq!(
+                brand(&bench),
+                Some("claude-code"),
+                "Claude Code brands a remote tab on its own"
+            );
+
+            let identity = bench.identity.clone();
+            let push = |bench: &mut RemoteBench, snapshot: GrokSessionSnapshot| {
+                bench
+                    .workbench
+                    .remote_workspace_mut()
+                    .unwrap()
+                    .accept_grok_push(grok_snapshot_envelope(&identity, attach, snapshot))
+                    .unwrap();
+            };
+            push(
+                &mut bench,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            );
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            assert_eq!(
+                brand(&bench),
+                Some("grok"),
+                "an open Grok Build session presents before Claude Code"
+            );
+
+            push(&mut bench, grok_snapshot(2, false, vec![]));
+            assert_eq!(
+                brand(&bench),
+                Some("claude-code"),
+                "Claude Code presents again once Grok Build has nothing open"
+            );
         }
 
         #[test]
@@ -8572,7 +8138,7 @@ mod tests {
                 .unwrap()
                 .disconnect();
             bench.pump();
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
             assert!(
                 !bench
                     .workbench
@@ -8591,12 +8157,13 @@ mod tests {
 
         #[test]
         fn remote_claude_diagnostics_follow_the_tab_detection_and_presence() {
-            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+            use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive};
 
             let (mut bench, attach) = remote_claude_bench();
             let row = |bench: &RemoteBench| {
                 let snapshot = bench.workbench.diagnostics_snapshot();
-                (snapshot.claude_pill, snapshot.claude_sentence)
+                let row = snapshot.row("claude status").unwrap();
+                (row.pill, row.sentence.clone())
             };
             assert_eq!(row(&bench).1, "Checking for Claude Code.");
             bench.workbench.set_remote_claude_detection(Some(false));
@@ -8661,7 +8228,7 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
             (bench, attach)
         }
 
@@ -8702,13 +8269,14 @@ mod tests {
 
         #[test]
         fn direct_remote_claude_is_present_until_it_exits_and_reports_honest_diagnostics() {
-            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+            use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive};
 
             let (mut bench, attach) = direct_claude_bench();
             bench.workbench.set_remote_claude_detection(Some(true));
             let row = |bench: &RemoteBench| {
                 let snapshot = bench.workbench.diagnostics_snapshot();
-                (snapshot.claude_pill, snapshot.claude_sentence)
+                let row = snapshot.row("claude status").unwrap();
+                (row.pill, row.sentence.clone())
             };
             // Present as soon as the remote claude runs, before any emission.
             let tab = bench.workbench.claude_tab().unwrap();
@@ -8719,8 +8287,9 @@ mod tests {
                 (Inactive, "Claude Code is starting.".to_owned())
             );
             // A probe alone, past the grace period: protocol unavailable.
-            bench.workbench.claude.as_mut().unwrap().present_since =
-                Some(Instant::now() - crate::integration_status::CLAUDE_GRACE * 2);
+            bench.workbench.claude_state_mut().set_present_since(Some(
+                Instant::now() - crate::integrations::claude_code::diagnostics::CLAUDE_GRACE * 2,
+            ));
             assert_eq!(
                 row(&bench),
                 (
@@ -8751,7 +8320,7 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            bench.workbench.poll_claude(Instant::now());
+            bench.workbench.poll_integrations(Instant::now());
             assert!(!bench.workbench.claude_tab().unwrap().present());
             assert_eq!(row(&bench).1, "Claude Code is not running.");
         }
@@ -9033,13 +8602,15 @@ mod tests {
 
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(bench.workbench.grok_row(), GrokDiagnosticsRow::READY);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
-                GrokDiagnosticsRow::READY
-            );
-            assert_eq!(
-                bench.workbench.diagnostics_snapshot().grok_sentence,
+                bench
+                    .workbench
+                    .diagnostics_snapshot()
+                    .row("grok status")
+                    .unwrap()
+                    .sentence,
                 GrokDiagnosticsRow::READY.sentence
             );
         }
@@ -9068,24 +8639,29 @@ mod tests {
             push(&mut bench, ready);
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
             assert_eq!(
-                bench.workbench.diagnostics_snapshot().grok_sentence,
+                bench
+                    .workbench
+                    .diagnostics_snapshot()
+                    .row("grok status")
+                    .unwrap()
+                    .sentence,
                 GrokDiagnosticsRow::READY.sentence
             );
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
+                bench.workbench.grok_row(),
                 GrokDiagnosticsRow::READY,
                 "a consented install is unnecessary when hooks are already armed"
             );
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
+                bench.workbench.grok_row(),
                 GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN
             );
 
@@ -9097,8 +8673,8 @@ mod tests {
                 GrokDiagnosticsRow::REMOTE_INSTALL_PENDING,
                 GrokDiagnosticsRow::REMOTE_INSTALL_FAILED,
             ] {
-                bench.workbench.set_grok_diagnostics(row.clone());
-                assert_eq!(bench.workbench.grok_diagnostics(), row);
+                bench.workbench.set_remote_grok_row(row.clone());
+                assert_eq!(bench.workbench.grok_row(), row);
             }
 
             // Idle inventory is sufficient to report an explicitly ready tier.
@@ -9111,11 +8687,8 @@ mod tests {
             push(&mut bench, idle);
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
-            assert_eq!(
-                bench.workbench.grok_diagnostics(),
-                GrokDiagnosticsRow::READY
-            );
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(bench.workbench.grok_row(), GrokDiagnosticsRow::READY);
         }
 
         #[test]

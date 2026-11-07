@@ -5,6 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use made_app::integrations::claude_code;
+use made_app::integrations::claude_code::launch::claude_launch_env;
+use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 use made_app::workspace::{
     LaunchPlan, Surfaces, WorkspaceLaunch, WorkspaceSelection, WorkspaceSource,
 };
@@ -318,7 +321,7 @@ fn workspace_source_labels_are_stable_for_diagnostics() {
 
 use std::ffi::{OsStr as ClaudeOsStr, OsString};
 
-use made_app::{CompatibleTui, TerminalTarget};
+use made_app::TerminalTarget;
 
 const PLUGIN_DIRS: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 const SPOOL: &str = "MADE_CLAUDE_SPOOL";
@@ -335,11 +338,9 @@ fn env_of(env: &[(OsString, OsString)], key: &str) -> Option<OsString> {
 fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
     let spool = Path::new("/run/user/1/made-1/claude/10-abc/tab.jsonl");
-    for target in [
-        TerminalTarget::Shell,
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
-    ] {
-        let launch = target.claude_launch_env(
+    for target in [TerminalTarget::Shell, TerminalTarget::Tui(CLAUDE_CODE)] {
+        let launch = claude_launch_env(
+            target,
             Some(shipped),
             Some(ClaudeOsStr::new("/user/one:/user/two")),
             Some(spool),
@@ -357,12 +358,13 @@ fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
             Some(spool.as_os_str().to_owned())
         );
     }
-    let bare = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, Some(spool));
+    let bare = claude_launch_env(TerminalTarget::Shell, Some(shipped), None, Some(spool));
     assert_eq!(
         env_of(&bare.env, PLUGIN_DIRS),
         Some(shipped.as_os_str().to_owned())
     );
-    let again = TerminalTarget::Shell.claude_launch_env(
+    let again = claude_launch_env(
+        TerminalTarget::Shell,
         Some(shipped),
         Some(shipped.as_os_str()),
         Some(spool),
@@ -381,13 +383,14 @@ fn other_launches_get_no_claude_environment() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
     let authority = made_remote::protocol::AuthorityId([7; 16]);
     for target in [
-        TerminalTarget::Tui(CompatibleTui::OpenCode),
-        TerminalTarget::Tui(CompatibleTui::Grok),
+        TerminalTarget::Tui(OPENCODE),
+        TerminalTarget::Tui(GROK),
         TerminalTarget::RemoteShell { authority },
         TerminalTarget::RemoteOpenCode { authority },
         TerminalTarget::RemoteGrok { authority },
     ] {
-        let launch = target.claude_launch_env(
+        let launch = claude_launch_env(
+            target,
             Some(shipped),
             Some(ClaudeOsStr::new("/user/one")),
             Some(spool),
@@ -404,16 +407,13 @@ fn other_launches_get_no_claude_environment() {
 #[test]
 fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
-    for target in [
-        TerminalTarget::Shell,
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
-    ] {
+    for target in [TerminalTarget::Shell, TerminalTarget::Tui(CLAUDE_CODE)] {
         for shipped in [
             "/opt/a:b/claude-code-made",
             "/opt/a\"b/claude-code-made",
             "relative/claude-code-made",
         ] {
-            let launch = target.claude_launch_env(Some(Path::new(shipped)), None, Some(spool));
+            let launch = claude_launch_env(target, Some(Path::new(shipped)), None, Some(spool));
             assert!(
                 env_of(&launch.env, PLUGIN_DIRS).is_none() && launch.env.is_empty(),
                 "{target:?} {shipped}: no empty or partial list, no spool binding: {launch:?}"
@@ -426,12 +426,13 @@ fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
 #[test]
 fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
-    for target in [
-        TerminalTarget::Shell,
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
-    ] {
-        let launch =
-            target.claude_launch_env(None, Some(ClaudeOsStr::new("/user/one")), Some(spool));
+    for target in [TerminalTarget::Shell, TerminalTarget::Tui(CLAUDE_CODE)] {
+        let launch = claude_launch_env(
+            target,
+            None,
+            Some(ClaudeOsStr::new("/user/one")),
+            Some(spool),
+        );
         assert!(
             launch.env.is_empty(),
             "no entry, no spool binding: {launch:?}"
@@ -439,7 +440,7 @@ fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
         assert!(launch.hooks_unavailable);
     }
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
-    let unwritable = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, None);
+    let unwritable = claude_launch_env(TerminalTarget::Shell, Some(shipped), None, None);
     assert!(unwritable.hooks_unavailable, "no spool means no hooks");
     assert!(env_of(&unwritable.env, SPOOL).is_none());
 }
@@ -461,23 +462,23 @@ fn the_claude_code_target_starts_the_detected_absolute_path_with_no_arguments() 
     fake_executable(root.path(), "grok");
     let path = std::env::join_paths([root.path()]).unwrap();
 
-    let options = TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+    let options = TerminalTarget::Tui(CLAUDE_CODE)
         .pty_options("/tmp", &path)
         .expect("a detected claude resolves");
     assert_eq!(options.shell.as_deref(), Some(claude.as_os_str()));
     assert!(options.args.is_empty(), "Made adds no argument to claude");
     assert!(
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode)
+        TerminalTarget::Tui(CLAUDE_CODE)
             .pty_options("/tmp", ClaudeOsStr::new(""))
             .is_none(),
         "nothing is spawned when claude is not on PATH"
     );
-    let grok = TerminalTarget::Tui(CompatibleTui::Grok)
+    let grok = TerminalTarget::Tui(GROK)
         .pty_options("/tmp", &path)
         .unwrap();
     assert_eq!(grok.args, vec![OsString::from("dashboard")]);
     assert_eq!(
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode).program_label(),
+        TerminalTarget::Tui(CLAUDE_CODE).program_label(),
         "Claude Code"
     );
 }
@@ -568,7 +569,7 @@ fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code(
     let start =
         |target| made_app::Workbench::start(None, None, home.clone(), target, Instant::now());
 
-    let mut claude = start(TerminalTarget::Tui(CompatibleTui::ClaudeCode));
+    let mut claude = start(TerminalTarget::Tui(CLAUDE_CODE));
     let options = claude.terminal().expect("claude child").options().clone();
     let program = options.shell.clone().expect("explicit program");
     assert!(
@@ -612,10 +613,7 @@ fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code(
     );
     assert_ne!(shell_spool, spool, "each tab has its own spool");
 
-    for target in [
-        TerminalTarget::Tui(CompatibleTui::Grok),
-        TerminalTarget::Tui(CompatibleTui::OpenCode),
-    ] {
+    for target in [TerminalTarget::Tui(GROK), TerminalTarget::Tui(OPENCODE)] {
         let mut other = start(target);
         let options = other.terminal().expect("child").options().clone();
         assert!(env_of(&options.env, PLUGIN_DIRS).is_none(), "{target:?}");
@@ -624,7 +622,7 @@ fn real_workbenches_carry_the_plugin_environment_only_for_shell_and_claude_code(
             options.env_remove.iter().any(|key| key == SPOOL),
             "an inherited spool binding is stripped from {target:?}"
         );
-        if target == TerminalTarget::Tui(CompatibleTui::Grok) {
+        if target == TerminalTarget::Tui(GROK) {
             assert_eq!(options.args, vec![OsString::from("dashboard")]);
             assert!(env_of(&options.env, made_bridge::config::CONFIG_CONTENT_ENV).is_none());
         }
@@ -663,7 +661,7 @@ fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
         Some(plan),
         None,
         root.clone(),
-        TerminalTarget::Tui(CompatibleTui::ClaudeCode),
+        TerminalTarget::Tui(CLAUDE_CODE),
         Instant::now(),
     );
     let pane_pid = workbench
@@ -694,7 +692,7 @@ fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
     };
 
     assert!(
-        workbench.claude_tab().unwrap().present(),
+        claude_code::tab(&workbench).unwrap().present(),
         "a direct tab is Claude Code while its child runs"
     );
     // A record whose ancestry never reaches this tab's terminal is not owned.
@@ -704,7 +702,7 @@ fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(workbench.explorer_root(), Some(root.as_path()));
-    assert!(workbench.claude_tab().unwrap().dots().is_empty());
+    assert!(claude_code::tab(&workbench).unwrap().dots().is_empty());
 
     // The hook shell (already exited) then the terminal child: owned.
     append(&session, "SessionStart", &[4_000_000, pane_pid]);

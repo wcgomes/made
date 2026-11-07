@@ -5,17 +5,15 @@
 //! It never writes to standard output and always exits with status 0, so it
 //! never denies a tool or a prompt.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use made_grok_hook::{build_line, log_path, read_event_with, status_of, Chunk, READ_DEADLINE};
+use made_hook_common::{run_silently, spawn_stdin_reader};
 
 fn main() {
-    // A panic must stay silent: standard error is part of the empty-output contract.
-    std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(run);
-    std::process::exit(0);
+    run_silently(run);
 }
 
 fn run() {
@@ -55,27 +53,6 @@ fn run() {
     }
 }
 
-/// Feed standard input to the decoder from a thread, because a blocking read
-/// cannot be given a deadline on every platform.
-fn spawn_stdin_reader() -> mpsc::Receiver<Chunk> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buffer = vec![0_u8; 65_536];
-        loop {
-            let chunk = match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => Chunk::Eof,
-                Ok(count) => Chunk::Data(buffer[..count].to_vec()),
-            };
-            let done = chunk == Chunk::Eof;
-            if sender.send(chunk).is_err() || done {
-                break;
-            }
-        }
-    });
-    receiver
-}
-
 #[cfg(unix)]
 fn parent_pid() -> u32 {
     std::os::unix::process::parent_id()
@@ -85,32 +62,7 @@ fn parent_pid() -> u32 {
 /// `os.getppid()` uses on Windows.
 #[cfg(windows)]
 fn parent_pid() -> u32 {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-
-    // SAFETY: plain Win32 calls; `entry` is a zeroed POD struct whose `dwSize`
-    // is set before use, and the snapshot handle is closed on every path.
-    unsafe {
-        let own = GetCurrentProcessId();
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return 0;
-        }
-        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
-        let mut parent = 0;
-        let mut more = Process32First(snapshot, &mut entry);
-        while more != 0 {
-            if entry.th32ProcessID == own {
-                parent = entry.th32ParentProcessID;
-                break;
-            }
-            more = Process32Next(snapshot, &mut entry);
-        }
-        CloseHandle(snapshot);
-        parent
-    }
+    made_hook_common::process_parents()
+        .and_then(|(own, parents)| parents.get(&own).copied())
+        .unwrap_or(0)
 }

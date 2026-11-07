@@ -113,7 +113,7 @@ impl SessionRow {
 ///
 /// Attention takes precedence over busy for that session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum SessionActivity {
+pub enum SessionActivity {
     /// The session is idle or stopped.
     #[default]
     Idle,
