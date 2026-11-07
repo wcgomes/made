@@ -197,7 +197,7 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 2.10 Remove `grok_mark` and the Grok branding predicate (path: crates/made-app/src/ui.rs)
 - [x] 2.11 Remote-file check: confirm `ssh_servers.rs`, `remote_workspace.rs` and `remote_session.rs` import no moved Grok item (none at `0b57210`) and record the result (path: specs/changes/agent-integration-modules/proposal.md)
 - [x] 2.12 Module declarations updated (path: crates/made-app/src/lib.rs)
-- [ ] 2.13 Revert check of the step 2 merge on a scratch branch (path: n/a (PR description))
+- [x] 2.13 Revert check of the step 2 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint
 - [ ] gates pass; phase 0 and phase 1 tests unchanged; PR CI green (merge gate)
