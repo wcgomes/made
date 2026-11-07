@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use made_app::integrations::claude_code;
+use made_app::integrations::claude_code::launch::claude_launch_env;
 use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 use made_app::workspace::{
     LaunchPlan, Surfaces, WorkspaceLaunch, WorkspaceSelection, WorkspaceSource,
@@ -337,7 +339,8 @@ fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
     let spool = Path::new("/run/user/1/made-1/claude/10-abc/tab.jsonl");
     for target in [TerminalTarget::Shell, TerminalTarget::Tui(CLAUDE_CODE)] {
-        let launch = target.claude_launch_env(
+        let launch = claude_launch_env(
+            target,
             Some(shipped),
             Some(ClaudeOsStr::new("/user/one:/user/two")),
             Some(spool),
@@ -355,12 +358,13 @@ fn shell_and_direct_claude_code_tabs_get_the_composed_environment() {
             Some(spool.as_os_str().to_owned())
         );
     }
-    let bare = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, Some(spool));
+    let bare = claude_launch_env(TerminalTarget::Shell, Some(shipped), None, Some(spool));
     assert_eq!(
         env_of(&bare.env, PLUGIN_DIRS),
         Some(shipped.as_os_str().to_owned())
     );
-    let again = TerminalTarget::Shell.claude_launch_env(
+    let again = claude_launch_env(
+        TerminalTarget::Shell,
         Some(shipped),
         Some(shipped.as_os_str()),
         Some(spool),
@@ -385,7 +389,8 @@ fn other_launches_get_no_claude_environment() {
         TerminalTarget::RemoteOpenCode { authority },
         TerminalTarget::RemoteGrok { authority },
     ] {
-        let launch = target.claude_launch_env(
+        let launch = claude_launch_env(
+            target,
             Some(shipped),
             Some(ClaudeOsStr::new("/user/one")),
             Some(spool),
@@ -408,7 +413,7 @@ fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
             "/opt/a\"b/claude-code-made",
             "relative/claude-code-made",
         ] {
-            let launch = target.claude_launch_env(Some(Path::new(shipped)), None, Some(spool));
+            let launch = claude_launch_env(target, Some(Path::new(shipped)), None, Some(spool));
             assert!(
                 env_of(&launch.env, PLUGIN_DIRS).is_none() && launch.env.is_empty(),
                 "{target:?} {shipped}: no empty or partial list, no spool binding: {launch:?}"
@@ -422,8 +427,12 @@ fn an_unsafe_shipped_path_never_sets_an_empty_plugin_list() {
 fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
     let spool = Path::new("/tmp/claude/10-abc/tab.jsonl");
     for target in [TerminalTarget::Shell, TerminalTarget::Tui(CLAUDE_CODE)] {
-        let launch =
-            target.claude_launch_env(None, Some(ClaudeOsStr::new("/user/one")), Some(spool));
+        let launch = claude_launch_env(
+            target,
+            None,
+            Some(ClaudeOsStr::new("/user/one")),
+            Some(spool),
+        );
         assert!(
             launch.env.is_empty(),
             "no entry, no spool binding: {launch:?}"
@@ -431,7 +440,7 @@ fn a_missing_shipped_plugin_adds_no_entry_and_records_hooks_unavailable() {
         assert!(launch.hooks_unavailable);
     }
     let shipped = Path::new("/opt/made/plugins/claude-code-made");
-    let unwritable = TerminalTarget::Shell.claude_launch_env(Some(shipped), None, None);
+    let unwritable = claude_launch_env(TerminalTarget::Shell, Some(shipped), None, None);
     assert!(unwritable.hooks_unavailable, "no spool means no hooks");
     assert!(env_of(&unwritable.env, SPOOL).is_none());
 }
@@ -683,7 +692,7 @@ fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
     };
 
     assert!(
-        workbench.claude_tab().unwrap().present(),
+        claude_code::tab(&workbench).unwrap().present(),
         "a direct tab is Claude Code while its child runs"
     );
     // A record whose ancestry never reaches this tab's terminal is not owned.
@@ -693,7 +702,7 @@ fn spool_records_of_the_tab_move_its_explorer_and_foreign_ones_do_not() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(workbench.explorer_root(), Some(root.as_path()));
-    assert!(workbench.claude_tab().unwrap().dots().is_empty());
+    assert!(claude_code::tab(&workbench).unwrap().dots().is_empty());
 
     // The hook shell (already exited) then the terminal child: owned.
     append(&session, "SessionStart", &[4_000_000, pane_pid]);
