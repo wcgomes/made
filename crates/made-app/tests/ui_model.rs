@@ -13961,7 +13961,7 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
         "an inherited spool binding is stripped"
     );
     assert!(
-        claude_code::tab(&workbench).is_none(),
+        claude_code::tab(workbench).is_none(),
         "an OpenCode tab carries no Claude Code state"
     );
     let report = workbench.sanitized_diagnostics_text();
