@@ -1,6 +1,6 @@
 # Adding an Integration
 
-An integration is an agent terminal UI Made can launch directly, follow and diagnose. Each one is one module under [`crates/made-app/src/integrations/<name>/`](../../crates/made-app/src/integrations/mod.rs) that implements the `Integration` trait, plus one line in the static `PRODUCT` list. Everything is compile-time: nothing is loaded, discovered or configured at run time, and this is not a plugin API. Rationale and rejected alternatives are in [ADR 0009](../decisions/0009-static-integration-modules.md); the normative requirements are in the [`agent-integration-modules` spec](../../specs/changes/agent-integration-modules/spec.md).
+An integration is an agent terminal UI Made can launch directly, follow and diagnose. Each one is one module under [`crates/made-app/src/integrations/<name>/`](../../crates/made-app/src/integrations/mod.rs) that implements the `Integration` trait, plus one line in the static `PRODUCT` list. Everything is compile-time: nothing is loaded, discovered or configured at run time, and this is not a plugin API. Rationale and rejected alternatives are in [ADR 0009](../decisions/0009-static-integration-modules.md); the normative requirements are in the [`agent-integration-modules` spec](../../specs/agent-integration-architecture.md).
 
 ## Module structure
 

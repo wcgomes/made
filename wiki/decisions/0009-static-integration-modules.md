@@ -1,6 +1,6 @@
 # 0009: Static Integration Modules
 
-**Status:** Accepted; implemented by the change [`agent-integration-modules`](../../specs/changes/agent-integration-modules/spec.md), delivered in steps 0 to 5.
+**Status:** Accepted; implemented by the change [`agent-integration-modules`](../../specs/agent-integration-architecture.md), delivered in steps 0 to 5.
 
 ## Context
 
@@ -39,4 +39,4 @@ Each integration becomes one module of `made-app` behind one compile-time trait.
 
 The change migrated in independently mergeable steps: step 0 characterization baselines on the unchanged code; step 1 interface, list and every integration's state plus Claude Code's channel code; step 2 Grok Build's channel code; step 3 OpenCode's channel code and removal of transitional shims; step 4 the shared hook library; step 5 scoped renames, wiki and verify. Each step was green on the full gates and had a revert check on a scratch worktree (revert applied cleanly, tree equal to the previous step's tip, `made-app` tests passing) for steps 1 to 4. The fake integration in [`fake_integration.rs`](../../crates/made-app/tests/fake_integration.rs) proves the extension property at two ranks and across every seam.
 
-See [`design.md`](../../specs/changes/agent-integration-modules/design.md), [`proposal.md`](../../specs/changes/agent-integration-modules/proposal.md) (evidence and CI run ids) and [Architecture](../architecture.md).
+See [`design.md`](../../specs/changes/archive/20261107-agent-integration-modules/design.md), [`proposal.md`](../../specs/changes/archive/20261107-agent-integration-modules/proposal.md) (evidence and CI run ids) and [Architecture](../architecture.md).
