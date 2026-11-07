@@ -226,33 +226,84 @@ mod neutrality {
         ("workbench.rs", 14),
     ];
 
-    /// Core-named items that stay outside remote-path regions: the session
-    /// channel's status vocabulary, which names OpenCode because OpenCode is
-    /// the session-channel owner, and the product copy that describes that
-    /// owner. Each row is (file, text a line contains, lines that match). An
-    /// empty text excuses the whole file. The expected counts are pinned, so
-    /// a new core-named line, or a stale row, fails the scan.
-    const ALLOWED_CORE_NAMES: &[(&str, &str, usize)] = &[
+    /// Lines inside remote-path regions per core file (the lines between the
+    /// markers, nested regions included). Widening a region changes the
+    /// count and shows in the diff of this list.
+    const EXEMPT_LINE_COUNTS: &[(&str, usize)] = &[
+        ("app.rs", 1075),
+        ("diagnostics.rs", 196),
+        ("tui.rs", 40),
+        ("ui.rs", 288),
+        ("workbench.rs", 245),
+    ];
+
+    /// Core-named items that stay outside remote-path regions, in two named
+    /// categories. A row is (file, integrations it excuses, text a line
+    /// contains, lines that match). A line is excused only when every
+    /// integration it names is among its row's integrations, so a row for
+    /// OpenCode never excuses a Grok or Claude Code hit. An empty text excuses
+    /// the whole file. The expected counts are pinned, so a new core-named
+    /// line, or a stale row, fails the scan.
+    type AllowedRow = (&'static str, &'static [&'static str], &'static str, usize);
+
+    /// Category 1, the session-channel status vocabulary: it names OpenCode
+    /// because OpenCode is the session-channel owner.
+    const SESSION_CHANNEL_NAMES: &[AllowedRow] = &[
         // The session-channel status vocabulary: reason codes, their
         // sentences and the peer-version fields.
-        ("integration_status.rs", "", 38),
+        ("integration_status.rs", &["opencode"], "", 36),
         // The peer version of the session-channel owner in the diagnostics
         // snapshot and its copied report.
-        ("diagnostics.rs", "opencode_version", 4),
-        ("diagnostics.rs", "opencode version", 1),
+        ("diagnostics.rs", &["opencode"], "opencode_version", 4),
+        ("diagnostics.rs", &["opencode"], "opencode version", 1),
         // The session-channel owner's connected pill label, its version row
         // and the copy that names it in the sessions surfaces.
-        ("ui.rs", "opencode_pill_label", 2),
-        ("ui.rs", "\"OpenCode\",", 1),
-        ("ui.rs", ".opencode_version", 1),
-        ("ui.rs", "including OpenCode, Grok and SSH sessions", 1),
-        ("ui.rs", "Open OpenCode in the terminal.", 2),
-        ("ui.rs", "All OpenCode sessions", 1),
+        ("ui.rs", &["opencode"], "opencode_pill_label", 2),
+        ("ui.rs", &["opencode"], "\"OpenCode\",", 1),
+        ("ui.rs", &["opencode"], ".opencode_version", 1),
+        ("ui.rs", &["opencode"], "Open OpenCode in the terminal.", 2),
+        ("ui.rs", &["opencode"], "All OpenCode sessions", 1),
         // The session-channel log lines.
-        ("workbench.rs", "OpenCode integration connected", 1),
-        ("workbench.rs", "info.opencode_version", 1),
-        ("workbench.rs", "OpenCode integration rejected", 1),
-        ("workbench.rs", "OpenCode integration unloaded", 1),
+        (
+            "workbench.rs",
+            &["opencode"],
+            "OpenCode integration connected",
+            1,
+        ),
+        ("workbench.rs", &["opencode"], "info.opencode_version", 1),
+        (
+            "workbench.rs",
+            &["opencode"],
+            "OpenCode integration rejected",
+            1,
+        ),
+        (
+            "workbench.rs",
+            &["opencode"],
+            "OpenCode integration unloaded",
+            1,
+        ),
+    ];
+
+    /// Category 2, preserved product copy / scope declaration (AIA-01): text
+    /// and declarations that existed before this refactor and are kept
+    /// verbatim. They name integrations as product copy or as a scope fact,
+    /// not as session-channel vocabulary.
+    const PRESERVED_PRODUCT_COPY: &[AllowedRow] = &[
+        // The restart confirmation, which lists the sessions a restart closes.
+        (
+            "ui.rs",
+            &["opencode", "grok"],
+            "including OpenCode, Grok and SSH sessions",
+            1,
+        ),
+        // The scope declaration that Made starts no OpenCode server of its own.
+        (
+            "integration_status.rs",
+            &["opencode"],
+            "separate_opencode_server",
+            2,
+        ),
     ];
 
     fn src_dir() -> PathBuf {
@@ -350,14 +401,8 @@ mod neutrality {
             if is_comment(line) {
                 continue;
             }
-            if open.is_none() {
-                let rest = trimmed
-                    .strip_prefix("pub(crate) ")
-                    .or_else(|| trimmed.strip_prefix("pub "))
-                    .unwrap_or(trimmed);
-                if rest.starts_with("use ") {
-                    open = Some((*number, String::new()));
-                }
+            if open.is_none() && strip_visibility(trimmed).starts_with("use ") {
+                open = Some((*number, String::new()));
             }
             if let Some((_, text)) = open.as_mut() {
                 text.push_str(trimmed);
@@ -368,6 +413,26 @@ mod neutrality {
             }
         }
         statements
+    }
+
+    /// `text` without a leading visibility: `pub`, `pub(crate)`,
+    /// `pub(super)`, `pub(self)` or `pub(in path)`.
+    fn strip_visibility(text: &str) -> &str {
+        let Some(rest) = text.strip_prefix("pub") else {
+            return text;
+        };
+        let rest = match rest.strip_prefix('(') {
+            Some(inner) => match inner.find(')') {
+                Some(close) => &inner[close + 1..],
+                None => return text,
+            },
+            None => rest,
+        };
+        if rest.starts_with(char::is_whitespace) {
+            rest.trim_start()
+        } else {
+            text
+        }
     }
 
     /// The core sources: every file of `src` outside `integrations/`, except
@@ -444,6 +509,21 @@ mod neutrality {
             "the `mod tests` block is not the last item of the file"
         );
         lines[..end].join("\n")
+    }
+
+    /// The number of lines inside remote-path regions of `source`, marker
+    /// lines excluded.
+    fn exempt_lines(source: &str) -> usize {
+        let total = source.lines().count();
+        let markers = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("// BEGIN remote-path")
+                    || trimmed.starts_with("// END remote-path")
+            })
+            .count();
+        total - markers - scanned_lines(source).len()
     }
 
     fn is_comment(line: &str) -> bool {
@@ -553,6 +633,14 @@ mod neutrality {
             "use crate::integrations::{\n    AppCtx,\n    claude_code,\n};"
         ));
         assert!(flagged("use crate::integrations as i;"));
+        assert!(flagged("pub(super) use crate::integrations::grok as g;"));
+        assert!(flagged(
+            "pub(in crate::ui) use crate::integrations::{\n    grok,\n};"
+        ));
+        assert!(flagged("pub use crate::integrations::claude_code;"));
+        assert!(!flagged(
+            "pub(super) use crate::integrations::PRODUCT as p;"
+        ));
         assert!(flagged("let x = i::grok::mark();"));
         assert!(flagged("crate::integrations::claude_code :: tab(w)"));
         assert!(!flagged("use crate::integrations::{AppCtx, PRODUCT};"));
@@ -580,6 +668,15 @@ mod neutrality {
                 .find(|(file, _)| *file == name)
                 .map_or(0, |(_, count)| *count);
             assert_eq!(regions, pinned, "{name}: remote-path regions");
+            let exempt = EXEMPT_LINE_COUNTS
+                .iter()
+                .find(|(file, _)| *file == name)
+                .map_or(0, |(_, count)| *count);
+            assert_eq!(
+                exempt_lines(&production),
+                exempt,
+                "{name}: lines inside remote-path regions"
+            );
         }
     }
 
@@ -596,7 +693,29 @@ mod neutrality {
         }
         names.sort();
         names.dedup();
-        let mut hits = vec![0usize; ALLOWED_CORE_NAMES.len()];
+        // The module an integration name belongs to: its folder name, or the
+        // folder name's first word.
+        let modules = integration_modules();
+        let named_modules = |lowered: &str| -> Vec<&str> {
+            modules
+                .iter()
+                .filter(|module| {
+                    lowered.contains(module.as_str())
+                        || module
+                            .split('_')
+                            .next()
+                            .is_some_and(|first| lowered.contains(first))
+                })
+                .map(String::as_str)
+                .collect()
+        };
+        // Preserved product copy is tried first, so a line it excuses is not
+        // counted against the session-channel rows.
+        let rows: Vec<&AllowedRow> = PRESERVED_PRODUCT_COPY
+            .iter()
+            .chain(SESSION_CHANNEL_NAMES)
+            .collect();
+        let mut hits = vec![0usize; rows.len()];
         let mut found = Vec::new();
         for path in core_files() {
             let file = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -609,28 +728,29 @@ mod neutrality {
                 if !names.iter().any(|name| lowered.contains(name.as_str())) {
                     continue;
                 }
-                let mut allowed = false;
-                for (row, (allowed_file, text, _)) in ALLOWED_CORE_NAMES.iter().enumerate() {
-                    if *allowed_file == file && line.contains(text) {
-                        hits[row] += 1;
-                        allowed = true;
-                    }
-                }
-                if !allowed {
-                    found.push(format!("{file}:{number}: {}", line.trim()));
+                let named = named_modules(&lowered);
+                let row = rows.iter().position(|(allowed_file, excused, text, _)| {
+                    *allowed_file == file
+                        && line.contains(text)
+                        && named.iter().all(|module| excused.contains(module))
+                });
+                match row {
+                    Some(row) => hits[row] += 1,
+                    None => found.push(format!("{file}:{number}: {}", line.trim())),
                 }
             }
         }
         assert!(
             found.is_empty(),
-            "core lines naming an integration outside remote-path regions:\n{}",
+            "core lines naming an integration outside remote-path regions, or \
+             naming one their row does not excuse:\n{}",
             found.join("\n")
         );
-        let drifted: Vec<String> = ALLOWED_CORE_NAMES
+        let drifted: Vec<String> = rows
             .iter()
             .enumerate()
-            .filter(|(row, (_, _, expected))| hits[*row] != *expected)
-            .map(|(row, (file, text, expected))| {
+            .filter(|(row, (_, _, _, expected))| hits[*row] != *expected)
+            .map(|(row, (file, _, text, expected))| {
                 format!(
                     "`{text}` in {file}: {} matching lines, pinned {expected}",
                     hits[row]

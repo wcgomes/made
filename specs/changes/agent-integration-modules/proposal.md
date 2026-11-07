@@ -63,6 +63,8 @@ Conflicts and overlaps flagged, not resolved here:
 ## Evidence
 <!-- Execution evidence recorded during implementation (baselines, decisions settled by tests, CI run ids; the verify scenario-to-test map is the last section). -->
 
+Known pre-existing flake (not from this change): RemoteBench pump_until drops unconsumed frames; follow-up.
+
 ### Phase 0 baselines (tests on unchanged production code; `rustc 1.99.0`)
 
 Scenario-to-test map (every test passes on the production code of `main` at `3c7f6d9`; no production source changed):

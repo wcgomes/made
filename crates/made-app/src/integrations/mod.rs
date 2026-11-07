@@ -429,15 +429,15 @@ pub struct TabInit<'a> {
 /// What the core lends to a tab that starts what its terminal needs before the
 /// terminal starts.
 ///
-/// `diag`, `session` and `failure` are for the session-channel owner only: no
-/// other integration reads or writes them.
+/// `session` and `failure` are for the session-channel owner only: no other
+/// integration reads or writes them. `diag` is usable by any integration.
 pub struct StartCtx<'a> {
     /// Resolved application paths.
     pub paths: Option<&'a AppPaths>,
     /// The tab's identifier.
     pub pane_id: &'a str,
-    /// The tab's diagnostics, whose log the start records into. Owner only
-    /// (the session-channel owner).
+    /// The tab's diagnostics, whose log the start records into. Usable by any
+    /// integration.
     pub diag: &'a mut Diagnostics,
     /// The tab's session-channel status. Owner only (the session-channel
     /// owner).
@@ -616,11 +616,10 @@ pub trait AppState: Any {
 
 /// What an app-wide state may record in one workspace.
 ///
-/// Both fields are for the session-channel owner only: no other integration
-/// reads or writes them.
+/// `session` is for the session-channel owner only: no other integration reads
+/// or writes it. `log` is usable by any integration.
 pub struct WorkspaceNotices<'a> {
-    /// The workspace's diagnostics log. Owner only (the session-channel
-    /// owner).
+    /// The workspace's diagnostics log. Usable by any integration.
     pub log: &'a mut DiagnosticLog,
     /// The workspace's session-channel status. Owner only (the
     /// session-channel owner).

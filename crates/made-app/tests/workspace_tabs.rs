@@ -4204,15 +4204,19 @@ mod tab_presentation_characterization {
     }
 
     /// Make Claude Code present in the shell tab through the status protocol,
-    /// with a window title. A foreground `tail` child of the shell keeps it off
-    /// its prompt and relays what the test appends.
+    /// with a window title. A foreground `tail` child of the shell keeps it
+    /// off its prompt and relays `emit` from its first byte, so the sequences
+    /// are read whether they are appended before or after `tail` opens the
+    /// file. They are appended only once `tail` runs: the shell's prompt
+    /// report, written to the terminal before `tail` started, is drawn in an
+    /// earlier frame and cannot clear the status.
     fn make_claude_present(lite: &mut Lite, id: WorkspaceId, emit: &Path) {
         let workbench = lite.model.workspace_mut(id).unwrap();
         let shell = workbench
             .terminal()
             .and_then(made_app::TerminalPane::pid)
             .expect("shell pid");
-        type_command(workbench, &format!("tail -n0 -f '{}'", emit.display()));
+        type_command(workbench, &format!("tail -c +1 -f '{}'", emit.display()));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             lite.render();
@@ -4226,12 +4230,12 @@ mod tab_presentation_characterization {
             assert!(Instant::now() < deadline, "tail did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        lite.render();
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new().append(true).open(emit).unwrap();
-            file.write_all(b"\x1b]0;Window title\x07").unwrap();
-            file.write_all(b"\x1b]7501;state=working:app=claude-code\x07")
+            file.write_all(b"]0;Window title").unwrap();
+            file.write_all(b"]7501;state=working:app=claude-code")
                 .unwrap();
         }
         lite.pump_until("claude present", |model| {
@@ -4428,10 +4432,13 @@ mod tab_presentation_characterization {
                     text_rects(&output, label)
                         .iter()
                         .any(|rect| tab.contains_rect(*rect))
-                }) || Instant::now() >= deadline
-                {
+                }) {
                     return output;
                 }
+                assert!(
+                    Instant::now() < deadline,
+                    "tab strip did not paint `{label}` within 10s"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -4455,7 +4462,11 @@ mod tab_presentation_characterization {
             let mut after = output_lines(&self.render());
             let mut same = 0;
             let deadline = Instant::now() + Duration::from_secs(10);
-            while (after.len() <= before.len() || same < 5) && Instant::now() < deadline {
+            while after.len() <= before.len() || same < 5 {
+                assert!(
+                    Instant::now() < deadline,
+                    "tooltip did not settle within 10s"
+                );
                 std::thread::sleep(Duration::from_millis(20));
                 let next = output_lines(&self.render());
                 same = if next == after { same + 1 } else { 0 };
