@@ -3346,7 +3346,7 @@ impl Workbench {
         }
         self.session_map.len().hash(&mut hasher);
         self.session_map.active_session_id().hash(&mut hasher);
-        if let Some(bridge) = self.bridge.as_ref() {
+        if let Some(bridge) = self.bridge() {
             bridge.current_connection_id().hash(&mut hasher);
             bridge.dropped_events().hash(&mut hasher);
             bridge.coalesced_states().hash(&mut hasher);
@@ -3382,8 +3382,7 @@ impl Workbench {
         // context through `workspace_diagnostics_context`.
         let snapshot = self.diagnostics_snapshot();
         let bridge_stats = self
-            .bridge
-            .as_ref()
+            .bridge()
             .map(|bridge| {
                 format!(
                     "connection={:?} dropped={} coalesced={}",
@@ -3394,7 +3393,7 @@ impl Workbench {
             })
             .unwrap_or_else(|| "bridge unavailable".to_owned());
         let log_path = self.sanitized_log_path();
-        let copy = sanitize_copy_text(&snapshot.to_text(), self.token.as_ref(), 1024 * 1024);
+        let copy = sanitize_copy_text(&snapshot.to_text(), self.token(), 1024 * 1024);
         let cache = Arc::new(DiagnosticsUiCache {
             signature,
             snapshot,

@@ -36,9 +36,10 @@ use crate::explorer_view::{
 use crate::integration_status::{ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus};
 use crate::integrations::claude_code;
 use crate::integrations::grok::{self, GrokTabState};
+use crate::integrations::opencode::{self, OpenCodeTabState};
 use crate::integrations::{
     EnvContribution, FollowKind, FollowPort, FollowStep, IntegrationList, LaunchCtx, Slots,
-    TabInit, TabIo, TabState, CLAUDE_CODE, GROK, PRODUCT,
+    TabInit, TabIo, TabState, PRODUCT,
 };
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -529,9 +530,6 @@ pub struct Workbench {
     pub(crate) terminal_cwd: PathBuf,
     pub(crate) terminal_target: TerminalTarget,
     pub(crate) paths: Option<AppPaths>,
-    pub(crate) token: Option<Token>,
-    pub(crate) bridge: Option<BridgeHandle>,
-    pub(crate) config_guard: Option<ConfigGuard>,
     pub(crate) config_failure: Option<String>,
     pub(crate) diag: Diagnostics,
     pub(crate) metrics: Metrics,
@@ -836,9 +834,6 @@ impl Workbench {
             terminal_cwd,
             terminal_target,
             paths: app_paths,
-            token: None,
-            bridge: None,
-            config_guard: None,
             config_failure: None,
             diag,
             metrics: Metrics::new(),
@@ -987,8 +982,8 @@ impl Workbench {
             );
             return workbench;
         }
-        let composed_content = workbench.start_integration();
-        workbench.start_terminal(composed_content);
+        workbench.start_integration();
+        workbench.start_terminal();
         workbench.refresh_shell_capability();
 
         if let Some(root) = workbench.explorer_root().map(Path::to_path_buf) {
@@ -1006,9 +1001,14 @@ impl Workbench {
     /// Start the bridge and compose the per-launch OpenCode configuration.
     ///
     /// The user's configuration is read only. A composition failure leaves the
-    /// child environment untouched and reports a degraded status. Returns the
-    /// composed content for the child environment, never persisted.
-    fn start_integration(&mut self) -> Option<String> {
+    /// child environment untouched and reports a degraded status. The composed
+    /// content waits in the OpenCode state for the launch preparation and is
+    /// never persisted.
+    fn start_integration(&mut self) {
+        // A list without OpenCode has no session channel to start.
+        if opencode::tab_state(self.integrations, &self.tab_states).is_none() {
+            return;
+        }
         let Some(paths) = self.paths.clone() else {
             self.config_failure = Some("app-owned paths are unavailable".to_owned());
             self.integration
@@ -1017,7 +1017,7 @@ impl Workbench {
                 LogLevel::Error,
                 "configuration not composed: app-owned paths are unavailable",
             );
-            return None;
+            return;
         };
 
         // Inspect the user's config before any read. Only a regular file within
@@ -1037,7 +1037,7 @@ impl Workbench {
 
         // Capture the user's config before the session, even if composition
         // later fails. Verification never rewrites the file.
-        self.config_guard = if let Some(path) = user_config.as_deref() {
+        let guard = if let Some(path) = user_config.as_deref() {
             match ConfigGuard::before_session(path) {
                 Ok(guard) => {
                     let state = guard.before().state();
@@ -1064,6 +1064,9 @@ impl Workbench {
         } else {
             None
         };
+        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
+            state.set_config_guard(guard);
+        }
 
         let pane_id = self.pane_id.clone();
         let token = match Token::generate() {
@@ -1075,7 +1078,7 @@ impl Workbench {
                 self.diag
                     .log_mut()
                     .record(LogLevel::Error, "bridge token generation failed");
-                return None;
+                return;
             }
         };
         self.diag = self
@@ -1094,7 +1097,7 @@ impl Workbench {
                     .log_mut()
                     .record(LogLevel::Error, "loopback bridge could not start");
                 self.config_failure = Some(detail);
-                return None;
+                return;
             }
         };
 
@@ -1121,7 +1124,7 @@ impl Workbench {
                     "configuration could not be composed; launching with the original environment",
                 );
                 let _ = bridge.shutdown();
-                return None;
+                return;
             }
         };
 
@@ -1137,27 +1140,17 @@ impl Workbench {
                 bridge.port()
             ),
         );
-        self.token = Some(token);
-        self.bridge = Some(bridge);
-        Some(composed.content)
+        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
+            state.set_started(token, bridge, composed.content);
+        }
     }
 
-    fn start_terminal(&mut self, composed_content: Option<String>) {
-        // Grok and Claude Code are started as-is. OpenCode and the shell keep
-        // the composed plugin environment; Grok and Claude Code must not
-        // receive it or a written config.
-        let composed_content = match self.terminal_target {
-            TerminalTarget::Tui(tui) if tui == GROK || tui == CLAUDE_CODE => None,
-            TerminalTarget::Shell | TerminalTarget::Tui(_) => composed_content,
-            // Remote tabs already return before this function. If it is reached,
-            // do not start a host PTY or inject the local OpenCode plugin.
-            TerminalTarget::RemoteShell { .. }
-            | TerminalTarget::RemoteOpenCode { .. }
-            | TerminalTarget::RemoteGrok { .. }
-            | TerminalTarget::RemoteClaude { .. } => {
-                return;
-            }
-        };
+    fn start_terminal(&mut self) {
+        // Remote tabs already return before this function. If it is reached,
+        // do not start a host PTY or inject the local OpenCode plugin.
+        if self.terminal_target.is_remote() {
+            return;
+        }
         // One PATH snapshot serves the primary spawn and the fallback retry, so
         // a TUI resolves to the same executable for both.
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1172,6 +1165,14 @@ impl Workbench {
             return;
         };
         let contributions = self.prepare_launches();
+        // Which targets receive the composed configuration is the policy of
+        // the integration that composed it.
+        let composed = contributions.iter().any(|contribution| {
+            contribution
+                .set
+                .iter()
+                .any(|(key, _)| key == CONFIG_CONTENT_ENV)
+        });
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1184,12 +1185,11 @@ impl Workbench {
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");
-        for contribution in &contributions {
+        // Applied last to first: the order in which the variables reach the
+        // child is pinned by the launch characterization, and the composed
+        // configuration (the first entry) has always been set after the rest.
+        for contribution in contributions.iter().rev() {
             options = contribution.apply(options);
-        }
-
-        if let Some(content) = &composed_content {
-            options = options.with_env(CONFIG_CONTENT_ENV, content.clone());
         }
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
@@ -1207,7 +1207,7 @@ impl Workbench {
                 self.notify_spawned(pane.pid());
                 self.terminal = Some(pane);
                 self.terminal_error = None;
-                if composed_content.is_none() {
+                if !composed {
                     self.diag.log_mut().record(
                         LogLevel::Warn,
                         format!(
@@ -1229,11 +1229,8 @@ impl Workbench {
                             .without_env("SHELLOPTS")
                             .without_env("BASH_ENV")
                             .without_env("ENV");
-                        for contribution in &contributions {
+                        for contribution in contributions.iter().rev() {
                             retry = contribution.apply(retry);
-                        }
-                        if let Some(content) = &composed_content {
-                            retry = retry.with_env(CONFIG_CONTENT_ENV, content.clone());
                         }
                         if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
                             let pane = pane.with_target(self.terminal_target);
@@ -1439,6 +1436,21 @@ impl Workbench {
             .map_or(GrokDiagnosticsRow::NOT_ON_PATH, GrokTabState::diagnostics)
     }
 
+    /// Record that OpenCode is not installed or not on PATH.
+    pub fn note_opencode_missing(&mut self) {
+        self.integration.note_opencode_missing();
+    }
+
+    /// The tab's bridge, once it started.
+    pub(crate) fn bridge(&self) -> Option<&BridgeHandle> {
+        opencode::bridge(self.integrations, &self.tab_states)
+    }
+
+    /// The bridge credential, while the tab runs.
+    pub(crate) fn token(&self) -> Option<&Token> {
+        opencode::token(self.integrations, &self.tab_states)
+    }
+
     /// The Grok state of this tab, for tests.
     #[cfg(test)]
     fn grok_state_mut(&mut self) -> &mut GrokTabState {
@@ -1490,11 +1502,6 @@ impl Workbench {
     /// Integration state.
     pub fn integration(&self) -> &IntegrationState {
         &self.integration
-    }
-
-    /// Record that OpenCode is not installed or not on PATH.
-    pub fn note_opencode_missing(&mut self) {
-        self.integration.note_opencode_missing();
     }
 
     /// Session map.
@@ -1919,7 +1926,7 @@ impl Workbench {
 
     /// Set a transient status notice.
     pub fn set_notice(&mut self, notice: impl Into<String>) {
-        let notice = sanitize_copy_text(&notice.into(), self.token.as_ref(), 240);
+        let notice = sanitize_copy_text(&notice.into(), self.token(), 240);
         self.pending_notice = Some((notice, Instant::now() + NOTICE_TTL));
     }
 
@@ -1935,7 +1942,7 @@ impl Workbench {
             }
             return;
         }
-        let Some(bridge) = self.bridge.as_ref() else {
+        let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) else {
             self.set_notice("Focus is unavailable: the integration is not connected.");
             return;
         };
@@ -4080,14 +4087,12 @@ impl Workbench {
         }
         self.push_git_chrome();
 
-        let bridge_counters = self
-            .bridge
-            .as_ref()
+        let bridge_counters = opencode::bridge(self.integrations, &self.tab_states)
             .map(|bridge| (bridge.dropped_events(), bridge.coalesced_states()));
         if let Some((dropped, coalesced)) = bridge_counters {
             self.metrics.set_bridge_counters(dropped, coalesced);
         }
-        if let Some(bridge) = self.bridge.as_ref() {
+        if let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) {
             let update = self.focus.tick(bridge);
             if update.outcome != FocusOutcome::Idle {
                 self.handle_focus_update(update);
@@ -4124,7 +4129,7 @@ impl Workbench {
 
         if active || recent_activity {
             ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
-        } else if self.bridge.as_ref().is_some_and(BridgeHandle::is_connected) {
+        } else if self.bridge().is_some_and(BridgeHandle::is_connected) {
             ctx.request_repaint_after(Duration::from_millis(50));
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -4220,7 +4225,7 @@ impl Workbench {
     }
 
     fn drain_bridge_events(&mut self) -> bool {
-        let Some(bridge) = self.bridge.as_ref() else {
+        let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) else {
             return false;
         };
         let mut events = Vec::new();
@@ -4310,7 +4315,7 @@ impl Workbench {
             }
             BridgeEvent::State(snapshot) => self.handle_state(snapshot),
             BridgeEvent::FocusResult(result) => {
-                if let Some(bridge) = self.bridge.as_ref() {
+                if let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) {
                     let update = self.focus.handle_result(bridge, result);
                     self.handle_focus_update(update);
                 }
@@ -4896,7 +4901,7 @@ impl Workbench {
             Some(title) => format!("{title} — {BASE_TITLE}"),
             None => format!("{BASE_TITLE} — {workspace}"),
         };
-        let title = sanitize_copy_text(&title, self.token.as_ref(), 220);
+        let title = sanitize_copy_text(&title, self.token(), 220);
         if self.last_title.as_deref() != Some(title.as_str()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = Some(title);
@@ -4945,14 +4950,18 @@ impl Workbench {
         }
         // Closing the tab deletes its spool.
         self.teardown_tab_states();
-        if let Some(bridge) = self.bridge.take() {
+        let bridge = opencode::tab_state_mut(self.integrations, &mut self.tab_states)
+            .and_then(OpenCodeTabState::take_bridge);
+        if let Some(bridge) = bridge {
             if let Err(error) = bridge.shutdown() {
                 self.diag
                     .log_mut()
                     .record(LogLevel::Warn, format!("bridge shutdown failed: {error}"));
             }
         }
-        if let Some(guard) = self.config_guard.take() {
+        let guard = opencode::tab_state_mut(self.integrations, &mut self.tab_states)
+            .and_then(OpenCodeTabState::take_config_guard);
+        if let Some(guard) = guard {
             match guard.after_session() {
                 Ok(ConfigVerification::Unchanged { state, .. }) => {
                     self.diag.log_mut().record(
@@ -4994,7 +5003,9 @@ impl Workbench {
             self.diag.log_mut().record(LogLevel::Info, line);
         }
         self.write_diagnostics_log();
-        self.token = None;
+        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
+            state.clear_token();
+        }
     }
 
     fn write_diagnostics_log(&mut self) {
@@ -5013,7 +5024,7 @@ impl Workbench {
         // Build and scan the exact record that is written; no second render.
         let mut record = format!("--- made diagnostics (unix {timestamp}) ---\n");
         record.push_str(&snapshot.to_text());
-        if let Some(token) = &self.token {
+        if let Some(token) = opencode::token(self.integrations, &self.tab_states) {
             let secret = token.expose_secret();
             if !secret.is_empty() && record.contains(secret) {
                 let message = "refused to write diagnostics containing the bridge secret";
@@ -5171,7 +5182,7 @@ impl Workbench {
 
     /// Sanitized and token-redacted log path for the clipboard.
     pub fn sanitized_log_path(&self) -> String {
-        sanitize_copy_text(self.diag.copyable_log_path(), self.token.as_ref(), 2048)
+        sanitize_copy_text(self.diag.copyable_log_path(), self.token(), 2048)
     }
 
     /// Sanitized and token-redacted full diagnostics text for the clipboard.
@@ -5179,7 +5190,7 @@ impl Workbench {
         let mut text = self.diagnostics_snapshot().to_text();
         text.push_str("performance:\n");
         text.push_str(&self.metrics.report().to_text());
-        sanitize_copy_text(&text, self.token.as_ref(), 1024 * 1024)
+        sanitize_copy_text(&text, self.token(), 1024 * 1024)
     }
 
     /// Whether the integration is connected.
@@ -5630,7 +5641,7 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::integrations::OPENCODE;
+    use crate::integrations::{GROK, OPENCODE};
     use crate::tui::{ClaudeLaunchEnv, CLAUDE_SPOOL_ENV};
 
     #[test]
@@ -5898,9 +5909,6 @@ mod tests {
             terminal_cwd: cwd.clone(),
             terminal_target: target,
             paths: None,
-            token: None,
-            bridge: None,
-            config_guard: None,
             config_failure: None,
             diag: Diagnostics::unavailable("grok running probe"),
             metrics: Metrics::new(),

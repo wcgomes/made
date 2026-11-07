@@ -123,13 +123,13 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [ ] verify: Branch table preserved; Grok arguments; Rows before detection; Existing suites stay the acceptance gate
 
 ### 1a-G3d OpenCode state (ATOMIC: not compile-green until 1.59)
-- [ ] 1.53 Inventory (re-run and update if the rebased tree differs). At `0b57210`: Workbench fields `bridge`, `config_guard`, the composed configuration and user-config capture state (`workbench.rs` ~1030-1160, 5265-5300, 5862-5885); public accessors and readers: `note_opencode_missing` (src: app.rs, integration_status.rs; tests: diagnostics.rs, degraded.rs), `smoke_summary` (app.rs); AppModel OpenCode-missing memory and `remember_opencode_missing`; staying core as session channel: `integration` (`IntegrationState`), `is_connected`, `focus_session` (path: specs/changes/agent-integration-modules/tasks.md)
-- [ ] 1.54 OpenCode `TabState`: `bridge`, `config_guard`, composed configuration and capture state moved into the module; the bridge-event drain runs at the session-channel tick position; the start and capture functions stay in `workbench.rs` and reach the state through the slot until step 3 (path: crates/made-app/src/integrations/opencode/tab.rs)
-- [ ] 1.55 OpenCode `AppState`: OpenCode-missing memory and `remember_opencode_missing` moved wholesale from `app.rs` (path: crates/made-app/src/integrations/opencode/diagnostics.rs)
-- [ ] 1.56 OpenCode `EnvPolicy { shell, own_direct }` for the composed configuration, state constructors (path: crates/made-app/src/integrations/opencode/mod.rs)
-- [ ] 1.57 Remove the OpenCode fields; the composition gating in `start_terminal` now comes only from `EnvPolicy` (the explicit target match goes); transitional `note_opencode_missing` inside transitional-shim markers (path: crates/made-app/src/workbench.rs)
-- [ ] 1.58 Remove the AppModel OpenCode field and detection branch; detection now runs only through `on_detection` (path: crates/made-app/src/app.rs)
-- [ ] 1.59 Adapter-block adaptation only, if the launch seam changed shape (path: crates/made-app/tests/launch_env_characterization.rs)
+- [x] 1.53 Inventory (re-run and update if the rebased tree differs). At `0b57210`: Workbench fields `bridge`, `config_guard`, the composed configuration and user-config capture state (`workbench.rs` ~1030-1160, 5265-5300, 5862-5885); public accessors and readers: `note_opencode_missing` (src: app.rs, integration_status.rs; tests: diagnostics.rs, degraded.rs), `smoke_summary` (app.rs); AppModel OpenCode-missing memory and `remember_opencode_missing`; staying core as session channel: `integration` (`IntegrationState`), `is_connected`, `focus_session` (path: specs/changes/agent-integration-modules/tasks.md)
+- [x] 1.54 OpenCode `TabState`: `bridge`, `config_guard`, composed configuration and capture state moved into the module; the bridge-event drain runs at the session-channel tick position; the start and capture functions stay in `workbench.rs` and reach the state through the slot until step 3 (path: crates/made-app/src/integrations/opencode/tab.rs)
+- [x] 1.55 OpenCode `AppState`: OpenCode-missing memory and `remember_opencode_missing` moved wholesale from `app.rs` (path: crates/made-app/src/integrations/opencode/diagnostics.rs)
+- [x] 1.56 OpenCode `EnvPolicy { shell, own_direct }` for the composed configuration, state constructors (path: crates/made-app/src/integrations/opencode/mod.rs)
+- [x] 1.57 Remove the OpenCode fields; the composition gating in `start_terminal` now comes only from `EnvPolicy` (the explicit target match goes); transitional `note_opencode_missing` inside transitional-shim markers (path: crates/made-app/src/workbench.rs)
+- [x] 1.58 Remove the AppModel OpenCode field and detection branch; detection now runs only through `on_detection` (path: crates/made-app/src/app.rs)
+- [x] 1.59 Adapter-block adaptation only, if the launch seam changed shape (path: crates/made-app/tests/launch_env_characterization.rs)
 
 #### Checkpoint G3d
 - [ ] compile-green; then gates pass; adapter checks pass for every phase 0 block

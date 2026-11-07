@@ -20,6 +20,7 @@ use crate::diagnostics::GrokDiagnosticsRow;
 use crate::integration_status::ClaudeDiagnosticsPhase;
 use crate::integrations::claude_code;
 use crate::integrations::grok::{self, diagnostics::GrokAppState};
+use crate::integrations::opencode::{self, diagnostics::OpenCodeAppState};
 use crate::integrations::{
     AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, OPENCODE, PRODUCT,
 };
@@ -460,10 +461,6 @@ pub struct AppModel {
     integrations: IntegrationList,
     /// App-wide integration state, parallel to `integrations`.
     app_states: Slots<Box<dyn AppState>>,
-    /// OpenCode was omitted by an explicit catalog, or PATH detection finished
-    /// without it. Stays false while detection is still running, so the row
-    /// keeps the inactive not-running sentence.
-    opencode_missing: bool,
     terminal_target: TerminalTarget,
     smoke: Option<SmokeState>,
     ssh: Result<ServerRegistry<PrivateMetadataStorage>, String>,
@@ -536,7 +533,6 @@ impl AppModel {
             reported: false,
         });
         let start_pending = launch.surfaces().has_terminal();
-        let catalog_has_opencode = options.compatible_tuis.contains(&OPENCODE);
         let compatible_tui_receiver = if options.detect_compatible_tuis {
             spawn_compatible_tui_detection()
         } else {
@@ -549,13 +545,6 @@ impl AppModel {
                 catalog: &options.compatible_tuis,
             })
         });
-        // A live worker has not answered yet. A thread that never started is
-        // the same as detection finishing without OpenCode.
-        let opencode_missing = if options.detect_compatible_tuis {
-            compatible_tui_receiver.is_none()
-        } else {
-            !catalog_has_opencode
-        };
         Self {
             launch,
             workspaces: Vec::new(),
@@ -582,7 +571,6 @@ impl AppModel {
             remote_grok_provisioned: Vec::new(),
             remote_grok_prompt_authority: None,
             remote_grok_install_refusals: Vec::new(),
-            opencode_missing,
             terminal_target: TerminalTarget::Shell,
             smoke,
             ssh: load_ssh_registry(),
@@ -2105,7 +2093,9 @@ impl AppModel {
         {
             workbench.note_grok_session_hooks_unavailable();
         }
-        if self.opencode_missing {
+        if opencode::app_state(self.integrations, &self.app_states)
+            .is_some_and(OpenCodeAppState::missing)
+        {
             workbench.note_opencode_missing();
         }
         workbench.set_benchmark_frames(self.smoke.is_some());
@@ -2393,13 +2383,10 @@ impl AppModel {
         };
         match receiver.try_recv() {
             Ok(tuis) => {
-                let detected_opencode = tuis.contains(&OPENCODE);
                 self.notify_detection(&tuis);
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
-                if !detected_opencode {
-                    self.remember_opencode_missing();
-                }
+                self.announce_opencode_missing();
                 self.push_grok_diagnostics();
             }
             Err(TryRecvError::Empty) => {
@@ -2410,7 +2397,7 @@ impl AppModel {
                 if self.notify_detection_failed().diagnostics_changed() {
                     self.push_grok_diagnostics();
                 }
-                self.remember_opencode_missing();
+                self.announce_opencode_missing();
             }
         }
     }
@@ -2445,6 +2432,20 @@ impl AppModel {
             }
         }
     }
+
+    /// Record that OpenCode is not on PATH for every current workspace, once.
+    ///
+    /// A workspace opened after this still receives the reason from
+    /// [`Self::insert_workbench`].
+    fn announce_opencode_missing(&mut self) {
+        let pending = opencode::app_state_mut(self.integrations, &mut self.app_states)
+            .is_some_and(OpenCodeAppState::take_missing_notice);
+        if pending {
+            for (_, workbench) in &mut self.workspaces {
+                workbench.note_opencode_missing();
+            }
+        }
+    }
     // END transitional-shim
 
     /// Tell every integration's app-wide state what PATH detection found.
@@ -2475,20 +2476,6 @@ impl AppModel {
             state.poll(&mut ctx);
         }
         ctx
-    }
-
-    /// Record that OpenCode is not on PATH for every current workspace.
-    ///
-    /// A workspace opened after this still receives the reason from
-    /// [`Self::insert_workbench`].
-    fn remember_opencode_missing(&mut self) {
-        if self.opencode_missing {
-            return;
-        }
-        self.opencode_missing = true;
-        for (_, workbench) in &mut self.workspaces {
-            workbench.note_opencode_missing();
-        }
     }
 
     /// Poll runtime work and drive the smoke run.
