@@ -279,7 +279,7 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 5.8 Link the new page (path: wiki/integration/index.md)
 - [x] 5.9 ADR 0009 with Status, Context, Decision, Consequences and Evidence: static trait-object list, ranks, declared follow policy, compile-time only and not a plugin system, AIA-04 exceptions including remote (path: wiki/decisions/0009-static-integration-modules.md)
 - [x] 5.10 Index entry for ADR 0009 (path: wiki/decisions/index.md)
-- [ ] 5.11 Map every spec.md scenario to its passing test (path: specs/changes/agent-integration-modules/proposal.md)
+- [x] 5.11 Map every spec.md scenario to its passing test (path: specs/changes/agent-integration-modules/proposal.md)
 
 ## Checkpoint
 - [ ] gates pass; renames change no test expectation; PR CI green (merge gate)
