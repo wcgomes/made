@@ -3,18 +3,29 @@
 //!
 //! The tab starts the bridge and composes the configuration before the
 //! terminal starts, and reads the bridge events at the session-channel
-//! position of its tick; this state only owns what those steps produce.
+//! position of its tick; this state owns what those steps produce.
 
 use std::any::Any;
+use std::path::Path;
 
-use made_bridge::config::CONFIG_CONTENT_ENV;
-use made_bridge::config_guard::ConfigGuard;
+use made_bridge::config::{self, ComposeOptions};
+use made_bridge::config_guard::{ConfigFileState, ConfigGuard, ConfigVerification};
 use made_bridge::security::Token;
-use made_bridge::server::BridgeHandle;
+use made_bridge::server::{self, BridgeHandle, BridgeOptions};
 
-use crate::integrations::{EnvContribution, LaunchCtx, Presentation, PresentationCtx, TabState};
+use super::launch;
+use crate::diagnostics::{DiagnosticLog, LogLevel};
+use crate::integrations::{
+    EnvContribution, LaunchCtx, Presentation, PresentationCtx, StartCtx, TabState,
+};
 use crate::session_map::SessionRow;
 use crate::tui::TerminalTarget;
+use crate::APP_VERSION;
+
+/// Maximum size of the user-owned OpenCode config Made is willing to read on
+/// the workspace preparation path. Larger or special files are skipped rather
+/// than read, so opening a workspace cannot stall behind an unbounded read.
+pub const MAX_USER_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// OpenCode state of one tab.
 #[derive(Default)]
@@ -33,41 +44,21 @@ impl OpenCodeTabState {
         Self::default()
     }
 
-    /// The tab's bridge, once it started.
-    pub(crate) fn bridge(&self) -> Option<&BridgeHandle> {
-        self.bridge.as_ref()
-    }
-
-    /// The bridge credential, while the tab runs.
-    pub(crate) fn token(&self) -> Option<&Token> {
-        self.token.as_ref()
-    }
-
     /// Keep the capture of the user's configuration taken before the session.
-    pub(crate) fn set_config_guard(&mut self, guard: Option<ConfigGuard>) {
+    fn set_config_guard(&mut self, guard: Option<ConfigGuard>) {
         self.config_guard = guard;
     }
 
     /// Keep the started bridge, its credential and the configuration composed
     /// for it.
-    pub(crate) fn set_started(&mut self, token: Token, bridge: BridgeHandle, composed: String) {
+    fn set_started(&mut self, token: Token, bridge: BridgeHandle, composed: String) {
         self.token = Some(token);
         self.bridge = Some(bridge);
         self.composed = Some(composed);
     }
 
-    /// The bridge, handed over for shutdown.
-    pub(crate) fn take_bridge(&mut self) -> Option<BridgeHandle> {
-        self.bridge.take()
-    }
-
-    /// The capture of the user's configuration, handed over for verification.
-    pub(crate) fn take_config_guard(&mut self) -> Option<ConfigGuard> {
-        self.config_guard.take()
-    }
-
     /// Forget the credential and the composed configuration that carries it.
-    pub(crate) fn clear_token(&mut self) {
+    fn clear_token(&mut self) {
         self.token = None;
         self.composed = None;
     }
@@ -81,17 +72,15 @@ impl TabState for OpenCodeTabState {
         if ctx.remote {
             return None;
         }
-        crate::ui::workspace_opencode_active(ctx.target, ctx.connected, ctx.terminal_running).then(
-            || Presentation {
-                dots: ctx
-                    .session_map
-                    .rows()
-                    .iter()
-                    .map(SessionRow::activity)
-                    .collect(),
-                title: None,
-            },
-        )
+        super::active(ctx.target, ctx.connected, ctx.terminal_running).then(|| Presentation {
+            dots: ctx
+                .session_map
+                .rows()
+                .iter()
+                .map(SessionRow::activity)
+                .collect(),
+            title: None,
+        })
     }
 
     /// The composed configuration, for the targets the policy covers. The
@@ -102,14 +91,142 @@ impl TabState for OpenCodeTabState {
         covered: bool,
         _ctx: &mut LaunchCtx<'_>,
     ) -> EnvContribution {
-        let composed = self.composed.take();
-        match composed {
-            Some(content) if covered => EnvContribution {
-                set: vec![(CONFIG_CONTENT_ENV.into(), content.into())],
-                strip: Vec::new(),
-            },
-            _ => EnvContribution::default(),
+        launch::contribution(self.composed.take(), covered)
+    }
+
+    /// Start the bridge and compose the per-launch OpenCode configuration.
+    ///
+    /// The user's configuration is read only. A composition failure leaves the
+    /// child environment untouched and reports a degraded status. The composed
+    /// content waits in this state for the launch preparation and is never
+    /// persisted.
+    fn start(&mut self, ctx: &mut StartCtx<'_>) {
+        let Some(paths) = ctx.paths else {
+            *ctx.failure = Some("app-owned paths are unavailable".to_owned());
+            ctx.session
+                .note_config_composition_failed("app-owned paths are unavailable");
+            ctx.diag.log_mut().record(
+                LogLevel::Error,
+                "configuration not composed: app-owned paths are unavailable",
+            );
+            return;
+        };
+
+        // Inspect the user's config before any read. Only a regular file within
+        // the bounded limit is captured or merged; FIFOs, devices, directories,
+        // and oversized files are skipped so workspace preparation cannot
+        // block on an unbounded or blocking read.
+        let user_config = match bounded_user_config(&paths.opencode_config_path) {
+            Ok(()) => Some(paths.opencode_config_path.clone()),
+            Err(detail) => {
+                *ctx.failure = Some(detail.clone());
+                ctx.session.note_config_composition_failed(detail.clone());
+                ctx.diag.log_mut().record(LogLevel::Error, detail);
+                None
+            }
+        };
+
+        // Capture the user's config before the session, even if composition
+        // later fails. Verification never rewrites the file.
+        let guard = if let Some(path) = user_config.as_deref() {
+            match ConfigGuard::before_session(path) {
+                Ok(guard) => {
+                    let state = guard.before().state();
+                    ctx.diag.log_mut().record(
+                        LogLevel::Info,
+                        format!(
+                            "user OpenCode config captured ({})",
+                            match state {
+                                ConfigFileState::Present => "present",
+                                ConfigFileState::Missing => "missing",
+                            }
+                        ),
+                    );
+                    Some(guard)
+                }
+                Err(error) => {
+                    ctx.diag.log_mut().record(
+                        LogLevel::Warn,
+                        format!("could not capture user OpenCode config: {error}"),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.set_config_guard(guard);
+
+        let pane_id = ctx.pane_id.to_owned();
+        let token = match Token::generate() {
+            Ok(token) => token,
+            Err(error) => {
+                let detail = format!("bridge token generation failed: {error}");
+                *ctx.failure = Some(detail.clone());
+                ctx.session.note_config_composition_failed(detail);
+                ctx.diag
+                    .log_mut()
+                    .record(LogLevel::Error, "bridge token generation failed");
+                return;
+            }
+        };
+        *ctx.diag = ctx.diag.clone().with_token_fingerprint(token.fingerprint());
+
+        let bridge = match server::start(
+            BridgeOptions::new(token.clone(), pane_id.clone()).with_app_version(APP_VERSION),
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                let detail = format!("bridge could not start: {error}");
+                ctx.session.note_plugin_unavailable(detail.clone());
+                ctx.diag
+                    .log_mut()
+                    .record(LogLevel::Error, "loopback bridge could not start");
+                *ctx.failure = Some(detail);
+                return;
+            }
+        };
+
+        let options = ComposeOptions {
+            plugin_dir: paths.plugin_dir.clone(),
+            app_owned_root: paths.plugin_root.clone(),
+            user_config_path: user_config,
+            inline_config: None,
+            bridge_url: bridge.url(),
+            token: token.clone(),
+            pane_id: pane_id.clone(),
+            app_version: APP_VERSION.to_owned(),
         }
+        .with_inline_config_from_env();
+
+        let composed = match config::compose(&options) {
+            Ok(composed) => composed,
+            Err(error) => {
+                let detail = format!("configuration could not be composed: {error}");
+                *ctx.failure = Some(detail.clone());
+                ctx.session.note_config_composition_failed(detail);
+                ctx.diag.log_mut().record(
+                    LogLevel::Error,
+                    "configuration could not be composed; launching with the original environment",
+                );
+                let _ = bridge.shutdown();
+                return;
+            }
+        };
+
+        for warning in &composed.warnings {
+            ctx.diag
+                .log_mut()
+                .record(LogLevel::Warn, format!("configuration warning: {warning}"));
+        }
+        ctx.diag.log_mut().record(
+            LogLevel::Info,
+            format!(
+                "integration ready on loopback port {} (pane {pane_id})",
+                bridge.port()
+            ),
+        );
+        self.set_started(token, bridge, composed.content);
     }
 
     /// The composed configuration holds the bridge credential, so a tab that
@@ -118,12 +235,94 @@ impl TabState for OpenCodeTabState {
         self.composed = None;
     }
 
+    /// Stop the bridge and compare the user's configuration with its capture.
+    fn shutdown(&mut self, log: &mut DiagnosticLog) {
+        if let Some(bridge) = self.bridge.take() {
+            if let Err(error) = bridge.shutdown() {
+                log.record(LogLevel::Warn, format!("bridge shutdown failed: {error}"));
+            }
+        }
+        if let Some(guard) = self.config_guard.take() {
+            match guard.after_session() {
+                Ok(ConfigVerification::Unchanged { state, .. }) => {
+                    log.record(
+                        LogLevel::Info,
+                        format!(
+                            "user OpenCode config unchanged ({})",
+                            match state {
+                                ConfigFileState::Present => "present",
+                                ConfigFileState::Missing => "missing",
+                            }
+                        ),
+                    );
+                }
+                Ok(ConfigVerification::Changed { .. }) => {
+                    log.record(
+                        LogLevel::Warn,
+                        "user OpenCode config changed during the session (Made never writes it)",
+                    );
+                }
+                Err(error) => {
+                    log.record(
+                        LogLevel::Warn,
+                        format!("could not verify user OpenCode config: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The credential stays readable until the diagnostics are written, so
+    /// they can be checked for it.
+    fn after_shutdown(&mut self) {
+        self.clear_token();
+    }
+
+    fn bridge(&self) -> Option<&BridgeHandle> {
+        self.bridge.as_ref()
+    }
+
+    fn token(&self) -> Option<&Token> {
+        self.token.as_ref()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+/// Reject special or oversized user config before any read.
+///
+/// Only a regular file at or below [`MAX_USER_CONFIG_BYTES`] is safe to read on
+/// the preparation path. A missing file is valid (composition starts empty).
+fn bounded_user_config(path: &Path) -> Result<(), String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(format!(
+                    "user OpenCode config {} is not a regular file; skipped without reading",
+                    path.display()
+                ));
+            }
+            if metadata.len() > MAX_USER_CONFIG_BYTES {
+                return Err(format!(
+                    "user OpenCode config {} is {} bytes, above the {} byte limit; skipped without reading",
+                    path.display(),
+                    metadata.len(),
+                    MAX_USER_CONFIG_BYTES
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "user OpenCode config {} could not be inspected; skipped without reading: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -149,5 +348,31 @@ mod tests {
         state.clear_token();
         assert!(state.composed.is_none());
         assert!(state.token().is_none());
+    }
+
+    #[test]
+    fn oversized_user_config_is_rejected_before_any_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cli.json");
+        std::fs::write(&path, vec![b'{'; (MAX_USER_CONFIG_BYTES + 1) as usize]).unwrap();
+        let error = bounded_user_config(&path).expect_err("oversized config must be skipped");
+        assert!(error.contains("above"), "{error}");
+        assert!(error.contains("skipped without reading"), "{error}");
+    }
+
+    #[test]
+    fn special_user_config_is_rejected_before_any_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = bounded_user_config(temp.path()).expect_err("directory is not a file");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn regular_user_config_within_the_cap_is_accepted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cli.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(bounded_user_config(&path).is_ok());
+        assert!(bounded_user_config(&temp.path().join("missing.json")).is_ok());
     }
 }

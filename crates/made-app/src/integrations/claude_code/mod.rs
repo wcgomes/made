@@ -1,6 +1,6 @@
 //! Claude Code integration.
 
-pub(crate) mod diagnostics;
+pub mod diagnostics;
 pub mod follow;
 pub mod launch;
 pub(crate) mod tab;
@@ -12,6 +12,7 @@ use super::{
 };
 use crate::diagnostics::DiagnosticsPill;
 use crate::tui::TerminalTarget;
+use crate::workbench::Workbench;
 use diagnostics::ClaudeAppState;
 use launch::CLAUDE_SPOOL_ENV;
 pub(crate) use tab::ClaudeTabState;
@@ -78,6 +79,13 @@ impl Integration for ClaudeCode {
             initial: RowReport::new(DiagnosticsPill::Inactive, "Claude Code is not on PATH."),
         })
     }
+}
+
+/// Claude Code state of a workbench's tab: presence, dots and title inputs.
+/// `None` for tabs that do not load Made's Claude Code plugin.
+#[doc(hidden)]
+pub fn tab(workbench: &Workbench) -> Option<&follow::ClaudeTab> {
+    tab_state(workbench.integrations(), workbench.tab_states()).and_then(ClaudeTabState::tab)
 }
 
 /// The Claude Code state of a tab built over `list`.

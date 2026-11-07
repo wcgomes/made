@@ -1,25 +1,22 @@
-//! Integration status state machine, OpenCode version gate, and last-known-root
-//! fallback.
+//! Integration status state machine, session-channel version gate, and
+//! last-known-root fallback.
 //!
 //! Status is one of `connected`, `degraded`, or `unsupported`. Every failure
 //! keeps the terminal and the last usable explorer root; nothing here can block
 //! input. The state machine consumes the bridge's normalized events and adds
-//! app-level events for configuration, OpenCode availability, tabs, focus, and
-//! unavailable directories.
+//! app-level events for configuration, tabs, focus, and unavailable
+//! directories.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::integrations::{IntegrationList, PRODUCT};
-use made_bridge::protocol::{opencode_major, PROTOCOL_VERSION};
+use crate::integrations::{session_peer_supported, IntegrationList, PRODUCT};
+use made_bridge::protocol::PROTOCOL_VERSION;
 use made_bridge::server::{
     BridgeEvent, ConnectionInfo, DisconnectedInfo, Goodbye, HeartbeatTimeout, ProtocolError,
 };
 use made_bridge::state::SessionSnapshot;
-
-/// Minimum supported OpenCode major version.
-pub const SUPPORTED_OPENCODE_MAJOR: u32 = 2;
 
 /// Integration availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -533,49 +530,6 @@ impl IntegrationState {
         )
     }
 
-    /// App-level event: OpenCode is not installed or not on PATH.
-    pub fn note_opencode_missing(&mut self) -> StatusChange {
-        self.transition(
-            IntegrationStatus::Unsupported,
-            StatusReason::new(ReasonCode::OpenCodeMissing),
-        )
-    }
-
-    /// Apply the OpenCode major-version gate.
-    pub fn note_opencode_version(&mut self, version: &str) -> StatusChange {
-        if version.trim().is_empty() {
-            return self.note_opencode_missing();
-        }
-        if !is_supported_opencode_version(version) {
-            return self.transition(
-                IntegrationStatus::Unsupported,
-                StatusReason::with_detail(ReasonCode::OpenCodeTooOld, version),
-            );
-        }
-
-        if self.status.is_unsupported()
-            && matches!(
-                self.reason.code,
-                ReasonCode::OpenCodeMissing | ReasonCode::OpenCodeTooOld
-            )
-        {
-            return self.transition(
-                IntegrationStatus::Inactive,
-                StatusReason::new(ReasonCode::Inactive),
-            );
-        }
-        self.unchanged()
-    }
-
-    /// App-level event: OpenCode exited normally.
-    pub fn note_opencode_exited(&mut self) -> StatusChange {
-        self.connection = None;
-        self.transition(
-            IntegrationStatus::Inactive,
-            StatusReason::new(ReasonCode::OpenCodeExited),
-        )
-    }
-
     /// OpenCode reports that session tabs are disabled.
     pub fn note_tabs_unavailable(&mut self) -> StatusChange {
         self.tabs_enabled = false;
@@ -700,7 +654,7 @@ impl IntegrationState {
                 ),
             );
         }
-        if !is_supported_opencode_version(&info.opencode_version) {
+        if !session_peer_supported(&info.opencode_version) {
             return self.transition(
                 IntegrationStatus::Unsupported,
                 StatusReason::with_detail(
@@ -841,7 +795,16 @@ impl IntegrationState {
         )
     }
 
-    fn transition(&mut self, status: IntegrationStatus, reason: StatusReason) -> StatusChange {
+    /// Forget the bridge connection without a transition.
+    pub(crate) fn drop_connection(&mut self) {
+        self.connection = None;
+    }
+
+    pub(crate) fn transition(
+        &mut self,
+        status: IntegrationStatus,
+        reason: StatusReason,
+    ) -> StatusChange {
         let previous = self.status;
         let previous_reason = self.reason.clone();
         let status_changed = previous != status;
@@ -861,11 +824,6 @@ impl IntegrationState {
             reason_changed,
         }
     }
-}
-
-/// Whether an OpenCode version string is v2 or newer.
-pub fn is_supported_opencode_version(version: &str) -> bool {
-    opencode_major(version).is_some_and(|major| major >= SUPPORTED_OPENCODE_MAJOR)
 }
 
 /// Compile-time v1 scope declaration used by the scope-boundary test.
@@ -904,4 +862,27 @@ pub use crate::integrations::claude_code::diagnostics::{
     claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
     ClaudeDiagnosticsPhase, CLAUDE_GRACE,
 };
+// END transitional-shim
+
+// BEGIN transitional-shim (AIA-11)
+pub use crate::integrations::opencode::diagnostics::{
+    is_supported_version as is_supported_opencode_version, SUPPORTED_OPENCODE_MAJOR,
+};
+
+impl IntegrationState {
+    /// App-level event: OpenCode is not installed or not on PATH.
+    pub fn note_opencode_missing(&mut self) -> StatusChange {
+        crate::integrations::opencode::diagnostics::note_missing(self)
+    }
+
+    /// Apply the OpenCode major-version gate.
+    pub fn note_opencode_version(&mut self, version: &str) -> StatusChange {
+        crate::integrations::opencode::diagnostics::note_version(self, version)
+    }
+
+    /// App-level event: OpenCode exited normally.
+    pub fn note_opencode_exited(&mut self) -> StatusChange {
+        crate::integrations::opencode::diagnostics::note_exited(self)
+    }
+}
 // END transitional-shim

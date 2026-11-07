@@ -1,17 +1,17 @@
 //! OpenCode v2 integration.
 
-pub(crate) mod diagnostics;
+pub mod diagnostics;
+pub(crate) mod launch;
 pub(crate) mod tab;
 
 use super::{
-    AppInit, AppState, Descriptor, DiagnosticsDecl, EnvPolicy, FollowKind, Integration,
-    IntegrationList, Mark, Rank, Slots, TabInit, TabState, OPENCODE,
+    AppInit, AppState, Descriptor, DiagnosticsDecl, EnvContribution, EnvPolicy, FollowKind,
+    Integration, Mark, Rank, TabInit, TabState, OPENCODE,
 };
 use crate::tui::TerminalTarget;
 use diagnostics::OpenCodeAppState;
-use made_bridge::security::Token;
-use made_bridge::server::BridgeHandle;
 pub(crate) use tab::OpenCodeTabState;
+pub use tab::MAX_USER_CONFIG_BYTES;
 
 /// OpenCode v2, the owner of the bridge session channel.
 pub(super) struct OpenCode;
@@ -60,49 +60,47 @@ impl Integration for OpenCode {
     fn diagnostics(&self) -> DiagnosticsDecl {
         DiagnosticsDecl::Primary
     }
+
+    fn configures_launch(&self, contribution: &EnvContribution) -> bool {
+        launch::composes(contribution)
+    }
+
+    fn supports_peer_version(&self, version: &str) -> bool {
+        diagnostics::is_supported_version(version)
+    }
 }
 
-/// The OpenCode state of a tab built over `list`.
-pub(crate) fn tab_state(
-    list: IntegrationList,
-    slots: &Slots<Box<dyn TabState>>,
-) -> Option<&OpenCodeTabState> {
-    super::tab_state::<OpenCodeTabState>(list, slots, OPENCODE)
+/// Whether OpenCode is active in a workspace tab.
+///
+/// A connected bridge covers both a directly launched TUI and a shell where
+/// the user ran `opencode` manually. A directly launched TUI also counts while
+/// its process is alive, even before the bridge handshakes.
+pub(crate) fn active(target: TerminalTarget, connected: bool, running: bool) -> bool {
+    connected || (target == TerminalTarget::Tui(OPENCODE) && running)
 }
 
-/// The OpenCode state of a tab built over `list`, mutably.
-pub(crate) fn tab_state_mut(
-    list: IntegrationList,
-    slots: &mut Slots<Box<dyn TabState>>,
-) -> Option<&mut OpenCodeTabState> {
-    super::tab_state_mut::<OpenCodeTabState>(list, slots, OPENCODE)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// The bridge of a tab built over `list`, once it started.
-pub(crate) fn bridge(
-    list: IntegrationList,
-    slots: &Slots<Box<dyn TabState>>,
-) -> Option<&BridgeHandle> {
-    tab_state(list, slots).and_then(OpenCodeTabState::bridge)
-}
-
-/// The bridge credential of a tab built over `list`, while it runs.
-pub(crate) fn token(list: IntegrationList, slots: &Slots<Box<dyn TabState>>) -> Option<&Token> {
-    tab_state(list, slots).and_then(OpenCodeTabState::token)
-}
-
-/// The OpenCode state of an app model built over `list`.
-pub(crate) fn app_state(
-    list: IntegrationList,
-    slots: &Slots<Box<dyn AppState>>,
-) -> Option<&OpenCodeAppState> {
-    super::app_state::<OpenCodeAppState>(list, slots, OPENCODE)
-}
-
-/// The OpenCode state of an app model built over `list`, mutably.
-pub(crate) fn app_state_mut(
-    list: IntegrationList,
-    slots: &mut Slots<Box<dyn AppState>>,
-) -> Option<&mut OpenCodeAppState> {
-    super::app_state_mut::<OpenCodeAppState>(list, slots, OPENCODE)
+    #[test]
+    fn workspace_tab_icon_follows_connection_or_a_live_direct_tui() {
+        let opencode = TerminalTarget::Tui(OPENCODE);
+        assert!(
+            !active(TerminalTarget::Shell, false, true),
+            "a running shell is not OpenCode"
+        );
+        assert!(
+            active(TerminalTarget::Shell, true, false),
+            "a connected integration covers a manually launched OpenCode"
+        );
+        assert!(
+            active(opencode, false, true),
+            "a directly launched TUI shows the icon before the bridge connects"
+        );
+        assert!(
+            !active(opencode, false, false),
+            "the icon disappears when a direct TUI exits or the integration disconnects"
+        );
+    }
 }

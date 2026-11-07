@@ -203,6 +203,15 @@ mod neutrality {
         "grok_row_for",
     ];
 
+    /// Identifiers of the legacy OpenCode seams. Core files must not name
+    /// them outside the exempt regions.
+    const LEGACY_OPENCODE: &[&str] = &[
+        "workspace_opencode_active",
+        "opencode_icon",
+        "remember_opencode_missing",
+        "note_opencode_",
+    ];
+
     /// Whole files that are remote paths.
     const REMOTE_FILES: &[&str] = &["ssh_servers.rs", "remote_workspace.rs", "remote_session.rs"];
 
@@ -320,7 +329,7 @@ mod neutrality {
     }
 
     #[test]
-    fn core_files_do_not_import_the_claude_code_or_grok_module() {
+    fn core_files_do_not_name_the_legacy_opencode_seams() {
         let mut found = Vec::new();
         for path in core_files() {
             let source = fs::read_to_string(&path).unwrap();
@@ -328,9 +337,32 @@ mod neutrality {
                 if is_comment(line) {
                     continue;
                 }
-                // OpenCode state is still reached from the core until its step
-                // relocates it; the deny-list grows then.
-                if line.contains("integrations::claude_code") || line.contains("integrations::grok")
+                for name in LEGACY_OPENCODE {
+                    if line.contains(name) {
+                        found.push(format!("{}:{number}: {name}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "legacy OpenCode seams in core files:\n{}",
+            found.join("\n")
+        );
+    }
+
+    #[test]
+    fn core_files_do_not_import_an_integration_module() {
+        let mut found = Vec::new();
+        for path in core_files() {
+            let source = fs::read_to_string(&path).unwrap();
+            for (number, line) in scanned_lines(&production_part(&source)) {
+                if is_comment(line) {
+                    continue;
+                }
+                if MODULES
+                    .iter()
+                    .any(|module| line.contains(&format!("integrations::{module}")))
                 {
                     found.push(format!("{}:{number}", path.display()));
                 }
@@ -338,7 +370,7 @@ mod neutrality {
         }
         assert!(
             found.is_empty(),
-            "core imports of the Claude Code or Grok Build module:\n{}",
+            "core imports of an integration module:\n{}",
             found.join("\n")
         );
     }

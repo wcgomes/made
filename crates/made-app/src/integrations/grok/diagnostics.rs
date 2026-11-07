@@ -7,8 +7,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use super::plugin::{self, EnsureOutcome};
 use crate::app::WorkspaceId;
-use crate::diagnostics::{DiagnosticsPill, RemoteGrokReport};
-use crate::integrations::{AppCtx, AppInit, AppState, RowReport, WorkspaceTabs, GROK};
+use crate::diagnostics::{DiagnosticsPill, LogLevel, RemoteGrokReport};
+use crate::integrations::{
+    AppCtx, AppInit, AppState, RowReport, WorkspaceNotices, WorkspaceTabs, GROK,
+};
 use made_platform::AppPaths;
 
 /// Grok Build detection, install and hold state for every workspace's row.
@@ -51,22 +53,6 @@ impl GrokAppState {
             .unwrap_or(self.phase)
     }
 
-    /// Whether a test hold replaces detection and install.
-    pub(crate) fn hold_active(&self) -> bool {
-        self.hold.is_some()
-    }
-
-    /// Whether the shipped plugin could not be installed.
-    pub(crate) fn hooks_unavailable(&self) -> bool {
-        self.hooks_unavailable
-    }
-
-    /// Whether a failed install still has to be reported to the open
-    /// workspaces. Asking clears it.
-    pub(crate) fn take_unavailable_notice(&mut self) -> bool {
-        std::mem::take(&mut self.unavailable_notice)
-    }
-
     /// The running mark held for one workspace.
     pub(crate) fn running_mark(&self, id: WorkspaceId) -> Option<GrokRunningHold> {
         self.running_hold
@@ -89,11 +75,6 @@ impl GrokAppState {
         } else {
             self.running_hold.push((id, running));
         }
-    }
-
-    /// Forget the running mark of a closed workspace.
-    pub(crate) fn forget_workspace(&mut self, id: WorkspaceId) {
-        self.running_hold.retain(|(key, _)| *key != id);
     }
 }
 
@@ -178,6 +159,39 @@ impl AppState for GrokAppState {
         let running = tab.follow_running(target, terminal_running);
         let row = grok_row_for(self.effective_phase(), self.running_mark(id), running);
         tab.set_diagnostics(row, false);
+    }
+
+    /// A test hold replaces detection and install.
+    fn holds_detection(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    fn on_workspace_closed(&mut self, id: WorkspaceId) {
+        self.running_hold.retain(|(key, _)| *key != id);
+    }
+
+    /// A failed install still has to be reported to the open workspaces.
+    fn take_pending_notice(&mut self) -> bool {
+        std::mem::take(&mut self.unavailable_notice)
+    }
+
+    /// A workspace records that Grok session follow has no status hooks, once.
+    ///
+    /// Called when the shipped plugin could not be installed. Repeated calls
+    /// keep a single warning.
+    fn notify_workspace(&self, workspace: &mut WorkspaceNotices<'_>) {
+        const MESSAGE: &str = "Grok session follow: session-status hooks are unavailable";
+        if !self.hooks_unavailable {
+            return;
+        }
+        if workspace.log.entries().any(|entry| {
+            entry
+                .message
+                .contains("session-status hooks are unavailable")
+        }) {
+            return;
+        }
+        workspace.log.record(LogLevel::Warn, MESSAGE);
     }
 
     /// Whether the shipped `made-grok-status` hook is staged beside the

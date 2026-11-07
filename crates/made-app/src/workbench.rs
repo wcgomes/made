@@ -14,10 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use made_bridge::config::{self, ComposeOptions, CONFIG_CONTENT_ENV};
-use made_bridge::config_guard::{ConfigFileState, ConfigGuard, ConfigVerification};
 use made_bridge::security::Token;
-use made_bridge::server::{self, BridgeEvent, BridgeHandle, BridgeOptions};
+use made_bridge::server::{BridgeEvent, BridgeHandle};
 use made_bridge::state::SessionSnapshot;
 use made_explorer::highlight::Highlighter;
 use made_explorer::root_switch::RootGeneration;
@@ -38,12 +36,12 @@ use crate::integration_status::{IntegrationState, IntegrationStatus};
 use crate::claude_follow::ClaudeTab;
 use crate::integrations::claude_code;
 use crate::integrations::grok;
+pub use crate::integrations::opencode::MAX_USER_CONFIG_BYTES;
 // END transitional-shim
-use crate::integrations::opencode::{self, OpenCodeTabState};
 use crate::integrations::{
-    apply_contributions, AppState, DiagnosticsDecl, EnvContribution, FollowKind, FollowPort,
-    FollowStep, IntegrationList, LaunchCtx, Presentation, PresentationCtx, RowReport, Slots,
-    TabInit, TabIo, TabState, WorkspaceTabs, PRODUCT,
+    apply_contributions, session_bridge, session_token, AppState, DiagnosticsDecl, EnvContribution,
+    FollowKind, FollowPort, FollowStep, IntegrationList, LaunchCtx, Presentation, PresentationCtx,
+    RowReport, Slots, StartCtx, TabInit, TabIo, TabState, WorkspaceNotices, WorkspaceTabs, PRODUCT,
 };
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -189,11 +187,6 @@ pub enum LeftSurface {
     Terminal,
     Preview,
 }
-
-/// Maximum size of the user-owned OpenCode config Made is willing to read on
-/// the workspace preparation path. Larger or special files are skipped rather
-/// than read, so opening a workspace cannot stall behind an unbounded read.
-pub const MAX_USER_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Worktree metadata state for the header and diagnostics.
 #[derive(Debug, Clone, Default)]
@@ -1013,150 +1006,18 @@ impl Workbench {
         workbench
     }
 
-    /// Start the bridge and compose the per-launch OpenCode configuration.
-    ///
-    /// The user's configuration is read only. A composition failure leaves the
-    /// child environment untouched and reports a degraded status. The composed
-    /// content waits in the OpenCode state for the launch preparation and is
-    /// never persisted.
+    /// Let every integration start what its terminal needs before the terminal
+    /// starts, in list order.
     fn start_integration(&mut self) {
-        // A list without OpenCode has no session channel to start.
-        if opencode::tab_state(self.integrations, &self.tab_states).is_none() {
-            return;
-        }
-        let Some(paths) = self.paths.clone() else {
-            self.config_failure = Some("app-owned paths are unavailable".to_owned());
-            self.integration
-                .note_config_composition_failed("app-owned paths are unavailable");
-            self.diag.log_mut().record(
-                LogLevel::Error,
-                "configuration not composed: app-owned paths are unavailable",
-            );
-            return;
+        let mut ctx = StartCtx {
+            paths: self.paths.as_ref(),
+            pane_id: &self.pane_id,
+            diag: &mut self.diag,
+            session: &mut self.integration,
+            failure: &mut self.config_failure,
         };
-
-        // Inspect the user's config before any read. Only a regular file within
-        // the bounded limit is captured or merged; FIFOs, devices, directories,
-        // and oversized files are skipped so workspace preparation cannot
-        // block on an unbounded or blocking read.
-        let user_config = match bounded_user_config(&paths.opencode_config_path) {
-            Ok(()) => Some(paths.opencode_config_path.clone()),
-            Err(detail) => {
-                self.config_failure = Some(detail.clone());
-                self.integration
-                    .note_config_composition_failed(detail.clone());
-                self.diag.log_mut().record(LogLevel::Error, detail);
-                None
-            }
-        };
-
-        // Capture the user's config before the session, even if composition
-        // later fails. Verification never rewrites the file.
-        let guard = if let Some(path) = user_config.as_deref() {
-            match ConfigGuard::before_session(path) {
-                Ok(guard) => {
-                    let state = guard.before().state();
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!(
-                            "user OpenCode config captured ({})",
-                            match state {
-                                ConfigFileState::Present => "present",
-                                ConfigFileState::Missing => "missing",
-                            }
-                        ),
-                    );
-                    Some(guard)
-                }
-                Err(error) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        format!("could not capture user OpenCode config: {error}"),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
-            state.set_config_guard(guard);
-        }
-
-        let pane_id = self.pane_id.clone();
-        let token = match Token::generate() {
-            Ok(token) => token,
-            Err(error) => {
-                let detail = format!("bridge token generation failed: {error}");
-                self.config_failure = Some(detail.clone());
-                self.integration.note_config_composition_failed(detail);
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Error, "bridge token generation failed");
-                return;
-            }
-        };
-        self.diag = self
-            .diag
-            .clone()
-            .with_token_fingerprint(token.fingerprint());
-
-        let bridge = match server::start(
-            BridgeOptions::new(token.clone(), pane_id.clone()).with_app_version(APP_VERSION),
-        ) {
-            Ok(bridge) => bridge,
-            Err(error) => {
-                let detail = format!("bridge could not start: {error}");
-                self.integration.note_plugin_unavailable(detail.clone());
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Error, "loopback bridge could not start");
-                self.config_failure = Some(detail);
-                return;
-            }
-        };
-
-        let options = ComposeOptions {
-            plugin_dir: paths.plugin_dir.clone(),
-            app_owned_root: paths.plugin_root.clone(),
-            user_config_path: user_config,
-            inline_config: None,
-            bridge_url: bridge.url(),
-            token: token.clone(),
-            pane_id: pane_id.clone(),
-            app_version: APP_VERSION.to_owned(),
-        }
-        .with_inline_config_from_env();
-
-        let composed = match config::compose(&options) {
-            Ok(composed) => composed,
-            Err(error) => {
-                let detail = format!("configuration could not be composed: {error}");
-                self.config_failure = Some(detail.clone());
-                self.integration.note_config_composition_failed(detail);
-                self.diag.log_mut().record(
-                    LogLevel::Error,
-                    "configuration could not be composed; launching with the original environment",
-                );
-                let _ = bridge.shutdown();
-                return;
-            }
-        };
-
-        for warning in &composed.warnings {
-            self.diag
-                .log_mut()
-                .record(LogLevel::Warn, format!("configuration warning: {warning}"));
-        }
-        self.diag.log_mut().record(
-            LogLevel::Info,
-            format!(
-                "integration ready on loopback port {} (pane {pane_id})",
-                bridge.port()
-            ),
-        );
-        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
-            state.set_started(token, bridge, composed.content);
+        for state in self.tab_states.iter_mut() {
+            state.start(&mut ctx);
         }
     }
 
@@ -1179,15 +1040,7 @@ impl Workbench {
             self.terminal_error = Some(detail);
             return;
         };
-        let contributions = self.prepare_launches();
-        // Which targets receive the composed configuration is the policy of
-        // the integration that composed it.
-        let composed = contributions.iter().any(|contribution| {
-            contribution
-                .set
-                .iter()
-                .any(|(key, _)| key == CONFIG_CONTENT_ENV)
-        });
+        let (contributions, composed) = self.prepare_launches();
         // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
         // An interactive terminal must not inherit that, or the first failed
         // prompt hook exits the shell while the workspace is still open.
@@ -1275,8 +1128,9 @@ impl Workbench {
     }
 
     /// Ask every integration state to prepare this tab's launch, in list
-    /// order.
-    fn prepare_launches(&mut self) -> Vec<EnvContribution> {
+    /// order. Also whether an integration's contribution is the configuration
+    /// the launch needs.
+    fn prepare_launches(&mut self) -> (Vec<EnvContribution>, bool) {
         let target = self.terminal_target;
         let mut ctx = LaunchCtx {
             paths: self.paths.as_ref(),
@@ -1284,6 +1138,7 @@ impl Workbench {
             log: self.diag.log_mut(),
         };
         let mut contributions = Vec::new();
+        let mut configured = false;
         for (index, entry) in self.integrations.iter().enumerate() {
             let Some(state) = self.tab_states.get_mut(index) else {
                 continue;
@@ -1291,13 +1146,15 @@ impl Workbench {
             let policy = entry.env_policy();
             let covered = policy.covers(*entry, target);
             let contribution = state.prepare_launch(target, covered, &mut ctx);
-            contributions.push(if covered {
+            let contribution = if covered {
                 contribution
             } else {
                 policy.uncovered_contribution()
-            });
+            };
+            configured |= entry.configures_launch(&contribution);
+            contributions.push(contribution);
         }
-        contributions
+        (contributions, configured)
     }
 
     /// Tell every integration state that the terminal child started.
@@ -1379,6 +1236,11 @@ impl Workbench {
                 state.on_follow_outcome(outcome.as_ref());
             }
         }
+    }
+
+    /// The per-tab integration states, parallel to [`Self::integrations`].
+    pub(crate) fn tab_states(&self) -> &Slots<Box<dyn TabState>> {
+        &self.tab_states
     }
 
     /// The integrations this tab was built with, in catalog order.
@@ -1498,12 +1360,12 @@ impl Workbench {
 
     /// The tab's bridge, once it started.
     pub(crate) fn bridge(&self) -> Option<&BridgeHandle> {
-        opencode::bridge(self.integrations, &self.tab_states)
+        session_bridge(self.integrations, &self.tab_states)
     }
 
     /// The bridge credential, while the tab runs.
     pub(crate) fn token(&self) -> Option<&Token> {
-        opencode::token(self.integrations, &self.tab_states)
+        session_token(self.integrations, &self.tab_states)
     }
 
     /// The Grok state of this tab, for tests.
@@ -1579,20 +1441,13 @@ impl Workbench {
         &self.diag
     }
 
-    /// Record that Grok session follow has no status hooks.
-    ///
-    /// Called when the shipped plugin could not be installed. Repeated calls
-    /// keep a single warning.
-    pub(crate) fn note_grok_session_hooks_unavailable(&mut self) {
-        const MESSAGE: &str = "Grok session follow: session-status hooks are unavailable";
-        if self.diag.log().entries().any(|entry| {
-            entry
-                .message
-                .contains("session-status hooks are unavailable")
-        }) {
-            return;
-        }
-        self.diag.log_mut().record(LogLevel::Warn, MESSAGE);
+    /// Record in this workspace what an app-wide integration state knows that
+    /// the workspace has to keep.
+    pub(crate) fn notify_from(&mut self, state: &dyn AppState) {
+        state.notify_workspace(&mut WorkspaceNotices {
+            log: self.diag.log_mut(),
+            session: &mut self.integration,
+        });
     }
 
     /// Terminal pane, when the shell started.
@@ -1997,7 +1852,7 @@ impl Workbench {
             }
             return;
         }
-        let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) else {
+        let Some(bridge) = session_bridge(self.integrations, &self.tab_states) else {
             self.set_notice("Focus is unavailable: the integration is not connected.");
             return;
         };
@@ -4148,12 +4003,12 @@ impl Workbench {
         }
         self.push_git_chrome();
 
-        let bridge_counters = opencode::bridge(self.integrations, &self.tab_states)
+        let bridge_counters = session_bridge(self.integrations, &self.tab_states)
             .map(|bridge| (bridge.dropped_events(), bridge.coalesced_states()));
         if let Some((dropped, coalesced)) = bridge_counters {
             self.metrics.set_bridge_counters(dropped, coalesced);
         }
-        if let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) {
+        if let Some(bridge) = session_bridge(self.integrations, &self.tab_states) {
             let update = self.focus.tick(bridge);
             if update.outcome != FocusOutcome::Idle {
                 self.handle_focus_update(update);
@@ -4286,7 +4141,7 @@ impl Workbench {
     }
 
     fn drain_bridge_events(&mut self) -> bool {
-        let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) else {
+        let Some(bridge) = session_bridge(self.integrations, &self.tab_states) else {
             return false;
         };
         let mut events = Vec::new();
@@ -4376,7 +4231,7 @@ impl Workbench {
             }
             BridgeEvent::State(snapshot) => self.handle_state(snapshot),
             BridgeEvent::FocusResult(result) => {
-                if let Some(bridge) = opencode::bridge(self.integrations, &self.tab_states) {
+                if let Some(bridge) = session_bridge(self.integrations, &self.tab_states) {
                     let update = self.focus.handle_result(bridge, result);
                     self.handle_focus_update(update);
                 }
@@ -5011,44 +4866,8 @@ impl Workbench {
         }
         // Closing the tab deletes its spool.
         self.teardown_tab_states();
-        let bridge = opencode::tab_state_mut(self.integrations, &mut self.tab_states)
-            .and_then(OpenCodeTabState::take_bridge);
-        if let Some(bridge) = bridge {
-            if let Err(error) = bridge.shutdown() {
-                self.diag
-                    .log_mut()
-                    .record(LogLevel::Warn, format!("bridge shutdown failed: {error}"));
-            }
-        }
-        let guard = opencode::tab_state_mut(self.integrations, &mut self.tab_states)
-            .and_then(OpenCodeTabState::take_config_guard);
-        if let Some(guard) = guard {
-            match guard.after_session() {
-                Ok(ConfigVerification::Unchanged { state, .. }) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Info,
-                        format!(
-                            "user OpenCode config unchanged ({})",
-                            match state {
-                                ConfigFileState::Present => "present",
-                                ConfigFileState::Missing => "missing",
-                            }
-                        ),
-                    );
-                }
-                Ok(ConfigVerification::Changed { .. }) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        "user OpenCode config changed during the session (Made never writes it)",
-                    );
-                }
-                Err(error) => {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        format!("could not verify user OpenCode config: {error}"),
-                    );
-                }
-            }
+        for state in self.tab_states.iter_mut() {
+            state.shutdown(self.diag.log_mut());
         }
 
         self.diag.log_mut().record(
@@ -5064,8 +4883,8 @@ impl Workbench {
             self.diag.log_mut().record(LogLevel::Info, line);
         }
         self.write_diagnostics_log();
-        if let Some(state) = opencode::tab_state_mut(self.integrations, &mut self.tab_states) {
-            state.clear_token();
+        for state in self.tab_states.iter_mut() {
+            state.after_shutdown();
         }
     }
 
@@ -5085,7 +4904,7 @@ impl Workbench {
         // Build and scan the exact record that is written; no second render.
         let mut record = format!("--- made diagnostics (unix {timestamp}) ---\n");
         record.push_str(&snapshot.to_text());
-        if let Some(token) = opencode::token(self.integrations, &self.tab_states) {
+        if let Some(token) = session_token(self.integrations, &self.tab_states) {
             let secret = token.expose_secret();
             if !secret.is_empty() && record.contains(secret) {
                 let message = "refused to write diagnostics containing the bridge secret";
@@ -5585,37 +5404,6 @@ fn diagnostics_log_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
     paths.map(|paths| paths.log_dir.join(DEFAULT_LOG_FILE))
 }
 
-/// Reject special or oversized user config before any read.
-///
-/// Only a regular file at or below [`MAX_USER_CONFIG_BYTES`] is safe to read on
-/// the preparation path. A missing file is valid (composition starts empty).
-fn bounded_user_config(path: &Path) -> Result<(), String> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(format!(
-                    "user OpenCode config {} is not a regular file; skipped without reading",
-                    path.display()
-                ));
-            }
-            if metadata.len() > MAX_USER_CONFIG_BYTES {
-                return Err(format!(
-                    "user OpenCode config {} is {} bytes, above the {} byte limit; skipped without reading",
-                    path.display(),
-                    metadata.len(),
-                    MAX_USER_CONFIG_BYTES
-                ));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "user OpenCode config {} could not be inspected; skipped without reading: {error}",
-            path.display()
-        )),
-    }
-}
-
 fn usable_directory(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
@@ -5719,7 +5507,7 @@ mod tests {
             TerminalTarget::RemoteClaude { authority },
         ] {
             let options = apply_contributions(
-                &idle_workbench(target, None).prepare_launches(),
+                &idle_workbench(target, None).prepare_launches().0,
                 made_terminal::PtyOptions::new(std::env::temp_dir()),
             );
             assert!(
@@ -5901,32 +5689,6 @@ mod tests {
         let integration = IntegrationState::new(Some(PathBuf::from("/tmp")), PathBuf::from("/tmp"));
         assert_eq!(integration.status(), IntegrationStatus::Inactive);
         assert!(!integration.status().is_degraded());
-    }
-
-    #[test]
-    fn oversized_user_config_is_rejected_before_any_read() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cli.json");
-        std::fs::write(&path, vec![b'{'; (MAX_USER_CONFIG_BYTES + 1) as usize]).unwrap();
-        let error = bounded_user_config(&path).expect_err("oversized config must be skipped");
-        assert!(error.contains("above"), "{error}");
-        assert!(error.contains("skipped without reading"), "{error}");
-    }
-
-    #[test]
-    fn special_user_config_is_rejected_before_any_read() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = bounded_user_config(temp.path()).expect_err("directory is not a file");
-        assert!(error.contains("not a regular file"), "{error}");
-    }
-
-    #[test]
-    fn regular_user_config_within_the_cap_is_accepted() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cli.json");
-        std::fs::write(&path, b"{}").unwrap();
-        assert!(bounded_user_config(&path).is_ok());
-        assert!(bounded_user_config(&temp.path().join("missing.json")).is_ok());
     }
 
     /// Terminates the stand-in child and skips the diagnostics-log write.

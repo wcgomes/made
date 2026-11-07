@@ -30,7 +30,6 @@ use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_text};
 use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
-use crate::tui::TerminalTarget;
 use crate::updates::{UpdateAction, UpdatePanel};
 use crate::workbench::{LeftSurface, Workbench};
 use crate::{APP_DESCRIPTION, APP_NAME, APP_VERSION};
@@ -967,19 +966,6 @@ fn workspace_tab_label_width(width: f32, session_count: usize) -> f32 {
         - WORKSPACE_TAB_RIGHT_EDGE_ALLOWANCE
         - WORKSPACE_TAB_ICON_SLOT)
         .max(8.0)
-}
-
-/// Whether OpenCode is active in a workspace tab.
-///
-/// A connected bridge covers both a directly launched TUI and a shell where
-/// the user ran `opencode` manually. A directly launched TUI also counts while
-/// its process is alive, even before the bridge handshakes.
-pub(crate) fn workspace_opencode_active(
-    target: TerminalTarget,
-    connected: bool,
-    running: bool,
-) -> bool {
-    connected || (target == TerminalTarget::Tui(OPENCODE) && running)
 }
 
 /// Claude Code brands a tab while it is present, unless OpenCode owns the tab
@@ -5145,6 +5131,7 @@ mod tests {
     use super::*;
     use crate::integrations::grok::workspace_grok_branded;
     use crate::session_map::SessionRow;
+    use crate::tui::TerminalTarget;
     use std::ffi::OsString;
     use std::sync::MutexGuard;
 
@@ -5680,27 +5667,6 @@ mod tests {
         assert_eq!(
             log_issue_tone(LogIssueSeverity::Error),
             (theme::ERROR_TINT, theme::ERROR)
-        );
-    }
-
-    #[test]
-    fn workspace_tab_icon_follows_connection_or_a_live_direct_tui() {
-        let opencode = TerminalTarget::Tui(OPENCODE);
-        assert!(
-            !workspace_opencode_active(TerminalTarget::Shell, false, true),
-            "a running shell is not OpenCode"
-        );
-        assert!(
-            workspace_opencode_active(TerminalTarget::Shell, true, false),
-            "a connected integration covers a manually launched OpenCode"
-        );
-        assert!(
-            workspace_opencode_active(opencode, false, true),
-            "a directly launched TUI shows the icon before the bridge connects"
-        );
-        assert!(
-            !workspace_opencode_active(opencode, false, false),
-            "the icon disappears when a direct TUI exits or the integration disconnects"
         );
     }
 

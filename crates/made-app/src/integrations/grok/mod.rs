@@ -10,8 +10,10 @@ use super::{
     IntegrationList, Mark, OnUnusable, Rank, RowDecl, Slots, TabInit, TabState, WhileOutranked,
     GROK,
 };
+use crate::app::{AppModel, WorkspaceId};
 use crate::tui::TerminalTarget;
 use diagnostics::{GrokAppState, GrokDiagnosticsRow};
+pub use diagnostics::{GrokDiagnosticsHold, GrokRunningHold};
 pub(crate) use tab::GrokTabState;
 
 /// Grok Build, started directly as `grok dashboard`.
@@ -114,18 +116,41 @@ pub(crate) fn tab_state_mut(
     super::tab_state_mut::<GrokTabState>(list, slots, GROK)
 }
 
-/// The Grok state of an app model built over `list`.
-pub(crate) fn app_state(
-    list: IntegrationList,
-    slots: &Slots<Box<dyn AppState>>,
-) -> Option<&GrokAppState> {
-    super::app_state::<GrokAppState>(list, slots, GROK)
-}
-
 /// The Grok state of an app model built over `list`, mutably.
 pub(crate) fn app_state_mut(
     list: IntegrationList,
     slots: &mut Slots<Box<dyn AppState>>,
 ) -> Option<&mut GrokAppState> {
     super::app_state_mut::<GrokAppState>(list, slots, GROK)
+}
+
+/// Hold the Grok Build diagnostics row without a grok process.
+///
+/// The hold replaces detection and install until the model is dropped. It
+/// does not spawn grok, wait on `PATH`, or start the shipped-plugin install.
+/// Background detection and install still run when no hold is set.
+/// [`GrokDiagnosticsHold::Installed`] and [`GrokDiagnosticsHold::AlreadyCurrent`]
+/// are ready only while that workspace's Grok is running.
+#[doc(hidden)]
+pub fn hold_diagnostics(model: &mut AppModel, hold: GrokDiagnosticsHold) {
+    let list = model.integrations();
+    if let Some(state) = super::app_state_mut::<GrokAppState>(list, model.app_states_mut(), GROK) {
+        state.set_hold(hold);
+    }
+    model.push_grok_diagnostics();
+}
+
+/// Mark whether Grok is running in one workspace, without a grok process.
+///
+/// The mark stays until replaced. It does not spawn grok, look up `PATH`,
+/// or install the plugin, and it does not change the tab label. Checking,
+/// not on PATH, installing, hooks unavailable, and the explicit-catalog
+/// sentence ignore it.
+#[doc(hidden)]
+pub fn hold_workspace_running(model: &mut AppModel, id: WorkspaceId, running: GrokRunningHold) {
+    let list = model.integrations();
+    if let Some(state) = super::app_state_mut::<GrokAppState>(list, model.app_states_mut(), GROK) {
+        state.set_running_hold(id, running);
+    }
+    model.push_grok_diagnostics();
 }

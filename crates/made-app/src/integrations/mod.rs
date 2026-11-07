@@ -19,19 +19,22 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use made_bridge::security::Token;
+use made_bridge::server::BridgeHandle;
 use made_platform::AppPaths;
 use made_terminal::PtyOptions;
 
 use crate::app::WorkspaceId;
-use crate::diagnostics::{DiagnosticLog, DiagnosticsPill};
+use crate::diagnostics::{DiagnosticLog, Diagnostics, DiagnosticsPill};
+use crate::integration_status::IntegrationState;
 use crate::session_follow::{RootSource, SessionFollowCoordinator, SessionFollowOutcome};
 use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
-pub(crate) mod claude_code;
-pub(crate) mod grok;
-pub(crate) mod opencode;
+pub mod claude_code;
+pub mod grok;
+pub mod opencode;
 pub(crate) mod shared;
 
 /// A static reference to one integration. Two references are equal when their
@@ -141,6 +144,19 @@ pub trait Integration: Sync + 'static {
     /// The integration's diagnostics contribution.
     fn diagnostics(&self) -> DiagnosticsDecl {
         DiagnosticsDecl::None
+    }
+
+    /// Whether `contribution`, which this integration made to a launch, is the
+    /// configuration the launch needs. A launch that no contribution
+    /// configures logs that it started with the original environment.
+    fn configures_launch(&self, _contribution: &EnvContribution) -> bool {
+        false
+    }
+
+    /// Whether the session channel accepts a peer that reports `version`. Only
+    /// the session-channel owner is asked.
+    fn supports_peer_version(&self, _version: &str) -> bool {
+        true
     }
 }
 
@@ -407,6 +423,21 @@ pub struct TabInit<'a> {
     pub remote: bool,
 }
 
+/// What the core lends to a tab that starts what its terminal needs before the
+/// terminal starts.
+pub struct StartCtx<'a> {
+    /// Resolved application paths.
+    pub paths: Option<&'a AppPaths>,
+    /// The tab's identifier.
+    pub pane_id: &'a str,
+    /// The tab's diagnostics, whose log the start records into.
+    pub diag: &'a mut Diagnostics,
+    /// The tab's session-channel status.
+    pub session: &'a mut IntegrationState,
+    /// Why the start failed, kept for the tab's presentation.
+    pub failure: &'a mut Option<String>,
+}
+
 /// What the core lends to a launch preparation.
 pub struct LaunchCtx<'a> {
     /// Resolved application paths.
@@ -546,11 +577,40 @@ pub trait AppState: Any {
         None
     }
 
+    /// Test holds replace PATH detection, which then also holds back every
+    /// integration's detection.
+    fn holds_detection(&self) -> bool {
+        false
+    }
+
+    /// The workspace `id` closed.
+    fn on_workspace_closed(&mut self, _id: WorkspaceId) {}
+
+    /// Whether the open workspaces still have to be told what this state
+    /// knows (see [`Self::notify_workspace`]). Asking clears it.
+    fn take_pending_notice(&mut self) -> bool {
+        false
+    }
+
+    /// Record in one workspace what this state knows that the workspace has
+    /// to keep: a log line, a status. Called for every open workspace when
+    /// [`Self::take_pending_notice`] answers yes, and for a workspace that
+    /// opens afterwards.
+    fn notify_workspace(&self, _workspace: &mut WorkspaceNotices<'_>) {}
+
     /// This state as `Any`.
     fn as_any(&self) -> &dyn Any;
 
     /// This state as mutable `Any`.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// What an app-wide state may record in one workspace.
+pub struct WorkspaceNotices<'a> {
+    /// The workspace's diagnostics log.
+    pub log: &'a mut DiagnosticLog,
+    /// The workspace's session-channel status.
+    pub session: &'a mut IntegrationState,
 }
 
 /// The tab states of one local workspace, lent to an app-wide state.
@@ -597,6 +657,11 @@ pub struct Presentation {
 /// An integration's state for one tab, owned by the tab. Tabs are prepared on
 /// a worker thread, so the state is `Send`.
 pub trait TabState: Any + Send {
+    /// Start what the terminal needs before it starts, such as a loopback
+    /// channel and its configuration. Called once, in list order, before the
+    /// launch is prepared.
+    fn start(&mut self, _ctx: &mut StartCtx<'_>) {}
+
     /// Prepare a launch of `target`: the variables to set and remove.
     /// `covered` is whether the integration's declared [`EnvPolicy`] covers
     /// the target. On an uncovered target the core discards what is returned
@@ -629,6 +694,24 @@ pub trait TabState: Any + Send {
     /// The tab closes or its terminal is replaced: drop per-terminal state.
     /// The core may call it more than once, so it must be idempotent.
     fn teardown(&mut self) {}
+
+    /// The tab closes for good: stop what [`Self::start`] started and record
+    /// what the session left behind. Called after [`Self::teardown`].
+    fn shutdown(&mut self, _log: &mut DiagnosticLog) {}
+
+    /// The tab's diagnostics were written: forget credentials that had to
+    /// stay readable until then.
+    fn after_shutdown(&mut self) {}
+
+    /// The loopback bridge of the session channel, once it started.
+    fn bridge(&self) -> Option<&BridgeHandle> {
+        None
+    }
+
+    /// The credential of the session channel, while the tab runs.
+    fn token(&self) -> Option<&Token> {
+        None
+    }
 
     /// The integration's diagnostics row for this tab, `remote` when the tab is
     /// a remote tab. `None` when the integration declares no row.
@@ -692,6 +775,45 @@ pub fn rank_order(list: IntegrationList) -> Vec<usize> {
     let mut order: Vec<usize> = (0..list.len()).collect();
     order.sort_by_key(|index| list[*index].descriptor().rank);
     order
+}
+
+/// The position of the session-channel owner in `list`.
+pub fn session_channel_position(list: IntegrationList) -> Option<usize> {
+    list.iter()
+        .position(|entry| entry.follow() == FollowKind::SessionChannel)
+}
+
+/// The tab state of the session-channel owner of `list`.
+pub fn session_channel_state(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn TabState>>,
+) -> Option<&dyn TabState> {
+    slots
+        .get(session_channel_position(list)?)
+        .map(|state| &**state)
+}
+
+/// The bridge of a tab built over `list`, once the session-channel owner
+/// started it.
+pub fn session_bridge(
+    list: IntegrationList,
+    slots: &Slots<Box<dyn TabState>>,
+) -> Option<&BridgeHandle> {
+    session_channel_state(list, slots).and_then(TabState::bridge)
+}
+
+/// The session-channel credential of a tab built over `list`, while it runs.
+pub fn session_token(list: IntegrationList, slots: &Slots<Box<dyn TabState>>) -> Option<&Token> {
+    session_channel_state(list, slots).and_then(TabState::token)
+}
+
+/// Whether the session channel of the product accepts a peer that reports
+/// `version`. A product without a session channel accepts any.
+pub fn session_peer_supported(version: &str) -> bool {
+    PRODUCT
+        .iter()
+        .find(|entry| entry.follow() == FollowKind::SessionChannel)
+        .is_none_or(|entry| entry.supports_peer_version(version))
 }
 
 /// The position of `entry` in `list`.

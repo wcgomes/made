@@ -18,12 +18,10 @@ use made_platform::Platform;
 use crate::cli::LaunchArgs;
 
 // BEGIN transitional-shim (AIA-11)
-use crate::integrations::grok::diagnostics::{GrokAppState, GrokDiagnosticsRow};
 pub use crate::integrations::grok::diagnostics::{GrokDiagnosticsHold, GrokRunningHold};
 use crate::integrations::grok::{self};
 // END transitional-shim
 
-use crate::integrations::opencode::{self, diagnostics::OpenCodeAppState};
 use crate::integrations::{
     AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, OPENCODE, PRODUCT,
 };
@@ -162,7 +160,7 @@ fn remote_grok_row_for(
     consented: bool,
     install: Option<crate::diagnostics::RemoteGrokInstallOutcome>,
     workbench: &Workbench,
-) -> GrokDiagnosticsRow {
+) -> crate::integrations::grok::diagnostics::GrokDiagnosticsRow {
     let report = crate::diagnostics::remote_grok_row(
         workbench.remote_transport_failed(),
         workbench.remote_attached(),
@@ -172,7 +170,7 @@ fn remote_grok_row_for(
         consented,
         workbench.remote_grok_running(),
     );
-    GrokDiagnosticsRow {
+    crate::integrations::grok::diagnostics::GrokDiagnosticsRow {
         pill: report.pill,
         sentence: report.sentence.into(),
     }
@@ -971,7 +969,13 @@ impl AppModel {
         self.push_grok_diagnostics();
     }
 
-    fn push_grok_diagnostics(&mut self) {
+    /// The app-wide integration states, parallel to [`Self::integrations`].
+    pub(crate) fn app_states_mut(&mut self) -> &mut Slots<Box<dyn AppState>> {
+        &mut self.app_states
+    }
+
+    /// Hand every workspace its rows from the app-wide integration states.
+    pub(crate) fn push_grok_diagnostics(&mut self) {
         let mut provisioned = Vec::new();
         let mut unprovisioned = Vec::new();
         for (id, workbench) in &mut self.workspaces {
@@ -1944,7 +1948,9 @@ impl AppModel {
         if let Some(watch) = workbench.take_remote_close() {
             self.remote_closes.push(watch);
         }
-        self.forget_grok_workspace(id);
+        for state in self.app_states.iter_mut() {
+            state.on_workspace_closed(id);
+        }
         workbench.shutdown();
         if self.active == Some(id) {
             self.reset_ui_focus = true;
@@ -2001,13 +2007,8 @@ impl AppModel {
                 workbench.publish_app_state(id, state.as_ref());
             }
         }
-        if self.grok_hooks_unavailable() {
-            workbench.note_grok_session_hooks_unavailable();
-        }
-        if opencode::app_state(self.integrations, &self.app_states)
-            .is_some_and(OpenCodeAppState::missing)
-        {
-            workbench.note_opencode_missing();
+        for state in self.app_states.iter() {
+            workbench.notify_from(state.as_ref());
         }
         workbench.set_benchmark_frames(self.smoke.is_some());
         workbench.set_visible(false);
@@ -2286,7 +2287,7 @@ impl AppModel {
     /// leaves the current (empty) list in place and records both TUIs as not
     /// on PATH.
     fn poll_compatible_tui_detection(&mut self, ctx: &egui::Context) {
-        if self.grok_hold_active() {
+        if self.app_states.iter().any(|state| state.holds_detection()) {
             return;
         }
         let Some(receiver) = self.compatible_tui_receiver.as_ref() else {
@@ -2297,7 +2298,7 @@ impl AppModel {
                 self.notify_detection(&tuis);
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
-                self.announce_opencode_missing();
+                self.announce_notices();
                 self.push_grok_diagnostics();
             }
             Err(TryRecvError::Empty) => {
@@ -2308,56 +2309,22 @@ impl AppModel {
                 if self.notify_detection_failed().diagnostics_changed() {
                     self.push_grok_diagnostics();
                 }
-                self.announce_opencode_missing();
+                self.announce_notices();
             }
         }
     }
 
-    // BEGIN transitional-shim (AIA-11)
-    /// Whether a test hold replaces Grok Build detection and install, which
-    /// then also holds back every integration's detection.
-    fn grok_hold_active(&self) -> bool {
-        grok::app_state(self.integrations, &self.app_states).is_some_and(GrokAppState::hold_active)
-    }
-
-    /// Forget the Grok running mark of a closed workspace.
-    fn forget_grok_workspace(&mut self, id: WorkspaceId) {
-        if let Some(state) = grok::app_state_mut(self.integrations, &mut self.app_states) {
-            state.forget_workspace(id);
-        }
-    }
-
-    /// Whether the shipped Grok plugin could not be installed.
-    fn grok_hooks_unavailable(&self) -> bool {
-        grok::app_state(self.integrations, &self.app_states)
-            .is_some_and(GrokAppState::hooks_unavailable)
-    }
-
-    /// Record a failed shipped-plugin install on every live workspace, once.
-    fn announce_grok_hooks_unavailable(&mut self) {
-        let pending = grok::app_state_mut(self.integrations, &mut self.app_states)
-            .is_some_and(GrokAppState::take_unavailable_notice);
-        if pending {
-            for (_, workbench) in &mut self.workspaces {
-                workbench.note_grok_session_hooks_unavailable();
+    /// Tell every open workspace what the app-wide states that have a pending
+    /// notice know, once.
+    fn announce_notices(&mut self) {
+        for state in self.app_states.iter_mut() {
+            if state.take_pending_notice() {
+                for (_, workbench) in &mut self.workspaces {
+                    workbench.notify_from(state.as_ref());
+                }
             }
         }
     }
-
-    /// Record that OpenCode is not on PATH for every current workspace, once.
-    ///
-    /// A workspace opened after this still receives the reason from
-    /// [`Self::insert_workbench`].
-    fn announce_opencode_missing(&mut self) {
-        let pending = opencode::app_state_mut(self.integrations, &mut self.app_states)
-            .is_some_and(OpenCodeAppState::take_missing_notice);
-        if pending {
-            for (_, workbench) in &mut self.workspaces {
-                workbench.note_opencode_missing();
-            }
-        }
-    }
-    // END transitional-shim
 
     /// Tell every integration's app-wide state what PATH detection found.
     fn notify_detection(&mut self, found: &[IntegrationRef]) -> AppCtx {
@@ -2396,7 +2363,7 @@ impl AppModel {
         if let Some(delay) = polled.repaint_after() {
             ctx.request_repaint_after(delay);
         }
-        self.announce_grok_hooks_unavailable();
+        self.announce_notices();
         if polled.diagnostics_changed() {
             self.push_grok_diagnostics();
         }
