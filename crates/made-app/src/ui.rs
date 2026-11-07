@@ -23,9 +23,7 @@ use crate::app::{AppModel, WorkspaceId};
 use crate::diagnostics::{DiagnosticsPill, DiagnosticsSnapshot};
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
-use crate::integrations::{
-    rank_order, IntegrationList, IntegrationRef, Mark, Presentation, CLAUDE_CODE, GROK, OPENCODE,
-};
+use crate::integrations::{rank_order, IntegrationList, IntegrationRef, Mark, Presentation};
 use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_text};
 use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
@@ -968,12 +966,6 @@ fn workspace_tab_label_width(width: f32, session_count: usize) -> f32 {
         .max(8.0)
 }
 
-/// Claude Code brands a tab while it is present, unless OpenCode owns the tab
-/// or a remote tab already presents Grok Build under SSH-10.
-fn workspace_claude_branded(opencode: bool, remote_grok_branded: bool, present: bool) -> bool {
-    !opencode && !remote_grok_branded && present
-}
-
 /// Non-color summary across all open sessions. Counts include sessions beyond
 /// the eight-dot visual cap.
 fn sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
@@ -1007,12 +999,6 @@ fn sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
         parts.push(format!("{idle} idle"));
     }
     Some(format!("Sessions: {}", parts.join(", ")))
-}
-
-/// Official Claude mark from `assets/claude-code.svg`, outside the Material
-/// icon inventory. The Material `claude.svg` file icon is not this mark.
-fn claude_mark() -> theme::MenuLeading {
-    mark_leading(CLAUDE_CODE.descriptor().mark)
 }
 
 /// The vendored icon of a mark name, resolved once per name.
@@ -1128,7 +1114,7 @@ struct TabBrand {
 
 /// The first integration of the tab's list, in rank order, whose presentation
 /// brands the tab, with that presentation.
-fn tab_brand(workbench: &Workbench) -> Option<(IntegrationRef, Presentation)> {
+pub(crate) fn tab_brand(workbench: &Workbench) -> Option<(IntegrationRef, Presentation)> {
     let list = workbench.integrations();
     let generic = rank_order(list).into_iter().find_map(|index| {
         workbench
@@ -1153,16 +1139,19 @@ fn remote_tab_brand(
     list: IntegrationList,
     generic: Option<(IntegrationRef, Presentation)>,
 ) -> Option<(IntegrationRef, Presentation)> {
-    let opencode = list.contains(&OPENCODE) && workbench.remote_opencode_active();
+    let opencode =
+        list.contains(&crate::integrations::OPENCODE) && workbench.remote_opencode_active();
     let grok_dots = workbench.remote_grok_activities();
-    let remote_grok = list.contains(&GROK)
+    let remote_grok = list.contains(&crate::integrations::GROK)
         && crate::integrations::grok::workspace_grok_branded(
             opencode,
             workbench.terminal_target(),
             workbench.remote_grok_running(),
             grok_dots.len(),
         );
-    let generic = generic.filter(|_| workspace_claude_branded(opencode, remote_grok, true));
+    let generic = generic.filter(|_| {
+        crate::integrations::claude_code::workspace_claude_branded(opencode, remote_grok, true)
+    });
     if opencode {
         let dots = workbench
             .session_map()
@@ -1170,12 +1159,15 @@ fn remote_tab_brand(
             .iter()
             .map(SessionRow::activity)
             .collect();
-        Some((OPENCODE, Presentation { dots, title: None }))
+        Some((
+            crate::integrations::OPENCODE,
+            Presentation { dots, title: None },
+        ))
     } else if generic.is_some() {
         generic
     } else if remote_grok {
         Some((
-            GROK,
+            crate::integrations::GROK,
             Presentation {
                 dots: grok_dots,
                 title: None,
@@ -1648,6 +1640,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
         .data(|data| data.get_temp::<f32>(ssh_body_height_id()))
         .unwrap_or(0.0)
         .clamp(0.0, body_max_height);
+    // BEGIN remote-path (AIA-02)
     let rows_tab_after_actions = model.ssh_prompt().is_none()
         && model.remote_launch().is_none()
         && !model.ssh_selected().is_some_and(|selected| {
@@ -1656,6 +1649,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
                 .ok()
                 .is_some_and(|registry| registry.can_launch_grok(selected))
         });
+    // END remote-path
     let mut first_row = None;
     let mut open = true;
     let layout = Layout::for_window(ctx.content_rect().width(), ctx.content_rect().height());
@@ -1721,6 +1715,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
                                 .map(|server| {
                                     let id = server.id();
                                     let probe = match registry.probe_state(id) {
+                                        // BEGIN remote-path (AIA-02)
                                         crate::ssh_servers::ProbeState::Complete(capabilities) => {
                                             let opencode = if capabilities.opencode {
                                                 "OpenCode detected"
@@ -1733,6 +1728,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
                                                 opencode.to_owned()
                                             }
                                         }
+                                        // END remote-path
                                         crate::ssh_servers::ProbeState::Failed(_) => "test failed".to_owned(),
                                         crate::ssh_servers::ProbeState::Running(_) => "testing".to_owned(),
                                         crate::ssh_servers::ProbeState::Cancelled => "cancelled".to_owned(),
@@ -1865,6 +1861,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
                                 }
                             });
                         }
+                        // BEGIN remote-path (AIA-02)
                         let launch_title = model.remote_launch().map(|launch| {
                             if launch.opencode {
                                 format!("OpenCode SSH — {}", sanitize_display(&launch.label, 48))
@@ -1873,6 +1870,7 @@ pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
                             }
                         });
                         grok_install_consent_card(model, ui, &layout);
+                        // END remote-path
                         if let Some(title) = launch_title {
                             ui.separator();
                             ui.label(theme::body(title));
@@ -1965,8 +1963,10 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut close = None;
     let mut create = false;
     let mut launch_tui = None;
+    // BEGIN remote-path (AIA-02)
     let mut launch_remote_grok = None;
     let mut launch_remote_claude = None;
+    // END remote-path
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
     let mut toggle_ssh = false;
@@ -2262,7 +2262,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                                 "ssh-claude-{}",
                                                 authority_key(server.id())
                                             )),
-                                            claude_mark(),
+                                            mark_leading(crate::integrations::claude_code::mark()),
                                             &claude_label,
                                             layout.button_height,
                                         ) {
@@ -3406,11 +3406,13 @@ impl Workbench {
             report.pill.label().hash(&mut hasher);
             report.sentence.hash(&mut hasher);
         }
+        // BEGIN remote-path (AIA-02)
         if let Some(report) = self.remote_opencode_diagnostics() {
             report.status.label().hash(&mut hasher);
             report.code.hash(&mut hasher);
             report.reason.hash(&mut hasher);
         }
+        // END remote-path
         hasher.finish()
     }
 
@@ -4644,6 +4646,7 @@ fn unavailable_card(ui: &mut Ui, layout: &Layout, title: &str, message: &str) {
         });
 }
 
+// BEGIN remote-path (AIA-02)
 /// The per-server/version Grok plugin install consent card.
 ///
 /// The card exists only where that server's own probe detected grok. Nothing
@@ -4783,6 +4786,7 @@ fn grok_install_consent_card(model: &mut crate::app::AppModel, ui: &mut Ui, layo
         }
     });
 }
+// END remote-path
 
 fn ssh_prompt_card(ui: &mut Ui, class: &crate::remote_session::SshPromptClass, draft: &mut String) {
     match class {
@@ -5129,7 +5133,9 @@ pub fn unread_label(unread: bool, prompt_pulse: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::claude_code::workspace_claude_branded;
     use crate::integrations::grok::workspace_grok_branded;
+    use crate::integrations::{GROK, OPENCODE};
     use crate::session_map::SessionRow;
     use crate::tui::TerminalTarget;
     use std::ffi::OsString;

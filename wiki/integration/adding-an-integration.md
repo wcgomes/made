@@ -69,8 +69,8 @@ A report is checked against the session channel first, then against higher-ranke
 ## Add an integration
 
 1. Create `integrations/<name>/mod.rs` with a `Descriptor` const and an implementation of `Integration`; add `tab.rs` and other files as needed.
-2. Pick a unique key and a rank not used by another entry.
-3. Add the one line `pub const <NAME>: IntegrationRef = &<name>::<Type>;` and add `<NAME>` to `PRODUCT` in `integrations/mod.rs` at the menu position you want.
+2. Pick a unique key and a rank not used by another entry. Give the descriptor `Mark::Image` with the integration's own bytes: `Mark::Vendored` names an icon file in the explorer icon inventory, so a vendored mark also needs an edit to that inventory (a core file). The test that every `PRODUCT` mark resolves covers both kinds.
+3. Add three lines to `integrations/mod.rs`: the `pub mod <name>;` declaration (with `#[doc(hidden)]`, like the others), the const `pub const <NAME>: IntegrationRef = &<name>::<Type>;`, and the `<NAME>` entry in `PRODUCT` at the menu position you want.
 4. Declare follow kind and policy, env policy and diagnostics row as needed; ship the integration's own assets and channel code.
 5. Run the gates in [Build and test](../operations/build-and-test.md). The pin test `integration_modules.rs` lists every descriptor field of `PRODUCT` and fails until you update it for the new entry.
 

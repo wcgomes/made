@@ -150,7 +150,7 @@ Explorer selection -> canonical path guard -> preview loader/refresh -> full-lef
 - Do not introduce a reverse dependency to reuse app types; move shared models upstream or pass owned values.
 - Do not duplicate snapshots, path guards, or platform traits in sibling crates.
 - Do not add OS branches outside `made-platform`.
-- Do not name an integration in core code outside the delimited remote paths; add a module and a `PRODUCT` line instead (see [Adding an integration](integration/adding-an-integration.md)).
+- Do not name an integration in core code outside the delimited remote paths (`// BEGIN remote-path (AIA-02)` regions and the whole-file remote modules); add a module and a `PRODUCT` line instead (see [Adding an integration](integration/adding-an-integration.md)). The documented exceptions are the session-channel status vocabulary, which names OpenCode because OpenCode owns the session channel: `ReasonCode::OpenCode*` and its sentences in `integration_status.rs`, the `opencode_version` peer fields in the diagnostics snapshot, the connected pill label `opencode_pill_label`, and the OpenCode copy in the sessions surfaces and session-channel log lines. They are an explicit allow-list pinned in `crates/made-app/tests/integration_modules.rs`; a new core line that names an integration, or a stale allow-list row, fails that test.
 - Do not add a network listener outside `made-bridge`.
 - Keep shell and explorer usable when optional integration is absent, disconnected, or unsupported.
 - Keep hidden workspaces bounded and never paint inactive grids.

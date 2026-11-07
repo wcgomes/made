@@ -2,8 +2,38 @@
 
 use std::any::Any;
 
-use crate::diagnostics::ClaudeDiagnosticsReport;
-use crate::integrations::{AppCtx, AppInit, AppState, WorkspaceTabs, CLAUDE_CODE};
+use std::borrow::Cow;
+
+use crate::diagnostics::DiagnosticsPill;
+use crate::integrations::{AppCtx, AppInit, AppState, RowReport, WorkspaceTabs, CLAUDE_CODE};
+
+/// The Claude Code pill plus its one fixed sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeDiagnosticsReport {
+    /// Pill beside the sentence.
+    pub pill: DiagnosticsPill,
+    /// The one Claude Code sentence. Fixed product wording; it never carries
+    /// prompt, message or title content.
+    pub sentence: String,
+}
+
+impl ClaudeDiagnosticsReport {
+    pub(crate) fn new(pill: DiagnosticsPill, sentence: &str) -> Self {
+        Self {
+            pill,
+            sentence: sentence.to_owned(),
+        }
+    }
+}
+
+impl From<ClaudeDiagnosticsReport> for RowReport {
+    fn from(report: ClaudeDiagnosticsReport) -> Self {
+        Self {
+            pill: report.pill,
+            sentence: Cow::Owned(report.sentence),
+        }
+    }
+}
 
 /// How long after Claude Code becomes present a missing channel still reads as
 /// starting rather than unavailable.

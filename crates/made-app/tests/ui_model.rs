@@ -11702,7 +11702,7 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
 
     grok::hold_diagnostics(&mut headless.model, GrokDiagnosticsHold::Installed);
     grok::hold_workspace_running(&mut headless.model, here_id, GrokRunningHold::LivingTarget);
-    headless.model.hold_workspace_opencode_label(here_id);
+    made_app::integrations::opencode::hold_label(&mut headless.model, here_id);
     expect_revealed_grok_row(
         &mut headless,
         here_id,

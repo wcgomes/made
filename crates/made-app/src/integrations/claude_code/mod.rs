@@ -81,6 +81,22 @@ impl Integration for ClaudeCode {
     }
 }
 
+/// Claude Code brands a tab while it is present, unless OpenCode owns the tab
+/// or a remote tab already presents Grok Build under SSH-10.
+pub(crate) fn workspace_claude_branded(
+    opencode: bool,
+    remote_grok_branded: bool,
+    present: bool,
+) -> bool {
+    !opencode && !remote_grok_branded && present
+}
+
+/// Official Claude mark from `assets/claude-code.svg`, outside the Material
+/// icon inventory. The Material `claude.svg` file icon is not this mark.
+pub(crate) fn mark() -> Mark {
+    DESCRIPTOR.mark
+}
+
 /// Claude Code state of a workbench's tab: presence, dots and title inputs.
 /// `None` for tabs that do not load Made's Claude Code plugin.
 #[doc(hidden)]

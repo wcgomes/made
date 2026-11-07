@@ -32,8 +32,11 @@ use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
+#[doc(hidden)]
 pub mod claude_code;
+#[doc(hidden)]
 pub mod grok;
+#[doc(hidden)]
 pub mod opencode;
 pub(crate) mod shared;
 
@@ -425,16 +428,22 @@ pub struct TabInit<'a> {
 
 /// What the core lends to a tab that starts what its terminal needs before the
 /// terminal starts.
+///
+/// `diag`, `session` and `failure` are for the session-channel owner only: no
+/// other integration reads or writes them.
 pub struct StartCtx<'a> {
     /// Resolved application paths.
     pub paths: Option<&'a AppPaths>,
     /// The tab's identifier.
     pub pane_id: &'a str,
-    /// The tab's diagnostics, whose log the start records into.
+    /// The tab's diagnostics, whose log the start records into. Owner only
+    /// (the session-channel owner).
     pub diag: &'a mut Diagnostics,
-    /// The tab's session-channel status.
+    /// The tab's session-channel status. Owner only (the session-channel
+    /// owner).
     pub session: &'a mut IntegrationState,
-    /// Why the start failed, kept for the tab's presentation.
+    /// Why the start failed, kept for the tab's presentation. Owner only (the
+    /// session-channel owner).
     pub failure: &'a mut Option<String>,
 }
 
@@ -606,10 +615,15 @@ pub trait AppState: Any {
 }
 
 /// What an app-wide state may record in one workspace.
+///
+/// Both fields are for the session-channel owner only: no other integration
+/// reads or writes them.
 pub struct WorkspaceNotices<'a> {
-    /// The workspace's diagnostics log.
+    /// The workspace's diagnostics log. Owner only (the session-channel
+    /// owner).
     pub log: &'a mut DiagnosticLog,
-    /// The workspace's session-channel status.
+    /// The workspace's session-channel status. Owner only (the
+    /// session-channel owner).
     pub session: &'a mut IntegrationState,
 }
 
@@ -807,11 +821,10 @@ pub fn session_token(list: IntegrationList, slots: &Slots<Box<dyn TabState>>) ->
     session_channel_state(list, slots).and_then(TabState::token)
 }
 
-/// Whether the session channel of the product accepts a peer that reports
-/// `version`. A product without a session channel accepts any.
-pub fn session_peer_supported(version: &str) -> bool {
-    PRODUCT
-        .iter()
+/// Whether the session channel of `list` accepts a peer that reports
+/// `version`. A list without a session channel accepts any.
+pub fn session_peer_supported(list: IntegrationList, version: &str) -> bool {
+    list.iter()
         .find(|entry| entry.follow() == FollowKind::SessionChannel)
         .is_none_or(|entry| entry.supports_peer_version(version))
 }

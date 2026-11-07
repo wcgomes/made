@@ -234,6 +234,7 @@ struct RemoteTab {
     detail: String,
     prompt: Option<made_platform::ssh_askpass::PromptRequest>,
     prompt_draft: String,
+    // BEGIN remote-path (AIA-02)
     opencode: bool,
     /// Whether the remote launch target is Grok: the first frame opens
     /// `grok dashboard` through LaunchTarget::Grok.
@@ -241,6 +242,7 @@ struct RemoteTab {
     /// Whether the remote launch target is Claude Code: the first frame opens
     /// the companion's direct `LaunchTarget::Claude`.
     claude: bool,
+    // END remote-path
     /// Sanitized target triple for the update card. The version is the shipped
     /// app version; no path or hash is stored here.
     update_target: Option<String>,
@@ -319,9 +321,11 @@ impl RemoteTab {
             detail: "Connecting. No local shell was started.".to_owned(),
             prompt: None,
             prompt_draft: String::new(),
+            // BEGIN remote-path (AIA-02)
             opencode: false,
             grok: false,
             claude: false,
+            // END remote-path
             update_target: None,
             update_approved: false,
             update_failed: false,
@@ -672,10 +676,10 @@ impl Workbench {
         started_at: Instant,
     ) -> Result<Self, String> {
         let mut remote = RemoteTab::connecting(snapshot.clone(), directory)?;
+        // BEGIN remote-path (AIA-02)
         remote.opencode = matches!(target, TerminalTarget::RemoteOpenCode { .. });
         remote.grok = matches!(target, TerminalTarget::RemoteGrok { .. });
         remote.claude = matches!(target, TerminalTarget::RemoteClaude { .. });
-        // BEGIN remote-path (AIA-02)
         remote.grok_detected = false;
         // END remote-path
         remote.probe = Some(crate::ssh_servers::spawn_probe(
@@ -714,9 +718,11 @@ impl Workbench {
             detail: detail.into(),
             prompt: None,
             prompt_draft: String::new(),
+            // BEGIN remote-path (AIA-02)
             opencode: matches!(target, TerminalTarget::RemoteOpenCode { .. }),
             grok: matches!(target, TerminalTarget::RemoteGrok { .. }),
             claude: matches!(target, TerminalTarget::RemoteClaude { .. }),
+            // END remote-path
             update_target: None,
             update_approved: false,
             update_failed: false,
@@ -2303,6 +2309,7 @@ impl Workbench {
             .map(|remote| remote.workspace.integration())
     }
 
+    // BEGIN remote-path (AIA-02)
     /// Whether this remote tab presents OpenCode: the owning remote
     /// integration is connected through the attached session, or a directly
     /// launched remote OpenCode process is still alive before its first
@@ -2339,7 +2346,6 @@ impl Workbench {
             .and_then(|remote| remote.workspace.grok_hooks_ready())
     }
 
-    // BEGIN remote-path (AIA-02)
     /// The owning tab's own launch-probe Grok detection. The host PATH is
     /// never consulted; a tab without a finished probe reports undetected.
     pub(crate) fn remote_grok_detected(&self) -> bool {
@@ -2347,7 +2353,6 @@ impl Workbench {
             .as_ref()
             .is_some_and(|remote| remote.grok_detected)
     }
-    // END remote-path
 
     /// Record the tab's own remote detection after its launch probe finishes.
     /// Test-only seam: record the resolved remote target without a live probe.
@@ -2358,13 +2363,11 @@ impl Workbench {
         }
     }
 
-    // BEGIN remote-path (AIA-02)
     pub(crate) fn set_remote_grok_detection(&mut self, detected: bool) {
         if let Some(remote) = self.remote.as_mut() {
             remote.grok_detected = detected;
         }
     }
-    // END remote-path
 
     /// Whether the tab's SSH transport is down: the attempt failed or the
     /// attached session is disconnected. Transport failure outranks every
@@ -2427,6 +2430,7 @@ impl Workbench {
             })
             .collect()
     }
+    // END remote-path
 
     pub fn remote_projection(&self) -> Option<&crate::remote_workspace::WorkspaceProjection> {
         self.remote
@@ -2855,6 +2859,7 @@ impl Workbench {
         let capabilities = report.capabilities;
         // Presence is recorded; the field itself is not a gate.
         let _ = capabilities.tmux;
+        // BEGIN remote-path (AIA-02)
         if remote.opencode && !capabilities.opencode {
             remote.phase = RemotePhase::Failed;
             remote.detail =
@@ -2881,11 +2886,8 @@ impl Workbench {
                 .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
             return;
         }
-        // BEGIN remote-path (AIA-02)
         // The owning tab's own detection feeds its Grok Build diagnostics row.
         remote.grok_detected = capabilities.grok;
-        // END remote-path
-        // BEGIN remote-path (AIA-02)
         if let Some(state) =
             crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
         {
@@ -3147,6 +3149,7 @@ impl Workbench {
             return;
         };
         let directory = remote.workspace.launch_directory().clone();
+        // BEGIN remote-path (AIA-02)
         let launch = if remote.opencode {
             made_remote::protocol::LaunchTarget::OpenCode
         } else if remote.grok {
@@ -3156,6 +3159,7 @@ impl Workbench {
         } else {
             made_remote::protocol::LaunchTarget::Shell
         };
+        // END remote-path
         let operation = crate::remote_session::first_operation(
             remote.session_open,
             directory,
@@ -3329,6 +3333,7 @@ impl Workbench {
                             LogLevel::Info,
                             format!("remote session reply: {}", operation_name(&reply.operation)),
                         );
+                        // BEGIN remote-path (AIA-02)
                         // The client classifies Grok snapshots and events as
                         // unsolicited pushes riding the current attach id.
                         // They never consume a pending workspace request
@@ -3342,6 +3347,7 @@ impl Workbench {
                             let _ = remote.workspace.accept_grok_push(reply);
                             continue;
                         }
+                        // END remote-path
                         if let Some(workspace_id) = remote.id_map.remove(&reply.request_id) {
                             let mut reply = reply;
                             reply.request_id = workspace_id;
@@ -4990,15 +4996,18 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
+        // BEGIN remote-path (AIA-02)
         if let Some(report) = self.remote_opencode_diagnostics() {
             snapshot.set_remote_opencode(report);
         }
+        // END remote-path
         for (key, report) in self.row_reports() {
             snapshot.set_row(key, report);
         }
         snapshot
     }
 
+    // BEGIN remote-path (AIA-02)
     /// The owning remote tab's OpenCode integration for the diagnostics pill.
     /// Transport loss and integration loss stay distinguishable; the
     /// host-local integration state is never claimed for a remote tab.
@@ -5017,6 +5026,7 @@ impl Workbench {
             remote.workspace.projection().integration_error,
         ))
     }
+    // END remote-path
 
     /// Sanitized and token-redacted log path for the clipboard.
     pub fn sanitized_log_path(&self) -> String {
@@ -8054,6 +8064,59 @@ mod tests {
             }
             bench.workbench.poll_integrations(Instant::now());
             assert!(!bench.workbench.claude_tab().unwrap().present());
+        }
+
+        #[test]
+        fn a_remote_tab_presents_grok_build_before_claude_code() {
+            // SSH-10 before SSH-11: a remote tab that presents Grok Build
+            // keeps it even though Claude Code ranks ahead of Grok Build.
+            let (mut bench, attach) = remote_claude_bench();
+            let brand = |bench: &RemoteBench| {
+                crate::ui::tab_brand(&bench.workbench).map(|(entry, _)| entry.descriptor().key)
+            };
+            assert_eq!(brand(&bench), None);
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            assert_eq!(
+                brand(&bench),
+                Some("claude-code"),
+                "Claude Code brands a remote tab on its own"
+            );
+
+            let identity = bench.identity.clone();
+            let push = |bench: &mut RemoteBench, snapshot: GrokSessionSnapshot| {
+                bench
+                    .workbench
+                    .remote_workspace_mut()
+                    .unwrap()
+                    .accept_grok_push(grok_snapshot_envelope(&identity, attach, snapshot))
+                    .unwrap();
+            };
+            push(
+                &mut bench,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            );
+            assert!(bench.workbench.claude_tab().unwrap().present());
+            assert_eq!(
+                brand(&bench),
+                Some("grok"),
+                "an open Grok Build session presents before Claude Code"
+            );
+
+            push(&mut bench, grok_snapshot(2, false, vec![]));
+            assert_eq!(
+                brand(&bench),
+                Some("claude-code"),
+                "Claude Code presents again once Grok Build has nothing open"
+            );
         }
 
         #[test]

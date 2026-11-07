@@ -215,10 +215,159 @@ mod neutrality {
     /// Whole files that are remote paths.
     const REMOTE_FILES: &[&str] = &["ssh_servers.rs", "remote_workspace.rs", "remote_session.rs"];
 
-    const MODULES: [&str; 3] = ["claude_code", "grok", "opencode"];
+    /// Remote-path regions per core file (AIA-02). A new or removed region
+    /// changes the count and trips the pin, so a region cannot be added to
+    /// hide code from the scans without this list changing in review.
+    const REGION_COUNTS: &[(&str, usize)] = &[
+        ("app.rs", 10),
+        ("diagnostics.rs", 2),
+        ("tui.rs", 7),
+        ("ui.rs", 10),
+        ("workbench.rs", 14),
+    ];
+
+    /// Core-named items that stay outside remote-path regions: the session
+    /// channel's status vocabulary, which names OpenCode because OpenCode is
+    /// the session-channel owner, and the product copy that describes that
+    /// owner. Each row is (file, text a line contains, lines that match). An
+    /// empty text excuses the whole file. The expected counts are pinned, so
+    /// a new core-named line, or a stale row, fails the scan.
+    const ALLOWED_CORE_NAMES: &[(&str, &str, usize)] = &[
+        // The session-channel status vocabulary: reason codes, their
+        // sentences and the peer-version fields.
+        ("integration_status.rs", "", 38),
+        // The peer version of the session-channel owner in the diagnostics
+        // snapshot and its copied report.
+        ("diagnostics.rs", "opencode_version", 4),
+        ("diagnostics.rs", "opencode version", 1),
+        // The session-channel owner's connected pill label, its version row
+        // and the copy that names it in the sessions surfaces.
+        ("ui.rs", "opencode_pill_label", 2),
+        ("ui.rs", "\"OpenCode\",", 1),
+        ("ui.rs", ".opencode_version", 1),
+        ("ui.rs", "including OpenCode, Grok and SSH sessions", 1),
+        ("ui.rs", "Open OpenCode in the terminal.", 2),
+        ("ui.rs", "All OpenCode sessions", 1),
+        // The session-channel log lines.
+        ("workbench.rs", "OpenCode integration connected", 1),
+        ("workbench.rs", "info.opencode_version", 1),
+        ("workbench.rs", "OpenCode integration rejected", 1),
+        ("workbench.rs", "OpenCode integration unloaded", 1),
+    ];
 
     fn src_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// The integration modules, read from the `src/integrations/` directory
+    /// listing: every folder except `shared`.
+    fn integration_modules() -> Vec<String> {
+        let mut modules: Vec<String> = fs::read_dir(src_dir().join("integrations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .filter(|name| name != "shared")
+            .collect();
+        modules.sort();
+        assert_eq!(
+            modules.len(),
+            PRODUCT.len(),
+            "the integration folders and the product list differ: {modules:?}"
+        );
+        modules
+    }
+
+    /// Whether `name` is a path segment of `line`: a whole word followed by
+    /// `::`.
+    fn has_path_segment(line: &str, name: &str) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut from = 0;
+        while let Some(found) = line[from..].find(name) {
+            let start = from + found;
+            let end = start + name.len();
+            let before = line[..start].chars().next_back();
+            if !before.is_some_and(is_word) && line[end..].trim_start().starts_with("::") {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// Whether `text` holds `name` as a whole word.
+    fn has_word(text: &str, name: &str) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut from = 0;
+        while let Some(found) = text[from..].find(name) {
+            let start = from + found;
+            let end = start + name.len();
+            let before = text[..start].chars().next_back();
+            let after = text[end..].chars().next();
+            if !before.is_some_and(is_word) && !after.is_some_and(is_word) {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// Every way the given lines reach an integration module: a path through
+    /// it, or a grouped, aliased or glob import of the integrations tree,
+    /// including multi-line statements. Each entry is `number: reason`.
+    fn import_violations(lines: &[(usize, &str)], modules: &[String]) -> Vec<String> {
+        let mut found = Vec::new();
+        for (number, line) in lines {
+            for module in modules {
+                if has_path_segment(line, module) {
+                    found.push(format!("{number}: path `{module}::`"));
+                }
+            }
+        }
+        for (number, statement) in use_statements(lines) {
+            if !statement.contains("integrations") {
+                continue;
+            }
+            for module in modules {
+                if has_word(&statement, module) {
+                    found.push(format!("{number}: imports `{module}`"));
+                }
+            }
+            if statement.contains("integrations as ") || statement.contains("integrations::*") {
+                found.push(format!("{number}: aliases or globs the integrations tree"));
+            }
+        }
+        found
+    }
+
+    /// The `use` statements among scanned lines, each joined into one string
+    /// with its first line number.
+    fn use_statements(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+        let mut statements = Vec::new();
+        let mut open: Option<(usize, String)> = None;
+        for (number, line) in lines {
+            let trimmed = line.trim_start();
+            if is_comment(line) {
+                continue;
+            }
+            if open.is_none() {
+                let rest = trimmed
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| trimmed.strip_prefix("pub "))
+                    .unwrap_or(trimmed);
+                if rest.starts_with("use ") {
+                    open = Some((*number, String::new()));
+                }
+            }
+            if let Some((_, text)) = open.as_mut() {
+                text.push_str(trimmed);
+                text.push(' ');
+                if trimmed.ends_with(';') {
+                    statements.push(open.take().unwrap());
+                }
+            }
+        }
+        statements
     }
 
     /// The core sources: every file of `src` outside `integrations/`, except
@@ -240,6 +389,8 @@ mod neutrality {
     }
 
     /// The lines of `source` outside remote-path regions, with their numbers.
+    /// Panics when the markers do not pair up: an END without a BEGIN, or a
+    /// BEGIN still open at the end of the source.
     fn scanned_lines(source: &str) -> Vec<(usize, &str)> {
         let mut depth = 0usize;
         let mut lines = Vec::new();
@@ -250,26 +401,48 @@ mod neutrality {
                 continue;
             }
             if trimmed.starts_with("// END remote-path") {
-                depth = depth.saturating_sub(1);
+                assert!(
+                    depth > 0,
+                    "line {}: END remote-path without BEGIN",
+                    index + 1
+                );
+                depth -= 1;
                 continue;
             }
             if depth == 0 {
                 lines.push((index + 1, line));
             }
         }
+        assert_eq!(depth, 0, "a BEGIN remote-path has no END");
         lines
     }
 
     /// The part of a core file the scans read: everything before its unit
-    /// tests.
+    /// tests. The unit-test module must be the last item of the file, so no
+    /// production code can follow it unscanned.
     fn production_part(source: &str) -> String {
         let lines: Vec<&str> = source.lines().collect();
-        let end = lines
+        let starts: Vec<usize> = lines
             .windows(2)
-            .position(|pair| {
+            .enumerate()
+            .filter(|(_, pair)| {
                 pair[0].trim_end() == "#[cfg(test)]" && pair[1].starts_with("mod tests")
             })
-            .unwrap_or(lines.len());
+            .map(|(index, _)| index)
+            .collect();
+        assert!(starts.len() <= 1, "more than one `mod tests` block");
+        let Some(&end) = starts.first() else {
+            return lines.join("\n");
+        };
+        let close = lines[end..]
+            .iter()
+            .position(|line| *line == "}")
+            .expect("the `mod tests` block never closes at column 0")
+            + end;
+        assert!(
+            lines[close + 1..].iter().all(|line| line.trim().is_empty()),
+            "the `mod tests` block is not the last item of the file"
+        );
         lines[..end].join("\n")
     }
 
@@ -348,25 +521,126 @@ mod neutrality {
 
     #[test]
     fn core_files_do_not_import_an_integration_module() {
+        let modules = integration_modules();
         let mut found = Vec::new();
         for path in core_files() {
             let source = fs::read_to_string(&path).unwrap();
-            for (number, line) in scanned_lines(&production_part(&source)) {
-                if is_comment(line) {
-                    continue;
-                }
-                if MODULES
-                    .iter()
-                    .any(|module| line.contains(&format!("integrations::{module}")))
-                {
-                    found.push(format!("{}:{number}", path.display()));
-                }
+            let production = production_part(&source);
+            let lines: Vec<(usize, &str)> = scanned_lines(&production)
+                .into_iter()
+                .filter(|(_, line)| !is_comment(line))
+                .collect();
+            for violation in import_violations(&lines, &modules) {
+                found.push(format!("{}:{violation}", path.display()));
             }
         }
         assert!(
             found.is_empty(),
             "core imports of an integration module:\n{}",
             found.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_import_scan_sees_grouped_aliased_and_deep_paths() {
+        let modules = ["claude_code".to_owned(), "grok".to_owned()];
+        let flagged = |source: &str| {
+            let lines: Vec<(usize, &str)> = source.lines().enumerate().collect();
+            !import_violations(&lines, &modules).is_empty()
+        };
+        assert!(flagged("use crate::integrations::{grok, AppCtx};"));
+        assert!(flagged(
+            "use crate::integrations::{\n    AppCtx,\n    claude_code,\n};"
+        ));
+        assert!(flagged("use crate::integrations as i;"));
+        assert!(flagged("let x = i::grok::mark();"));
+        assert!(flagged("crate::integrations::claude_code :: tab(w)"));
+        assert!(!flagged("use crate::integrations::{AppCtx, PRODUCT};"));
+        assert!(!flagged("let grokked = pregrok::x();"));
+        assert!(!flagged("let claude_code_label = 1;"));
+    }
+
+    #[test]
+    fn remote_path_regions_are_balanced_and_pinned_per_core_file() {
+        for path in core_files() {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let source = fs::read_to_string(&path).unwrap();
+            // Panics on an unpaired marker, or when the unit tests are not
+            // the file's last item.
+            let production = production_part(&source);
+            scanned_lines(&production);
+            // Regions in the unit tests would be dead markers.
+            scanned_lines(&source);
+            let regions = source
+                .lines()
+                .filter(|line| line.trim_start().starts_with("// BEGIN remote-path"))
+                .count();
+            let pinned = REGION_COUNTS
+                .iter()
+                .find(|(file, _)| *file == name)
+                .map_or(0, |(_, count)| *count);
+            assert_eq!(regions, pinned, "{name}: remote-path regions");
+        }
+    }
+
+    #[test]
+    fn core_production_lines_name_no_integration_outside_pinned_exceptions() {
+        // The integration names, from the module folders: the folder name and
+        // its first word (`claude_code` is named `claude`).
+        let mut names: Vec<String> = Vec::new();
+        for module in integration_modules() {
+            names.push(module.clone());
+            if let Some(first) = module.split('_').next() {
+                names.push(first.to_owned());
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut hits = vec![0usize; ALLOWED_CORE_NAMES.len()];
+        let mut found = Vec::new();
+        for path in core_files() {
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            let source = fs::read_to_string(&path).unwrap();
+            for (number, line) in scanned_lines(&production_part(&source)) {
+                if is_comment(line) {
+                    continue;
+                }
+                let lowered = line.to_ascii_lowercase();
+                if !names.iter().any(|name| lowered.contains(name.as_str())) {
+                    continue;
+                }
+                let mut allowed = false;
+                for (row, (allowed_file, text, _)) in ALLOWED_CORE_NAMES.iter().enumerate() {
+                    if *allowed_file == file && line.contains(text) {
+                        hits[row] += 1;
+                        allowed = true;
+                    }
+                }
+                if !allowed {
+                    found.push(format!("{file}:{number}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "core lines naming an integration outside remote-path regions:\n{}",
+            found.join("\n")
+        );
+        let drifted: Vec<String> = ALLOWED_CORE_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(row, (_, _, expected))| hits[*row] != *expected)
+            .map(|(row, (file, text, expected))| {
+                format!(
+                    "`{text}` in {file}: {} matching lines, pinned {expected}",
+                    hits[row]
+                )
+            })
+            .collect();
+        assert!(
+            drifted.is_empty(),
+            "allowed core names drifted:\n{}",
+            drifted.join("\n")
         );
     }
 
@@ -409,14 +683,15 @@ mod neutrality {
     fn no_integration_folder_references_another() {
         let root = src_dir().join("integrations");
         let mut checked = 0;
-        for folder in MODULES {
+        let modules = integration_modules();
+        for folder in &modules {
             let mut files = Vec::new();
             module_files(&root.join(folder), &mut files);
             assert!(!files.is_empty(), "{folder} has no file");
             for path in files {
                 let source = fs::read_to_string(&path).unwrap();
                 checked += 1;
-                for other in MODULES {
+                for other in &modules {
                     if other == folder {
                         continue;
                     }

@@ -6,6 +6,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::diagnostics::ClaudeDiagnosticsReport;
 use super::diagnostics::{
     claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
     ClaudeDiagnosticsPhase,
@@ -15,7 +16,7 @@ use super::launch::{
     claude_launch_env, shipped_claude_plugin_dir, ClaudeLaunchEnv, CLAUDE_CODE_PLUGIN_DIRS_ENV,
     CLAUDE_SPOOL_ENV,
 };
-use crate::diagnostics::{ClaudeDiagnosticsReport, LogLevel};
+use crate::diagnostics::LogLevel;
 use crate::integrations::{
     EnvContribution, LaunchCtx, Presentation, PresentationCtx, RowReport, TabInit, TabIo,
     TabReport, TabState, CLAUDE_CODE,
@@ -367,5 +368,109 @@ impl TabState for ClaudeTabState {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::super::follow::{HookStatus, Record};
+    use super::*;
+    use crate::integrations::FollowPort;
+    use crate::session_follow::SessionFollowCoordinator;
+    use crate::terminal_view::TerminalPane;
+    use made_terminal::PtyOptions;
+
+    #[test]
+    fn a_rejected_unusable_directory_is_retried_only_at_the_next_liveness_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let usable = temp.path().join("usable");
+        fs::create_dir(&usable).unwrap();
+        let session_dir = temp.path().join("session-dir");
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(&platform, PtyOptions::new(temp.path())).unwrap();
+        let pid = pane.pid().expect("a terminal process");
+        let mut coordinator = SessionFollowCoordinator::new(&usable, temp.path()).unwrap();
+
+        // A live session whose working directory does not exist yet.
+        let mut tab = ClaudeTab::new(pid, true);
+        let parents = made_platform::process_parent_map();
+        tab.ingest(
+            vec![Record {
+                session_id: "s".to_owned(),
+                cwd: session_dir.to_string_lossy().into_owned(),
+                event: "SessionStart".to_owned(),
+                status: Some(HookStatus::Idle),
+                title: String::new(),
+                pids: vec![pid],
+            }],
+            |pid| parents.get(&pid).copied(),
+        );
+        let start = Instant::now();
+        let mut state = ClaudeTabState {
+            plugin: None,
+            phase: ClaudeDiagnosticsPhase::NotOnPath,
+            remote_detected: None,
+            runtime: Some(ClaudeRuntime {
+                tab,
+                spool: None,
+                liveness_checked_at: start,
+                present_since: None,
+                applied_directory: None,
+                rejected_directory: None,
+            }),
+            launching: None,
+            reported: None,
+        };
+        let mut poll = |state: &mut ClaudeTabState, after: Duration| {
+            let mut io = TabIo {
+                terminal: Some(&mut pane),
+                target: TerminalTarget::Shell,
+                remote: false,
+                follow: FollowPort::new(None, None),
+            };
+            state.poll(start + after, &mut io)
+        };
+        let answer = |state: &mut ClaudeTabState,
+                      coordinator: &mut SessionFollowCoordinator,
+                      report: TabReport| {
+            let directory = report.directory.expect("a directory report").unwrap();
+            let outcome = coordinator.follow_directory(CLAUDE_CODE, Some(&directory));
+            state.on_follow_outcome(Some(&outcome));
+            outcome.update
+        };
+
+        // The first poll reports the directory and the coordinator rejects it.
+        let first = poll(&mut state, Duration::from_millis(10));
+        assert_eq!(first.directory, Some(Some(session_dir.clone())));
+        assert!(matches!(
+            answer(&mut state, &mut coordinator, first),
+            SessionFollowUpdate::RejectedSnapshot { .. }
+        ));
+
+        // Before the next liveness check the rejected directory is not retried.
+        let between = poll(&mut state, Duration::from_millis(500));
+        assert_eq!(between, TabReport::default());
+
+        // The liveness check is due again: the directory is retried, and
+        // accepted once it exists.
+        fs::create_dir(&session_dir).unwrap();
+        let retried = poll(
+            &mut state,
+            CLAUDE_LIVENESS_INTERVAL + Duration::from_millis(20),
+        );
+        assert_eq!(retried.directory, Some(Some(session_dir.clone())));
+        assert!(!matches!(
+            answer(&mut state, &mut coordinator, retried),
+            SessionFollowUpdate::RejectedSnapshot { .. }
+        ));
+
+        // An accepted directory is not reported again, even at a liveness check.
+        let settled = poll(
+            &mut state,
+            CLAUDE_LIVENESS_INTERVAL * 2 + Duration::from_millis(40),
+        );
+        assert_eq!(settled, TabReport::default());
     }
 }

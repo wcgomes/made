@@ -32,13 +32,13 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_app::app::{AppModel, AppOptions};
-use made_app::diagnostics::{DiagnosticsPill, DiagnosticsSnapshot};
+use made_app::diagnostics::{DiagnosticLog, DiagnosticsPill, DiagnosticsSnapshot, LogLevel};
 use made_app::integrations::{
     apply_contributions, validate, AppCtx, AppInit, AppState, Descriptor, DiagnosticsDecl,
     EnvContribution, EnvPolicy, FollowKind, FollowPolicy, Integration, IntegrationList,
     IntegrationRef, LaunchCtx, Mark, OnUnusable, Presentation, PresentationCtx, Rank, RowDecl,
-    RowReport, TabInit, TabIo, TabReport, TabState, WhileOutranked, WorkspaceTabs, CLAUDE_CODE,
-    GROK, OPENCODE, PRODUCT,
+    RowReport, StartCtx, TabInit, TabIo, TabReport, TabState, WhileOutranked, WorkspaceNotices,
+    WorkspaceTabs, CLAUDE_CODE, GROK, OPENCODE, PRODUCT,
 };
 use made_app::session_follow::{RootSource, SessionFollowCoordinator};
 use made_app::session_map::SessionActivity;
@@ -78,6 +78,18 @@ fn events_with(prefix: &str) -> Vec<String> {
         .filter(|event| event.starts_with(prefix))
         .collect()
 }
+
+/// Whether the fake app states hold PATH detection back.
+static HOLD_DETECTION: AtomicBool = AtomicBool::new(false);
+
+/// Whether the fake app states have a notice to hand to the open workspaces.
+static PENDING_NOTICE: AtomicBool = AtomicBool::new(false);
+
+/// The notice the fake app states record in a workspace, when there is one.
+static NOTICE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The line the fake tab states put in their workspace log on shutdown.
+const SHUTDOWN_MARKER: &str = "fake tab shut down";
 
 const FAKE_BYTES: &[u8] = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
 
@@ -127,6 +139,8 @@ struct FakeAgent {
     marker: &'static str,
     /// Whether the tab state reports [`FAKE_DIR`] to the follow coordinator.
     reports_directory: bool,
+    /// Whether the entry counts a launch carrying its variable as configured.
+    configures: bool,
 }
 
 static FAKE: FakeAgent = FakeAgent {
@@ -136,6 +150,7 @@ static FAKE: FakeAgent = FakeAgent {
     sentence_key: "fake",
     marker: "fake_status",
     reports_directory: true,
+    configures: true,
 };
 
 static ABOVE: FakeAgent = FakeAgent {
@@ -145,6 +160,7 @@ static ABOVE: FakeAgent = FakeAgent {
     sentence_key: "fake",
     marker: "fake_status",
     reports_directory: true,
+    configures: true,
 };
 
 static SECOND: FakeAgent = FakeAgent {
@@ -154,6 +170,18 @@ static SECOND: FakeAgent = FakeAgent {
     sentence_key: "second",
     marker: "second_status",
     reports_directory: false,
+    configures: true,
+};
+
+/// A fake that never counts a launch as configured.
+static INERT: FakeAgent = FakeAgent {
+    this: &INERT,
+    descriptor: &SECOND_DESCRIPTOR,
+    status_key: "second status",
+    sentence_key: "second",
+    marker: "second_status",
+    reports_directory: false,
+    configures: false,
 };
 
 const FAKE_ENV: &str = "FAKE_AGENT_VAR";
@@ -218,6 +246,10 @@ impl Integration for FakeAgent {
             initial: RowReport::new(DiagnosticsPill::Inactive, "Fake Agent is not on PATH."),
         })
     }
+
+    fn configures_launch(&self, contribution: &EnvContribution) -> bool {
+        self.configures && contribution.set.iter().any(|(name, _)| name == FAKE_ENV)
+    }
 }
 
 struct FakeApp {
@@ -258,6 +290,24 @@ impl AppState for FakeApp {
         Some((self.marker, "ok".to_owned()))
     }
 
+    fn holds_detection(&self) -> bool {
+        HOLD_DETECTION.load(Ordering::SeqCst)
+    }
+
+    fn on_workspace_closed(&mut self, id: made_app::WorkspaceId) {
+        record(format!("closed:{}:{id:?}", self.descriptor.key));
+    }
+
+    fn take_pending_notice(&mut self) -> bool {
+        PENDING_NOTICE.swap(false, Ordering::SeqCst)
+    }
+
+    fn notify_workspace(&self, workspace: &mut WorkspaceNotices<'_>) {
+        if let Some(notice) = NOTICE.lock().unwrap().as_ref() {
+            workspace.log.record(LogLevel::Info, notice.as_str());
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -286,6 +336,10 @@ impl FakeTab {
 }
 
 impl TabState for FakeTab {
+    fn start(&mut self, _ctx: &mut StartCtx<'_>) {
+        record(format!("start:{}", self.key()));
+    }
+
     /// The core decides coverage from the declared policy and passes it in; the
     /// fake only supplies the variable of a covered launch.
     fn prepare_launch(
@@ -336,6 +390,19 @@ impl TabState for FakeTab {
 
     fn teardown(&mut self) {
         record(format!("teardown:{}", self.key()));
+    }
+
+    fn shutdown(&mut self, log: &mut DiagnosticLog) {
+        record(format!("shutdown:{}", self.key()));
+        log.record(LogLevel::Info, SHUTDOWN_MARKER);
+    }
+
+    fn after_shutdown(&mut self) {
+        record(format!(
+            "after-shutdown:{}:written={}",
+            self.key(),
+            home_holds_text(SHUTDOWN_MARKER)
+        ));
     }
 
     fn row(&self, _remote: bool) -> Option<RowReport> {
@@ -548,6 +615,25 @@ fn home_file(name: &str) -> String {
         assert!(Instant::now() < deadline, "{name} was never written");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Whether any file under the home holds `text`: the diagnostics log written at
+/// shutdown carries the workspace's log entries.
+fn home_holds_text(text: &str) -> bool {
+    fn walk(dir: &Path, text: &str) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, text)
+            } else {
+                fs::read_to_string(&path).is_ok_and(|content| content.contains(text))
+            }
+        })
+    }
+    walk(Path::new(&std::env::var_os("HOME").unwrap()), text)
 }
 
 /// The terminal options of the active workbench.
@@ -942,6 +1028,131 @@ fn tab_state_is_created_polled_in_list_order_and_torn_down_once() {
 }
 
 #[test]
+fn tab_hooks_run_once_each_in_order_around_a_launch_and_its_shutdown() {
+    if isolated("tab_hooks_run_once_each_in_order_around_a_launch_and_its_shutdown") {
+        return;
+    }
+    let mut model = empty_model(WITH_FAKE);
+    let temp = tempfile::tempdir().unwrap();
+    let id = open_shell(&mut model, temp.path());
+    drive(&mut model, |model| {
+        model
+            .workbench()
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
+    assert!(model.close_workspace(id));
+    let fake: Vec<String> = events()
+        .into_iter()
+        .filter(|event| event.contains(":fake"))
+        .filter(|event| {
+            !["poll:", "saw:", "app-state:", "closed:"]
+                .iter()
+                .any(|prefix| event.starts_with(prefix))
+        })
+        .collect();
+    assert_eq!(
+        fake,
+        [
+            "tab-state:fake:Shell",
+            "start:fake",
+            "prepare:fake:Shell:covered=true",
+            "teardown:fake",
+            "shutdown:fake",
+            // The diagnostics log, which carries the line `shutdown` added,
+            // was written before the last hook ran.
+            "after-shutdown:fake:written=true",
+        ]
+    );
+}
+
+#[test]
+fn a_launch_counts_as_configured_only_when_an_entry_says_so() {
+    if isolated("a_launch_counts_as_configured_only_when_an_entry_says_so") {
+        return;
+    }
+    const ORIGINAL: &str = "started with the original environment";
+    let logged = |model: &AppModel| {
+        model
+            .workbench()
+            .expect("a workbench")
+            .diagnostics()
+            .log()
+            .entries()
+            .any(|entry| entry.message.contains(ORIGINAL))
+    };
+    const CONFIGURING: IntegrationList = &[&FAKE];
+    const INERT_LIST: IntegrationList = &[&INERT];
+    let configured = model_with_tab(CONFIGURING, None);
+    assert!(!logged(&configured), "an entry configured the launch");
+    drop(configured);
+    let inert = model_with_tab(INERT_LIST, None);
+    assert!(logged(&inert), "no entry configured the launch");
+}
+
+#[test]
+fn app_hooks_hold_detection_notify_every_workspace_once_and_report_closes() {
+    if isolated("app_hooks_hold_detection_notify_every_workspace_once_and_report_closes") {
+        return;
+    }
+    // Detection is held back while a state asks for it, then proceeds.
+    HOLD_DETECTION.store(true, Ordering::SeqCst);
+    let mut model = AppModel::from_launch(
+        made_app::workspace::WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tui_detection(),
+    )
+    .with_integrations(WITH_FAKE);
+    let ctx = context();
+    for _ in 0..30 {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(events_with("detected:").is_empty(), "detection was held");
+    assert!(model.compatible_tuis().is_empty());
+    HOLD_DETECTION.store(false, Ordering::SeqCst);
+    drive(&mut model, |model| !model.compatible_tuis().is_empty());
+    assert_eq!(events_with("detected:"), ["detected:fake:true"]);
+
+    // A notice reaches every open workspace once.
+    let temp = tempfile::tempdir().unwrap();
+    let first = open_shell(&mut model, &directory(temp.path(), "first"));
+    let second = open_shell(&mut model, &directory(temp.path(), "second"));
+    let noticed = |model: &AppModel, id| {
+        model
+            .workspace(id)
+            .expect("an open workspace")
+            .diagnostics()
+            .log()
+            .entries()
+            .filter(|entry| entry.message == "fake notice")
+            .count()
+    };
+    assert_eq!((noticed(&model, first), noticed(&model, second)), (0, 0));
+    *NOTICE.lock().unwrap() = Some("fake notice".to_owned());
+    PENDING_NOTICE.store(true, Ordering::SeqCst);
+    drive(&mut model, |model| noticed(model, first) > 0);
+    drive(&mut model, |_| true);
+    drive(&mut model, |_| true);
+    assert_eq!((noticed(&model, first), noticed(&model, second)), (1, 1));
+
+    // A workspace opened later gets it too, and the first two are not told again.
+    let third = open_shell(&mut model, &directory(temp.path(), "third"));
+    drive(&mut model, |_| true);
+    assert_eq!(
+        (
+            noticed(&model, first),
+            noticed(&model, second),
+            noticed(&model, third)
+        ),
+        (1, 1, 1)
+    );
+
+    // Closing a workspace tells the state, once, with that workspace's id.
+    assert!(model.close_workspace(second));
+    assert_eq!(events_with("closed:"), [format!("closed:fake:{second:?}")]);
+}
+
+#[test]
 fn a_fake_polls_after_the_product_entries_that_precede_it_in_the_list() {
     if isolated("a_fake_polls_after_the_product_entries_that_precede_it_in_the_list") {
         return;
@@ -1096,7 +1307,7 @@ fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude()
 
     // OpenCode connected (its label held here) outranks the fake.
     let id = model.active_workspace_id().unwrap();
-    model.hold_workspace_opencode_label(id);
+    made_app::integrations::opencode::hold_label(&mut model, id);
     assert_eq!(tab(&model).label, "OpenCode");
     drop(model);
 
@@ -1133,7 +1344,7 @@ fn a_fake_at_rank_150_brands_a_tab_over_claude_code() {
     drive_to_label(&mut model, "Fake Agent");
     assert_eq!(tab(&model).mark, Some(ABOVE_DESCRIPTOR.mark));
     let id = model.active_workspace_id().unwrap();
-    model.hold_workspace_opencode_label(id);
+    made_app::integrations::opencode::hold_label(&mut model, id);
     assert_eq!(tab(&model).label, "OpenCode", "OpenCode keeps rank 100");
     drop(model);
     set_fake_directory(None);

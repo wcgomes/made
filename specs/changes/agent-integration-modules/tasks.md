@@ -34,8 +34,8 @@ Conventions:
 - [x] 0.8 Record baseline external dependency sets: `cargo tree -p made-grok-hook -e normal --prefix none` and the same for `made-claude-hook`, for a Unix and a Windows target (path: specs/changes/agent-integration-modules/proposal.md)
 
 ## Checkpoint
-- [ ] gates pass on unchanged production code; 0.1 to 0.7 pass without any production edit
-- [ ] verify baselines for: Branch table preserved; Launch environment matrix; Grok arguments; Copied report unchanged; Smoke markers unchanged; Rows before detection; Report order follows the list; Precedence by rank; Rank is independent of catalog order; Remote behavior unchanged; Golden corpus byte-identical; Diverged read limits kept
+- [x] gates pass on unchanged production code; 0.1 to 0.7 pass without any production edit
+- [x] verify baselines for: Branch table preserved; Launch environment matrix; Grok arguments; Copied report unchanged; Smoke markers unchanged; Rows before detection; Report order follows the list; Precedence by rank; Rank is independent of catalog order; Remote behavior unchanged; Golden corpus byte-identical; Diverged read limits kept
 
 ## 1. Step 1 (step 1 PR)
 
@@ -71,8 +71,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.28 Adapter-block migration of identity references (detection setup) to `IntegrationRef`; nothing outside the block changes (path: crates/made-app/tests/smoke_markers.rs)
 
 #### Checkpoint G1
-- [ ] compile-green; then gates pass; adapter checks pass for `launch_env_characterization.rs`, `diagnostics.rs` and `smoke_markers.rs`, and the 1.26 grep is clean; no `CompatibleTui` identifier remains in the workspace
-- [ ] verify: List order is catalog order; Product list is exact; Duplicate rank rejected; A list change trips the pin; Moved sources stay scanned; Grok arguments; Launch environment matrix
+- [x] compile-green; then gates pass; adapter checks pass for `launch_env_characterization.rs`, `diagnostics.rs` and `smoke_markers.rs`, and the 1.26 grep is clean; no `CompatibleTui` identifier remains in the workspace
+- [x] verify: List order is catalog order; Product list is exact; Duplicate rank rejected; A list change trips the pin; Moved sources stay scanned; Grok arguments; Launch environment matrix
 
 ### 1a-G2 Follow (ATOMIC: not compile-green until 1.36)
 - [x] 1.29 `FollowKind`, `FollowPolicy`, `OnUnusable`, `WhileOutranked` and `Integration::follow()` (path: crates/made-app/src/integrations/mod.rs)
@@ -119,8 +119,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.52 Remove the AppModel Grok fields and detection branch; transitional `hold_grok_diagnostics` and `hold_workspace_grok_running` delegating to the slot, inside transitional-shim markers (path: crates/made-app/src/app.rs)
 
 #### Checkpoint G3c
-- [ ] compile-green; then gates pass; adapter checks pass for every phase 0 block
-- [ ] verify: Branch table preserved; Grok arguments; Rows before detection; Existing suites stay the acceptance gate
+- [x] compile-green; then gates pass; adapter checks pass for every phase 0 block
+- [x] verify: Branch table preserved; Grok arguments; Rows before detection; Existing suites stay the acceptance gate
 
 ### 1a-G3d OpenCode state (ATOMIC: not compile-green until 1.59)
 - [x] 1.53 Inventory (re-run and update if the rebased tree differs). At `0b57210`: Workbench fields `bridge`, `config_guard`, the composed configuration and user-config capture state (`workbench.rs` ~1030-1160, 5265-5300, 5862-5885); public accessors and readers: `note_opencode_missing` (src: app.rs, integration_status.rs; tests: diagnostics.rs, degraded.rs), `smoke_summary` (app.rs); AppModel OpenCode-missing memory and `remember_opencode_missing`; staying core as session channel: `integration` (`IntegrationState`), `is_connected`, `focus_session` (path: specs/changes/agent-integration-modules/tasks.md)
@@ -132,8 +132,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.59 Adapter-block adaptation only, if the launch seam changed shape (path: crates/made-app/tests/launch_env_characterization.rs)
 
 #### Checkpoint G3d
-- [ ] compile-green; then gates pass; adapter checks pass for every phase 0 block
-- [ ] verify: Launch environment matrix; Grok arguments; Branch table preserved; Remote behavior unchanged; Existing suites stay the acceptance gate
+- [x] compile-green; then gates pass; adapter checks pass for every phase 0 block
+- [x] verify: Launch environment matrix; Grok arguments; Branch table preserved; Remote behavior unchanged; Existing suites stay the acceptance gate
 
 ### 1a-G4 Presentation and diagnostics (ATOMIC: not compile-green until 1.70)
 - [x] 1.60 `DiagnosticsDecl`, `RowReport`, `Presentation`; `AppState::{row, smoke_marker}`; `TabState::presentation` (path: crates/made-app/src/integrations/mod.rs)
@@ -161,8 +161,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.76 List variation for diagnostics rows, About rows, copied report and smoke markers (path: crates/made-app/tests/fake_integration.rs)
 
 #### Checkpoint 1a
-- [ ] gates pass; all per-block adapter checks pass
-- [ ] verify: One module per integration (state of all three, Claude Code seams); No cross-integration dependency; Compile-time only; Nothing outside the build adds an integration; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; A seam that ignores the list fails
+- [x] gates pass; all per-block adapter checks pass
+- [x] verify: One module per integration (state of all three, Claude Code seams); No cross-integration dependency; Compile-time only; Nothing outside the build adds an integration; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; A seam that ignores the list fails
 
 ### 1b Claude Code channel code relocation (each task green)
 - [x] 1.77 Move `process_belongs_to_with` and helpers out of `grok_follow.rs` (path: crates/made-app/src/integrations/shared/process_ancestry.rs)
@@ -181,8 +181,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 1.90 Revert check of the step 1 merge on a scratch branch, gates pass (path: n/a (PR description))
 
 ## Checkpoint
-- [ ] gates pass; phase 0 tests differ only inside adapter blocks; other test diffs path-only or AIA-09; PR CI green (merge gate)
-- [ ] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration; No cross-integration dependency; Moved sources stay scanned; Green after each step; Revert of the latest step
+- [x] gates pass; phase 0 tests differ only inside adapter blocks; other test diffs path-only or AIA-09; PR CI green (merge gate)
+- [x] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration; No cross-integration dependency; Moved sources stay scanned; Green after each step; Revert of the latest step
 
 ## 2. Step 2: Grok Build channel code (step 2 PR; each task green)
 - [x] 2.1 Extend the neutrality deny-list with Grok legacy identifiers (`grok_root`, `GrokLiveSession`, `poll_grok_`, `GrokDiagnosticsPhase`, `grok_row_for`), still exempting transitional-shim regions; confirm failing locally, commit with 2.10, the last removal (2.7, 2.8 and 2.10 remove the items) (path: crates/made-app/tests/integration_modules.rs)
@@ -200,8 +200,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 2.13 Revert check of the step 2 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint
-- [ ] gates pass; phase 0 and phase 1 tests unchanged; PR CI green (merge gate)
-- [ ] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; One module per integration (Claude Code, Grok Build); No cross-integration dependency; Grok ignores an unusable directory silently; Grok is ignored under OpenCode; Grok retains under Claude Code; Branch table preserved; Launch environment matrix; Grok arguments; Rows before detection; Report order follows the list; Green after each step; Revert of the latest step
+- [x] gates pass; phase 0 and phase 1 tests unchanged; PR CI green (merge gate)
+- [x] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; One module per integration (Claude Code, Grok Build); No cross-integration dependency; Grok ignores an unusable directory silently; Grok is ignored under OpenCode; Grok retains under Claude Code; Branch table preserved; Launch environment matrix; Grok arguments; Rows before detection; Report order follows the list; Green after each step; Revert of the latest step
 
 ## 3. Step 3: OpenCode channel code and shim removal (step 3 PR)
 - [x] 3.1 Extend the neutrality deny-list with OpenCode legacy identifiers (`workspace_opencode_active`, `opencode_icon`, `remember_opencode_missing`, `note_opencode_`), still exempting transitional-shim regions; confirm failing locally, commit with 3.8 (path: crates/made-app/tests/integration_modules.rs) Done: the deny-list names `workspace_opencode_active`, `opencode_icon`, `remember_opencode_missing` and `note_opencode_`; the import scan now covers all three module paths (it failed on the `integrations::opencode` imports of `app.rs` and `workbench.rs` before 3.3 to 3.8).
@@ -244,8 +244,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 3.38 Revert check of the step 3 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint
-- [ ] gates pass; per-block adapter checks pass; OpenCode plugin `npm test` and `npm run typecheck` unchanged; PR CI green (merge gate)
-- [ ] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration (all three); No cross-integration dependency; Compile-time only; List order is catalog order; Nothing outside the build adds an integration; Product list is exact; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; Precedence by rank; Rank is independent of catalog order; Duplicate rank rejected; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Branch table preserved; Launch environment matrix; Rows before detection; Report order follows the list; A seam that ignores the list fails; A list change trips the pin; Moved sources stay scanned; Green after each step; Revert of the latest step
+- [x] gates pass; per-block adapter checks pass; OpenCode plugin `npm test` and `npm run typecheck` unchanged; PR CI green (merge gate)
+- [x] verify: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration (all three); No cross-integration dependency; Compile-time only; List order is catalog order; Nothing outside the build adds an integration; Product list is exact; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; Precedence by rank; Rank is independent of catalog order; Duplicate rank rejected; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Branch table preserved; Launch environment matrix; Rows before detection; Report order follows the list; A seam that ignores the list fails; A list change trips the pin; Moved sources stay scanned; Green after each step; Revert of the latest step
 
 ## 4. Step 4: shared hook library (step 4 PR)
 - [x] 4.1 Crate manifest: library only, `publish` from workspace, `serde_json` and the `windows-sys` Foundation/ToolHelp/Threading features under `cfg(windows)`, nothing else; the same commit adds the workspace member to `Cargo.toml` and the `Cargo.lock` entry required by `--locked` builds (path: crates/made-hook-common/Cargo.toml)
@@ -265,8 +265,8 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 4.15 Revert check of the step 4 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint
-- [ ] gates pass; `cargo test -p made-grok-hook -p made-claude-hook -p made-hook-common --locked` passes with 0.6 and 0.7 unchanged; Windows cross-check shows no new warning; PR CI and `ci-artifacts` green (merge gate)
-- [ ] verify: Golden corpus byte-identical; Diverged read limits kept; Packaged hooks unchanged; Source scans keep their coverage; Existing suites stay the acceptance gate; Remote behavior unchanged; Green after each step; Revert of the latest step
+- [x] gates pass; `cargo test -p made-grok-hook -p made-claude-hook -p made-hook-common --locked` passes with 0.6 and 0.7 unchanged; Windows cross-check shows no new warning; PR CI and `ci-artifacts` green (merge gate)
+- [x] verify: Golden corpus byte-identical; Diverged read limits kept; Packaged hooks unchanged; Source scans keep their coverage; Existing suites stay the acceptance gate; Remote behavior unchanged; Green after each step; Revert of the latest step
 
 ## 5. Final step: scoped renames, wiki, ADR and verify (final PR)
 - [x] 5.1 Rename `push_grok_diagnostics` to a neutral name (path: crates/made-app/src/app.rs)
@@ -282,6 +282,6 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 5.11 Map every spec.md scenario to its passing test (path: specs/changes/agent-integration-modules/proposal.md)
 
 ## Checkpoint
-- [ ] gates pass; renames change no test expectation; PR CI green (merge gate)
-- [ ] `verify` against spec.md passes, every scenario mapped to a passing test: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration; No cross-integration dependency; Compile-time only; List order is catalog order; Nothing outside the build adds an integration; Product list is exact; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; Precedence by rank; Rank is independent of catalog order; Duplicate rank rejected; Claude Code rejects an unusable directory; Grok ignores an unusable directory silently; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Grok retains under Claude Code; Branch table preserved; Launch environment matrix; Grok arguments; Rows before detection; Report order follows the list; A seam that ignores the list fails; A list change trips the pin; Moved sources stay scanned; Golden corpus byte-identical; Diverged read limits kept; Packaged hooks unchanged; Green after each step; Revert of the latest step
+- [x] gates pass; renames change no test expectation; PR CI green (merge gate)
+- [x] `verify` against spec.md passes, every scenario mapped to a passing test: Existing suites stay the acceptance gate; Copied report unchanged; Smoke markers unchanged; Remote behavior unchanged; Source scans keep their coverage; One module per integration; No cross-integration dependency; Compile-time only; List order is catalog order; Nothing outside the build adds an integration; Product list is exact; Fake integration in the menu; Fake integration detection reaction; Fake integration launch environment; Fake integration state, polling and teardown; Fake integration follow and presentation at its rank; Fake integration above Claude Code; Fake integration diagnostics; Fake integration smoke marker; A list without an entry drops it from every seam; Fake absent from the product; Precedence by rank; Rank is independent of catalog order; Duplicate rank rejected; Claude Code rejects an unusable directory; Grok ignores an unusable directory silently; Claude Code retains under OpenCode; Grok is ignored under OpenCode; Grok retains under Claude Code; Branch table preserved; Launch environment matrix; Grok arguments; Rows before detection; Report order follows the list; A seam that ignores the list fails; A list change trips the pin; Moved sources stay scanned; Golden corpus byte-identical; Diverged read limits kept; Packaged hooks unchanged; Green after each step; Revert of the latest step
 - [ ] archive order noted for the archive gate: after `claude-code-integration` and `grok-native-hook` archive (their domains are the live contract this change preserves); no MODIFIED reconciliation needed

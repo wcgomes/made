@@ -16,9 +16,8 @@ use made_platform::native_backdrop::NativeBackdropStatus;
 use made_platform::Platform;
 
 use crate::cli::LaunchArgs;
-
 use crate::integrations::{
-    AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, OPENCODE, PRODUCT,
+    AppCtx, AppInit, AppState, IntegrationList, IntegrationRef, Slots, PRODUCT,
 };
 use crate::session_follow::validate_remote_directory;
 use crate::ssh_servers::{PrivateMetadataStorage, ProbeAttempt, ServerMetadata, ServerRegistry};
@@ -170,7 +169,6 @@ fn remote_grok_row_for(
         sentence: report.sentence.into(),
     }
 }
-// END remote-path
 
 /// Recorded outcome of one server's consented remote Grok plugin install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +222,7 @@ impl RemoteGrokInstallState {
         }
     }
 }
+// END remote-path
 
 struct SmokeState {
     started: Option<Instant>,
@@ -290,6 +289,7 @@ pub(crate) struct SshDraft {
     pub directory: String,
 }
 
+// BEGIN remote-path (AIA-02)
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteLaunchDraft {
     pub authority: made_remote::protocol::AuthorityId,
@@ -297,6 +297,7 @@ pub(crate) struct RemoteLaunchDraft {
     pub directory: String,
     pub label: String,
 }
+// END remote-path
 
 fn load_ssh_registry() -> Result<ServerRegistry<PrivateMetadataStorage>, String> {
     let storage = PrivateMetadataStorage::from_app_paths()
@@ -924,17 +925,6 @@ impl AppModel {
     }
     // END remote-path
 
-    /// Give this workspace the OpenCode tab label without a bridge.
-    ///
-    /// The existing terminal process stays the child. This does not spawn
-    /// OpenCode or grok, and the label is not the Grok running signal.
-    pub fn hold_workspace_opencode_label(&mut self, id: WorkspaceId) {
-        if let Some(workbench) = self.workspace_mut(id) {
-            workbench.terminal_target = TerminalTarget::Tui(OPENCODE);
-        }
-        self.push_integration_diagnostics();
-    }
-
     /// The app-wide integration states, parallel to [`Self::integrations`].
     pub(crate) fn app_states_mut(&mut self) -> &mut Slots<Box<dyn AppState>> {
         &mut self.app_states
@@ -982,6 +972,7 @@ impl AppModel {
                 workbench.publish_app_state(*id, state.as_ref());
             }
         }
+        // BEGIN remote-path (AIA-02)
         // A failed or update-required transition is not a provisioned path for
         // the Grok installer, even if an earlier attempt succeeded.
         self.remote_grok_provisioned.retain(|authority| {
@@ -992,6 +983,7 @@ impl AppModel {
                 self.remote_grok_provisioned.push(authority);
             }
         }
+        // END remote-path
     }
 
     /// PTY child selected for the next workspace preparation.
@@ -1204,6 +1196,7 @@ impl AppModel {
         Ok(id)
     }
 
+    // BEGIN remote-path (AIA-02)
     /// Attach a remote model without starting a host shell. A missing live SSH
     /// process is not reported as a successful connection.
     pub fn attach_remote_model(
@@ -1773,6 +1766,7 @@ impl AppModel {
         self.ssh_prompt = None;
         self.remote_grok_prompt_authority = None;
     }
+    // END remote-path
 
     /// Look up a live owner; closed identities never resolve again.
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workbench> {
@@ -2334,7 +2328,9 @@ impl AppModel {
             self.push_integration_diagnostics();
         }
         self.poll_ssh_probe();
+        // BEGIN remote-path (AIA-02)
         self.poll_remote_grok_install();
+        // END remote-path
         self.poll_remote_closes();
         self.persist_remote_consent();
         self.apply_focus_reset(ctx);

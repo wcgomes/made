@@ -8,6 +8,7 @@ use super::{
     AppInit, AppState, Descriptor, DiagnosticsDecl, EnvContribution, EnvPolicy, FollowKind,
     Integration, Mark, Rank, TabInit, TabState, OPENCODE,
 };
+use crate::app::{AppModel, WorkspaceId};
 use crate::tui::TerminalTarget;
 use diagnostics::OpenCodeAppState;
 pub(crate) use tab::OpenCodeTabState;
@@ -77,6 +78,18 @@ impl Integration for OpenCode {
 /// its process is alive, even before the bridge handshakes.
 pub(crate) fn active(target: TerminalTarget, connected: bool, running: bool) -> bool {
     connected || (target == TerminalTarget::Tui(OPENCODE) && running)
+}
+
+/// Give a workspace the OpenCode tab label without a bridge.
+///
+/// The existing terminal process stays the child. This does not spawn
+/// OpenCode or grok, and the label is not the Grok running signal.
+#[doc(hidden)]
+pub fn hold_label(model: &mut AppModel, id: WorkspaceId) {
+    if let Some(workbench) = model.workspace_mut(id) {
+        workbench.terminal_target = TerminalTarget::Tui(OPENCODE);
+    }
+    model.push_integration_diagnostics();
 }
 
 #[cfg(test)]

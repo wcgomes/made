@@ -759,25 +759,6 @@ pub fn initial_rows(list: IntegrationList) -> Vec<DiagnosticsRow> {
         .collect()
 }
 
-/// The Claude Code pill plus its one fixed sentence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeDiagnosticsReport {
-    /// Pill beside the sentence.
-    pub pill: DiagnosticsPill,
-    /// The one Claude Code sentence. Fixed product wording; it never carries
-    /// prompt, message or title content.
-    pub sentence: String,
-}
-
-impl ClaudeDiagnosticsReport {
-    pub(crate) fn new(pill: DiagnosticsPill, sentence: &str) -> Self {
-        Self {
-            pill,
-            sentence: sentence.to_owned(),
-        }
-    }
-}
-
 /// Immutable diagnostics data consumed by the panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticsSnapshot {
@@ -871,6 +852,7 @@ pub struct DiagnosticsSnapshot {
     pub entries: Vec<LogEntry>,
 }
 
+// BEGIN remote-path (AIA-02)
 /// The owning remote tab's OpenCode integration, reported by the status pill
 /// and copied report instead of the host-local integration state. Transport
 /// loss and integration loss stay distinguishable and honest.
@@ -884,7 +866,6 @@ pub struct RemoteOpenCodeReport {
     pub reason: String,
 }
 
-// BEGIN remote-path (AIA-02)
 /// Derive the owning tab's Grok Build row.
 ///
 /// Every value comes from the owning tab's own remote state: its launch
@@ -942,7 +923,6 @@ pub fn remote_grok_row(
         _ => RemoteGrokReport::from(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED),
     }
 }
-// END remote-path
 
 /// The owning remote tab's Grok Build tier inputs for [`remote_grok_row`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -961,15 +941,6 @@ pub enum RemoteGrokInstallOutcome {
 pub struct RemoteGrokReport {
     pub pill: DiagnosticsPill,
     pub sentence: String,
-}
-
-impl From<ClaudeDiagnosticsReport> for RowReport {
-    fn from(report: ClaudeDiagnosticsReport) -> Self {
-        Self {
-            pill: report.pill,
-            sentence: Cow::Owned(report.sentence),
-        }
-    }
 }
 
 impl From<RemoteGrokReport> for RowReport {
@@ -1064,6 +1035,7 @@ pub fn remote_opencode_report(
         }
     }
 }
+// END remote-path
 
 impl DiagnosticsSnapshot {
     /// Attach the selected workspace's shell/root context.
@@ -1148,7 +1120,6 @@ impl DiagnosticsSnapshot {
     pub fn set_remote_grok(&mut self, report: RemoteGrokReport) {
         self.set_row("grok status", report);
     }
-    // END remote-path
 
     /// Report the owning remote tab's OpenCode integration, replacing the
     /// host-local status and reason. The reason is sanitized and redacted.
@@ -1158,6 +1129,7 @@ impl DiagnosticsSnapshot {
         self.reason_code = report.code;
         self.reason = sanitize_log_text(&redact_hex_secrets(&report.reason));
     }
+    // END remote-path
 
     /// Human-readable report suitable for copying into a bug report.
     pub fn to_text(&self) -> String {

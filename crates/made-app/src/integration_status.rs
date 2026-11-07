@@ -654,7 +654,7 @@ impl IntegrationState {
                 ),
             );
         }
-        if !session_peer_supported(&info.opencode_version) {
+        if !session_peer_supported(PRODUCT, &info.opencode_version) {
             return self.transition(
                 IntegrationStatus::Unsupported,
                 StatusReason::with_detail(
