@@ -4,8 +4,8 @@ pub(crate) mod diagnostics;
 pub(crate) mod tab;
 
 use super::{
-    AppInit, AppState, Descriptor, EnvPolicy, FollowKind, Integration, IntegrationList, Mark, Rank,
-    Slots, TabInit, TabState, OPENCODE,
+    AppInit, AppState, Descriptor, DiagnosticsDecl, EnvPolicy, FollowKind, Integration,
+    IntegrationList, Mark, Rank, Slots, TabInit, TabState, OPENCODE,
 };
 use crate::tui::TerminalTarget;
 use diagnostics::OpenCodeAppState;
@@ -55,6 +55,10 @@ impl Integration for OpenCode {
         _init: &TabInit<'_>,
     ) -> Option<Box<dyn TabState>> {
         Some(Box::new(OpenCodeTabState::new()))
+    }
+
+    fn diagnostics(&self) -> DiagnosticsDecl {
+        DiagnosticsDecl::Primary
     }
 }
 

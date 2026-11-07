@@ -13,7 +13,8 @@ use crate::integration_status::{
     ClaudeDiagnosticsPhase,
 };
 use crate::integrations::{
-    EnvContribution, LaunchCtx, TabInit, TabIo, TabReport, TabState, CLAUDE_CODE,
+    EnvContribution, LaunchCtx, Presentation, PresentationCtx, RowReport, TabInit, TabIo,
+    TabReport, TabState, CLAUDE_CODE,
 };
 use crate::session_follow::{SessionFollowOutcome, SessionFollowUpdate};
 use crate::tui::{ClaudeLaunchEnv, TerminalTarget, CLAUDE_SPOOL_ENV};
@@ -74,15 +75,6 @@ impl ClaudeTabState {
             launching: None,
             reported: None,
         }
-    }
-
-    /// The state of a tab whose list has no Claude Code entry, before any
-    /// detection.
-    pub(crate) fn absent() -> Self {
-        Self::new(&TabInit {
-            paths: None,
-            remote: false,
-        })
     }
 
     /// Claude Code state of this tab: presence, dots and title inputs. `None`
@@ -200,6 +192,20 @@ pub(crate) fn launch_contribution(
 }
 
 impl TabState for ClaudeTabState {
+    fn row(&self, remote: bool) -> Option<RowReport> {
+        Some(self.diagnostics(remote).into())
+    }
+
+    /// Claude Code brands a tab while it is present, with its dots and the
+    /// title of its latest session.
+    fn presentation(&self, ctx: &PresentationCtx<'_>) -> Option<Presentation> {
+        let tab = self.tab().filter(|tab| tab.present())?;
+        Some(Presentation {
+            dots: tab.dots().into_iter().map(Into::into).collect(),
+            title: Some(tab.tooltip_title(ctx.terminal_title)),
+        })
+    }
+
     /// Create this tab's spool and compose its Claude Code environment. Only
     /// local shell and direct Claude Code tabs get one.
     fn prepare_launch(

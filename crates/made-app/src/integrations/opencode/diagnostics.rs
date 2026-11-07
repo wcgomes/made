@@ -2,6 +2,8 @@
 
 use std::any::Any;
 
+use made_platform::AppPaths;
+
 use crate::integrations::{AppCtx, AppInit, AppState, OPENCODE};
 
 /// OpenCode was omitted by an explicit catalog, or PATH detection finished
@@ -53,6 +55,22 @@ impl AppState for OpenCodeAppState {
 
     fn on_detection_failed(&mut self, _ctx: &mut AppCtx) {
         self.missing = true;
+    }
+
+    /// Where the OpenCode plugin source resolves from, and whether its package
+    /// is there.
+    fn smoke_marker(&self, paths: Option<&AppPaths>) -> Option<(&'static str, String)> {
+        let plugin = paths
+            .map(|paths| {
+                let found = paths.plugin_dir.join("package.json").is_file();
+                format!(
+                    "{}{}",
+                    paths.plugin_source.name(),
+                    if found { "" } else { ":missing" }
+                )
+            })
+            .unwrap_or_else(|| "unresolved".to_owned());
+        Some(("opencode_plugin", plugin))
     }
 
     fn as_any(&self) -> &dyn Any {

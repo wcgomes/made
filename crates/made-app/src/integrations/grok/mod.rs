@@ -4,9 +4,11 @@ pub(crate) mod diagnostics;
 pub(crate) mod tab;
 
 use super::{
-    AppInit, AppState, Descriptor, FollowKind, FollowPolicy, Integration, IntegrationList, Mark,
-    OnUnusable, Rank, Slots, TabInit, TabState, WhileOutranked, GROK,
+    AppInit, AppState, Descriptor, DiagnosticsDecl, FollowKind, FollowPolicy, Integration,
+    IntegrationList, Mark, OnUnusable, Rank, RowDecl, Slots, TabInit, TabState, WhileOutranked,
+    GROK,
 };
+use crate::diagnostics::GrokDiagnosticsRow;
 use crate::tui::TerminalTarget;
 use diagnostics::GrokAppState;
 pub(crate) use tab::GrokTabState;
@@ -57,9 +59,18 @@ impl Integration for Grok {
     ) -> Option<Box<dyn TabState>> {
         Some(Box::new(GrokTabState::new()))
     }
+
+    fn diagnostics(&self) -> DiagnosticsDecl {
+        DiagnosticsDecl::Row(RowDecl {
+            status_key: "grok status",
+            sentence_key: "grok",
+            initial: GrokDiagnosticsRow::NOT_ON_PATH.into(),
+        })
+    }
 }
 
 /// The Grok state of a tab built over `list`.
+#[cfg(test)]
 pub(crate) fn tab_state(
     list: IntegrationList,
     slots: &Slots<Box<dyn TabState>>,

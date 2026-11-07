@@ -17,8 +17,6 @@ use made_platform::Platform;
 
 use crate::cli::LaunchArgs;
 use crate::diagnostics::GrokDiagnosticsRow;
-use crate::integration_status::ClaudeDiagnosticsPhase;
-use crate::integrations::claude_code;
 use crate::integrations::grok::{self, diagnostics::GrokAppState};
 use crate::integrations::opencode::{self, diagnostics::OpenCodeAppState};
 use crate::integrations::{
@@ -233,11 +231,12 @@ pub enum GrokRunningHold {
     NotRunning,
 }
 
-/// Row for one workspace. Install success is ready only while Grok is running there.
-fn grok_row_for(
+/// Row for one workspace. Install success is ready only while Grok is running
+/// there, as the workspace's own state (`running`) or a test mark says.
+pub(crate) fn grok_row_for(
     phase: GrokDiagnosticsPhase,
     mark: Option<GrokRunningHold>,
-    workbench: &Workbench,
+    running: bool,
 ) -> GrokDiagnosticsRow {
     if phase != GrokDiagnosticsPhase::Ready {
         return phase.row();
@@ -245,7 +244,7 @@ fn grok_row_for(
     let running = match mark {
         Some(GrokRunningHold::LivingTarget | GrokRunningHold::OpenSession) => true,
         Some(GrokRunningHold::NotRunning) => false,
-        None => workbench.grok_follow_running(),
+        None => running,
     };
     if running {
         GrokDiagnosticsRow::READY
@@ -612,6 +611,12 @@ impl AppModel {
         });
         self.integrations = list;
         self
+    }
+
+    /// The integrations this model was built over, in catalog order.
+    #[doc(hidden)]
+    pub fn integrations(&self) -> IntegrationList {
+        self.integrations
     }
 
     /// Launch state.
@@ -1052,14 +1057,11 @@ impl AppModel {
     }
 
     fn push_grok_diagnostics(&mut self) {
-        let phase = self.grok_phase();
-        let claude_phase = self.claude_phase();
         let mut provisioned = Vec::new();
         let mut unprovisioned = Vec::new();
         for (id, workbench) in &mut self.workspaces {
-            let mark = grok::app_state(self.integrations, &self.app_states)
-                .and_then(|state| state.running_mark(*id));
             if workbench.is_remote() {
+                // BEGIN remote-path (AIA-02)
                 if let Some(authority) = workbench.remote_authority() {
                     if workbench.remote_companion_provisioned() {
                         provisioned.push(authority);
@@ -1087,12 +1089,12 @@ impl AppModel {
                             .map(|(_, state)| *state)
                     })
                     .map(RemoteGrokInstallState::outcome);
-                workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, workbench));
+                workbench.set_remote_grok_row(remote_grok_row_for(consented, install, workbench));
+                // END remote-path
                 continue;
             }
-            workbench.set_grok_diagnostics(grok_row_for(phase, mark, workbench));
-            if let Some(claude_phase) = claude_phase {
-                workbench.set_claude_phase(claude_phase);
+            for state in self.app_states.iter() {
+                workbench.publish_app_state(*id, state.as_ref());
             }
         }
         // A failed or update-required transition is not a provisioned path for
@@ -2061,10 +2063,8 @@ impl AppModel {
             .next_workspace
             .checked_add(1)
             .expect("workspace identity exhausted");
-        let phase = self.grok_phase();
-        let mark = grok::app_state(self.integrations, &self.app_states)
-            .and_then(|state| state.running_mark(id));
         if workbench.is_remote() {
+            // BEGIN remote-path (AIA-02)
             let consented = workbench
                 .remote_authority()
                 .and_then(|authority| {
@@ -2081,11 +2081,11 @@ impl AppModel {
                         .map(|(_, state)| *state)
                 })
                 .map(RemoteGrokInstallState::outcome);
-            workbench.set_grok_diagnostics(remote_grok_row_for(consented, install, &workbench));
+            workbench.set_remote_grok_row(remote_grok_row_for(consented, install, &workbench));
+            // END remote-path
         } else {
-            workbench.set_grok_diagnostics(grok_row_for(phase, mark, &workbench));
-            if let Some(claude_phase) = self.claude_phase() {
-                workbench.set_claude_phase(claude_phase);
+            for state in self.app_states.iter() {
+                workbench.publish_app_state(id, state.as_ref());
             }
         }
         if grok::app_state(self.integrations, &self.app_states)
@@ -2403,19 +2403,6 @@ impl AppModel {
     }
 
     // BEGIN transitional-shim (AIA-11)
-    /// The Claude Code detection state every workspace's row shows.
-    fn claude_phase(&self) -> Option<ClaudeDiagnosticsPhase> {
-        claude_code::app_phase(self.integrations, &self.app_states)
-    }
-
-    /// The Grok Build phase every workspace's row shows.
-    fn grok_phase(&self) -> GrokDiagnosticsPhase {
-        grok::app_state(self.integrations, &self.app_states).map_or(
-            GrokDiagnosticsPhase::NotOnPath,
-            GrokAppState::effective_phase,
-        )
-    }
-
     /// Whether a test hold replaces Grok Build detection and install, which
     /// then also holds back every integration's detection.
     fn grok_hold_active(&self) -> bool {
@@ -2788,7 +2775,8 @@ impl AppModel {
     }
 
     /// Smoke markers for the installed-layout check (REL-03, REL-11): the
-    /// OpenCode plugin source, `made-grok-status`, companion and askpass
+    /// marker of each integration in list order (the OpenCode plugin source
+    /// and `made-grok-status` for the product), companion and askpass
     /// resolution, the update state, the production update repository and
     /// whether the test-only update seam was compiled in.
     pub fn smoke_layout_markers(&self) -> String {
@@ -2799,24 +2787,12 @@ impl AppModel {
             "aarch64-apple-darwin",
         ];
         let paths = made_platform::host_platform().app_paths().ok();
-        let plugin = paths
-            .as_ref()
-            .map(|paths| {
-                let found = paths.plugin_dir.join("package.json").is_file();
-                format!(
-                    "{}{}",
-                    paths.plugin_source.name(),
-                    if found { "" } else { ":missing" }
-                )
-            })
-            .unwrap_or_else(|| "unresolved".to_owned());
-        let hook = format!("made-grok-status{}", std::env::consts::EXE_SUFFIX);
-        let grok = paths
-            .as_ref()
-            .and_then(|paths| paths.plugin_package_dir("grok-made"))
-            .map(|dir| dir.join("hooks").join("bin").join(&hook).is_file())
-            .map(|found| if found { "present" } else { "missing" })
-            .unwrap_or("unresolved");
+        let markers: String = self
+            .app_states
+            .iter()
+            .filter_map(|state| state.smoke_marker(paths.as_ref()))
+            .map(|(name, value)| format!("{name}={value} "))
+            .collect();
         let companions = COMPANION_TARGETS
             .iter()
             .filter(|target| crate::ssh_servers::companion_artifact(target).is_some())
@@ -2829,7 +2805,7 @@ impl AppModel {
             })
             .is_some_and(|path| path.is_file());
         format!(
-            "version={APP_VERSION} opencode_plugin={plugin} grok_status={grok} companions={companions}/4 askpass={} updates={} update_repo={} update_seam={}",
+            "version={APP_VERSION} {markers}companions={companions}/4 askpass={} updates={} update_repo={} update_seam={}",
             if askpass { "found" } else { "missing" },
             if self.updates.available() { "enabled" } else { "disabled" },
             made_platform::update::UPDATE_REPOSITORY,

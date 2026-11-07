@@ -12,7 +12,10 @@ use made_bridge::config_guard::ConfigGuard;
 use made_bridge::security::Token;
 use made_bridge::server::BridgeHandle;
 
-use crate::integrations::{EnvContribution, LaunchCtx, TabState, OPENCODE};
+use crate::integrations::{
+    EnvContribution, LaunchCtx, Presentation, PresentationCtx, TabState, OPENCODE,
+};
+use crate::session_map::SessionRow;
 use crate::tui::TerminalTarget;
 
 /// OpenCode state of one tab.
@@ -72,6 +75,26 @@ impl OpenCodeTabState {
 }
 
 impl TabState for OpenCodeTabState {
+    /// OpenCode brands a local tab while its bridge is connected or its direct
+    /// TUI runs, with the sessions of the bridge. A remote tab's branding
+    /// comes from its own server state.
+    fn presentation(&self, ctx: &PresentationCtx<'_>) -> Option<Presentation> {
+        if ctx.remote {
+            return None;
+        }
+        crate::ui::workspace_opencode_active(ctx.target, ctx.connected, ctx.terminal_running).then(
+            || Presentation {
+                dots: ctx
+                    .session_map
+                    .rows()
+                    .iter()
+                    .map(SessionRow::activity)
+                    .collect(),
+                title: None,
+            },
+        )
+    }
+
     /// The composed configuration, for the targets the policy covers. The
     /// content is handed over once.
     fn prepare_launch(

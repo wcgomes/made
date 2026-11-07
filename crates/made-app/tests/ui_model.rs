@@ -11889,7 +11889,7 @@ fn assert_opencode_diagnostics_row(
     );
     assert_eq!(snapshot.reason_code, reason_code);
     assert_eq!(snapshot.reason, sentence);
-    assert_eq!(snapshot.grok_sentence, grok_sentence);
+    assert_eq!(snapshot.row("grok status").unwrap().sentence, grok_sentence);
 
     let output = headless.render();
     let text = output_text(&output);
@@ -12161,7 +12161,10 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
         .diagnostics_snapshot();
     assert_eq!(pending.reason, OPENCODE_DIAGNOSTIC_SENTENCE);
     assert_eq!(pending.status_label, "inactive");
-    assert_eq!(pending.grok_sentence, "Checking for Grok Build.");
+    assert_eq!(
+        pending.row("grok status").unwrap().sentence,
+        "Checking for Grok Build."
+    );
     assert!(
         !pending.reason.contains("not on PATH"),
         "detection still running must not say OpenCode is not on PATH"
@@ -12184,7 +12187,7 @@ fn opencode_diagnostics_row_uses_the_grok_wording() {
     detecting.pump_until(|model| {
         let view = model.workspace(detect_id).unwrap().diagnostics_snapshot();
         view.reason == OPENCODE_MISSING_SENTENCE
-            && view.grok_sentence == "Grok Build is not on PATH."
+            && view.row("grok status").unwrap().sentence == "Grok Build is not on PATH."
     });
     wait_explorer_ready(&mut detecting, detect_id);
     assert_opencode_diagnostics_row(
@@ -12312,7 +12315,9 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
             .workspace(remote_id)
             .unwrap()
             .diagnostics_snapshot()
-            .grok_sentence
+            .row("grok status")
+            .unwrap()
+            .sentence
             .to_owned()
     };
     let pill = |headless: &Headless| {
@@ -12321,7 +12326,9 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
             .workspace(remote_id)
             .unwrap()
             .diagnostics_snapshot()
-            .grok_pill
+            .row("grok status")
+            .unwrap()
+            .pill
     };
 
     // Attached, detected, nothing running: the honest row is not running.
@@ -12370,7 +12377,7 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
     );
     assert_eq!(
         pill(&headless),
-        made_app::diagnostics::GrokDiagnosticsPill::Degraded
+        made_app::diagnostics::DiagnosticsPill::Degraded
     );
 
     // The bounded attempt is busy while it runs.

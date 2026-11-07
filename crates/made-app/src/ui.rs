@@ -20,10 +20,12 @@ use eframe::egui::{
 };
 
 use crate::app::{AppModel, WorkspaceId};
-use crate::diagnostics::{DiagnosticsSnapshot, GrokDiagnosticsPill};
+use crate::diagnostics::{DiagnosticsPill, DiagnosticsSnapshot};
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
-use crate::integrations::{Mark, CLAUDE_CODE, GROK, OPENCODE};
+use crate::integrations::{
+    rank_order, IntegrationList, IntegrationRef, Mark, Presentation, CLAUDE_CODE, GROK, OPENCODE,
+};
 use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_text};
 use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
@@ -77,15 +79,15 @@ fn status_pill_ui(
 
 fn grok_status_pill_ui(
     ui: &mut Ui,
-    pill: GrokDiagnosticsPill,
+    pill: DiagnosticsPill,
     sentence: &str,
     layout: &Layout,
 ) -> egui::Response {
     let (tone, tint, symbol) = match pill {
-        GrokDiagnosticsPill::Inactive => status_tone(IntegrationStatus::Inactive),
-        GrokDiagnosticsPill::Degraded => status_tone(IntegrationStatus::Degraded),
+        DiagnosticsPill::Inactive => status_tone(IntegrationStatus::Inactive),
+        DiagnosticsPill::Degraded => status_tone(IntegrationStatus::Degraded),
         // Ready uses the connected pill's success tone, not its label.
-        GrokDiagnosticsPill::Ready => status_tone(IntegrationStatus::Connected),
+        DiagnosticsPill::Ready => status_tone(IntegrationStatus::Connected),
     };
     paint_status_pill(ui, symbol, pill.label(), tone, tint, sentence, layout)
 }
@@ -972,7 +974,11 @@ fn workspace_tab_label_width(width: f32, session_count: usize) -> f32 {
 /// A connected bridge covers both a directly launched TUI and a shell where
 /// the user ran `opencode` manually. A directly launched TUI also counts while
 /// its process is alive, even before the bridge handshakes.
-fn workspace_opencode_active(target: TerminalTarget, connected: bool, running: bool) -> bool {
+pub(crate) fn workspace_opencode_active(
+    target: TerminalTarget,
+    connected: bool,
+    running: bool,
+) -> bool {
     connected || (target == TerminalTarget::Tui(OPENCODE) && running)
 }
 
@@ -984,7 +990,7 @@ fn workspace_opencode_active(target: TerminalTarget, connected: bool, running: b
 /// state: a directly launched remote grok (`TerminalTarget::RemoteGrok`) or
 /// any owned open Grok session in the tab's projection. An active OpenCode
 /// tab never does: its label, icon, and dots stay OpenCode's.
-fn workspace_grok_branded(
+pub(crate) fn workspace_grok_branded(
     opencode: bool,
     target: TerminalTarget,
     running: bool,
@@ -1036,15 +1042,6 @@ fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
         parts.push(format!("{idle} idle"));
     }
     Some(format!("Sessions: {}", parts.join(", ")))
-}
-
-/// Vendored OpenCode tab icon, resolved once per process.
-fn opencode_icon() -> crate::explorer_icons::IconId {
-    static ICON: std::sync::OnceLock<crate::explorer_icons::IconId> = std::sync::OnceLock::new();
-    *ICON.get_or_init(|| {
-        crate::explorer_icons::icon_by_file_name("opencode.svg")
-            .expect("opencode.svg is vendored with the explorer icons")
-    })
 }
 
 /// Official Grok mark from `assets/grok.svg`, outside the Material icon inventory.
@@ -1141,13 +1138,205 @@ struct WorkspaceTabInfo {
     label: String,
     path: std::path::PathBuf,
     remote_path: Option<String>,
-    opencode: bool,
-    grok: bool,
-    /// Claude Code is present and OpenCode is not active.
-    claude: bool,
-    /// Sanitized tooltip title while `claude` is set.
-    claude_title: String,
+    /// The integration that brands the tab: its label, mark and dots.
+    brand: Option<TabBrand>,
     sessions: Vec<SessionActivity>,
+}
+
+/// The integration that brands a workspace tab.
+struct TabBrand {
+    entry: IntegrationRef,
+    /// Sanitized tooltip title, for an integration whose tooltip names its
+    /// session.
+    title: Option<String>,
+}
+
+/// The first integration of the tab's list, in rank order, whose presentation
+/// brands the tab, with that presentation.
+fn tab_brand(workbench: &Workbench) -> Option<(IntegrationRef, Presentation)> {
+    let list = workbench.integrations();
+    let generic = rank_order(list).into_iter().find_map(|index| {
+        workbench
+            .presentation_of(index)
+            .map(|presentation| (list[index], presentation))
+    });
+    if workbench.is_remote() {
+        // BEGIN remote-path (AIA-02)
+        return remote_tab_brand(workbench, list, generic);
+        // END remote-path
+    }
+    generic
+}
+
+// BEGIN remote-path (AIA-02)
+/// The branding of a remote tab. OpenCode and Grok Build present from the
+/// tab's own server state; an integration that presents from its tab state
+/// yields to OpenCode and to a remote tab that already presents Grok Build
+/// under SSH-10.
+fn remote_tab_brand(
+    workbench: &Workbench,
+    list: IntegrationList,
+    generic: Option<(IntegrationRef, Presentation)>,
+) -> Option<(IntegrationRef, Presentation)> {
+    let opencode = list.contains(&OPENCODE) && workbench.remote_opencode_active();
+    let grok_dots = workbench.remote_grok_activities();
+    let remote_grok = list.contains(&GROK)
+        && workspace_grok_branded(
+            opencode,
+            workbench.terminal_target(),
+            workbench.remote_grok_running(),
+            grok_dots.len(),
+        );
+    let generic = generic.filter(|_| workspace_claude_branded(opencode, remote_grok, true));
+    if opencode {
+        let dots = workbench
+            .session_map()
+            .rows()
+            .iter()
+            .map(SessionRow::activity)
+            .collect();
+        Some((OPENCODE, Presentation { dots, title: None }))
+    } else if generic.is_some() {
+        generic
+    } else if remote_grok {
+        Some((
+            GROK,
+            Presentation {
+                dots: grok_dots,
+                title: None,
+            },
+        ))
+    } else {
+        None
+    }
+}
+// END remote-path
+
+/// The tab of one workspace.
+fn workspace_tab_info(id: WorkspaceId, workbench: &Workbench) -> WorkspaceTabInfo {
+    let path = workbench.shell_cwd().to_path_buf();
+    let remote_path = workbench.remote_path_label();
+    let branded = tab_brand(workbench);
+    // A branded tab shows its integration's label; only an unbranded remote
+    // tab falls back to its server name so SSH identity stays inspectable.
+    let label = if let Some((entry, _)) = &branded {
+        entry.descriptor().label.to_owned()
+    } else if let Some(name) = workbench.remote_label() {
+        name
+    } else {
+        workbench
+            .launch_plan()
+            .map(|plan| plan.workspace.display_name().to_owned())
+            .unwrap_or_else(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Workspace".to_owned())
+            })
+    };
+    // Session dots follow the brand, so stale rows cannot paint status after a
+    // disconnect or fatal protocol failure.
+    let (brand, sessions) = match branded {
+        Some((entry, presentation)) => (
+            Some(TabBrand {
+                entry,
+                title: presentation.title,
+            }),
+            presentation.dots,
+        ),
+        None => (None, Vec::new()),
+    };
+    WorkspaceTabInfo {
+        id,
+        label,
+        path,
+        remote_path,
+        brand,
+        sessions,
+    }
+}
+
+/// The tooltip of a workspace tab: a branded tab names its session and the
+/// sessions' summary and never the path; an unbranded tab with sessions shows
+/// the summary, and one without shows its path.
+fn workspace_tab_tooltip(tab: &WorkspaceTabInfo, summary: Option<&str>) -> Option<String> {
+    match &tab.brand {
+        Some(TabBrand {
+            title: Some(title), ..
+        }) => Some(match summary {
+            Some(summary) => format!("{title} — {summary}"),
+            None => title.clone(),
+        }),
+        Some(_) => summary.map(str::to_owned),
+        None if !tab.sessions.is_empty() => summary.map(str::to_owned),
+        None => Some(match &tab.remote_path {
+            Some(path) => sanitize_display(path, 900),
+            None => sanitize_display(&tab.path.display().to_string(), 900),
+        }),
+    }
+}
+
+/// What a workspace tab shows, for tests of the presentation seam.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabSummary {
+    /// The workspace.
+    pub id: WorkspaceId,
+    /// Tab label.
+    pub label: String,
+    /// The mark painted in the tab, or `None` for the terminal glyph.
+    pub mark: Option<Mark>,
+    /// Session status dots.
+    pub dots: Vec<SessionActivity>,
+    /// Tooltip, or `None` when the tab has none.
+    pub tooltip: Option<String>,
+    /// Accessible name of the tab.
+    pub accessible_name: String,
+}
+
+/// The tabs of the open workspaces as they paint, in strip order.
+#[doc(hidden)]
+pub fn workspace_tab_summaries(model: &AppModel) -> Vec<TabSummary> {
+    model
+        .workspace_ids()
+        .filter_map(|id| {
+            let tab = workspace_tab_info(id, model.workspace(id)?);
+            let summary = opencode_sessions_summary(&tab.sessions);
+            Some(TabSummary {
+                id,
+                mark: tab
+                    .brand
+                    .as_ref()
+                    .map(|brand| brand.entry.descriptor().mark),
+                tooltip: workspace_tab_tooltip(&tab, summary.as_deref()),
+                accessible_name: workspace_tab_accessible_label(&tab.label, summary.as_deref()),
+                dots: tab.sessions,
+                label: tab.label,
+            })
+        })
+        .collect()
+}
+
+/// The entries of the new-tab menu below Terminal: the integrations of the
+/// model's list that PATH detection found, in list order.
+#[doc(hidden)]
+pub fn new_tab_menu_entries(model: &AppModel) -> Vec<IntegrationRef> {
+    model
+        .integrations()
+        .iter()
+        .copied()
+        .filter(|entry| model.compatible_tuis().contains(entry))
+        .collect()
+}
+
+/// The integration rows of the About card: the pill and the sentence of each
+/// row of the snapshot, in list order.
+#[doc(hidden)]
+pub fn about_integration_rows(snapshot: &DiagnosticsSnapshot) -> Vec<(DiagnosticsPill, &str)> {
+    snapshot
+        .rows
+        .iter()
+        .map(|row| (row.pill, row.sentence.as_str()))
+        .collect()
 }
 
 fn authority_key(id: made_remote::protocol::AuthorityId) -> String {
@@ -1775,114 +1964,10 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let update_ready = model.update_ready();
     let tabs: Vec<WorkspaceTabInfo> = model
         .workspace_ids()
-        .filter_map(|id| {
-            let workbench = model.workspace(id)?;
-            let path = workbench.shell_cwd().to_path_buf();
-            let remote_path = workbench.remote_path_label();
-            let target = workbench.terminal_target();
-            let running = workbench
-                .terminal()
-                .is_some_and(|terminal| terminal.is_running());
-            let opencode = if workbench.is_remote() {
-                // A remote tab presents OpenCode from its own server state;
-                // the host integration and host process state never apply.
-                workbench.remote_opencode_active()
-            } else {
-                workspace_opencode_active(target, workbench.is_connected(), running)
-            };
-            // Claude Code presence yields to OpenCode and takes a local tab from
-            // Grok. A remote tab that already presents Grok Build under SSH-10
-            // keeps it, so remote Claude Code yields to it too.
-            let claude_tab = workbench.claude_tab().filter(|tab| tab.present());
-            let remote_grok_branded = workbench.is_remote()
-                && workspace_grok_branded(
-                    opencode,
-                    target,
-                    workbench.remote_grok_running(),
-                    workbench.remote_grok_activities().len(),
-                );
-            let claude =
-                workspace_claude_branded(opencode, remote_grok_branded, claude_tab.is_some());
-            let claude_title = claude_tab
-                .filter(|_| claude)
-                .map(|tab| {
-                    tab.tooltip_title(workbench.terminal().and_then(|terminal| terminal.title()))
-                })
-                .unwrap_or_default();
-            let claude_activities: Vec<SessionActivity> = claude_tab
-                .filter(|_| claude)
-                .map(|tab| tab.dots().into_iter().map(Into::into).collect())
-                .unwrap_or_default();
-            // Grok dots stay off an OpenCode tab. Using the OpenCode flag for
-            // them would paint Grok status from the OpenCode session map.
-            // Remote dots come from that tab's own Grok projection.
-            let grok_activities = if opencode || claude {
-                Vec::new()
-            } else if workbench.is_remote() {
-                workbench.remote_grok_activities()
-            } else {
-                workbench.grok_tab_activities()
-            };
-            let grok = if workbench.is_remote() {
-                workspace_grok_branded(
-                    opencode,
-                    target,
-                    workbench.remote_grok_running(),
-                    grok_activities.len(),
-                )
-            } else {
-                workspace_grok_branded(opencode || claude, target, running, grok_activities.len())
-            };
-            // OpenCode owns the label first. A branded Grok tab — local or
-            // remote — shows `Grok Build`; only an unbranded remote tab falls
-            // back to its server name so SSH identity stays inspectable.
-            let label = if opencode {
-                "OpenCode".to_owned()
-            } else if claude {
-                CLAUDE_CODE.descriptor().label.to_owned()
-            } else if grok {
-                GROK.descriptor().label.to_owned()
-            } else if let Some(name) = workbench.remote_label() {
-                name
-            } else {
-                workbench
-                    .launch_plan()
-                    .map(|plan| plan.workspace.display_name().to_owned())
-                    .unwrap_or_else(|| {
-                        path.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "Workspace".to_owned())
-                    })
-            };
-            // Session dots follow the icon, so stale rows cannot paint status
-            // after a disconnect or fatal protocol failure.
-            let sessions = if opencode {
-                workbench
-                    .session_map()
-                    .rows()
-                    .iter()
-                    .map(SessionRow::activity)
-                    .collect()
-            } else if claude {
-                claude_activities
-            } else {
-                grok_activities
-            };
-            Some(WorkspaceTabInfo {
-                id,
-                label,
-                path,
-                remote_path,
-                opencode,
-                grok,
-                claude,
-                claude_title,
-                sessions,
-            })
-        })
+        .filter_map(|id| Some(workspace_tab_info(id, model.workspace(id)?)))
         .collect();
     let has_workbench = model.workbench().is_some();
-    let compatible_tuis = model.compatible_tuis().to_vec();
+    let compatible_tuis = new_tab_menu_entries(model);
     let explorer_visible = model.workbench().is_some_and(Workbench::explorer_visible);
     let sessions_visible = model.workbench().is_some_and(Workbench::sessions_visible);
     let sessions_available = model.workbench().is_some_and(|workbench| {
@@ -2177,6 +2262,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                             ui.close();
                                         }
                                     }
+                                    // BEGIN remote-path (AIA-02)
                                     if registry.can_launch_grok(server.id()) {
                                         let grok_label = format!("Grok SSH — {name}");
                                         if new_tab_menu_item(
@@ -2209,6 +2295,7 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                             ui.close();
                                         }
                                     }
+                                    // END remote-path
                                 }
                             }
                         });
@@ -2450,15 +2537,8 @@ fn workspace_tab_ui(
         ),
         egui::Vec2::splat(WORKSPACE_TAB_ICON_SIZE),
     );
-    if tab.opencode {
-        let icon = opencode_icon();
-        egui::Image::from_bytes(icon.uri(), icon.bytes()).paint_at(ui, icon_rect);
-    } else if tab.claude || tab.grok {
-        match if tab.claude {
-            claude_mark()
-        } else {
-            grok_mark()
-        } {
+    if let Some(brand) = &tab.brand {
+        match mark_leading(brand.entry.descriptor().mark) {
             theme::MenuLeading::Image { uri, bytes } => {
                 egui::Image::from_bytes(uri, bytes).paint_at(ui, icon_rect);
             }
@@ -2505,21 +2585,9 @@ fn workspace_tab_ui(
     if close_response.has_focus() {
         theme::paint_inside_focus_ring(ui.painter(), close_rect.shrink(1.0), CornerRadius::same(4));
     }
-    // OpenCode and Grok Build omit the workspace path. With no sessions the
-    // summary is empty, so the tab has no parent tooltip.
-    let tooltip = if tab.claude {
-        // The title, then the session summary when dots exist. Never the path.
-        Some(match &session_summary {
-            Some(summary) => format!("{} — {summary}", tab.claude_title),
-            None => tab.claude_title.clone(),
-        })
-    } else if tab.opencode || tab.grok || !tab.sessions.is_empty() {
-        session_summary.clone()
-    } else if let Some(path) = &tab.remote_path {
-        Some(sanitize_display(path, 900))
-    } else {
-        Some(sanitize_display(&tab.path.display().to_string(), 900))
-    };
+    // A branded tab omits the workspace path. With no sessions the summary is
+    // empty, so the tab has no parent tooltip.
+    let tooltip = workspace_tab_tooltip(tab, session_summary.as_deref());
     let tab_response = if close_hovered {
         response
     } else if let Some(tooltip) = tooltip {
@@ -3356,12 +3424,11 @@ impl Workbench {
             explorer.watcher_loading().hash(&mut hasher);
             explorer.watcher_error().hash(&mut hasher);
         }
-        let grok = self.grok_diagnostics();
-        grok.pill.label().hash(&mut hasher);
-        grok.sentence.hash(&mut hasher);
-        let claude = self.claude_diagnostics();
-        claude.pill.label().hash(&mut hasher);
-        claude.sentence.hash(&mut hasher);
+        for (key, report) in self.row_reports() {
+            key.hash(&mut hasher);
+            report.pill.label().hash(&mut hasher);
+            report.sentence.hash(&mut hasher);
+        }
         if let Some(report) = self.remote_opencode_diagnostics() {
             report.status.label().hash(&mut hasher);
             report.code.hash(&mut hasher);
@@ -3574,21 +3641,12 @@ impl Workbench {
                         }
                     });
                 });
-                ui.horizontal(|ui| {
-                    grok_status_pill_ui(ui, snapshot.grok_pill, &snapshot.grok_sentence, layout);
-                    ui.label(theme::micro(&snapshot.grok_sentence))
-                        .on_hover_text(&snapshot.grok_sentence);
-                });
-                ui.horizontal(|ui| {
-                    grok_status_pill_ui(
-                        ui,
-                        snapshot.claude_pill,
-                        &snapshot.claude_sentence,
-                        layout,
-                    );
-                    ui.label(theme::micro(&snapshot.claude_sentence))
-                        .on_hover_text(&snapshot.claude_sentence);
-                });
+                for (pill, sentence) in about_integration_rows(snapshot) {
+                    ui.horizontal(|ui| {
+                        grok_status_pill_ui(ui, pill, sentence, layout);
+                        ui.label(theme::micro(sentence)).on_hover_text(sentence);
+                    });
+                }
                 if let Some(failure) = &config_failure {
                     notice_strip(
                         ui,

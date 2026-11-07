@@ -4,9 +4,12 @@
 use std::any::Any;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use crate::app::{GrokDiagnosticsHold, GrokDiagnosticsPhase, GrokRunningHold, WorkspaceId};
+use crate::app::{
+    grok_row_for, GrokDiagnosticsHold, GrokDiagnosticsPhase, GrokRunningHold, WorkspaceId,
+};
 use crate::grok_plugin::{self, EnsureOutcome};
-use crate::integrations::{AppCtx, AppInit, AppState, GROK};
+use crate::integrations::{AppCtx, AppInit, AppState, WorkspaceTabs, GROK};
+use made_platform::AppPaths;
 
 /// Grok Build detection, install and hold state for every workspace's row.
 pub(crate) struct GrokAppState {
@@ -162,6 +165,31 @@ impl AppState for GrokAppState {
             }
             None => {}
         }
+    }
+
+    /// The tab's row: the app-wide phase, and whether Grok runs in the tab.
+    fn publish(&self, workspace: &mut WorkspaceTabs<'_>) {
+        let id = workspace.id;
+        let target = workspace.target;
+        let terminal_running = workspace.terminal_running;
+        let Some(tab) = super::tab_state_mut(workspace.list, workspace.tab_states) else {
+            return;
+        };
+        let running = tab.follow_running(target, terminal_running);
+        let row = grok_row_for(self.effective_phase(), self.running_mark(id), running);
+        tab.set_diagnostics(row, false);
+    }
+
+    /// Whether the shipped `made-grok-status` hook is staged beside the
+    /// plugin manifest.
+    fn smoke_marker(&self, paths: Option<&AppPaths>) -> Option<(&'static str, String)> {
+        let hook = format!("made-grok-status{}", std::env::consts::EXE_SUFFIX);
+        let status = paths
+            .and_then(|paths| paths.plugin_package_dir("grok-made"))
+            .map(|dir| dir.join("hooks").join("bin").join(&hook).is_file())
+            .map(|found| if found { "present" } else { "missing" })
+            .unwrap_or("unresolved");
+        Some(("grok_status", status.to_owned()))
     }
 
     fn as_any(&self) -> &dyn Any {

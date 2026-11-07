@@ -937,7 +937,7 @@ pub struct ClaudeDiagnosticsInputs {
 
 /// The Claude Code row: the first state that applies.
 pub fn claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnosticsReport {
-    use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive, Ready};
+    use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive, Ready};
     const HOOKS: &str = "Claude Code session-status hooks are unavailable.";
     let waiting = !inputs.live_session || !inputs.protocol_observed;
     let (pill, sentence) = match inputs.phase {
@@ -964,7 +964,7 @@ pub fn claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnos
 /// plugin and live-session inputs describe local hooks and are ignored; the
 /// phase is the owning tab's own remote detection.
 pub fn remote_claude_diagnostics_row(inputs: &ClaudeDiagnosticsInputs) -> ClaudeDiagnosticsReport {
-    use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+    use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive};
     let (pill, sentence) = match inputs.phase {
         ClaudeDiagnosticsPhase::Checking => (Inactive, "Checking for Claude Code."),
         ClaudeDiagnosticsPhase::NotOnPath => (Inactive, "Claude Code is not on PATH."),

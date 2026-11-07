@@ -12,6 +12,7 @@
 //! in [`PRODUCT`], which is the catalog (new-tab menu) order.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -21,8 +22,10 @@ use std::time::{Duration, Instant};
 use made_platform::AppPaths;
 use made_terminal::PtyOptions;
 
-use crate::diagnostics::DiagnosticLog;
+use crate::app::WorkspaceId;
+use crate::diagnostics::{DiagnosticLog, DiagnosticsPill};
 use crate::session_follow::{RootSource, SessionFollowCoordinator, SessionFollowOutcome};
+use crate::session_map::{SessionActivity, SessionMap};
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
 
@@ -133,6 +136,55 @@ pub trait Integration: Sync + 'static {
     fn polls_remote_tabs(&self) -> bool {
         false
     }
+
+    /// The integration's diagnostics contribution.
+    fn diagnostics(&self) -> DiagnosticsDecl {
+        DiagnosticsDecl::None
+    }
+}
+
+/// The pill and the one sentence beside it on a diagnostics row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowReport {
+    /// Pill beside the sentence.
+    pub pill: DiagnosticsPill,
+    /// The one sentence. Fixed product wording, or a bounded and sanitized
+    /// failure detail.
+    pub sentence: Cow<'static, str>,
+}
+
+impl RowReport {
+    /// A report with fixed product wording.
+    pub const fn new(pill: DiagnosticsPill, sentence: &'static str) -> Self {
+        Self {
+            pill,
+            sentence: Cow::Borrowed(sentence),
+        }
+    }
+}
+
+/// A secondary diagnostics row: its copied-report keys and its state before
+/// detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowDecl {
+    /// Key of the copied-report line that carries the pill label.
+    pub status_key: &'static str,
+    /// Key of the copied-report line that carries the sentence.
+    pub sentence_key: &'static str,
+    /// The row before detection has finished.
+    pub initial: RowReport,
+}
+
+/// What an integration contributes to diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticsDecl {
+    /// Nothing.
+    None,
+    /// The integration owns the primary integration status (the status, reason
+    /// code and reason lines). At most one entry of a list does.
+    Primary,
+    /// The integration owns a secondary row.
+    Row(RowDecl),
 }
 
 /// How an integration takes part in explorer-root follow.
@@ -459,11 +511,62 @@ pub trait AppState: Any {
     /// Apply the state's background work once per frame.
     fn poll(&mut self, _ctx: &mut AppCtx) {}
 
+    /// Hand what the app-wide state knows about one local workspace to the
+    /// tab states of that workspace: the diagnostics row, the detection state.
+    fn publish(&self, _workspace: &mut WorkspaceTabs<'_>) {}
+
+    /// The integration's smoke-layout marker: its name and value. `paths` are
+    /// the resolved application paths, when they resolved.
+    fn smoke_marker(&self, _paths: Option<&AppPaths>) -> Option<(&'static str, String)> {
+        None
+    }
+
     /// This state as `Any`.
     fn as_any(&self) -> &dyn Any;
 
     /// This state as mutable `Any`.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// The tab states of one local workspace, lent to an app-wide state.
+pub struct WorkspaceTabs<'a> {
+    /// The workspace.
+    pub id: WorkspaceId,
+    /// The list the tab states were built over.
+    pub list: IntegrationList,
+    /// The workspace's terminal target.
+    pub target: TerminalTarget,
+    /// The workspace's terminal child is alive.
+    pub terminal_running: bool,
+    /// The per-tab states, parallel to `list`.
+    pub tab_states: &'a mut Slots<Box<dyn TabState>>,
+}
+
+/// What the core lends to a presentation query: the facts of a tab that
+/// decide which integration brands it.
+pub struct PresentationCtx<'a> {
+    /// The tab's launch target.
+    pub target: TerminalTarget,
+    /// The tab is a remote tab.
+    pub remote: bool,
+    /// The tab's terminal child is alive.
+    pub terminal_running: bool,
+    /// The title the terminal child reported, if any.
+    pub terminal_title: Option<&'a str>,
+    /// The session channel is connected.
+    pub connected: bool,
+    /// The sessions of the session channel.
+    pub session_map: &'a SessionMap,
+}
+
+/// How an integration brands a tab: the dots it paints and the title its
+/// tooltip starts with. The label and the mark come from the descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Presentation {
+    /// Session status dots, in paint order.
+    pub dots: Vec<SessionActivity>,
+    /// Tooltip title, for an integration whose tooltip names the session.
+    pub title: Option<String>,
 }
 
 /// An integration's state for one tab, owned by the tab. Tabs are prepared on
@@ -496,6 +599,18 @@ pub trait TabState: Any + Send {
 
     /// The tab closes or its terminal is replaced: drop per-terminal state.
     fn teardown(&mut self) {}
+
+    /// The integration's diagnostics row for this tab, `remote` when the tab is
+    /// a remote tab. `None` when the integration declares no row.
+    fn row(&self, _remote: bool) -> Option<RowReport> {
+        None
+    }
+
+    /// How the integration brands the tab, or `None` when it does not. The
+    /// core asks in rank order and the first answer brands the tab.
+    fn presentation(&self, _ctx: &PresentationCtx<'_>) -> Option<Presentation> {
+        None
+    }
 
     /// This state as `Any`.
     fn as_any(&self) -> &dyn Any;
@@ -532,9 +647,21 @@ impl<T> Slots<T> {
     }
 
     /// Every filled slot, in list order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.items.iter().filter_map(Option::as_ref)
+    }
+
+    /// Every filled slot, in list order, mutably.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.items.iter_mut().filter_map(Option::as_mut)
     }
+}
+
+/// The positions of `list` in precedence order: lowest rank first.
+pub fn rank_order(list: IntegrationList) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..list.len()).collect();
+    order.sort_by_key(|index| list[*index].descriptor().rank);
+    order
 }
 
 /// The position of `entry` in `list`.

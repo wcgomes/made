@@ -4,10 +4,11 @@ pub(crate) mod diagnostics;
 pub(crate) mod tab;
 
 use super::{
-    AppInit, AppState, Descriptor, EnvPolicy, FollowKind, FollowPolicy, Integration,
-    IntegrationList, Mark, OnUnusable, Rank, Slots, TabInit, TabState, WhileOutranked, CLAUDE_CODE,
+    AppInit, AppState, Descriptor, DiagnosticsDecl, EnvPolicy, FollowKind, FollowPolicy,
+    Integration, IntegrationList, Mark, OnUnusable, Rank, RowDecl, RowReport, Slots, TabInit,
+    TabState, WhileOutranked, CLAUDE_CODE,
 };
-use crate::integration_status::ClaudeDiagnosticsPhase;
+use crate::diagnostics::DiagnosticsPill;
 use crate::tui::{TerminalTarget, CLAUDE_SPOOL_ENV};
 use diagnostics::ClaudeAppState;
 pub(crate) use tab::ClaudeTabState;
@@ -66,6 +67,14 @@ impl Integration for ClaudeCode {
     fn polls_remote_tabs(&self) -> bool {
         true
     }
+
+    fn diagnostics(&self) -> DiagnosticsDecl {
+        DiagnosticsDecl::Row(RowDecl {
+            status_key: "claude status",
+            sentence_key: "claude",
+            initial: RowReport::new(DiagnosticsPill::Inactive, "Claude Code is not on PATH."),
+        })
+    }
 }
 
 /// The Claude Code state of a tab built over `list`.
@@ -82,12 +91,4 @@ pub(crate) fn tab_state_mut(
     slots: &mut Slots<Box<dyn TabState>>,
 ) -> Option<&mut ClaudeTabState> {
     super::tab_state_mut::<ClaudeTabState>(list, slots, CLAUDE_CODE)
-}
-
-/// The Claude Code detection state of an app model built over `list`.
-pub(crate) fn app_phase(
-    list: IntegrationList,
-    slots: &Slots<Box<dyn AppState>>,
-) -> Option<ClaudeDiagnosticsPhase> {
-    super::app_state::<ClaudeAppState>(list, slots, CLAUDE_CODE).map(ClaudeAppState::phase)
 }

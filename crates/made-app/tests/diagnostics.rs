@@ -908,10 +908,7 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
 
     // Before the SSH session attaches, nothing remote may be claimed.
     let row = remote_grok_row(false, false, None, true, None, false, true);
-    assert_eq!(
-        row.pill,
-        made_app::diagnostics::GrokDiagnosticsPill::Inactive
-    );
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Inactive);
     assert!(
         row.sentence.contains("not known yet"),
         "an unattached tab claims no Grok state: {}",
@@ -929,10 +926,7 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
         true,
         true,
     );
-    assert_eq!(
-        row.pill,
-        made_app::diagnostics::GrokDiagnosticsPill::Degraded
-    );
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Degraded);
     assert!(
         row.sentence.contains("SSH transport is disconnected"),
         "the transport failure must name the transport: {}",
@@ -953,10 +947,7 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
 
     // Grok was not detected by this tab's own probe.
     let row = remote_grok_row(false, true, None, false, None, false, true);
-    assert_eq!(
-        row.pill,
-        made_app::diagnostics::GrokDiagnosticsPill::Inactive
-    );
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Inactive);
     assert!(
         row.sentence.contains("not detected on this server"),
         "{}",
@@ -996,10 +987,7 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
     // Inventory tier without consent: the reason says the install was not
     // approved, and never claims hook readiness.
     let row = remote_grok_row(false, true, None, true, None, false, true);
-    assert_eq!(
-        row.pill,
-        made_app::diagnostics::GrokDiagnosticsPill::Degraded
-    );
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Degraded);
     assert!(
         row.sentence.contains("hooks are unavailable"),
         "{}",
@@ -1072,7 +1060,7 @@ fn remote_grok_rows_follow_the_owning_tab_tier_honestly() {
         false,
         true,
     );
-    assert_eq!(row.pill, made_app::diagnostics::GrokDiagnosticsPill::Ready);
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Ready);
     assert_eq!(row.sentence, "Grok Build session follow is ready.");
 }
 
@@ -1097,7 +1085,8 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         ..WorkspaceDiagnostics::default()
     });
     assert_eq!(
-        view.grok_sentence, "Grok Build is not on PATH.",
+        view.row("grok status").unwrap().sentence,
+        "Grok Build is not on PATH.",
         "the pre-existing host sentence is what a remote tab must replace"
     );
 
@@ -1113,8 +1102,8 @@ fn remote_grok_row_reaches_the_snapshot_and_copied_report() {
         true,
     );
     view.set_remote_grok(report.clone());
-    assert_eq!(view.grok_pill, report.pill);
-    assert_eq!(view.grok_sentence, report.sentence);
+    assert_eq!(view.row("grok status").unwrap().pill, report.pill);
+    assert_eq!(view.row("grok status").unwrap().sentence, report.sentence);
     let text = view.to_text();
     assert!(
         text.contains("grok status: degraded"),
@@ -1138,10 +1127,7 @@ fn remote_grok_failure_names_the_actual_failure_not_generic_transport() {
     // be flattened into the generic transport row.
     let detail = "Grok was not detected on this server. Nothing ran locally.";
     let row = remote_grok_row(true, false, Some(detail), false, None, false, false);
-    assert_eq!(
-        row.pill,
-        made_app::diagnostics::GrokDiagnosticsPill::Degraded
-    );
+    assert_eq!(row.pill, made_app::diagnostics::DiagnosticsPill::Degraded);
     assert!(
         row.sentence
             .contains("Grok was not detected on this server"),
@@ -1302,7 +1288,7 @@ mod claude_row {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use made_app::diagnostics::{ClaudeDiagnosticsPill, Diagnostics};
+    use made_app::diagnostics::{Diagnostics, DiagnosticsPill};
     use made_app::integration_status::{
         claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, IntegrationState,
         CLAUDE_GRACE,
@@ -1321,7 +1307,7 @@ mod claude_row {
         }
     }
 
-    fn row(inputs: ClaudeDiagnosticsInputs) -> (ClaudeDiagnosticsPill, String) {
+    fn row(inputs: ClaudeDiagnosticsInputs) -> (DiagnosticsPill, String) {
         let report = claude_diagnostics_row(&inputs);
         (report.pill, report.sentence)
     }
@@ -1340,7 +1326,7 @@ mod claude_row {
         assert_eq!(
             row(inputs),
             (
-                ClaudeDiagnosticsPill::Inactive,
+                DiagnosticsPill::Inactive,
                 "Checking for Claude Code.".to_owned()
             )
         );
@@ -1351,7 +1337,7 @@ mod claude_row {
         assert_eq!(
             row(inputs),
             (
-                ClaudeDiagnosticsPill::Inactive,
+                DiagnosticsPill::Inactive,
                 "Claude Code is not on PATH.".to_owned()
             )
         );
@@ -1368,7 +1354,7 @@ mod claude_row {
             assert_eq!(
                 row(inputs),
                 (
-                    ClaudeDiagnosticsPill::Degraded,
+                    DiagnosticsPill::Degraded,
                     "Claude Code session-status hooks are unavailable.".to_owned()
                 )
             );
@@ -1395,7 +1381,7 @@ mod claude_row {
         assert_eq!(
             row(inputs),
             (
-                ClaudeDiagnosticsPill::Inactive,
+                DiagnosticsPill::Inactive,
                 "Claude Code is not running.".to_owned()
             )
         );
@@ -1416,7 +1402,7 @@ mod claude_row {
             assert_eq!(
                 row(inputs),
                 (
-                    ClaudeDiagnosticsPill::Inactive,
+                    DiagnosticsPill::Inactive,
                     "Claude Code is starting.".to_owned()
                 ),
                 "session {live_session}, observed {protocol_observed}"
@@ -1441,7 +1427,7 @@ mod claude_row {
             assert_eq!(
                 row(inputs),
                 (
-                    ClaudeDiagnosticsPill::Degraded,
+                    DiagnosticsPill::Degraded,
                     "Claude Code session-status hooks are unavailable.".to_owned()
                 )
             );
@@ -1459,7 +1445,7 @@ mod claude_row {
         assert_eq!(
             row(inputs),
             (
-                ClaudeDiagnosticsPill::Degraded,
+                DiagnosticsPill::Degraded,
                 "Claude Code status protocol is unavailable.".to_owned()
             )
         );
@@ -1470,7 +1456,7 @@ mod claude_row {
         assert_eq!(
             row(ready()),
             (
-                ClaudeDiagnosticsPill::Ready,
+                DiagnosticsPill::Ready,
                 "Claude Code session follow is ready.".to_owned()
             )
         );
@@ -1521,7 +1507,8 @@ mod claude_row {
             None,
         );
         assert_eq!(
-            view.claude_sentence, "Claude Code is not on PATH.",
+            view.row("claude status").unwrap().sentence,
+            "Claude Code is not on PATH.",
             "the default is the not-on-PATH row"
         );
         for inputs in [
@@ -1540,9 +1527,9 @@ mod claude_row {
             },
         ] {
             let report = claude_diagnostics_row(&inputs);
-            view.set_claude_diagnostics(report.clone());
-            assert_eq!(view.claude_pill, report.pill);
-            assert_eq!(view.claude_sentence, report.sentence);
+            view.set_row("claude status", report.clone());
+            assert_eq!(view.row("claude status").unwrap().pill, report.pill);
+            assert_eq!(view.row("claude status").unwrap().sentence, report.sentence);
             let text = view.to_text();
             assert!(
                 text.contains(&format!("claude status: {}", report.pill.label())),
@@ -1585,12 +1572,12 @@ mod copied_report_characterization {
 
     /// Apply the local Claude Code row for `inputs`.
     fn apply_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
-        view.set_claude_diagnostics(claude_diagnostics_row(inputs));
+        view.set_row("claude status", claude_diagnostics_row(inputs));
     }
 
     /// Apply the remote Claude Code row for `inputs`.
     fn apply_remote_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
-        view.set_claude_diagnostics(remote_claude_diagnostics_row(inputs));
+        view.set_row("claude status", remote_claude_diagnostics_row(inputs));
     }
 
     /// Apply a remote Grok Build row.
@@ -1623,10 +1610,7 @@ mod copied_report_characterization {
             .workbench()
             .expect("a workspace is open")
             .diagnostics_snapshot();
-        view.grok_pill = derived.grok_pill;
-        view.grok_sentence = derived.grok_sentence;
-        view.claude_pill = derived.claude_pill;
-        view.claude_sentence = derived.claude_sentence;
+        view.rows = derived.rows;
     }
 
     /// Model options for a state of detection: pending, or finished with an
@@ -1758,10 +1742,22 @@ recent log:\n";
     #[test]
     fn rows_before_detection_are_the_not_on_path_rows_in_the_copied_report() {
         let view = fixed();
-        assert_eq!(view.grok_pill.label(), GROK_NOT_ON_PATH.0);
-        assert_eq!(view.grok_sentence, GROK_NOT_ON_PATH.1);
-        assert_eq!(view.claude_pill.label(), CLAUDE_NOT_ON_PATH.0);
-        assert_eq!(view.claude_sentence, CLAUDE_NOT_ON_PATH.1);
+        assert_eq!(
+            view.row("grok status").unwrap().pill.label(),
+            GROK_NOT_ON_PATH.0
+        );
+        assert_eq!(
+            view.row("grok status").unwrap().sentence,
+            GROK_NOT_ON_PATH.1
+        );
+        assert_eq!(
+            view.row("claude status").unwrap().pill.label(),
+            CLAUDE_NOT_ON_PATH.0
+        );
+        assert_eq!(
+            view.row("claude status").unwrap().sentence,
+            CLAUDE_NOT_ON_PATH.1
+        );
         assert_eq!(view.to_text(), report(GROK_NOT_ON_PATH, CLAUDE_NOT_ON_PATH));
     }
 

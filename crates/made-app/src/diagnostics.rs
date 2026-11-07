@@ -19,6 +19,7 @@ use made_bridge::security::{redact_secret, Token};
 use made_platform::{previous_private_log_path, Clipboard, PlatformError};
 
 use crate::integration_status::{IntegrationState, IntegrationStatus, ReasonCode, StatusChange};
+use crate::integrations::{DiagnosticsDecl, IntegrationList, RowReport, PRODUCT};
 use crate::remote_workspace::{
     ConnectionState as RemoteConnectionState, IntegrationState as RemoteIntegrationState,
 };
@@ -378,6 +379,8 @@ pub struct Diagnostics {
     app_version: String,
     token_fingerprint: Option<String>,
     update_apply: Option<String>,
+    /// The integrations whose rows a snapshot carries.
+    integrations: IntegrationList,
 }
 
 impl Diagnostics {
@@ -400,6 +403,7 @@ impl Diagnostics {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             update_apply: None,
             token_fingerprint: None,
+            integrations: PRODUCT,
         }
     }
 
@@ -419,7 +423,15 @@ impl Diagnostics {
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             update_apply: None,
             token_fingerprint: None,
+            integrations: PRODUCT,
         }
+    }
+
+    /// Carry the rows of a given integration list instead of the product's.
+    #[doc(hidden)]
+    pub fn with_integrations(mut self, list: IntegrationList) -> Self {
+        self.integrations = list;
+        self
     }
 
     /// Override the app version shown in diagnostics.
@@ -631,10 +643,7 @@ impl Diagnostics {
                 .token_fingerprint
                 .clone()
                 .map(|value| sanitize_display(&value, 128)),
-            grok_pill: GrokDiagnosticsRow::NOT_ON_PATH.pill,
-            grok_sentence: GrokDiagnosticsRow::NOT_ON_PATH.sentence.into_owned(),
-            claude_pill: ClaudeDiagnosticsPill::Inactive,
-            claude_sentence: "Claude Code is not on PATH.".to_owned(),
+            rows: initial_rows(self.integrations),
             entries: self
                 .log
                 .entries()
@@ -697,9 +706,9 @@ pub struct WorkspaceDiagnostics {
     pub cleanup_unconfirmed: Option<bool>,
 }
 
-/// Pill on the revealed Grok Build diagnostics row.
+/// Pill on a revealed integration diagnostics row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GrokDiagnosticsPill {
+pub enum DiagnosticsPill {
     /// PATH lookup or install has not produced a usable plugin.
     Inactive,
     /// The shipped plugin is installed or already current.
@@ -708,7 +717,7 @@ pub enum GrokDiagnosticsPill {
     Degraded,
 }
 
-impl GrokDiagnosticsPill {
+impl DiagnosticsPill {
     /// Lowercase pill label. Ready is not the OpenCode "connected" label.
     pub const fn label(self) -> &'static str {
         match self {
@@ -719,22 +728,49 @@ impl GrokDiagnosticsPill {
     }
 }
 
-/// Pill on the revealed Claude Code diagnostics row. It uses the same
-/// inactive, degraded and ready treatments as the Grok Build row.
-pub type ClaudeDiagnosticsPill = GrokDiagnosticsPill;
+/// One integration row of the diagnostics snapshot: the pill and the one
+/// sentence beside it, under the keys the integration declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsRow {
+    /// Key of the copied-report line that carries the pill label.
+    pub status_key: &'static str,
+    /// Key of the copied-report line that carries the sentence.
+    pub sentence_key: &'static str,
+    /// Pill beside the sentence.
+    pub pill: DiagnosticsPill,
+    /// The one sentence.
+    pub sentence: String,
+}
+
+/// The rows of a snapshot built over `list`, in list order, each in the state
+/// its integration declared before detection.
+#[doc(hidden)]
+pub fn initial_rows(list: IntegrationList) -> Vec<DiagnosticsRow> {
+    list.iter()
+        .filter_map(|entry| match entry.diagnostics() {
+            DiagnosticsDecl::Row(decl) => Some(DiagnosticsRow {
+                status_key: decl.status_key,
+                sentence_key: decl.sentence_key,
+                pill: decl.initial.pill,
+                sentence: decl.initial.sentence.into_owned(),
+            }),
+            DiagnosticsDecl::None | DiagnosticsDecl::Primary => None,
+        })
+        .collect()
+}
 
 /// The Claude Code pill plus its one fixed sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeDiagnosticsReport {
     /// Pill beside the sentence.
-    pub pill: ClaudeDiagnosticsPill,
+    pub pill: DiagnosticsPill,
     /// The one Claude Code sentence. Fixed product wording; it never carries
     /// prompt, message or title content.
     pub sentence: String,
 }
 
 impl ClaudeDiagnosticsReport {
-    pub(crate) fn new(pill: ClaudeDiagnosticsPill, sentence: &str) -> Self {
+    pub(crate) fn new(pill: DiagnosticsPill, sentence: &str) -> Self {
         Self {
             pill,
             sentence: sentence.to_owned(),
@@ -745,66 +781,66 @@ impl ClaudeDiagnosticsReport {
 /// Current Grok Build pill and the one sentence shown beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct GrokDiagnosticsRow {
-    pub(crate) pill: GrokDiagnosticsPill,
+    pub(crate) pill: DiagnosticsPill,
     /// Fixed product wording, or the owning tab's bounded failure detail.
     pub(crate) sentence: Cow<'static, str>,
 }
 
 impl GrokDiagnosticsRow {
     pub(crate) const CHECKING: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Checking for Grok Build."),
     };
     pub(crate) const NOT_ON_PATH: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Grok Build is not on PATH."),
     };
     pub(crate) const INSTALLING: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Installing the Grok Build plugin."),
     };
     pub(crate) const READY: Self = Self {
-        pill: GrokDiagnosticsPill::Ready,
+        pill: DiagnosticsPill::Ready,
         sentence: Cow::Borrowed("Grok Build session follow is ready."),
     };
     pub(crate) const NOT_RUNNING: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Grok Build is not running."),
     };
     pub(crate) const HOOKS_UNAVAILABLE: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
+        pill: DiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Grok Build session-status hooks are unavailable."),
     };
     pub(crate) const NOT_INSTALLED: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Grok Build plugin was not installed for this launch."),
     };
     pub(crate) const REMOTE_NOT_DETECTED: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Grok Build is not detected on this server."),
     };
     pub(crate) const REMOTE_INSTALLING: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("Installing the Grok Build plugin on this server."),
     };
     pub(crate) const REMOTE_HOOKS_NOT_APPROVED: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
+        pill: DiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install was not approved."),
     };
     pub(crate) const REMOTE_INSTALL_PENDING: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
+        pill: DiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install has not run on this server yet."),
     };
     pub(crate) const REMOTE_INSTALL_FAILED: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
+        pill: DiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("Remote Grok Build session-status hooks are unavailable: the plugin install failed on this server."),
     };
     pub(crate) const REMOTE_TRANSPORT_DOWN: Self = Self {
-        pill: GrokDiagnosticsPill::Degraded,
+        pill: DiagnosticsPill::Degraded,
         sentence: Cow::Borrowed("The SSH transport is disconnected; the remote Grok Build state is unknown until reattach."),
     };
     pub(crate) const REMOTE_UNKNOWN: Self = Self {
-        pill: GrokDiagnosticsPill::Inactive,
+        pill: DiagnosticsPill::Inactive,
         sentence: Cow::Borrowed("The remote Grok Build state is not known yet."),
     };
 }
@@ -896,14 +932,8 @@ pub struct DiagnosticsSnapshot {
     pub previous_log_exists: bool,
     /// Safe bridge token fingerprint.
     pub token_fingerprint: Option<String>,
-    /// Grok Build pill label (`inactive`, `ready`, or `degraded`).
-    pub grok_pill: GrokDiagnosticsPill,
-    /// The one Grok Build sentence shown beside that pill.
-    pub grok_sentence: String,
-    /// Claude Code pill label (`inactive`, `ready`, or `degraded`).
-    pub claude_pill: ClaudeDiagnosticsPill,
-    /// The one Claude Code sentence shown beside that pill.
-    pub claude_sentence: String,
+    /// The integration rows beside the primary status, in list order.
+    pub rows: Vec<DiagnosticsRow>,
     /// Recent log entries, oldest to newest.
     pub entries: Vec<LogEntry>,
 }
@@ -942,7 +972,7 @@ pub fn remote_grok_row(
 ) -> RemoteGrokReport {
     if let Some(detail) = failed_detail {
         return RemoteGrokReport {
-            pill: GrokDiagnosticsPill::Degraded,
+            pill: DiagnosticsPill::Degraded,
             sentence: format!(
                 "The remote Grok Build session failed: {}",
                 sanitize_display(&redact_hex_secrets(detail), 400)
@@ -993,8 +1023,35 @@ pub enum RemoteGrokInstallOutcome {
 /// One remote Grok Build diagnostics row: the pill plus its bounded sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteGrokReport {
-    pub pill: GrokDiagnosticsPill,
+    pub pill: DiagnosticsPill,
     pub sentence: String,
+}
+
+impl From<ClaudeDiagnosticsReport> for RowReport {
+    fn from(report: ClaudeDiagnosticsReport) -> Self {
+        Self {
+            pill: report.pill,
+            sentence: Cow::Owned(report.sentence),
+        }
+    }
+}
+
+impl From<RemoteGrokReport> for RowReport {
+    fn from(report: RemoteGrokReport) -> Self {
+        Self {
+            pill: report.pill,
+            sentence: Cow::Owned(report.sentence),
+        }
+    }
+}
+
+impl From<GrokDiagnosticsRow> for RowReport {
+    fn from(row: GrokDiagnosticsRow) -> Self {
+        Self {
+            pill: row.pill,
+            sentence: row.sentence,
+        }
+    }
 }
 
 impl From<GrokDiagnosticsRow> for RemoteGrokReport {
@@ -1145,25 +1202,35 @@ impl DiagnosticsSnapshot {
         self.cleanup_unconfirmed = workspace.cleanup_unconfirmed;
     }
 
-    /// Record the Grok Build row. Fixed product wording stays fixed; a remote
-    /// failure detail is already bounded and sanitized by its source.
-    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
-        self.grok_pill = row.pill;
-        self.grok_sentence = row.sentence.into_owned();
+    /// The row whose status line has this key (`grok status`).
+    pub fn row(&self, status_key: &str) -> Option<&DiagnosticsRow> {
+        self.rows.iter().find(|row| row.status_key == status_key)
     }
 
-    /// Record the Claude Code row for the next render and copied report.
-    pub fn set_claude_diagnostics(&mut self, report: ClaudeDiagnosticsReport) {
-        self.claude_pill = report.pill;
-        self.claude_sentence = report.sentence;
+    /// Record the row whose status line has this key for the next render and
+    /// copied report. A key no row declares is ignored: the list that built
+    /// the snapshot has no such integration. Fixed product wording stays
+    /// fixed; a remote failure detail is already bounded and sanitized by its
+    /// source.
+    pub fn set_row(&mut self, status_key: &str, report: impl Into<RowReport>) {
+        let report = report.into();
+        if let Some(row) = self
+            .rows
+            .iter_mut()
+            .find(|row| row.status_key == status_key)
+        {
+            row.pill = report.pill;
+            row.sentence = report.sentence.into_owned();
+        }
     }
 
+    // BEGIN remote-path (AIA-02)
     /// Report the owning remote tab's Grok Build tier, replacing the host
     /// row. A failure sentence is bounded and sanitized by `remote_grok_row`.
     pub fn set_remote_grok(&mut self, report: RemoteGrokReport) {
-        self.grok_pill = report.pill;
-        self.grok_sentence = report.sentence;
+        self.set_row("grok status", report);
     }
+    // END remote-path
 
     /// Report the owning remote tab's OpenCode integration, replacing the
     /// host-local status and reason. The reason is sanitized and redacted.
@@ -1181,10 +1248,10 @@ impl DiagnosticsSnapshot {
         push_line(&mut text, "status", &self.status_label);
         push_line(&mut text, "reason code", self.reason_code);
         push_line(&mut text, "reason", &self.reason);
-        push_line(&mut text, "grok status", self.grok_pill.label());
-        push_line(&mut text, "grok", &self.grok_sentence);
-        push_line(&mut text, "claude status", self.claude_pill.label());
-        push_line(&mut text, "claude", &self.claude_sentence);
+        for row in &self.rows {
+            push_line(&mut text, row.status_key, row.pill.label());
+            push_line(&mut text, row.sentence_key, &row.sentence);
+        }
         if let Some(identity) = &self.workspace_identity {
             push_line(&mut text, "workspace identity", identity);
         }

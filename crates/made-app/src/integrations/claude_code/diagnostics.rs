@@ -3,7 +3,7 @@
 use std::any::Any;
 
 use crate::integration_status::ClaudeDiagnosticsPhase;
-use crate::integrations::{AppCtx, AppInit, AppState, CLAUDE_CODE};
+use crate::integrations::{AppCtx, AppInit, AppState, WorkspaceTabs, CLAUDE_CODE};
 
 /// Claude Code PATH detection state for every workspace's diagnostics row.
 pub(crate) struct ClaudeAppState {
@@ -19,11 +19,6 @@ impl ClaudeAppState {
                 init.catalog.contains(&CLAUDE_CODE),
             ),
         }
-    }
-
-    /// The detection state every workspace's row shows.
-    pub(crate) fn phase(&self) -> ClaudeDiagnosticsPhase {
-        self.phase
     }
 }
 
@@ -59,6 +54,12 @@ impl AppState for ClaudeAppState {
         if self.phase == ClaudeDiagnosticsPhase::Checking {
             self.phase = ClaudeDiagnosticsPhase::NotOnPath;
             ctx.mark_diagnostics_changed();
+        }
+    }
+
+    fn publish(&self, workspace: &mut WorkspaceTabs<'_>) {
+        if let Some(state) = super::tab_state_mut(workspace.list, workspace.tab_states) {
+            state.set_phase(self.phase);
         }
     }
 

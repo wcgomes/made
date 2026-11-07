@@ -25,6 +25,7 @@ use made_platform::{
     host_platform, AppPaths, LogIssue, LogIssueSeverity, Platform, PlatformFamily, PtySize,
 };
 
+use crate::app::WorkspaceId;
 use crate::claude_follow::ClaudeTab;
 use crate::diagnostics::{
     Diagnostics, DiagnosticsSnapshot, GrokDiagnosticsRow, LogEntry, LogLevel, WorkspaceDiagnostics,
@@ -33,13 +34,14 @@ use crate::diagnostics::{
 use crate::explorer_view::{
     ExplorerGitChrome, ExplorerPane, GitHeader, PreviewDocument, PreviewUiAction,
 };
-use crate::integration_status::{ClaudeDiagnosticsPhase, IntegrationState, IntegrationStatus};
+use crate::integration_status::{IntegrationState, IntegrationStatus};
 use crate::integrations::claude_code;
-use crate::integrations::grok::{self, GrokTabState};
+use crate::integrations::grok;
 use crate::integrations::opencode::{self, OpenCodeTabState};
 use crate::integrations::{
-    EnvContribution, FollowKind, FollowPort, FollowStep, IntegrationList, LaunchCtx, Slots,
-    TabInit, TabIo, TabState, PRODUCT,
+    AppState, DiagnosticsDecl, EnvContribution, FollowKind, FollowPort, FollowStep,
+    IntegrationList, LaunchCtx, Presentation, PresentationCtx, RowReport, Slots, TabInit, TabIo,
+    TabState, WorkspaceTabs, PRODUCT,
 };
 use crate::metrics::Metrics;
 use crate::sanitize::{sanitize_copy_text, sanitize_display};
@@ -811,7 +813,8 @@ impl Workbench {
             None => Diagnostics::unavailable(
                 "app paths are unavailable; no shared temporary log is used",
             ),
-        };
+        }
+        .with_integrations(integrations);
 
         let launch_root = plan.as_ref().map(|plan| plan.explorer_root.clone());
         let integration = IntegrationState::new(launch_root.clone(), terminal_cwd.clone());
@@ -1362,6 +1365,60 @@ impl Workbench {
         }
     }
 
+    /// The integrations this tab was built with, in catalog order.
+    pub(crate) fn integrations(&self) -> IntegrationList {
+        self.integrations
+    }
+
+    /// Hand what one integration's app-wide state knows about this local
+    /// workspace to the tab states.
+    pub(crate) fn publish_app_state(&mut self, id: WorkspaceId, state: &dyn AppState) {
+        let terminal_running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
+        state.publish(&mut WorkspaceTabs {
+            id,
+            list: self.integrations,
+            target: self.terminal_target,
+            terminal_running,
+            tab_states: &mut self.tab_states,
+        });
+    }
+
+    /// How the integration at `index` of this tab's list brands the tab, or
+    /// `None` when it does not.
+    pub(crate) fn presentation_of(&self, index: usize) -> Option<Presentation> {
+        let state = self.tab_states.get(index)?;
+        let terminal = self.terminal.as_ref();
+        state.presentation(&PresentationCtx {
+            target: self.terminal_target,
+            remote: self.remote.is_some(),
+            terminal_running: terminal.is_some_and(TerminalPane::is_running),
+            terminal_title: terminal.and_then(TerminalPane::title),
+            connected: self.is_connected(),
+            session_map: &self.session_map,
+        })
+    }
+
+    /// The diagnostics rows of this tab's integrations, in list order, under
+    /// the keys they declared. An integration with no tab state keeps the row
+    /// it declared before detection.
+    pub(crate) fn row_reports(&self) -> Vec<(&'static str, RowReport)> {
+        let remote = self.remote.is_some();
+        self.integrations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let DiagnosticsDecl::Row(decl) = entry.diagnostics() else {
+                    return None;
+                };
+                let report = self
+                    .tab_states
+                    .get(index)
+                    .and_then(|state| state.row(remote))?;
+                Some((decl.status_key, report))
+            })
+            .collect()
+    }
+
     // BEGIN transitional-shim (AIA-11)
     /// Claude Code state of this tab: presence, dots and title inputs. `None`
     /// for tabs that do not load Made's Claude Code plugin.
@@ -1382,24 +1439,6 @@ impl Workbench {
     }
     // END remote-path
 
-    /// Record the app-wide Claude Code detection state for the diagnostics row.
-    pub(crate) fn set_claude_phase(&mut self, phase: ClaudeDiagnosticsPhase) {
-        if let Some(state) = claude_code::tab_state_mut(self.integrations, &mut self.tab_states) {
-            state.set_phase(phase);
-        }
-    }
-
-    /// The Claude Code diagnostics row for this workspace.
-    pub(crate) fn claude_diagnostics(&self) -> crate::diagnostics::ClaudeDiagnosticsReport {
-        let remote = self.remote.is_some();
-        match claude_code::tab_state(self.integrations, &self.tab_states) {
-            Some(state) => state.diagnostics(remote),
-            // A list without Claude Code reports the tab as it is before any
-            // detection.
-            None => claude_code::ClaudeTabState::absent().diagnostics(remote),
-        }
-    }
-
     /// The Claude Code state of this tab, for tests.
     #[cfg(test)]
     fn claude_state_mut(&mut self) -> &mut claude_code::ClaudeTabState {
@@ -1408,32 +1447,32 @@ impl Workbench {
     }
 
     /// Whether Grok is running in this workspace.
+    #[cfg(test)]
     pub(crate) fn grok_follow_running(&self) -> bool {
         let running = self.terminal.as_ref().is_some_and(TerminalPane::is_running);
         grok::tab_state(self.integrations, &self.tab_states)
             .is_some_and(|state| state.follow_running(self.terminal_target, running))
     }
 
-    /// Status dots for Grok sessions open in this terminal.
-    pub(crate) fn grok_tab_activities(&self) -> Vec<SessionActivity> {
-        grok::tab_state(self.integrations, &self.tab_states)
-            .map(GrokTabState::tab_activities)
-            .unwrap_or_default()
-    }
-
-    /// Keep the Grok Build diagnostics row for the next snapshot.
-    pub(crate) fn set_grok_diagnostics(&mut self, row: GrokDiagnosticsRow) {
+    // BEGIN remote-path (AIA-02)
+    /// Keep this remote tab's Grok Build diagnostics row for the next
+    /// snapshot.
+    pub(crate) fn set_remote_grok_row(&mut self, row: GrokDiagnosticsRow) {
         let remote_hooks_ready =
             self.remote_grok_running() && self.remote_grok_hooks_ready() == Some(true);
         if let Some(state) = grok::tab_state_mut(self.integrations, &mut self.tab_states) {
             state.set_diagnostics(row, remote_hooks_ready);
         }
     }
+    // END remote-path
 
-    /// Grok Build pill and sentence currently shown in About.
-    pub(crate) fn grok_diagnostics(&self) -> GrokDiagnosticsRow {
-        grok::tab_state(self.integrations, &self.tab_states)
-            .map_or(GrokDiagnosticsRow::NOT_ON_PATH, GrokTabState::diagnostics)
+    /// Grok Build pill and sentence currently kept for this tab.
+    #[cfg(test)]
+    fn grok_row(&self) -> GrokDiagnosticsRow {
+        grok::tab_state(self.integrations, &self.tab_states).map_or(
+            GrokDiagnosticsRow::NOT_ON_PATH,
+            grok::GrokTabState::diagnostics,
+        )
     }
 
     /// Record that OpenCode is not installed or not on PATH.
@@ -1453,7 +1492,7 @@ impl Workbench {
 
     /// The Grok state of this tab, for tests.
     #[cfg(test)]
-    fn grok_state_mut(&mut self) -> &mut GrokTabState {
+    fn grok_state_mut(&mut self) -> &mut grok::GrokTabState {
         grok::tab_state_mut(self.integrations, &mut self.tab_states)
             .expect("the product list has Grok")
     }
@@ -5156,8 +5195,9 @@ impl Workbench {
         if let Some(report) = self.remote_opencode_diagnostics() {
             snapshot.set_remote_opencode(report);
         }
-        snapshot.set_grok_diagnostics(self.grok_diagnostics());
-        snapshot.set_claude_diagnostics(self.claude_diagnostics());
+        for (key, report) in self.row_reports() {
+            snapshot.set_row(key, report);
+        }
         snapshot
     }
 
@@ -5641,6 +5681,7 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration_status::ClaudeDiagnosticsPhase;
     use crate::integrations::{GROK, OPENCODE};
     use crate::tui::{ClaudeLaunchEnv, CLAUDE_SPOOL_ENV};
 
@@ -5673,8 +5714,16 @@ mod tests {
     #[test]
     fn the_diagnostics_row_reads_the_cached_plugin_state_not_the_filesystem() {
         let mut workbench = idle_workbench(TerminalTarget::Shell, None);
-        workbench.set_claude_phase(ClaudeDiagnosticsPhase::Available);
-        let sentence = |workbench: &Workbench| workbench.claude_diagnostics().sentence;
+        workbench
+            .claude_state_mut()
+            .set_phase(ClaudeDiagnosticsPhase::Available);
+        let sentence = |workbench: &Workbench| {
+            workbench
+                .diagnostics_snapshot()
+                .row("claude status")
+                .map(|row| row.sentence.clone())
+                .unwrap()
+        };
 
         assert_eq!(
             sentence(&workbench),
@@ -8265,12 +8314,13 @@ mod tests {
 
         #[test]
         fn remote_claude_diagnostics_follow_the_tab_detection_and_presence() {
-            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+            use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive};
 
             let (mut bench, attach) = remote_claude_bench();
             let row = |bench: &RemoteBench| {
                 let snapshot = bench.workbench.diagnostics_snapshot();
-                (snapshot.claude_pill, snapshot.claude_sentence)
+                let row = snapshot.row("claude status").unwrap();
+                (row.pill, row.sentence.clone())
             };
             assert_eq!(row(&bench).1, "Checking for Claude Code.");
             bench.workbench.set_remote_claude_detection(Some(false));
@@ -8376,13 +8426,14 @@ mod tests {
 
         #[test]
         fn direct_remote_claude_is_present_until_it_exits_and_reports_honest_diagnostics() {
-            use crate::diagnostics::GrokDiagnosticsPill::{Degraded, Inactive};
+            use crate::diagnostics::DiagnosticsPill::{Degraded, Inactive};
 
             let (mut bench, attach) = direct_claude_bench();
             bench.workbench.set_remote_claude_detection(Some(true));
             let row = |bench: &RemoteBench| {
                 let snapshot = bench.workbench.diagnostics_snapshot();
-                (snapshot.claude_pill, snapshot.claude_sentence)
+                let row = snapshot.row("claude status").unwrap();
+                (row.pill, row.sentence.clone())
             };
             // Present as soon as the remote claude runs, before any emission.
             let tab = bench.workbench.claude_tab().unwrap();
@@ -8708,13 +8759,15 @@ mod tests {
 
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(bench.workbench.grok_row(), GrokDiagnosticsRow::READY);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
-                GrokDiagnosticsRow::READY
-            );
-            assert_eq!(
-                bench.workbench.diagnostics_snapshot().grok_sentence,
+                bench
+                    .workbench
+                    .diagnostics_snapshot()
+                    .row("grok status")
+                    .unwrap()
+                    .sentence,
                 GrokDiagnosticsRow::READY.sentence
             );
         }
@@ -8743,24 +8796,29 @@ mod tests {
             push(&mut bench, ready);
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
             assert_eq!(
-                bench.workbench.diagnostics_snapshot().grok_sentence,
+                bench
+                    .workbench
+                    .diagnostics_snapshot()
+                    .row("grok status")
+                    .unwrap()
+                    .sentence,
                 GrokDiagnosticsRow::READY.sentence
             );
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_INSTALL_PENDING);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
+                bench.workbench.grok_row(),
                 GrokDiagnosticsRow::READY,
                 "a consented install is unnecessary when hooks are already armed"
             );
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN);
             assert_eq!(
-                bench.workbench.grok_diagnostics(),
+                bench.workbench.grok_row(),
                 GrokDiagnosticsRow::REMOTE_TRANSPORT_DOWN
             );
 
@@ -8772,8 +8830,8 @@ mod tests {
                 GrokDiagnosticsRow::REMOTE_INSTALL_PENDING,
                 GrokDiagnosticsRow::REMOTE_INSTALL_FAILED,
             ] {
-                bench.workbench.set_grok_diagnostics(row.clone());
-                assert_eq!(bench.workbench.grok_diagnostics(), row);
+                bench.workbench.set_remote_grok_row(row.clone());
+                assert_eq!(bench.workbench.grok_row(), row);
             }
 
             // Idle inventory is sufficient to report an explicitly ready tier.
@@ -8786,11 +8844,8 @@ mod tests {
             push(&mut bench, idle);
             bench
                 .workbench
-                .set_grok_diagnostics(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
-            assert_eq!(
-                bench.workbench.grok_diagnostics(),
-                GrokDiagnosticsRow::READY
-            );
+                .set_remote_grok_row(GrokDiagnosticsRow::REMOTE_HOOKS_NOT_APPROVED);
+            assert_eq!(bench.workbench.grok_row(), GrokDiagnosticsRow::READY);
         }
 
         #[test]

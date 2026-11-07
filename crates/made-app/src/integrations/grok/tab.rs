@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::diagnostics::GrokDiagnosticsRow;
-use crate::integrations::{TabIo, TabReport, TabState, GROK};
+use crate::integrations::{
+    Presentation, PresentationCtx, RowReport, TabIo, TabReport, TabState, GROK,
+};
 use crate::session_map::SessionActivity;
 use crate::terminal_view::TerminalPane;
 use crate::tui::TerminalTarget;
@@ -311,6 +313,22 @@ impl GrokTabState {
 }
 
 impl TabState for GrokTabState {
+    fn row(&self, _remote: bool) -> Option<RowReport> {
+        Some(self.diagnostics().into())
+    }
+
+    /// Grok Build brands a local tab while its TUI runs or while the terminal
+    /// has open Grok sessions. A remote tab's branding comes from its own
+    /// server state.
+    fn presentation(&self, ctx: &PresentationCtx<'_>) -> Option<Presentation> {
+        if ctx.remote {
+            return None;
+        }
+        let dots = self.tab_activities();
+        crate::ui::workspace_grok_branded(false, ctx.target, ctx.terminal_running, dots.len())
+            .then_some(Presentation { dots, title: None })
+    }
+
     /// Apply the hook lines, then refresh the inventory. The directories they
     /// follow reach the coordinator through the poll's follow port.
     fn poll(&mut self, now: Instant, io: &mut TabIo<'_>) -> TabReport {
