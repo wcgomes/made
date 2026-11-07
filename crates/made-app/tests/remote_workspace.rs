@@ -1529,7 +1529,7 @@ fn grok_cwd_is_used_byte_exact_and_granted_like_any_remote_report() {
 mod remote_claude_row {
     use made_app::diagnostics::DiagnosticsPill;
     use made_app::diagnostics::DiagnosticsPill::{Degraded, Inactive};
-    use made_app::integration_status::{
+    use made_app::integrations::claude_code::diagnostics::{
         remote_claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase,
         CLAUDE_GRACE,
     };
