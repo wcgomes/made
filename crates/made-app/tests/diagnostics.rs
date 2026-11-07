@@ -8,6 +8,7 @@ use made_app::diagnostics::{
     MAX_LOG_ENTRIES, MAX_LOG_FILE_BYTES, MAX_LOG_MESSAGE_BYTES, MAX_LOG_TEXT_BYTES,
 };
 use made_app::integration_status::{IntegrationState, IntegrationStatus, ReasonCode};
+use made_app::integrations::opencode;
 use made_app::session_follow::FollowedSession;
 use made_app::worktree::{MetadataStatus, WorktreeMetadata};
 use made_bridge::security::Token;
@@ -605,7 +606,7 @@ fn unavailable_diagnostics_have_no_previous_log_state() {
 #[test]
 fn unsupported_diagnostics_are_actionable() {
     let mut integration = IntegrationState::new(None, "/workspace");
-    integration.note_opencode_version("1.2.3");
+    opencode::diagnostics::note_version(&mut integration, "1.2.3");
     let view = Diagnostics::new("/tmp/log").snapshot(&integration, None, None, None);
     assert_eq!(view.status_label, "unsupported");
     assert_eq!(view.reason_code, "opencode_too_old");
@@ -766,7 +767,7 @@ fn opencode_reason_sentences_follow_the_grok_wording() {
         "reconnected",
     );
 
-    integration.note_opencode_missing();
+    opencode::diagnostics::note_missing(&mut integration);
     assert_eq!(integration.status(), IntegrationStatus::Unsupported);
     assert_copied_opencode_reason(
         &integration,
@@ -1289,9 +1290,9 @@ mod claude_row {
     use std::time::Duration;
 
     use made_app::diagnostics::{Diagnostics, DiagnosticsPill};
-    use made_app::integration_status::{
-        claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, IntegrationState,
-        CLAUDE_GRACE,
+    use made_app::integration_status::IntegrationState;
+    use made_app::integrations::claude_code::diagnostics::{
+        claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, CLAUDE_GRACE,
     };
 
     /// A present Claude Code with a plugin, a live session, an observed
@@ -1559,15 +1560,17 @@ mod copied_report_characterization {
     use std::time::Duration;
 
     use made_app::diagnostics::{Diagnostics, DiagnosticsSnapshot};
-    use made_app::integration_status::{IntegrationState, CLAUDE_GRACE};
+    use made_app::integration_status::IntegrationState;
+    use made_app::integrations::claude_code::diagnostics::CLAUDE_GRACE;
 
     // BEGIN characterization adapter
-    use made_app::app::{AppModel, AppOptions, GrokDiagnosticsHold, GrokRunningHold};
+    use made_app::app::{AppModel, AppOptions};
     use made_app::diagnostics::{remote_grok_row, RemoteGrokInstallOutcome};
-    use made_app::integration_status::{
+    use made_app::integrations::claude_code::diagnostics::{
         claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
         ClaudeDiagnosticsPhase,
     };
+    use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
     use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
 
     /// Apply the local Claude Code row for `inputs`.
@@ -1624,19 +1627,23 @@ mod copied_report_characterization {
     }
 
     fn hold_grok(model: &mut AppModel, hold: Hold) {
-        model.hold_grok_diagnostics(match hold {
-            Hold::Detecting => GrokDiagnosticsHold::Detecting,
-            Hold::NotOnPath => GrokDiagnosticsHold::NotOnPath,
-            Hold::Installing => GrokDiagnosticsHold::Installing,
-            Hold::Installed => GrokDiagnosticsHold::Installed,
-            Hold::AlreadyCurrent => GrokDiagnosticsHold::AlreadyCurrent,
-            Hold::InstallFailed => GrokDiagnosticsHold::InstallFailed,
-        });
+        grok::hold_diagnostics(
+            model,
+            match hold {
+                Hold::Detecting => GrokDiagnosticsHold::Detecting,
+                Hold::NotOnPath => GrokDiagnosticsHold::NotOnPath,
+                Hold::Installing => GrokDiagnosticsHold::Installing,
+                Hold::Installed => GrokDiagnosticsHold::Installed,
+                Hold::AlreadyCurrent => GrokDiagnosticsHold::AlreadyCurrent,
+                Hold::InstallFailed => GrokDiagnosticsHold::InstallFailed,
+            },
+        );
     }
 
     fn hold_grok_running(model: &mut AppModel, running: Mark) {
         let id = model.active_workspace_id().expect("a workspace is open");
-        model.hold_workspace_grok_running(
+        grok::hold_workspace_running(
+            model,
             id,
             match running {
                 Mark::LivingTarget => GrokRunningHold::LivingTarget,
