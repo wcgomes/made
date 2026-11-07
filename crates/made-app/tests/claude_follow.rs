@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use made_app::claude_follow::{
+use made_app::integrations::claude_code::follow::{
     parse_record, ready_claude_plugin_dir, resolve_anchor, ClaudeActivity, ClaudeTab, HookStatus,
     Record, SpoolReader, SpoolWatcher, MAX_HOPS,
 };
