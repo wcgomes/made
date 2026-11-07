@@ -241,7 +241,7 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [x] 3.35 Remove the Claude Code env re-export (path: crates/made-app/src/tui.rs)
 - [x] 3.36 Confirm the fake integration tests are unchanged since step 1 and pass, and that no core file of design.md "Seam inventory" names the fake (path: crates/made-app/tests/fake_integration.rs)
 - [x] 3.37 Scan asserting no `transitional-shim (AIA-11)` marker remains under `crates/made-app/src` (path: crates/made-app/tests/integration_modules.rs)
-- [ ] 3.38 Revert check of the step 3 merge on a scratch branch (path: n/a (PR description))
+- [x] 3.38 Revert check of the step 3 merge on a scratch branch (path: n/a (PR description))
 
 ## Checkpoint
 - [ ] gates pass; per-block adapter checks pass; OpenCode plugin `npm test` and `npm run typecheck` unchanged; PR CI green (merge gate)

@@ -107,3 +107,11 @@ External dependency sets (`cargo tree -p <crate> -e normal --prefix none --locke
 - Old paths: `grok_follow.rs` and `grok_plugin.rs` were deleted, not turned into re-exports, because nothing outside the Grok module imported them and an unused `pub(crate) use` warns `unused_imports`. Re-exports remain for `GrokDiagnosticsHold`/`GrokRunningHold` (`app.rs`, used by tests through `made_app::app`) and `GrokDiagnosticsRow` (`diagnostics.rs`), inside transitional-shim markers.
 - Neutrality scans now deny `grok_root`, `GrokLiveSession`, `poll_grok_`, `GrokDiagnosticsPhase` and `grok_row_for` in core production code, and `integrations::grok` next to `integrations::claude_code` in the import scan, exempting remote-path and transitional-shim regions.
 - Revert check (task 2.13): in a scratch worktree at b32c619, `git revert --no-commit b32c619^..b32c619` applied cleanly; the tree equals the step 1 tip 6361066; made-app tests 853 passed, 0 failed (`cargo test -p made-app --locked -j 3 -- --test-threads=1`); step 2 reverts alone. The scratch worktree was removed.
+
+### Step 3 evidence
+
+- Final public test surface: see design.md "Public test surface (settled in step 3)". The old core paths are gone; tests use `integrations::{claude_code, grok, opencode}`.
+- The neutrality scans now deny the OpenCode legacy identifiers and any `integrations::<module>` import in core code outside remote-path regions; no transitional-shim marker remains (scan `no_transitional_shim_marker_remains`).
+- Fake integration tests unchanged since the step 1 tip 6361066; no core file names the fake.
+- Commit f25b040 also carries the deletion of `claude_follow.rs` (staged by mistake) and does not compile alone; the step 3 tip is green. Squash on merge.
+- Revert check (task 3.38): in a scratch worktree at 0148c68, `git revert --no-commit d18babc^..0148c68` applied cleanly; the tree equals the step 2 tip 5d12d3f (no diff in code or specs); made-app tests 854 passed, 0 failed (`cargo test -p made-app --locked -j 3 -- --test-threads=1`); step 3 reverts alone. The scratch worktree was removed.
