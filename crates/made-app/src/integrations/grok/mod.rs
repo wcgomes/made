@@ -129,7 +129,7 @@ pub fn hold_diagnostics(model: &mut AppModel, hold: GrokDiagnosticsHold) {
     if let Some(state) = super::app_state_mut::<GrokAppState>(list, model.app_states_mut(), GROK) {
         state.set_hold(hold);
     }
-    model.push_grok_diagnostics();
+    model.push_integration_diagnostics();
 }
 
 /// Mark whether Grok is running in one workspace, without a grok process.
@@ -144,5 +144,5 @@ pub fn hold_workspace_running(model: &mut AppModel, id: WorkspaceId, running: Gr
     if let Some(state) = super::app_state_mut::<GrokAppState>(list, model.app_states_mut(), GROK) {
         state.set_running_hold(id, running);
     }
-    model.push_grok_diagnostics();
+    model.push_integration_diagnostics();
 }

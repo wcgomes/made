@@ -76,7 +76,7 @@ fn status_pill_ui(
     )
 }
 
-fn grok_status_pill_ui(
+fn integration_status_pill_ui(
     ui: &mut Ui,
     pill: DiagnosticsPill,
     sentence: &str,
@@ -976,7 +976,7 @@ fn workspace_claude_branded(opencode: bool, remote_grok_branded: bool, present: 
 
 /// Non-color summary across all open sessions. Counts include sessions beyond
 /// the eight-dot visual cap.
-fn opencode_sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
+fn sessions_summary(sessions: &[SessionActivity]) -> Option<String> {
     if sessions.is_empty() {
         return None;
     }
@@ -1275,7 +1275,7 @@ pub fn workspace_tab_summaries(model: &AppModel) -> Vec<TabSummary> {
         .workspace_ids()
         .filter_map(|id| {
             let tab = workspace_tab_info(id, model.workspace(id)?);
-            let summary = opencode_sessions_summary(&tab.sessions);
+            let summary = sessions_summary(&tab.sessions);
             Some(TabSummary {
                 id,
                 mark: tab
@@ -2491,7 +2491,7 @@ fn workspace_tab_ui(
         stroke,
         StrokeKind::Inside,
     );
-    let session_summary = opencode_sessions_summary(&tab.sessions);
+    let session_summary = sessions_summary(&tab.sessions);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::Role::Tab,
@@ -3620,7 +3620,7 @@ impl Workbench {
                 });
                 for (pill, sentence) in about_integration_rows(snapshot) {
                     ui.horizontal(|ui| {
-                        grok_status_pill_ui(ui, pill, sentence, layout);
+                        integration_status_pill_ui(ui, pill, sentence, layout);
                         ui.label(theme::micro(sentence)).on_hover_text(sentence);
                     });
                 }
@@ -5747,11 +5747,11 @@ mod tests {
 
     #[test]
     fn workspace_tab_accessible_name_includes_session_summary() {
-        let busy = opencode_sessions_summary(&[SessionActivity::Busy, SessionActivity::Idle])
+        let busy = sessions_summary(&[SessionActivity::Busy, SessionActivity::Idle])
             .expect("busy summary");
         assert_eq!(busy, "Sessions: 1 running, 1 idle");
 
-        let attention = opencode_sessions_summary(&[
+        let attention = sessions_summary(&[
             SessionActivity::Attention,
             SessionActivity::Idle,
             SessionActivity::Busy,
@@ -5759,11 +5759,11 @@ mod tests {
         .expect("attention summary");
         assert_eq!(attention, "Sessions: 1 running, 1 needs attention, 1 idle");
         assert_eq!(
-            opencode_sessions_summary(&[SessionActivity::Attention]),
+            sessions_summary(&[SessionActivity::Attention]),
             Some("Sessions: 1 needs attention".to_owned())
         );
         assert_eq!(
-            opencode_sessions_summary(&[
+            sessions_summary(&[
                 SessionActivity::Attention,
                 SessionActivity::Attention,
                 SessionActivity::Busy,
@@ -5771,11 +5771,11 @@ mod tests {
             Some("Sessions: 1 running, 2 need attention".to_owned())
         );
         assert_eq!(
-            opencode_sessions_summary(&[SessionActivity::Busy; 9]),
+            sessions_summary(&[SessionActivity::Busy; 9]),
             Some("Sessions: 9 running".to_owned()),
             "the summary counts sessions beyond the eight painted dots"
         );
-        assert_eq!(opencode_sessions_summary(&[]), None);
+        assert_eq!(sessions_summary(&[]), None);
 
         let accessible = workspace_tab_accessible_label("OpenCode", Some(&attention));
         assert_eq!(accessible, format!("OpenCode — {attention}"));

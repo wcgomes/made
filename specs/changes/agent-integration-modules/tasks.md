@@ -269,10 +269,10 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [ ] verify: Golden corpus byte-identical; Diverged read limits kept; Packaged hooks unchanged; Source scans keep their coverage; Existing suites stay the acceptance gate; Remote behavior unchanged; Green after each step; Revert of the latest step
 
 ## 5. Final step: scoped renames, wiki, ADR and verify (final PR)
-- [ ] 5.1 Rename `push_grok_diagnostics` to a neutral name (path: crates/made-app/src/app.rs)
-- [ ] 5.2 Rename `grok_status_pill_ui` to a neutral name (path: crates/made-app/src/ui.rs)
-- [ ] 5.3 Rename `opencode_sessions_summary` to a neutral name (path: crates/made-app/src/ui.rs)
-- [ ] 5.4 Grep audit for other core names that imply one integration while serving several; list findings in the PR without renaming beyond scope (path: n/a (PR description))
+- [x] 5.1 Rename `push_grok_diagnostics` to a neutral name (path: crates/made-app/src/app.rs)
+- [x] 5.2 Rename `grok_status_pill_ui` to a neutral name (path: crates/made-app/src/ui.rs)
+- [x] 5.3 Rename `opencode_sessions_summary` to a neutral name (path: crates/made-app/src/ui.rs)
+- [x] 5.4 Grep audit for other core names that imply one integration while serving several; list findings in the PR without renaming beyond scope (path: n/a (PR description))
 - [x] 5.5 Rule 4 names `made-hook-common` with the two hooks; rule 3 context updated; module table and ownership rows for `integrations/`, `session_follow.rs`, `integration_status.rs`; hook-crate rows' dependency columns updated for `made-hook-common` and the dropped direct `windows-sys` (path: wiki/architecture.md)
 - [x] 5.6 Root precedence described by ranks and module references updated (path: wiki/runtime/terminal-first.md)
 - [x] 5.7 New page "Adding an integration": the standard module structure, descriptor and trait methods, the one list line, rank choice, follow kinds and policy, launch policy, diagnostics row, assets, the fake-integration test as template, what stays outside the guarantee (remote/SSH, redaction list, packaging, spec change); links ADR 0009 (path: wiki/integration/adding-an-integration.md)

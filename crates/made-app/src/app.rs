@@ -656,7 +656,7 @@ impl AppModel {
         } else {
             self.remote_grok_installs.push((id, state));
         }
-        self.push_grok_diagnostics();
+        self.push_integration_diagnostics();
     }
 
     /// Whether this server's own probe detected remote grok. Absent or failed
@@ -791,7 +791,7 @@ impl AppModel {
                 target.to_owned(),
             ),
         ));
-        self.push_grok_diagnostics();
+        self.push_integration_diagnostics();
         self.ssh_notice = Some(
             "Approved for this server and version. Installing the official Grok Build plugin."
                 .to_owned(),
@@ -919,7 +919,7 @@ impl AppModel {
             }
         }
         if any_finished {
-            self.push_grok_diagnostics();
+            self.push_integration_diagnostics();
         }
     }
     // END remote-path
@@ -932,7 +932,7 @@ impl AppModel {
         if let Some(workbench) = self.workspace_mut(id) {
             workbench.terminal_target = TerminalTarget::Tui(OPENCODE);
         }
-        self.push_grok_diagnostics();
+        self.push_integration_diagnostics();
     }
 
     /// The app-wide integration states, parallel to [`Self::integrations`].
@@ -941,7 +941,7 @@ impl AppModel {
     }
 
     /// Hand every workspace its rows from the app-wide integration states.
-    pub(crate) fn push_grok_diagnostics(&mut self) {
+    pub(crate) fn push_integration_diagnostics(&mut self) {
         let mut provisioned = Vec::new();
         let mut unprovisioned = Vec::new();
         for (id, workbench) in &mut self.workspaces {
@@ -2265,7 +2265,7 @@ impl AppModel {
                 self.compatible_tuis = tuis;
                 self.compatible_tui_receiver = None;
                 self.announce_notices();
-                self.push_grok_diagnostics();
+                self.push_integration_diagnostics();
             }
             Err(TryRecvError::Empty) => {
                 ctx.request_repaint_after(crate::metrics::ACTIVE_REPAINT_INTERVAL);
@@ -2273,7 +2273,7 @@ impl AppModel {
             Err(TryRecvError::Disconnected) => {
                 self.compatible_tui_receiver = None;
                 if self.notify_detection_failed().diagnostics_changed() {
-                    self.push_grok_diagnostics();
+                    self.push_integration_diagnostics();
                 }
                 self.announce_notices();
             }
@@ -2331,7 +2331,7 @@ impl AppModel {
         }
         self.announce_notices();
         if polled.diagnostics_changed() {
-            self.push_grok_diagnostics();
+            self.push_integration_diagnostics();
         }
         self.poll_ssh_probe();
         self.poll_remote_grok_install();
@@ -2343,7 +2343,7 @@ impl AppModel {
         for (_, workbench) in &mut self.workspaces {
             workbench.tick(ctx);
         }
-        self.push_grok_diagnostics();
+        self.push_integration_diagnostics();
         self.poll_updates(ctx);
         if ctx.input(|input| input.viewport().close_requested()) {
             self.shutdown();
