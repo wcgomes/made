@@ -10,7 +10,7 @@
 //! identity or directory; and Made opens no listener or connection and touches
 //! no Claude Code transcript, session, IDE lockfile or configuration path.
 
-use made_app::claude_follow::{parse_record, ClaudeActivity, ClaudeTab};
+use made_app::integrations::claude_code::follow::{parse_record, ClaudeActivity, ClaudeTab};
 
 const MARKERS: [&str; 5] = [
     "MARKER-PROMPT-7f3a",
@@ -226,6 +226,7 @@ mod running_tab {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use made_app::integrations::claude_code;
     use made_app::integrations::CLAUDE_CODE;
     use made_app::workspace::{LaunchPlan, WorkspaceSource};
     use made_app::{TerminalTarget, Workbench};
@@ -445,7 +446,7 @@ mod running_tab {
             window_title.as_deref().is_some_and(|t| t.contains(TITLE)),
             "the fixture title reached the terminal: {window_title:?}"
         );
-        let tab = workbench.claude_tab().expect("direct tab");
+        let tab = claude_code::tab(&workbench).expect("direct tab");
         assert!(tab.dots().is_empty(), "a title is not a status");
         assert_eq!(tab.directory(), None, "a title is not a directory");
         assert_eq!(
@@ -479,15 +480,13 @@ mod running_tab {
         }
         fs::write(std::env::var_os(TRIGGER).unwrap(), b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !workbench
-            .claude_tab()
-            .is_some_and(|tab| tab.protocol_live())
+        while !claude_code::tab(&workbench).is_some_and(|tab| tab.protocol_live())
             && Instant::now() < deadline
         {
             tick(&mut workbench, 1);
         }
         tick(&mut workbench, 20);
-        let tab = workbench.claude_tab().expect("direct tab");
+        let tab = claude_code::tab(&workbench).expect("direct tab");
         assert!(tab.protocol_live(), "the protocol status went live");
         let window_title = workbench
             .terminal()
@@ -500,7 +499,10 @@ mod running_tab {
         );
 
         // Content markers appear on no surface Made renders or records.
-        assert_no_markers(&format!("{:?}", workbench.claude_tab()), "the tab state");
+        assert_no_markers(
+            &format!("{:?}", claude_code::tab(&workbench)),
+            "the tab state",
+        );
         assert_no_markers(&shown, "the tooltip");
         assert_no_markers(&workbench.sanitized_diagnostics_text(), "the copied report");
         let log: String = workbench
