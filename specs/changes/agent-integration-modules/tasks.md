@@ -273,12 +273,12 @@ No `CompatibleTui` shim: this group migrates every caller of `CompatibleTui` in 
 - [ ] 5.2 Rename `grok_status_pill_ui` to a neutral name (path: crates/made-app/src/ui.rs)
 - [ ] 5.3 Rename `opencode_sessions_summary` to a neutral name (path: crates/made-app/src/ui.rs)
 - [ ] 5.4 Grep audit for other core names that imply one integration while serving several; list findings in the PR without renaming beyond scope (path: n/a (PR description))
-- [ ] 5.5 Rule 4 names `made-hook-common` with the two hooks; rule 3 context updated; module table and ownership rows for `integrations/`, `session_follow.rs`, `integration_status.rs`; hook-crate rows' dependency columns updated for `made-hook-common` and the dropped direct `windows-sys` (path: wiki/architecture.md)
-- [ ] 5.6 Root precedence described by ranks and module references updated (path: wiki/runtime/terminal-first.md)
-- [ ] 5.7 New page "Adding an integration": the standard module structure, descriptor and trait methods, the one list line, rank choice, follow kinds and policy, launch policy, diagnostics row, assets, the fake-integration test as template, what stays outside the guarantee (remote/SSH, redaction list, packaging, spec change); links ADR 0009 (path: wiki/integration/adding-an-integration.md)
-- [ ] 5.8 Link the new page (path: wiki/integration/index.md)
-- [ ] 5.9 ADR 0009 with Status, Context, Decision, Consequences and Evidence: static trait-object list, ranks, declared follow policy, compile-time only and not a plugin system, AIA-04 exceptions including remote (path: wiki/decisions/0009-static-integration-modules.md)
-- [ ] 5.10 Index entry for ADR 0009 (path: wiki/decisions/index.md)
+- [x] 5.5 Rule 4 names `made-hook-common` with the two hooks; rule 3 context updated; module table and ownership rows for `integrations/`, `session_follow.rs`, `integration_status.rs`; hook-crate rows' dependency columns updated for `made-hook-common` and the dropped direct `windows-sys` (path: wiki/architecture.md)
+- [x] 5.6 Root precedence described by ranks and module references updated (path: wiki/runtime/terminal-first.md)
+- [x] 5.7 New page "Adding an integration": the standard module structure, descriptor and trait methods, the one list line, rank choice, follow kinds and policy, launch policy, diagnostics row, assets, the fake-integration test as template, what stays outside the guarantee (remote/SSH, redaction list, packaging, spec change); links ADR 0009 (path: wiki/integration/adding-an-integration.md)
+- [x] 5.8 Link the new page (path: wiki/integration/index.md)
+- [x] 5.9 ADR 0009 with Status, Context, Decision, Consequences and Evidence: static trait-object list, ranks, declared follow policy, compile-time only and not a plugin system, AIA-04 exceptions including remote (path: wiki/decisions/0009-static-integration-modules.md)
+- [x] 5.10 Index entry for ADR 0009 (path: wiki/decisions/index.md)
 - [ ] 5.11 Map every spec.md scenario to its passing test (path: specs/changes/agent-integration-modules/proposal.md)
 
 ## Checkpoint
