@@ -744,6 +744,7 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
     let mut panes = Vec::new();
     let mut bootstraps = Vec::new();
     let mut configs = Vec::new();
+    let first_spawn = Instant::now();
     for name in ["one", "two", "three"] {
         let path = root.join(name);
         std::fs::create_dir(&path).unwrap();
@@ -819,9 +820,26 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(5));
     }
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let workbench = model.workspace(*id).unwrap();
-        assert!(workbench.terminal().unwrap().is_running());
+        let terminal = workbench.terminal().unwrap();
+        // Distinguish a shell that exited (exit status set) from one whose
+        // monitor failed or that never produced output.
+        assert!(
+            terminal.is_running(),
+            "workspace {index} ({}) shell is not running {:?} after the first spawn: \
+             pid {:?} (spawned {:?}), exit {:?}, monitor error {:?}, status {:?}, \
+             {} output bytes, {} ticks",
+            ["one", "two", "three"][index],
+            first_spawn.elapsed(),
+            terminal.pid(),
+            pids[index],
+            terminal.exit_status(),
+            terminal.monitor_error(),
+            terminal.shell_status_label(),
+            terminal.output_bytes(),
+            workbench.tick_count(),
+        );
         assert!(workbench.tick_count() > 1);
         assert_eq!(workbench.paint_count(), 0);
         assert_eq!(
