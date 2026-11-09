@@ -242,7 +242,7 @@ mod tests {
     fn chunk_reader_stops_at_a_syntax_error_but_waits_on_truncation() {
         let started = Instant::now();
         let bad = read_event_with(
-            |_| Chunk::Data(b"not json".to_vec()),
+            |_| Chunk::Data(b"not json}".to_vec()),
             Duration::from_secs(5),
         );
         assert!(bad.is_none() && started.elapsed() < Duration::from_secs(1));
