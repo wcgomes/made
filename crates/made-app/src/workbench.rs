@@ -5381,7 +5381,10 @@ fn with_utf8_ctype(
     let env = platform
         .environment(&options.env, &options.env_remove)
         .into_vec();
-    match made_platform::locale::local_utf8_ctype(&env, made_platform::locale::installed_locales) {
+    match made_platform::locale::local_utf8_ctype(
+        &env,
+        made_platform::locale::host_installed_locales,
+    ) {
         Some(ctype) => options.with_env("LC_CTYPE", ctype),
         None => options,
     }
@@ -9012,9 +9015,15 @@ mod tests {
     fn typed_accent_output(fix_locale: bool) -> String {
         let home = tempfile::tempdir().unwrap();
         let platform = host_platform();
+        // An empty inputrc: a user's `set input-meta on` or `convert-meta off`
+        // would keep 8-bit input even under the C locale.
+        let inputrc = home.path().join("inputrc");
+        std::fs::write(&inputrc, "").unwrap();
         let options = without_locale(made_terminal::PtyOptions::new(home.path()))
             .with_shell("/bin/bash")
             .with_env("HOME", home.path())
+            .with_env("INPUTRC", &inputrc)
+            .without_env("BASHOPTS")
             .without_env("SHELLOPTS")
             .without_env("BASH_ENV")
             .without_env("ENV");

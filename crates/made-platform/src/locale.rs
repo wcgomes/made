@@ -8,6 +8,7 @@
 use std::{
     ffi::OsString,
     io::Read,
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
@@ -46,16 +47,17 @@ fn utf8_locales(installed: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// The preferred UTF-8 locale among `installed` (already UTF-8 only):
-/// `C.UTF-8`, then `en_US.UTF-8`, then the first listed.
-fn pick_utf8_locale(installed: &[String]) -> Option<&String> {
+/// The preferred UTF-8 locale among `installed` (already UTF-8 only): the
+/// entries of `preferred` in order, then the first listed.
+fn pick_utf8_locale<'a>(installed: &'a [String], preferred: [&str; 2]) -> Option<&'a String> {
     let pick = |wanted: &str| {
         installed
             .iter()
             .find(|name| locale_key(name) == locale_key(wanted))
     };
-    pick("C.UTF-8")
-        .or_else(|| pick("en_US.UTF-8"))
+    preferred
+        .into_iter()
+        .find_map(pick)
         .or_else(|| installed.first())
 }
 
@@ -87,7 +89,7 @@ pub fn ensure_utf8_locale(
     }) {
         return;
     }
-    let Some(choice) = pick_utf8_locale(&installed) else {
+    let Some(choice) = pick_utf8_locale(&installed, ["C.UTF-8", "en_US.UTF-8"]) else {
         return;
     };
     env.retain(|(key, _)| key != "LC_CTYPE");
@@ -102,10 +104,12 @@ pub fn ensure_utf8_locale(
 /// first non-empty wins) is the user's and is trusted by name: on this host,
 /// unlike a remote server, it is the same libc that will read it, and macOS
 /// accepts a plain `UTF-8` that `locale -a` does not list. Otherwise the value
-/// comes from `installed` with the same preference as
-/// [`ensure_utf8_locale`]. As there, a non-empty `LC_ALL` is left alone even
-/// when it is not UTF-8 (it overrides `LC_CTYPE`, so setting one would not
-/// help), and `installed` is not consulted unless a value is needed.
+/// comes from `installed`, preferring `en_US.UTF-8`, then `C.UTF-8`, then the
+/// first UTF-8 entry: the variable can travel on (macOS `ssh_config` sends
+/// `LC_*`), and older servers have no `C.UTF-8`. As in [`ensure_utf8_locale`],
+/// a non-empty `LC_ALL` is left alone even when it is not UTF-8 (it overrides
+/// `LC_CTYPE`, so setting one would not help), and `installed` is not
+/// consulted unless a value is needed.
 pub fn local_utf8_ctype(
     env: &[(OsString, OsString)],
     installed: impl FnOnce() -> Vec<String>,
@@ -115,7 +119,14 @@ pub fn local_utf8_ctype(
     {
         return None;
     }
-    pick_utf8_locale(&utf8_locales(installed())).cloned()
+    pick_utf8_locale(&utf8_locales(installed()), ["en_US.UTF-8", "C.UTF-8"]).cloned()
+}
+
+/// [`installed_locales`] of this host, queried once per process so that later
+/// terminal spawns do not wait for `locale -a` again.
+pub fn host_installed_locales() -> Vec<String> {
+    static INSTALLED: OnceLock<Vec<String>> = OnceLock::new();
+    INSTALLED.get_or_init(installed_locales).clone()
 }
 
 /// This host's installed locale names. Bounded in time and size; any failure
@@ -186,28 +197,31 @@ mod tests {
 
     #[test]
     fn no_locale_gets_a_listed_utf8_ctype() {
-        assert_eq!(ctype(&[]).as_deref(), Some("C.UTF-8"));
+        assert_eq!(ctype(&[]).as_deref(), Some("en_US.UTF-8"));
     }
 
     #[test]
     fn empty_values_count_as_unset() {
-        assert_eq!(ctype(&[("LANG", "")]).as_deref(), Some("C.UTF-8"));
+        assert_eq!(ctype(&[("LANG", "")]).as_deref(), Some("en_US.UTF-8"));
         assert_eq!(
             ctype(&[("LC_ALL", ""), ("LC_CTYPE", ""), ("LANG", "")]).as_deref(),
-            Some("C.UTF-8")
+            Some("en_US.UTF-8")
         );
     }
 
     #[test]
     fn non_utf8_lang_or_ctype_gets_a_utf8_ctype() {
         for value in ["C", "POSIX", "pt_BR.ISO8859-1"] {
-            assert_eq!(ctype(&[("LANG", value)]).as_deref(), Some("C.UTF-8"));
-            assert_eq!(ctype(&[("LC_CTYPE", value)]).as_deref(), Some("C.UTF-8"));
+            assert_eq!(ctype(&[("LANG", value)]).as_deref(), Some("en_US.UTF-8"));
+            assert_eq!(
+                ctype(&[("LC_CTYPE", value)]).as_deref(),
+                Some("en_US.UTF-8")
+            );
         }
         // LC_CTYPE outranks a UTF-8 LANG.
         assert_eq!(
             ctype(&[("LANG", "en_US.UTF-8"), ("LC_CTYPE", "C")]).as_deref(),
-            Some("C.UTF-8")
+            Some("en_US.UTF-8")
         );
     }
 
@@ -234,7 +248,11 @@ mod tests {
             local_utf8_ctype(&[], || installed)
         };
         assert_eq!(
-            pick(&["C", "en_US.UTF-8", "C.utf8"]).as_deref(),
+            pick(&["C", "C.utf8", "en_US.utf8"]).as_deref(),
+            Some("en_US.utf8")
+        );
+        assert_eq!(
+            pick(&["C", "fr_FR.UTF-8", "C.utf8"]).as_deref(),
             Some("C.utf8")
         );
         assert_eq!(

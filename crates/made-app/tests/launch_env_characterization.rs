@@ -158,6 +158,13 @@ fn make_executable(path: &Path, script: &str) {
 /// Re-run `test` in a child process for `layout`. Returns `true` in the parent
 /// after the child passed.
 fn isolated(test: &str, layout: Layout) -> bool {
+    isolated_with_locale(test, layout, Some("en_US.UTF-8"))
+}
+
+/// [`isolated`] with `LANG` set to `lang`, or with no locale at all for
+/// `None`, as an app started from Finder has. `LC_ALL` and `LC_CTYPE` are
+/// always removed.
+fn isolated_with_locale(test: &str, layout: Layout, lang: Option<&str>) -> bool {
     if std::env::var_os(CHILD_ENV).is_some() {
         return false;
     }
@@ -200,7 +207,15 @@ fn isolated(test: &str, layout: Layout) -> bool {
 
     let path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin.clone()).chain(std::env::split_paths(&path));
-    let output = Command::new(&executable)
+    let mut command = Command::new(&executable);
+    // A UTF-8 locale unless `lang` says otherwise, so the transcripts do not
+    // depend on the runner's: without one a local terminal also gets a UTF-8
+    // `LC_CTYPE`.
+    match lang {
+        Some(lang) => command.env("LANG", lang),
+        None => command.env_remove("LANG"),
+    };
+    let output = command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .current_dir(home.path())
         .env(CHILD_ENV, "1")
@@ -224,9 +239,6 @@ fn isolated(test: &str, layout: Layout) -> bool {
         .env("SHELLOPTS", "errexit")
         .env("BASH_ENV", "/inherited/bash_env")
         .env("ENV", "/inherited/env")
-        // A UTF-8 locale, so the transcripts do not depend on the runner's:
-        // without one a local terminal also gets a UTF-8 `LC_CTYPE`.
-        .env("LANG", "en_US.UTF-8")
         .env_remove("LC_ALL")
         .env_remove("LC_CTYPE")
         .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
@@ -410,21 +422,29 @@ fn home_dir() -> PathBuf {
         .expect("canonical test home")
 }
 
+/// A workspace the child cannot enter, so the first spawn fails and the
+/// fallback-directory retry runs; a missing one would be ignored by the PTY
+/// layer and never reach the retry. `None` when permissions are not enforced.
+fn locked_workspace() -> Option<PathBuf> {
+    let locked = home_dir().join("locked-workspace");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("permissions are not enforced for this user; fallback retry not exercised");
+        return None;
+    }
+    Some(locked)
+}
+
 fn scenario(name: &str, layout: Layout, retry: bool) {
     if isolated(name, layout) {
         return;
     }
     let cwd = if retry {
-        // A directory the child cannot enter fails the first spawn; a missing
-        // one would be ignored by the PTY layer and never reach the retry.
-        let locked = home_dir().join("locked-workspace");
-        fs::create_dir(&locked).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::read_dir(&locked).is_ok() {
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-            eprintln!("permissions are not enforced for this user; fallback retry not exercised");
+        let Some(locked) = locked_workspace() else {
             return;
-        }
+        };
         locked
     } else {
         home_dir()
@@ -499,6 +519,63 @@ fn fallback_directory_retry_without_the_plugin() {
         Layout::NoPlugin,
         true,
     );
+}
+
+/// The `LC_CTYPE` a started tab was given, if any.
+fn started_ctype(workbench: &Workbench) -> Option<String> {
+    env_value(
+        &workbench.terminal().expect("started").options().env,
+        "LC_CTYPE",
+    )
+}
+
+fn started_in_fallback(workbench: &Workbench) -> bool {
+    workbench.diagnostics().log().entries().any(|entry| {
+        entry
+            .message
+            .contains("terminal started in the fallback directory")
+    })
+}
+
+/// Started from Finder, Made inherits no locale. A local terminal then gets a
+/// UTF-8 `LC_CTYPE`, from the first spawn and from the fallback-directory
+/// retry alike.
+#[test]
+fn a_launch_without_a_locale_gets_a_utf8_ctype_on_both_spawn_paths() {
+    if isolated_with_locale(
+        "a_launch_without_a_locale_gets_a_utf8_ctype_on_both_spawn_paths",
+        Layout::NoPlugin,
+        None,
+    ) {
+        return;
+    }
+    let expected =
+        made_platform::locale::local_utf8_ctype(&[], made_platform::locale::installed_locales)
+            .expect("this host lists a UTF-8 locale");
+    for (label, target) in local_targets() {
+        let mut workbench = Workbench::start(None, None, home_dir(), target, Instant::now());
+        assert!(!started_in_fallback(&workbench), "{label}");
+        assert_eq!(
+            started_ctype(&workbench).as_ref(),
+            Some(&expected),
+            "{label}"
+        );
+        workbench.shutdown();
+    }
+    let Some(locked) = locked_workspace() else {
+        return;
+    };
+    for (label, target) in local_targets() {
+        let mut workbench = Workbench::start(None, None, locked.clone(), target, Instant::now());
+        assert!(started_in_fallback(&workbench), "{label}");
+        assert_eq!(
+            started_ctype(&workbench).as_ref(),
+            Some(&expected),
+            "{label}"
+        );
+        workbench.shutdown();
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
