@@ -224,6 +224,11 @@ fn isolated(test: &str, layout: Layout) -> bool {
         .env("SHELLOPTS", "errexit")
         .env("BASH_ENV", "/inherited/bash_env")
         .env("ENV", "/inherited/env")
+        // A UTF-8 locale, so the transcripts do not depend on the runner's:
+        // without one a local terminal also gets a UTF-8 `LC_CTYPE`.
+        .env("LANG", "en_US.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_CTYPE")
         .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
         .env_remove(made_platform::SHELL_ENV)
         .envs(inherited_variables())

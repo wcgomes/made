@@ -3108,6 +3108,7 @@ pub fn in_memory_clipboard() -> InMemoryClipboard {
     InMemoryClipboard::new()
 }
 mod detach;
+pub mod locale;
 mod process;
 pub mod shell_integration;
 pub mod ssh;
