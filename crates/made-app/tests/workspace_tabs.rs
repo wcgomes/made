@@ -81,6 +81,16 @@ fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize
         command.env("MADE_OPENCODE_CONFIG_CAPTURE", &config_capture);
         command.env("MADE_OPENCODE_CWD_CAPTURE", &cwd_capture);
         command.env("SHELL", "/bin/bash");
+        // /bin/bash 3.2 readline drops 8-bit input (the "é" in `space café`)
+        // outside a UTF-8 locale. LC_ALL so an inherited LC_ALL=C cannot win.
+        command.env(
+            "LC_ALL",
+            if cfg!(target_os = "macos") {
+                "en_US.UTF-8"
+            } else {
+                "C.UTF-8"
+            },
+        );
     }
     // Hand the child an explicit fixture plugin package staged inside the
     // install root, which release builds require the plugin override to
@@ -744,6 +754,7 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
     let mut panes = Vec::new();
     let mut bootstraps = Vec::new();
     let mut configs = Vec::new();
+    let first_spawn = Instant::now();
     for name in ["one", "two", "three"] {
         let path = root.join(name);
         std::fs::create_dir(&path).unwrap();
@@ -819,9 +830,26 @@ fn three_live_tabs_keep_independent_resources_and_close_only_the_owner() {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(5));
     }
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let workbench = model.workspace(*id).unwrap();
-        assert!(workbench.terminal().unwrap().is_running());
+        let terminal = workbench.terminal().unwrap();
+        // Distinguish a shell that exited (exit status set) from one whose
+        // monitor failed or that never produced output.
+        assert!(
+            terminal.is_running(),
+            "workspace {index} ({}) shell is not running {:?} after the first spawn: \
+             pid {:?} (spawned {:?}), exit {:?}, monitor error {:?}, status {:?}, \
+             {} output bytes, {} ticks",
+            ["one", "two", "three"][index],
+            first_spawn.elapsed(),
+            terminal.pid(),
+            pids[index],
+            terminal.exit_status(),
+            terminal.monitor_error(),
+            terminal.shell_status_label(),
+            terminal.output_bytes(),
+            workbench.tick_count(),
+        );
         assert!(workbench.tick_count() > 1);
         assert_eq!(workbench.paint_count(), 0);
         assert_eq!(
@@ -880,6 +908,24 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
     }
     let ids: Vec<_> = model.workspace_ids().collect();
     let ctx = egui::Context::default();
+    let first_spawn = Instant::now();
+    // Same per-shell report as the three-tab liveness check: distinguish a
+    // shell that exited, lost its monitor, or never produced output.
+    let report = |model: &AppModel, index: usize| {
+        let workbench = model.workspace(ids[index]).unwrap();
+        let terminal = workbench.terminal().unwrap();
+        format!(
+            "workspace {index} after {:?} since the first spawn: pid {:?}, exit {:?}, \
+             monitor error {:?}, status {:?}, {} output bytes, {} ticks",
+            first_spawn.elapsed(),
+            terminal.pid(),
+            terminal.exit_status(),
+            terminal.monitor_error(),
+            terminal.shell_status_label(),
+            terminal.output_bytes(),
+            workbench.tick_count(),
+        )
+    };
     // Bounded wait until every shell has drawn its first output (its prompt),
     // so the commands below are typed into a started shell on slow runners.
     let ready_deadline = Instant::now() + Duration::from_secs(30);
@@ -894,6 +940,23 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(10));
     }
+    let not_ready: Vec<_> = (0..ids.len())
+        .filter(|index| {
+            model
+                .workspace(ids[*index])
+                .unwrap()
+                .terminal()
+                .unwrap()
+                .output_bytes()
+                == 0
+        })
+        .map(|index| report(&model, index))
+        .collect();
+    assert!(
+        not_ready.is_empty(),
+        "shells produced no output within the 30s ready wait:\n{}",
+        not_ready.join("\n")
+    );
     for id in &ids {
         type_command(
             model.workspace_mut(*id).unwrap(),
@@ -938,13 +1001,19 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
     }
     assert_eq!(
         model.workspace(ids[0]).unwrap().explorer_root(),
-        Some(target.as_path())
+        Some(target.as_path()),
+        "cd did not reach the explorer: {}",
+        report(&model, 0)
     );
-    for id in &ids[..2] {
+    for (index, id) in ids[..2].iter().enumerate() {
         let terminal = model.workspace(*id).unwrap().terminal().unwrap();
-        assert!(terminal.output_bytes() > 2000);
-        assert_eq!(terminal.grid_paint_count(), 0);
-        assert!(!terminal.is_focused());
+        assert!(
+            terminal.output_bytes() > 2000,
+            "hidden output did not arrive: {}",
+            report(&model, index)
+        );
+        assert_eq!(terminal.grid_paint_count(), 0, "{}", report(&model, index));
+        assert!(!terminal.is_focused(), "{}", report(&model, index));
     }
     assert!(
         model

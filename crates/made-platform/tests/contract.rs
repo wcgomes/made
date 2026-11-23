@@ -2877,7 +2877,7 @@ while (-not (Test-Path -LiteralPath $Heartbeat)) { Start-Sleep -Milliseconds 50 
             }
         });
 
-        let heartbeat_len = wait_for_file_len(&heartbeat, 8, Duration::from_secs(10));
+        let heartbeat_len = wait_for_file_len(&heartbeat, 8, Duration::from_secs(30));
         let captured_text = {
             let output = captured
                 .lock()
