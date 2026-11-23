@@ -20,6 +20,11 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - macOS `/bin/bash` 3.2 executes only element 0 of a `PROMPT_COMMAND` array. The shell hook appends natively on bash 5.1+, but flattens existing hooks through `IFS=$'\n'` and `"${PROMPT_COMMAND[*]}"` on older shells so every user hook runs before `__made_cwd`.
 - Regression: [`pty.rs`](../../crates/made-terminal/tests/pty.rs) `bash_prompt_command_array_keeps_every_hook_in_order` asserts two hooks run in order; set `MADE_TEST_BASH32` to exercise a 3.2 binary locally. Source: [`shell_integration.rs`](../../crates/made-platform/src/shell_integration.rs).
 
+## macOS bash 3.2 non-ASCII input
+
+- bash 3.2 readline drops 8-bit input without a UTF-8 locale. Any test that spawns `/bin/bash` 3.2 and types non-ASCII text must pin a UTF-8 locale and isolate `INPUTRC`/`HOME`, or it fails on a locale-less runner. Product rule: [terminal-first](../runtime/terminal-first.md) (Local PTY locale).
+- Known open case: 2 tests in [`shell_integration.rs`](../../crates/made-platform/tests/shell_integration.rs) still fail without a runner locale (not fixed yet).
+
 ## macOS FSEvents metadata
 
 - FSEvents reports access/atime and metadata-only changes (`INODE_META_MOD`), including chmod and touch. Preview refresh ignores both, so permission-only changes do not re-read while content writes still do. This is intentional; the preview can remain stale until the next content event or explicit refresh.

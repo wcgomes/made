@@ -39,7 +39,9 @@ Contracts live in [`specs/ssh-remote-workspaces.md`](../../specs/ssh-remote-work
 
 - Remote shell cwd arrives as companion `ShellCwd` frames, not OSC 7. The workbench `pump_remote_client` routes them before the `waiting_attach` match, and the supervisor re-emits the cwd on reattach.
 - `tick_remote` returns before the local idle repaint cadence, so any new remote event source needs an explicit wake through `RemoteClient::set_wake`.
-- Remote PTY locale: the supervisor ensures a UTF-8 `LC_CTYPE` chosen from the server's `locale -a`; it never invents one and leaves `LC_ALL` untouched.
+- Remote PTY locale: the supervisor ensures a UTF-8 `LC_CTYPE` chosen from the server's `locale -a`; it never invents one and leaves `LC_ALL` untouched. It prefers `C.UTF-8` and checks an existing UTF-8 locale against `locale -a`.
+- Local PTY locale: `with_utf8_ctype` in [`workbench.rs`](../../crates/made-app/src/workbench.rs) gives the main spawn and the fallback-cwd retry a UTF-8 `LC_CTYPE` (not on Windows). A non-empty `LC_ALL` is left alone even when not UTF-8, since it overrides `LC_CTYPE`. Otherwise the first non-empty of `LC_CTYPE`/`LANG` is trusted by name if it says utf-8/utf8; else `LC_CTYPE` comes from the cached host `locale -a`, preferring `en_US.UTF-8` (macOS `ssh_config` `SendEnv LC_*` forwards it, and older servers lack `C.UTF-8`), then `C.UTF-8`, then the first UTF-8 entry. Nothing is invented when none is installed. Why: macOS `/bin/bash` 3.2 readline drops 8-bit input (`é`) without a UTF-8 locale, and Finder-launched apps get no `LANG` from launchd.
+- Local and remote differ on purpose: macOS `locale -a` lists `C.UTF-8` and `en_US.UTF-8` but not plain `UTF-8`, which libc accepts and Terminal.app sets, so the local check trusts the name. Shared code is [`locale.rs`](../../crates/made-platform/src/locale.rs); `made-remote` re-exports `ensure_utf8_locale`/`installed_locales` from it.
 - Reattach: the resnapshot carries SGR attributes, and a rows-1 resize nudge forces full-screen children to redraw.
 - These fixes are Linux-tested only; live-SSH validation is pending (see the [platform matrix](../testing/platform-matrix.md)).
 

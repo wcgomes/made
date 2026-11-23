@@ -1054,6 +1054,7 @@ impl Workbench {
             .without_env("BASH_ENV")
             .without_env("ENV");
         options = apply_contributions(&contributions, options);
+        options = with_utf8_ctype(&self.platform, options);
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
             Ok(pane) => {
@@ -1093,6 +1094,7 @@ impl Workbench {
                             .without_env("BASH_ENV")
                             .without_env("ENV");
                         retry = apply_contributions(&contributions, retry);
+                        retry = with_utf8_ctype(&self.platform, retry);
                         if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
                             let pane = pane.with_target(self.terminal_target);
                             self.diag.log_mut().record(
@@ -5365,6 +5367,29 @@ impl Drop for ShellRootWorker {
     }
 }
 
+/// Give a local terminal a UTF-8 `LC_CTYPE` when the environment it would get
+/// has no UTF-8 locale. An app started from Finder inherits no `LANG`, and
+/// macOS `/bin/bash` 3.2 then drops typed accented characters. Windows consoles
+/// do not use POSIX locales and are left as they are.
+fn with_utf8_ctype(
+    platform: &dyn Platform,
+    options: made_terminal::PtyOptions,
+) -> made_terminal::PtyOptions {
+    if platform.family() == PlatformFamily::Windows {
+        return options;
+    }
+    let env = platform
+        .environment(&options.env, &options.env_remove)
+        .into_vec();
+    match made_platform::locale::local_utf8_ctype(
+        &env,
+        made_platform::locale::host_installed_locales,
+    ) {
+        Some(ctype) => options.with_env("LC_CTYPE", ctype),
+        None => options,
+    }
+}
+
 fn diagnostics_log_path(paths: Option<&AppPaths>) -> Option<PathBuf> {
     // If app paths are unavailable, fail closed. A shared $TMPDIR path would be
     // predictable and symlink-attackable.
@@ -8927,5 +8952,114 @@ mod tests {
             remote_preview_loading_and_error(&preview(Freshness::Current), false, false);
         assert!(!loading);
         assert!(error.is_none());
+    }
+
+    /// Locale variables an app started from Finder does not have.
+    fn without_locale(options: made_terminal::PtyOptions) -> made_terminal::PtyOptions {
+        options
+            .without_env("LC_ALL")
+            .without_env("LC_CTYPE")
+            .without_env("LANG")
+    }
+
+    fn set_ctype(options: &made_terminal::PtyOptions) -> Option<String> {
+        options
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "LC_CTYPE")
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_terminal_without_a_locale_gets_a_utf8_ctype() {
+        let platform = host_platform();
+        let options = without_locale(made_terminal::PtyOptions::new(std::env::temp_dir()));
+        let ctype = set_ctype(&with_utf8_ctype(&platform, options));
+        let ctype = ctype.expect("a UTF-8 LC_CTYPE for a locale-less environment");
+        assert!(
+            made_platform::locale::installed_locales().contains(&ctype),
+            "{ctype} comes from locale -a"
+        );
+        let lower = ctype.to_ascii_lowercase();
+        assert!(lower.contains("utf-8") || lower.contains("utf8"), "{ctype}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_terminal_keeps_an_existing_utf8_locale() {
+        let platform = host_platform();
+        for (name, value) in [
+            ("LANG", "pt_BR.UTF-8"),
+            ("LC_CTYPE", "UTF-8"),
+            ("LC_ALL", "en_US.utf8"),
+        ] {
+            let options = without_locale(made_terminal::PtyOptions::new(std::env::temp_dir()))
+                .with_env(name, value);
+            let options = with_utf8_ctype(&platform, options);
+            assert_eq!(
+                set_ctype(&options).as_deref(),
+                (name == "LC_CTYPE").then_some(value)
+            );
+        }
+        // A non-UTF-8 LC_ALL overrides LC_CTYPE; it is left to the user.
+        let options = without_locale(made_terminal::PtyOptions::new(std::env::temp_dir()))
+            .with_env("LC_ALL", "C");
+        assert_eq!(set_ctype(&with_utf8_ctype(&platform, options)), None);
+    }
+
+    /// Type `echo X$((1+1))éY` into a fresh macOS `/bin/bash` 3.2 started
+    /// through the local spawn path and return what the command printed.
+    #[cfg(target_os = "macos")]
+    fn typed_accent_output(fix_locale: bool) -> String {
+        let home = tempfile::tempdir().unwrap();
+        let platform = host_platform();
+        // An empty inputrc: a user's `set input-meta on` or `convert-meta off`
+        // would keep 8-bit input even under the C locale.
+        let inputrc = home.path().join("inputrc");
+        std::fs::write(&inputrc, "").unwrap();
+        let options = without_locale(made_terminal::PtyOptions::new(home.path()))
+            .with_shell("/bin/bash")
+            .with_env("HOME", home.path())
+            .with_env("INPUTRC", &inputrc)
+            .without_env("BASHOPTS")
+            .without_env("SHELLOPTS")
+            .without_env("BASH_ENV")
+            .without_env("ENV");
+        let options = if fix_locale {
+            with_utf8_ctype(&platform, options)
+        } else {
+            options
+        };
+        let mut pty = made_terminal::PtyProcess::spawn(&platform, options).unwrap();
+        pty.write("echo X$((1+1))\u{e9}Y\r".as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let line = loop {
+            if let Ok(made_terminal::PtyEvent::Data(bytes)) =
+                pty.recv_timeout(Duration::from_millis(100))
+            {
+                output.extend_from_slice(&bytes);
+            }
+            let text = String::from_utf8_lossy(&output);
+            if let Some(line) = text
+                .split(['\r', '\n'])
+                .find(|line| line.starts_with("X2") && line.ends_with('Y'))
+            {
+                break line.to_owned();
+            }
+            assert!(Instant::now() < deadline, "no command output: {text:?}");
+        };
+        let _ = pty.kill();
+        line
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_bash_keeps_typed_accents_without_an_inherited_locale() {
+        assert_eq!(typed_accent_output(true), "X2\u{e9}Y");
+        // Without the fix bash 3.2 readline drops the 8-bit bytes.
+        assert_eq!(typed_accent_output(false), "X2Y");
     }
 }

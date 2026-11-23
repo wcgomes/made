@@ -93,3 +93,35 @@ pub fn stage_shipped_grok_plugin() -> PathBuf {
     std::fs::rename(&scratch, directory.join("plugin.json")).expect("staged grok-made manifest");
     directory
 }
+
+/// Stage the shipped claude-code-made hook where the app resolves it: beside
+/// the plugins of the running test executable's install root. The app treats
+/// the Claude plugin as ready only when this executable hook exists, and each
+/// test binary may have its own install root, so every test that needs it
+/// stages it. The hook is written through a rename, so parallel tests in one
+/// binary can all call this without observing a partial file.
+// Shared by several test binaries; only some tests stage the package.
+#[allow(dead_code)]
+pub fn stage_shipped_claude_plugin() -> PathBuf {
+    let directory = install_root_from_current_executable(PlatformFamily::current())
+        .expect("test executable install root")
+        .join("plugins")
+        .join("claude-code-made");
+    let bin = directory.join("bin");
+    std::fs::create_dir_all(&bin).expect("staged claude-code-made directory");
+    let scratch = bin.join(format!(
+        ".made-claude-status.{}.{}",
+        std::process::id(),
+        STAGED_SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&scratch, "#!/bin/sh\nexit 0\n").expect("staged claude-code-made hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755))
+            .expect("staged claude-code-made hook mode");
+    }
+    std::fs::rename(&scratch, bin.join("made-claude-status"))
+        .expect("staged claude-code-made hook");
+    directory
+}
