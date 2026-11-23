@@ -1317,6 +1317,8 @@ fn isolated(name: &str) -> bool {
     // canonicalize into; cargo never packages a plugin beside the test
     // binary.
     let plugins = support::StagedPlugins::stage("ui-model");
+    // The shipped claude-code-made hook is the staged copy beside the install root.
+    support::stage_shipped_claude_plugin();
     command.env(
         made_platform::PLUGIN_DIR_ENV,
         plugins.package("opencode-made"),

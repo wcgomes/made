@@ -3001,6 +3001,8 @@ sleep 30\n",
     );
     // The shipped grok-made package is the staged copy beside the install root.
     support::stage_shipped_grok_plugin();
+    // The shipped claude-code-made hook is the staged copy beside the install root.
+    support::stage_shipped_claude_plugin();
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
