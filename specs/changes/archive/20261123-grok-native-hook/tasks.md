@@ -45,6 +45,16 @@ IDs 2.1, 2.3 and 2.4 moved to 6.1 to 6.3 so the switch lands after packaging.
 ## Checkpoint
 - [x] verify scenarios `Missing or older plugin is installed`, `Same version skips install`, `Newer installed copy stays`, `Development run installs only the staged copy` and `Install failure leaves hooks unavailable` map to passing tests
 
+Verify defect M1: Made resolved the Grok home from `GROK_HOME` then `HOME`, but the hook uses `std::env::home_dir()` (`USERPROFILE` on Windows), so a Windows GUI launch without `HOME` skipped the install and read the log and inventory from another home. Task 3.3's file moved to `crates/made-app/src/integrations/grok/plugin.rs` in `agent-integration-modules`. Listed in dependency order: 3.6, 3.7, 3.8, 3.9, 3.10.
+- [x] 3.6 Add cross-platform unit tests (no `#[cfg(unix)]`), run in a child process with `GROK_HOME` and `HOME` removed so the test process environment is never mutated: Made's Grok-home resolution returns `std::env::home_dir()` joined with `.grok` (the `USERPROFILE` home on Windows), the directory the hook's `log_path(None, std::env::home_dir())` writes into; a non-empty `GROK_HOME` wins; an empty `GROK_HOME` falls through to the platform home; and with `GROK_HOME` and `HOME` unset the resolution is never none while the platform reports a home, so the ensure flow does not return unavailable without running the install check (path: crates/made-app/src/integrations/grok/plugin.rs)
+- [x] 3.7 [P] Add cross-platform unit tests: with `GROK_HOME` and `HOME` removed in a child process, `status_log()` is `made-grok-status.jsonl` and `sessions_file()` is `active_sessions.json` in the same Grok home that 3.6 resolves (path: crates/made-app/src/integrations/grok/follow.rs)
+- [x] 3.8 Run `cargo test -p made-app --lib integrations::grok` and confirm 3.6 and 3.7 fail on the current `HOME`-only resolution (path: crates/made-app/src/integrations/grok/plugin.rs)
+- [x] 3.9 Resolve the Grok home as a non-empty `GROK_HOME`, otherwise `std::env::home_dir()` joined with `.grok`, the same rule as the hook, and expose it crate-wide as the single resolver (path: crates/made-app/src/integrations/grok/plugin.rs)
+- [x] 3.10 Derive `status_log()` and `sessions_file()` from the 3.9 resolver and drop their `HOME` lookups (path: crates/made-app/src/integrations/grok/follow.rs)
+
+## Checkpoint
+- [ ] verify 3.6 and 3.7 pass on every target, including Windows x64 through the `windows-2025` `cargo test --workspace` step of `.github/workflows/ci.yml` (no workflow change needed; `ci-windows.yml` runs only the hook crates), and that scenario `Shipped package matches the host` (Windows x64) and the local follow scenarios no longer depend on `HOME`. Open at archive (2026-11-23): Windows CI has not run yet; `verify` passed with this checkpoint unchecked.
+
 ## 4. Remote python3 removal and stage set
 - [x] 4.1 Update tests: the probe no longer looks up python3; the staged grok-made set is the 10-artifact list with the hook at mode 700; no `status.py` or `status_test.py`; confirm failure (path: crates/made-platform/tests/ssh.rs)
 - [x] 4.2 Drop the python3 lookup from the probe and update both stage-script file lists and the 700-mode rule to the native hook (path: crates/made-platform/src/ssh.rs)
@@ -102,8 +112,8 @@ Listed in dependency order: 5.1, 5.2, 5.7, 5.8, 5.3, 5.4, 5.9, 5.10, 5.5, 5.6.
 - [x] verify `cargo test --workspace --locked` passes and every spec scenario maps to a passing test or a labeled `UNVERIFIED` combination
 
 ## Coverage map
-- `Grok status hook`: 0.1, 0.3, 1.1 to 1.9, 5.9, 5.10, 6.1 to 6.3, 7.1, 7.3
-- `Shipped Grok plugin install`: 0.1, 0.2, 2.2, 2.5, 2.6, 3.1 to 3.5, 5.4, 5.9, 5.10, 7.3
+- `Grok status hook`: 0.1, 0.3, 1.1 to 1.9, 3.7, 3.8, 3.10, 5.9, 5.10, 6.1 to 6.3, 7.1, 7.3
+- `Shipped Grok plugin install`: 0.1, 0.2, 2.2, 2.5, 2.6, 3.1 to 3.10, 5.4, 5.9, 5.10, 7.3
 - `Remote OpenCode session and cwd follow (SSH-06)`: 4.1, 4.2, 4.3, 5.1, 5.2, 5.3, 5.7, 5.8
 - `Local preservation and truthful parity evidence (SSH-09)`: 4.1, 4.2, 4.4 to 4.11, 7.1 to 7.3
 - `Remote Grok Build session follow and tab parity (SSH-10)`: 0.2, 4.4, 4.6, 4.12 to 4.18, 5.1, 5.3, 5.7, 5.8, 7.1 to 7.3

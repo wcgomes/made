@@ -2,7 +2,7 @@
 
 Readiness: `analyze` must pass before implementation; review runs `verify` against the persisted spec.
 
-Phase 1 probes must finish, and any fallback that changes observable behavior must be routed back into spec.md with `analyze` rerun, before Phases 3 to 7 start. Cross-change ordering with `specs/changes/grok-native-hook/` is listed under Cross-change dependencies. The only wiki edit in scope is 8.2; other descriptive knowledge is updated by a post-implementation ingest.
+Phase 1 probes must finish, and any fallback that changes observable behavior must be routed back into spec.md with `analyze` rerun, before Phases 3 to 7 start. Cross-change ordering with `specs/changes/archive/20261123-grok-native-hook/` is listed under Cross-change dependencies. The only wiki edit in scope is 8.2; other descriptive knowledge is updated by a post-implementation ingest.
 
 ## 1. Early verification probes (Velopack and self-containment)
 - [x] 1.1 Create a standalone probe crate with its own empty `[workspace]` table, not a workspace member, depending only on a pinned `velopack` crate version (path: tests/release-probe/Cargo.toml)
@@ -317,7 +317,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] verify REL-12 "Windows command-line apply hand-off", "Windows hand-off failure", "Killed apply never blocks startup", "Command-line upgrade uses the same path" and "GUI startup refused during command-line apply"; REL-04 "AppImage extraction directory is private"; REL-12 "Post-publish upgrade check" on Windows through 11.10
 
 ## Cross-change dependencies
-`specs/changes/grok-native-hook/` lands its tasks 2.6 through 6.3 in one merge to main. This change archives before or together with it, because it cites REL-02.
+The archived `specs/changes/archive/20261123-grok-native-hook/` landed its tasks 2.6 through 6.3 in one merge to main. It cites REL-02.
 - **plugin.json version:** `grok-native-hook` 2.2 sets the source `plugins/grok-made/plugin.json` to `0.1.0`, and its 2.6 `stage-grok-plugin.sh` writes the staged version per REL-02. 2.7 lands after 2.2. After that, only `scripts/bump-version.sh` (2.5) changes that field.
 - **Staging and packaging:** after the 2.6–6.3 merge, 3.1–3.3, 7.7 and 7.9 consume its work:
   - 2.6 `stage-grok-plugin.sh`;
