@@ -92,12 +92,13 @@ fn shipped_grok_plugin() -> Option<(PathBuf, Vec<u64>)> {
     Some((directory, version))
 }
 
-fn grok_home_dir() -> Option<PathBuf> {
+/// The Grok home: a non-empty `GROK_HOME`, otherwise the platform home
+/// joined with `.grok`, the same rule the grok-made hook writes by.
+pub(crate) fn grok_home_dir() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("GROK_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(value));
     }
-    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
-    Some(PathBuf::from(home).join(".grok"))
+    Some(std::env::home_dir()?.join(".grok"))
 }
 
 fn installed_grok_made_version(home: &Path) -> Option<Vec<u64>> {
@@ -231,5 +232,88 @@ mod tests {
         )
         .unwrap();
         assert!(manifest_version(&manifest).is_none());
+    }
+
+    const CHILD: &str = "MADE_TEST_GROK_HOME_CHILD";
+    const EXPECT: &str = "MADE_TEST_GROK_HOME_EXPECT";
+
+    /// Rerun `name` in a child with `HOME` removed and `GROK_HOME` as given,
+    /// so this process's environment is never mutated.
+    fn run_child(name: &str, grok_home: Option<&str>, expect: Option<&str>) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .env_remove("GROK_HOME")
+            .env_remove(EXPECT);
+        if let Some(value) = grok_home {
+            command.env("GROK_HOME", value);
+        }
+        if let Some(value) = expect {
+            command.env(EXPECT, value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    /// In the child: the resolution equals `EXPECT`, or else the platform
+    /// home joined with `.grok`, the directory the hook's
+    /// `log_path(None, std::env::home_dir())` writes into.
+    fn assert_child_resolution() {
+        let expected = match std::env::var_os(EXPECT) {
+            Some(value) => Some(PathBuf::from(value)),
+            None => std::env::home_dir().map(|home| home.join(".grok")),
+        };
+        assert!(std::env::var_os("HOME").is_none());
+        assert_eq!(grok_home_dir(), expected);
+        if std::env::home_dir().is_some() {
+            assert!(grok_home_dir().is_some());
+        }
+    }
+
+    #[test]
+    fn grok_home_without_home_uses_the_platform_home() {
+        if std::env::var_os(CHILD).is_some() {
+            return assert_child_resolution();
+        }
+        run_child(
+            "integrations::grok::plugin::tests::grok_home_without_home_uses_the_platform_home",
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn grok_home_empty_value_falls_through_to_the_platform_home() {
+        if std::env::var_os(CHILD).is_some() {
+            return assert_child_resolution();
+        }
+        run_child(
+            "integrations::grok::plugin::tests::grok_home_empty_value_falls_through_to_the_platform_home",
+            Some(""),
+            None,
+        );
+    }
+
+    #[test]
+    fn grok_home_non_empty_value_wins() {
+        if std::env::var_os(CHILD).is_some() {
+            return assert_child_resolution();
+        }
+        let root = tempfile::tempdir().unwrap();
+        let custom = root.path().join("custom-grok");
+        let custom = custom.to_str().unwrap();
+        run_child(
+            "integrations::grok::plugin::tests::grok_home_non_empty_value_wins",
+            Some(custom),
+            Some(custom),
+        );
     }
 }

@@ -137,11 +137,7 @@ fn read_hook_events_at(path: &Path, offset: u64) -> (u64, Vec<HookEvent>) {
 }
 
 fn status_log() -> Option<PathBuf> {
-    let home = std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".grok")))?;
-    Some(home.join("made-grok-status.jsonl"))
+    Some(super::plugin::grok_home_dir()?.join("made-grok-status.jsonl"))
 }
 
 fn read_open_sessions_at(path: &Path) -> Option<Vec<OpenSession>> {
@@ -186,11 +182,7 @@ fn after_key<'a>(object: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn sessions_file() -> Option<PathBuf> {
-    let home = std::env::var_os("GROK_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".grok")))?;
-    Some(home.join("active_sessions.json"))
+    Some(super::plugin::grok_home_dir()?.join("active_sessions.json"))
 }
 
 #[cfg(test)]
@@ -412,5 +404,44 @@ mod tests {
         assert_eq!(events[0].cwd, "/live");
         assert_eq!(events[0].event, "SessionStart");
         assert_eq!(events[0].status, "idle");
+    }
+
+    #[test]
+    fn grok_files_without_home_live_in_the_platform_grok_home() {
+        const CHILD: &str = "MADE_TEST_GROK_FOLLOW_HOME_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("HOME").is_none());
+            let home = std::env::home_dir().map(|home| home.join(".grok"));
+            assert!(home.is_some());
+            assert_eq!(
+                status_log(),
+                home.as_ref()
+                    .map(|home| home.join("made-grok-status.jsonl"))
+            );
+            assert_eq!(
+                sessions_file(),
+                home.as_ref().map(|home| home.join("active_sessions.json"))
+            );
+            return;
+        }
+        // The child keeps this process's environment unmutated.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "integrations::grok::follow::tests::grok_files_without_home_live_in_the_platform_grok_home",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .env_remove("GROK_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
