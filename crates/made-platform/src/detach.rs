@@ -413,6 +413,11 @@ pub fn kill_child_and_group(child: &mut std::process::Child) {
 /// [`own_process_group`] that has already been reaped: processes it started
 /// that still hold its output open. Made's own process group is never
 /// signalled. Does nothing on Windows.
+///
+/// Safe only while some process of that group is still alive, so the group id
+/// cannot have been reused; a reader still blocked on the child's output
+/// implies that, unless the holder is a descendant that left the group (for
+/// example with `setsid`), which this does not reach.
 pub fn kill_reaped_child_group(pid: u32) {
     #[cfg(unix)]
     kill_foreign_group(pid);

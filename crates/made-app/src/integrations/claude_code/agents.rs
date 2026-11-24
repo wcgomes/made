@@ -280,20 +280,35 @@ fn work(generation: u64) {
         if !reader_alive {
             let mut reader = None;
             let entries = run_agents(&mut reader, &stop);
-            let mut poller = poller();
-            poller.reader = reader;
-            if stop() {
+            if !publish(&mut poller(), &stop, reader, entries, started_at) {
                 return;
-            }
-            if let Some(entries) = entries {
-                poller.snapshot = Some(Arc::new(AgentSnapshot {
-                    started_at,
-                    entries,
-                }));
             }
         }
         pause(POLL_INTERVAL.saturating_sub(started_at.elapsed()), &stop);
     }
+}
+
+/// Record a finished run in `poller`, unless the worker was stopped meanwhile:
+/// a stopped worker leaves the state of a newer one alone. Returns whether the
+/// worker keeps running.
+fn publish(
+    poller: &mut Poller,
+    stop: &dyn Fn() -> bool,
+    reader: Option<JoinHandle<()>>,
+    entries: Option<Vec<AgentCwd>>,
+    started_at: Instant,
+) -> bool {
+    if stop() {
+        return false;
+    }
+    poller.reader = reader;
+    if let Some(entries) = entries {
+        poller.snapshot = Some(Arc::new(AgentSnapshot {
+            started_at,
+            entries,
+        }));
+    }
+    true
 }
 
 /// Sleep for `duration`, or until `stop` answers yes.
@@ -432,7 +447,8 @@ mod tests {
     }
 
     /// A script that first records its pid (its process group id), then
-    /// leaves a background process holding its output open and runs `tail`.
+    /// leaves a background process holding its output open, marks that with a
+    /// `.ready` file beside the pid file, and runs `tail`.
     #[cfg(unix)]
     fn group_script(temp: &Path, tail: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -441,7 +457,7 @@ mod tests {
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\necho $$ > '{pid}.tmp'\nmv '{pid}.tmp' '{pid}'\nsleep 30 &\n{tail}\n",
+                "#!/bin/sh\necho $$ > '{pid}.tmp'\nmv '{pid}.tmp' '{pid}'\nsleep 30 &\n: > '{pid}.ready'\n{tail}\n",
                 pid = pid_file.display()
             ),
         )
@@ -492,10 +508,12 @@ mod tests {
     fn a_stopped_run_is_killed_with_its_whole_process_group() {
         let temp = tempfile::tempdir().unwrap();
         let (program, pid_file) = group_script(temp.path(), "sleep 30");
+        // Stop once the background process exists, not while it is forked.
+        let ready = pid_file.with_extension("ready");
         let started = Instant::now();
         let mut reader = None;
         let output = run_with_timeout(&program, &[], Duration::from_secs(60), &mut reader, &|| {
-            pid_file.exists()
+            ready.exists()
         });
         assert_eq!(output, None);
         assert!(started.elapsed() < Duration::from_secs(30));
@@ -552,11 +570,38 @@ mod tests {
         for handle in shutdowns {
             handle.join().unwrap();
         }
+        // Other tests may shut down concurrently too: only the stop of the
+        // earlier generation is certain.
         assert!(stopped(before), "a worker started before is stopped");
-        let now = GENERATION.load(Ordering::Acquire);
-        assert!(!stopped(now), "a worker started afterwards runs");
-        let poller = poller();
-        assert!(!poller.running && poller.worker.is_none() && poller.snapshot.is_none());
+    }
+
+    #[test]
+    fn a_stopped_worker_leaves_the_poller_state_alone() {
+        let mut poller = Poller {
+            demanded_at: None,
+            running: true,
+            worker: None,
+            reader: None,
+            snapshot: None,
+        };
+        let finished = || thread::spawn(|| {});
+        let entries = || Some(vec![interactive(1, "/work")]);
+        assert!(!publish(
+            &mut poller,
+            &|| true,
+            Some(finished()),
+            entries(),
+            Instant::now()
+        ));
+        assert!(poller.reader.is_none() && poller.snapshot.is_none());
+        assert!(publish(
+            &mut poller,
+            &|| false,
+            Some(finished()),
+            entries(),
+            Instant::now()
+        ));
+        assert!(poller.reader.is_some() && poller.snapshot.is_some());
     }
 
     fn interactive(pid: u32, cwd: &str) -> AgentCwd {
