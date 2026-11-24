@@ -26,4 +26,4 @@ Replace the Python hook with a small Rust executable, `made-grok-status` (`made-
 
 ## Evidence
 
-[`specs/changes/grok-native-hook/proposal.md`](../../specs/changes/grok-native-hook/proposal.md), [`tests/e2e/grok_native_hook_validation.md`](../../tests/e2e/grok_native_hook_validation.md), [Grok integration](../integration/grok.md).
+[archived proposal](../../specs/changes/archive/20261123-grok-native-hook/proposal.md); realized contract in [`grok-session-follow.md`](../../specs/grok-session-follow.md) (`Grok status hook`, `Shipped Grok plugin install`) and [`ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md) (SSH-06/09/10); [`tests/e2e/grok_native_hook_validation.md`](../../tests/e2e/grok_native_hook_validation.md), [Grok integration](../integration/grok.md).
