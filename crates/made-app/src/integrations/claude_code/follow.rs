@@ -855,13 +855,15 @@ impl ClaudeTab {
     }
 
     /// Apply the working directories a `claude agents --json` run that started
-    /// at `observed_at` reported. Only a change is applied: a session takes its
-    /// process's listed directory when it differs from the directory the
-    /// previous snapshot listed for that process (on the first sighting, from
-    /// the session's current directory) and the run started after the last
-    /// hook record that changed the session's directory. The change counts as
-    /// a move. A listing that keeps disagreeing with the hook never applies
-    /// again, so the two sources cannot alternate.
+    /// at `observed_at` reported. A listing counts only when the run started
+    /// after the last hook record that changed the session's directory; an
+    /// earlier run is ignored and not remembered. Of the listings that count,
+    /// only a change is applied: a session takes its process's listed
+    /// directory when it differs from the directory the previous counted
+    /// listing gave for that process (on the first sighting, from the session's
+    /// current directory). The change counts as a move. A listing that keeps
+    /// disagreeing with the hook never applies again, so the two sources
+    /// cannot alternate.
     pub(crate) fn apply_agent_cwds(&mut self, entries: &[AgentCwd], observed_at: Instant) {
         let sessions = &self.sessions;
         self.listed
@@ -871,6 +873,10 @@ impl ClaudeTab {
             let Some(cwd) = cwd_for_pid(entries, anchor) else {
                 continue;
             };
+            let session = &self.sessions[index];
+            if session.hook_moved_at.is_some_and(|at| observed_at <= at) {
+                continue;
+            }
             let changed = match self.listed.iter_mut().find(|(pid, _)| *pid == anchor) {
                 Some((_, seen)) if seen == cwd => false,
                 Some((_, seen)) => {
@@ -883,8 +889,7 @@ impl ClaudeTab {
                 }
             };
             let session = &mut self.sessions[index];
-            let after_hook = session.hook_moved_at.is_none_or(|at| observed_at > at);
-            if !changed || !after_hook || session.cwd == cwd {
+            if !changed || session.cwd == cwd {
                 continue;
             }
             session.cwd = cwd.to_owned();

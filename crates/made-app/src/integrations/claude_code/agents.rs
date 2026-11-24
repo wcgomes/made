@@ -5,8 +5,8 @@
 //! session's process id and current working directory immediately. While a
 //! tab has a live owned session, one app-wide worker thread runs it about once
 //! a second (never through a shell, never two runs at once, in its own process
-//! group that is killed after a short timeout or when the worker is stopped)
-//! and publishes the latest snapshot; tabs match it to their owned Claude Code
+//! group that is killed after a short timeout, when the worker is stopped, or
+//! when the output stays held open after the run exits) and publishes the latest snapshot; tabs match it to their owned Claude Code
 //! pids. Every failure leaves the previous snapshot in place, a snapshot older
 //! than a few seconds is not used, and the worker stops once no tab has asked
 //! for a snapshot for a while or the app shuts down ([`shutdown`]).
@@ -25,8 +25,8 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -190,11 +190,25 @@ static POLLER: Mutex<Poller> = Mutex::new(Poller {
     snapshot: None,
 });
 
-/// Set by [`shutdown`]: the worker kills its in-flight run and exits.
-static STOP: AtomicBool = AtomicBool::new(false);
+/// Bumped by [`shutdown`]. A worker runs only while the generation it started
+/// in is current, so a shutdown stops exactly the workers started before it.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Longest [`shutdown`] waits for the stopped worker to exit.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(1);
 
 fn poller() -> std::sync::MutexGuard<'static, Poller> {
     POLLER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the worker started in `generation` has been stopped.
+fn stopped(generation: u64) -> bool {
+    GENERATION.load(Ordering::Acquire) != generation
+}
+
+/// Whether `snapshot` is recent enough to be used.
+fn is_fresh(snapshot: &AgentSnapshot) -> bool {
+    snapshot.started_at.elapsed() <= MAX_SNAPSHOT_AGE
 }
 
 /// Keep the worker running for a tab with a live owned session, and return
@@ -202,10 +216,11 @@ fn poller() -> std::sync::MutexGuard<'static, Poller> {
 pub(crate) fn demand() -> Option<Arc<AgentSnapshot>> {
     let mut poller = poller();
     poller.demanded_at = Some(Instant::now());
-    if !poller.running && !STOP.load(Ordering::Acquire) {
+    if !poller.running {
+        let generation = GENERATION.load(Ordering::Acquire);
         if let Ok(worker) = thread::Builder::new()
             .name("made-claude-agents".to_owned())
-            .spawn(work)
+            .spawn(move || work(generation))
         {
             poller.running = true;
             poller.worker = Some(worker);
@@ -214,35 +229,43 @@ pub(crate) fn demand() -> Option<Arc<AgentSnapshot>> {
     poller
         .snapshot
         .clone()
-        .filter(|snapshot| snapshot.started_at.elapsed() <= MAX_SNAPSHOT_AGE)
+        .filter(|snapshot| is_fresh(snapshot))
 }
 
 /// Stop the worker, killing the process group of its in-flight run, and wait
-/// for it to exit. A later [`demand`] starts a new worker.
+/// a bounded time for it to exit. A later [`demand`] starts a new worker.
 pub(crate) fn shutdown() {
     let worker = {
         let mut poller = poller();
-        STOP.store(true, Ordering::Release);
+        GENERATION.fetch_add(1, Ordering::AcqRel);
+        poller.running = false;
+        poller.demanded_at = None;
+        poller.snapshot = None;
         poller.worker.take()
     };
-    if let Some(worker) = worker {
+    let Some(worker) = worker else {
+        return;
+    };
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(STEP);
+    }
+    if worker.is_finished() {
         let _ = worker.join();
     }
-    let mut poller = poller();
-    poller.running = false;
-    poller.demanded_at = None;
-    poller.snapshot = None;
-    STOP.store(false, Ordering::Release);
 }
 
-fn work() {
+fn work(generation: u64) {
+    let stop = || stopped(generation);
     loop {
         let reader_alive = {
             let mut poller = poller();
-            if STOP.load(Ordering::Acquire)
-                || poller
-                    .demanded_at
-                    .is_none_or(|at| at.elapsed() > IDLE_AFTER)
+            if stop() {
+                return;
+            }
+            if poller
+                .demanded_at
+                .is_none_or(|at| at.elapsed() > IDLE_AFTER)
             {
                 poller.running = false;
                 poller.snapshot = None;
@@ -256,9 +279,12 @@ fn work() {
         let started_at = Instant::now();
         if !reader_alive {
             let mut reader = None;
-            let entries = run_agents(&mut reader);
+            let entries = run_agents(&mut reader, &stop);
             let mut poller = poller();
             poller.reader = reader;
+            if stop() {
+                return;
+            }
             if let Some(entries) = entries {
                 poller.snapshot = Some(Arc::new(AgentSnapshot {
                     started_at,
@@ -266,14 +292,14 @@ fn work() {
                 }));
             }
         }
-        pause(POLL_INTERVAL.saturating_sub(started_at.elapsed()));
+        pause(POLL_INTERVAL.saturating_sub(started_at.elapsed()), &stop);
     }
 }
 
-/// Sleep for `duration`, or until [`shutdown`] asks the worker to stop.
-fn pause(duration: Duration) {
+/// Sleep for `duration`, or until `stop` answers yes.
+fn pause(duration: Duration, stop: &dyn Fn() -> bool) {
     let until = Instant::now() + duration;
-    while !STOP.load(Ordering::Acquire) {
+    while !stop() {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return;
@@ -284,26 +310,32 @@ fn pause(duration: Duration) {
 
 /// Run `<absolute claude> agents --json` once, without a shell. `reader`
 /// receives the run's output reader thread.
-fn run_agents(reader: &mut Option<JoinHandle<()>>) -> Option<Vec<AgentCwd>> {
+fn run_agents(
+    reader: &mut Option<JoinHandle<()>>,
+    stop: &dyn Fn() -> bool,
+) -> Option<Vec<AgentCwd>> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let program = made_platform::find_executable_on_path(
         OsStr::new(CLAUDE_CODE.descriptor().program),
         &path,
     )?;
-    let bytes = run_with_timeout(&program, &["agents", "--json"], RUN_TIMEOUT, reader)?;
+    let bytes = run_with_timeout(&program, &["agents", "--json"], RUN_TIMEOUT, reader, stop)?;
     parse_agents(&bytes)
 }
 
 /// Standard output of a successful run of `program`, or `None` when it fails
-/// to start, exits unsuccessfully, outlives `timeout`, is stopped by
-/// [`shutdown`] or its output is not complete shortly after it exits. On Unix
-/// the run leads its own process group, which is killed with it. `reader`
-/// receives the output reader thread, which may outlive the call.
+/// to start, exits unsuccessfully, outlives `timeout`, `stop` answers yes or
+/// its output is not complete shortly after it exits. The run leads its own
+/// process group: on timeout or stop the group is killed with the run, and when
+/// the output is still held open after the run exits, what is left of the
+/// group is killed. `reader` receives the output reader thread, which may
+/// outlive the call.
 fn run_with_timeout(
     program: &Path,
     args: &[&str],
     timeout: Duration,
     reader: &mut Option<JoinHandle<()>>,
+    stop: &dyn Fn() -> bool,
 ) -> Option<Vec<u8>> {
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(program);
@@ -312,11 +344,7 @@ fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    made_platform::own_process_group(&mut command);
     made_platform::hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take();
@@ -332,11 +360,11 @@ fn run_with_timeout(
             .ok()
     });
     if reader.is_none() {
-        kill(&mut child);
+        made_platform::kill_child_and_group(&mut child);
         return None;
     }
     let status = loop {
-        if STOP.load(Ordering::Acquire) {
+        if stop() {
             break None;
         }
         match child.try_wait() {
@@ -346,21 +374,18 @@ fn run_with_timeout(
         }
     };
     let Some(status) = status else {
-        kill(&mut child);
+        made_platform::kill_child_and_group(&mut child);
         return None;
     };
-    if !status.success() {
-        return None;
-    }
-    receiver.recv_timeout(EXIT_GRACE).ok().flatten()
-}
-
-/// Kill a run that has not been reaped yet, with its process group on Unix.
-fn kill(child: &mut Child) {
-    #[cfg(unix)]
-    made_platform::kill_process_group(child.id());
-    let _ = child.kill();
-    let _ = child.wait();
+    let output = match receiver.recv_timeout(EXIT_GRACE) {
+        Ok(output) => output,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            made_platform::kill_reaped_child_group(child.id());
+            return None;
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    };
+    status.success().then_some(output).flatten()
 }
 
 #[cfg(test)]
@@ -399,51 +424,95 @@ mod tests {
     #[test]
     #[ignore = "needs claude on PATH"]
     fn real_claude_agents_output_parses() {
-        let entries = run_agents(&mut None).expect("claude agents --json ran and parsed");
+        let entries =
+            run_agents(&mut None, &|| false).expect("claude agents --json ran and parsed");
         let pids: Vec<u32> = entries.iter().map(|entry| entry.pid).collect();
         eprintln!("agent pids: {pids:?}");
         assert!(entries.iter().all(|entry| !entry.cwd.is_empty()));
     }
 
+    /// A script that first records its pid (its process group id), then
+    /// leaves a background process holding its output open and runs `tail`.
     #[cfg(unix)]
-    #[test]
-    fn a_timed_out_run_is_killed_with_its_whole_process_group() {
+    fn group_script(temp: &Path, tail: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let program = temp.path().join("slow");
-        let grandchild = temp.path().join("grandchild");
+        let program = temp.join("run");
+        let pid_file = temp.join("pgid");
         std::fs::write(
             &program,
             format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
-                grandchild.display()
+                "#!/bin/sh\necho $$ > '{pid}.tmp'\nmv '{pid}.tmp' '{pid}'\nsleep 30 &\n{tail}\n",
+                pid = pid_file.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let started = Instant::now();
-        let mut reader = None;
-        assert_eq!(
-            run_with_timeout(&program, &[], Duration::from_millis(300), &mut reader),
-            None
-        );
-        assert!(started.elapsed() < Duration::from_secs(5));
-        let pid = std::fs::read_to_string(&grandchild).unwrap();
-        let alive = || {
-            Command::new("kill")
-                .args(["-0", pid.trim()])
+        (program, pid_file)
+    }
+
+    /// Wait for the run's process group to be empty and its output reader to
+    /// finish. Returns whether both happened.
+    #[cfg(unix)]
+    fn group_and_reader_gone(pid_file: &Path, reader: Option<JoinHandle<()>>) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pid_file.exists() && Instant::now() < deadline {
+            thread::sleep(STEP);
+        }
+        let pgid = std::fs::read_to_string(pid_file).expect("the run recorded its pid");
+        let group_alive = || {
+            Command::new("/bin/sh")
+                .args(["-c", "kill -0 -- -\"$1\"", "sh", pgid.trim()])
                 .stderr(Stdio::null())
                 .status()
                 .unwrap()
                 .success()
         };
         let reader = reader.expect("a reader thread");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while (alive() || !reader.is_finished()) && Instant::now() < deadline {
+        while (group_alive() || !reader.is_finished()) && Instant::now() < deadline {
             thread::sleep(STEP);
         }
-        assert!(!alive(), "the grandchild outlived the killed run");
-        assert!(reader.is_finished(), "the output reader is still blocked");
+        !group_alive() && reader.is_finished()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_run_is_killed_with_its_whole_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = group_script(temp.path(), "sleep 30");
+        let mut reader = None;
+        let output = run_with_timeout(&program, &[], Duration::from_secs(3), &mut reader, &|| {
+            false
+        });
+        assert_eq!(output, None);
+        assert!(group_and_reader_gone(&pid_file, reader));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_run_is_killed_with_its_whole_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = group_script(temp.path(), "sleep 30");
+        let started = Instant::now();
+        let mut reader = None;
+        let output = run_with_timeout(&program, &[], Duration::from_secs(60), &mut reader, &|| {
+            pid_file.exists()
+        });
+        assert_eq!(output, None);
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(group_and_reader_gone(&pid_file, reader));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_held_open_after_the_run_exits_kills_the_rest_of_its_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, pid_file) = group_script(temp.path(), "printf '[]'\nexit 0");
+        let mut reader = None;
+        let output = run_with_timeout(&program, &[], Duration::from_secs(30), &mut reader, &|| {
+            false
+        });
+        assert_eq!(output, None);
+        assert!(group_and_reader_gone(&pid_file, reader));
     }
 
     #[cfg(unix)]
@@ -455,8 +524,39 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nprintf '[]'\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut reader = None;
-        let output = run_with_timeout(&program, &[], RUN_TIMEOUT, &mut reader);
+        let output = run_with_timeout(&program, &[], RUN_TIMEOUT, &mut reader, &|| false);
         assert_eq!(output.as_deref(), Some(&b"[]"[..]));
+    }
+
+    #[test]
+    fn a_snapshot_older_than_the_limit_is_not_used() {
+        let snapshot = |age: Duration| AgentSnapshot {
+            started_at: Instant::now()
+                .checked_sub(age)
+                .expect("the clock has run long enough"),
+            entries: Vec::new(),
+        };
+        assert!(is_fresh(&snapshot(Duration::ZERO)));
+        assert!(is_fresh(&snapshot(
+            MAX_SNAPSHOT_AGE - Duration::from_millis(500)
+        )));
+        assert!(!is_fresh(&snapshot(
+            MAX_SNAPSHOT_AGE + Duration::from_secs(1)
+        )));
+    }
+
+    #[test]
+    fn shutdown_stops_earlier_workers_only_and_may_run_concurrently() {
+        let before = GENERATION.load(Ordering::Acquire);
+        let shutdowns: Vec<_> = (0..4).map(|_| thread::spawn(shutdown)).collect();
+        for handle in shutdowns {
+            handle.join().unwrap();
+        }
+        assert!(stopped(before), "a worker started before is stopped");
+        let now = GENERATION.load(Ordering::Acquire);
+        assert!(!stopped(now), "a worker started afterwards runs");
+        let poller = poller();
+        assert!(!poller.running && poller.worker.is_none() && poller.snapshot.is_none());
     }
 
     fn interactive(pid: u32, cwd: &str) -> AgentCwd {
@@ -633,6 +733,23 @@ mod tests {
         tab.ingest(vec![record("/work/start")], alive);
         tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], before_hook);
         assert_eq!(tab.directory().as_deref(), Some("/work/start"));
+    }
+
+    #[test]
+    fn a_cd_listed_first_by_a_run_from_before_a_hook_move_still_follows() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/start")], &alive);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later());
+        // A run starts, `/cd` happens, then a hook record moves the session
+        // before that run's snapshot is applied.
+        let in_flight = later();
+        thread::sleep(Duration::from_millis(2));
+        tab.ingest(vec![record("/work/hook")], &alive);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], in_flight);
+        assert_eq!(tab.directory().as_deref(), Some("/work/hook"));
+        // The next run lists the same directory: it is still a change.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
+        assert_eq!(tab.directory().as_deref(), Some("/work/after-cd"));
     }
 
     #[test]

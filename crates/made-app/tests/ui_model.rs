@@ -13619,7 +13619,11 @@ fn a_direct_claude_code_tab_is_branded_before_any_status() {
         .next()
         .expect("isolated bin");
     let claude = bin.join("claude");
-    std::fs::write(&claude, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\nsleep 30\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");

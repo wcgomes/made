@@ -386,12 +386,54 @@ fn output_is_opencode_v2(output: &[u8]) -> bool {
         })
 }
 
-/// Kill the process group led by `pid`, a direct child spawned with
-/// `process_group(0)`, then the child itself. Call it only before the child is
-/// reaped, so `pid` cannot name another process group.
+/// Start the child of `command` as the leader of its own process group, so
+/// [`kill_child_and_group`] and [`kill_reaped_child_group`] reach the processes
+/// it starts that stay in that group. Does nothing on Windows.
+pub fn own_process_group(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+/// Kill `child`, which has not been reaped yet, together with the process
+/// group it leads when it was started with [`own_process_group`], then reap
+/// it. Made's own process group is never signalled. On Windows only the child
+/// itself is killed.
+pub fn kill_child_and_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_foreign_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kill what is left of the process group led by `pid`, a child started with
+/// [`own_process_group`] that has already been reaped: processes it started
+/// that still hold its output open. Made's own process group is never
+/// signalled. Does nothing on Windows.
+pub fn kill_reaped_child_group(pid: u32) {
+    #[cfg(unix)]
+    kill_foreign_group(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// SIGKILL the process group `pgid`, unless it is Made's own.
 #[cfg(unix)]
-pub fn kill_process_group(pid: u32) {
-    signal_process_group(pid, libc::SIGKILL);
+fn kill_foreign_group(pgid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
+        return;
+    }
+    // SAFETY: a negative pid names the process group. ESRCH means it is gone.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
 }
 
 #[cfg(unix)]

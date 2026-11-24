@@ -175,11 +175,12 @@ fn isolated_with_locale(test: &str, layout: Layout, lang: Option<&str>) -> bool 
     let recorded = home.path().join("args");
     fs::create_dir(&recorded).unwrap();
     for program in PROGRAMS {
-        // Each fake records its argument count and arguments, then idles.
+        // Each fake records its argument count and arguments, then idles. The
+        // `claude agents --json` poll exits at once with no side effect.
         make_executable(
             &bin.join(program),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"$MADE_FAKE_ARGS_DIR/{program}\"\nsleep 30\n"
+                "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\nprintf '%s\\n' \"$#\" \"$@\" > \"$MADE_FAKE_ARGS_DIR/{program}\"\nsleep 30\n"
             ),
         );
     }
