@@ -1358,7 +1358,7 @@ impl TerminalPane {
                 position,
                 egui::Align2::LEFT_TOP,
                 &self.ime_preedit,
-                egui::FontId::monospace(self.font_size),
+                crate::render::terminal_font(self.font_size),
                 crate::theme::TEXT_PRIMARY,
             );
         }
@@ -2241,7 +2241,7 @@ mod tests {
         // into the bounded channel.
         std::thread::sleep(Duration::from_millis(100));
 
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         let mut metrics = Metrics::new();
         let mut log = DiagnosticLog::new();
         let _ = run_terminal_frame(
@@ -2290,7 +2290,7 @@ mod tests {
         let mut pane = TerminalPane::spawn(&platform, PtyOptions::new(temp.path())).unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         for _ in 0..3 {
             let _ = run_terminal_frame(
                 &ctx,
@@ -2399,7 +2399,7 @@ mod tests {
         .expect("spawn flood child");
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
 
         // Wait until the child has executed `stty -echo` and its flood has
         // actually reached the PTY, so startup input cannot be echoed by the
@@ -2576,7 +2576,7 @@ mod tests {
         .unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         let _ = run_terminal_frame(
             &ctx,
             &mut pane,
@@ -2702,7 +2702,7 @@ mod tests {
         let mut pane = TerminalPane::spawn(&platform, options).unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         if cfg!(unix) {
             // The child has disabled echo once its marker reaches the pane, so
             // nothing else will ever be written to the grid.
@@ -2832,7 +2832,7 @@ mod tests {
         .unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         let _ = run_terminal_frame(
             &ctx,
             &mut pane,
@@ -3361,6 +3361,14 @@ mod tests {
         }
     }
 
+    /// A headless context with the terminal font family installed, as
+    /// `theme::install` does for the app.
+    fn terminal_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::render::install_terminal_font(&ctx);
+        ctx
+    }
+
     fn run_terminal_frame(
         ctx: &egui::Context,
         pane: &mut TerminalPane,
@@ -3430,7 +3438,7 @@ mod tests {
         .unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
 
         let (_, primary) = run_terminal_frame_capture(
             &ctx,
@@ -3508,7 +3516,7 @@ mod tests {
         .unwrap();
         let mut log = DiagnosticLog::new();
         let mut metrics = Metrics::new();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         for _ in 0..3 {
             let _ = run_terminal_frame(
                 &ctx,
@@ -3575,7 +3583,7 @@ mod tests {
         let platform = made_platform::host_platform();
         let mut pane = TerminalPane::spawn(&platform, PtyOptions::new(temp.path())).unwrap();
         let pid = pane.pid();
-        let ctx = egui::Context::default();
+        let ctx = terminal_context();
         let id = egui::Id::unique("owned-terminal-focus");
         ctx.memory_mut(|memory| memory.request_focus(id));
         pane.focus_id = Some(id);
