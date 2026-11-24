@@ -1,6 +1,6 @@
 //! Claude Code integration.
 
-pub(crate) mod agents;
+pub mod agents;
 pub mod diagnostics;
 pub mod follow;
 pub mod launch;

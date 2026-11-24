@@ -386,6 +386,14 @@ fn output_is_opencode_v2(output: &[u8]) -> bool {
         })
 }
 
+/// Kill the process group led by `pid`, a direct child spawned with
+/// `process_group(0)`, then the child itself. Call it only before the child is
+/// reaped, so `pid` cannot name another process group.
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) {
+    signal_process_group(pid, libc::SIGKILL);
+}
+
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {

@@ -3113,6 +3113,8 @@ mod process;
 pub mod shell_integration;
 pub mod ssh;
 pub mod ssh_askpass;
+#[cfg(unix)]
+pub use detach::kill_process_group;
 pub use detach::{
     create_private_directory_new, create_private_file_new, ensure_private_directory,
     exec_remote_child, lock_private_file, read_private_file, remote_path_bytes,

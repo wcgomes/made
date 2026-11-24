@@ -4,10 +4,12 @@
 //! directory at the next prompt. `claude agents --json` reports every running
 //! session's process id and current working directory immediately. While a
 //! tab has a live owned session, one app-wide worker thread runs it about once
-//! a second (never through a shell, never two runs at once, killed after a
-//! short timeout) and publishes the latest snapshot; tabs match it to their
-//! owned Claude Code pids. Every failure leaves the previous snapshot in place,
-//! and the worker stops once no tab has asked for a snapshot for a while.
+//! a second (never through a shell, never two runs at once, in its own process
+//! group that is killed after a short timeout or when the worker is stopped)
+//! and publishes the latest snapshot; tabs match it to their owned Claude Code
+//! pids. Every failure leaves the previous snapshot in place, a snapshot older
+//! than a few seconds is not used, and the worker stops once no tab has asked
+//! for a snapshot for a while or the app shuts down ([`shutdown`]).
 //!
 //! A background session opened from Claude Code's agent view runs under the
 //! Claude Code daemon, not under the tab, so it is never matched by pid. While
@@ -15,16 +17,19 @@
 //! attached session: a title that equals the `name` of exactly one background
 //! entry selects that entry's directory ([`background_cwd_for_title`]).
 //!
-//! Only `pid`, `cwd`, `kind` and `name` are deserialized; every other field of
-//! the output is skipped without being copied, and nothing is logged.
+//! Each array entry is decoded on its own, so a malformed entry drops only
+//! itself. Only `pid`, `cwd`, `kind` and `name` are kept; every other field is
+//! discarded, and nothing is logged.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -42,12 +47,21 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The worker stops when no tab asked for a snapshot for this long.
 const IDLE_AFTER: Duration = Duration::from_secs(3);
 
+/// A snapshot whose run started longer ago than this is not used.
+const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(5);
+
+/// How long the output reader may still take once the run has exited.
+const EXIT_GRACE: Duration = Duration::from_millis(200);
+
+/// Granularity of every wait, and so of reacting to [`shutdown`].
+const STEP: Duration = Duration::from_millis(10);
+
 /// Most output bytes read from one run.
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 /// One running Claude Code session as `claude agents --json` reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AgentCwd {
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentCwd {
     pub pid: u32,
     /// Untrusted and unvalidated, exactly like a hook record's `cwd`.
     pub cwd: String,
@@ -58,8 +72,18 @@ pub(crate) struct AgentCwd {
     pub name: String,
 }
 
+/// Leaves out the untrusted `cwd` and `name`.
+impl fmt::Debug for AgentCwd {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentCwd")
+            .field("pid", &self.pid)
+            .field("background", &self.background)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The output of one successful run.
-#[derive(Debug)]
 pub(crate) struct AgentSnapshot {
     /// When the run started: the reported directories are at least this new.
     pub started_at: Instant,
@@ -78,12 +102,13 @@ struct RawAgent {
     name: Option<String>,
 }
 
-/// Parse `claude agents --json` output, or `None` when it is not a JSON array
-/// of agents. Entries without a pid or a directory are dropped.
-pub(crate) fn parse_agents(json: &[u8]) -> Option<Vec<AgentCwd>> {
-    let raw: Vec<RawAgent> = serde_json::from_slice(json).ok()?;
+/// Parse `claude agents --json` output, or `None` when it is not a JSON array.
+/// Entries that are malformed or lack a pid or a directory are dropped.
+pub fn parse_agents(json: &[u8]) -> Option<Vec<AgentCwd>> {
+    let raw: Vec<serde_json::Value> = serde_json::from_slice(json).ok()?;
     Some(
         raw.into_iter()
+            .filter_map(|value| serde_json::from_value::<RawAgent>(value).ok())
             .filter_map(|agent| {
                 let pid = agent.pid.filter(|pid| *pid != 0)?;
                 let cwd = agent.cwd.filter(|cwd| !cwd.is_empty())?;
@@ -151,70 +176,135 @@ pub(crate) fn background_cwd_for_title<'a>(
 struct Poller {
     demanded_at: Option<Instant>,
     running: bool,
+    worker: Option<JoinHandle<()>>,
+    /// The output reader of the latest run. No run starts while it is alive.
+    reader: Option<JoinHandle<()>>,
     snapshot: Option<Arc<AgentSnapshot>>,
 }
 
 static POLLER: Mutex<Poller> = Mutex::new(Poller {
     demanded_at: None,
     running: false,
+    worker: None,
+    reader: None,
     snapshot: None,
 });
 
+/// Set by [`shutdown`]: the worker kills its in-flight run and exits.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+fn poller() -> std::sync::MutexGuard<'static, Poller> {
+    POLLER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Keep the worker running for a tab with a live owned session, and return
-/// the latest snapshot. Never blocks on the command.
+/// the latest snapshot unless it is too old. Never blocks on the command.
 pub(crate) fn demand() -> Option<Arc<AgentSnapshot>> {
-    let mut poller = POLLER.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut poller = poller();
     poller.demanded_at = Some(Instant::now());
-    if !poller.running {
-        poller.running = thread::Builder::new()
+    if !poller.running && !STOP.load(Ordering::Acquire) {
+        if let Ok(worker) = thread::Builder::new()
             .name("made-claude-agents".to_owned())
             .spawn(work)
-            .is_ok();
+        {
+            poller.running = true;
+            poller.worker = Some(worker);
+        }
     }
-    poller.snapshot.clone()
+    poller
+        .snapshot
+        .clone()
+        .filter(|snapshot| snapshot.started_at.elapsed() <= MAX_SNAPSHOT_AGE)
+}
+
+/// Stop the worker, killing the process group of its in-flight run, and wait
+/// for it to exit. A later [`demand`] starts a new worker.
+pub(crate) fn shutdown() {
+    let worker = {
+        let mut poller = poller();
+        STOP.store(true, Ordering::Release);
+        poller.worker.take()
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    let mut poller = poller();
+    poller.running = false;
+    poller.demanded_at = None;
+    poller.snapshot = None;
+    STOP.store(false, Ordering::Release);
 }
 
 fn work() {
     loop {
-        {
-            let mut poller = POLLER.lock().unwrap_or_else(PoisonError::into_inner);
-            if poller
-                .demanded_at
-                .is_none_or(|at| at.elapsed() > IDLE_AFTER)
+        let reader_alive = {
+            let mut poller = poller();
+            if STOP.load(Ordering::Acquire)
+                || poller
+                    .demanded_at
+                    .is_none_or(|at| at.elapsed() > IDLE_AFTER)
             {
                 poller.running = false;
                 poller.snapshot = None;
                 return;
             }
-        }
+            poller
+                .reader
+                .as_ref()
+                .is_some_and(|reader| !reader.is_finished())
+        };
         let started_at = Instant::now();
-        if let Some(entries) = run_agents() {
-            POLLER
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .snapshot = Some(Arc::new(AgentSnapshot {
-                started_at,
-                entries,
-            }));
+        if !reader_alive {
+            let mut reader = None;
+            let entries = run_agents(&mut reader);
+            let mut poller = poller();
+            poller.reader = reader;
+            if let Some(entries) = entries {
+                poller.snapshot = Some(Arc::new(AgentSnapshot {
+                    started_at,
+                    entries,
+                }));
+            }
         }
-        thread::sleep(POLL_INTERVAL.saturating_sub(started_at.elapsed()));
+        pause(POLL_INTERVAL.saturating_sub(started_at.elapsed()));
     }
 }
 
-/// Run `<absolute claude> agents --json` once, without a shell.
-fn run_agents() -> Option<Vec<AgentCwd>> {
+/// Sleep for `duration`, or until [`shutdown`] asks the worker to stop.
+fn pause(duration: Duration) {
+    let until = Instant::now() + duration;
+    while !STOP.load(Ordering::Acquire) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(STEP));
+    }
+}
+
+/// Run `<absolute claude> agents --json` once, without a shell. `reader`
+/// receives the run's output reader thread.
+fn run_agents(reader: &mut Option<JoinHandle<()>>) -> Option<Vec<AgentCwd>> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let program = made_platform::find_executable_on_path(
         OsStr::new(CLAUDE_CODE.descriptor().program),
         &path,
     )?;
-    let bytes = run_with_timeout(&program, &["agents", "--json"], RUN_TIMEOUT)?;
+    let bytes = run_with_timeout(&program, &["agents", "--json"], RUN_TIMEOUT, reader)?;
     parse_agents(&bytes)
 }
 
 /// Standard output of a successful run of `program`, or `None` when it fails
-/// to start, exits unsuccessfully or outlives `timeout`.
-fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+/// to start, exits unsuccessfully, outlives `timeout`, is stopped by
+/// [`shutdown`] or its output is not complete shortly after it exits. On Unix
+/// the run leads its own process group, which is killed with it. `reader`
+/// receives the output reader thread, which may outlive the call.
+fn run_with_timeout(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+    reader: &mut Option<JoinHandle<()>>,
+) -> Option<Vec<u8>> {
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(program);
     command
@@ -222,11 +312,16 @@ fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Option<
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     made_platform::hide_console_window(&mut command);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take();
     let (sender, receiver) = mpsc::channel();
-    let reader = stdout.and_then(|stdout| {
+    *reader = stdout.and_then(|stdout| {
         thread::Builder::new()
             .name("made-claude-agents-read".to_owned())
             .spawn(move || {
@@ -236,25 +331,36 @@ fn run_with_timeout(program: &Path, args: &[&str], timeout: Duration) -> Option<
             })
             .ok()
     });
-    let output = reader.and_then(|_| {
-        receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .ok()
-            .flatten()
-    });
+    if reader.is_none() {
+        kill(&mut child);
+        return None;
+    }
     let status = loop {
+        if STOP.load(Ordering::Acquire) {
+            break None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < deadline => thread::sleep(STEP),
             _ => break None,
         }
     };
     let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill(&mut child);
         return None;
     };
-    status.success().then_some(output).flatten()
+    if !status.success() {
+        return None;
+    }
+    receiver.recv_timeout(EXIT_GRACE).ok().flatten()
+}
+
+/// Kill a run that has not been reaped yet, with its process group on Unix.
+fn kill(child: &mut Child) {
+    #[cfg(unix)]
+    made_platform::kill_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -293,10 +399,64 @@ mod tests {
     #[test]
     #[ignore = "needs claude on PATH"]
     fn real_claude_agents_output_parses() {
-        let entries = run_agents().expect("claude agents --json ran and parsed");
+        let entries = run_agents(&mut None).expect("claude agents --json ran and parsed");
         let pids: Vec<u32> = entries.iter().map(|entry| entry.pid).collect();
         eprintln!("agent pids: {pids:?}");
         assert!(entries.iter().all(|entry| !entry.cwd.is_empty()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_run_is_killed_with_its_whole_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("slow");
+        let grandchild = temp.path().join("grandchild");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
+                grandchild.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let mut reader = None;
+        assert_eq!(
+            run_with_timeout(&program, &[], Duration::from_millis(300), &mut reader),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = std::fs::read_to_string(&grandchild).unwrap();
+        let alive = || {
+            Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let reader = reader.expect("a reader thread");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (alive() || !reader.is_finished()) && Instant::now() < deadline {
+            thread::sleep(STEP);
+        }
+        assert!(!alive(), "the grandchild outlived the killed run");
+        assert!(reader.is_finished(), "the output reader is still blocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_is_read_shortly_after_the_run_exits() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("quick");
+        std::fs::write(&program, "#!/bin/sh\nprintf '[]'\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut reader = None;
+        let output = run_with_timeout(&program, &[], RUN_TIMEOUT, &mut reader);
+        assert_eq!(output.as_deref(), Some(&b"[]"[..]));
     }
 
     fn interactive(pid: u32, cwd: &str) -> AgentCwd {
@@ -418,16 +578,36 @@ mod tests {
     fn rejects_output_that_is_not_an_agent_array() {
         assert_eq!(parse_agents(b""), None);
         assert_eq!(parse_agents(b"{\"pid\":1}"), None);
-        assert_eq!(parse_agents(b"[{\"pid\":\"x\"}]"), None);
         assert_eq!(parse_agents(b"[]"), Some(Vec::new()));
     }
 
     #[test]
-    fn the_newer_of_hook_and_agents_directory_wins() {
+    fn a_malformed_entry_drops_only_itself() {
+        let parsed = parse_agents(
+            br#"[{"pid":"x","cwd":"/work/bad"},7,{"pid":1,"cwd":["/work/bad"]},
+                {"pid":4202,"cwd":"/work/good","kind":"interactive"}]"#,
+        );
+        assert_eq!(parsed, Some(vec![interactive(4202, "/work/good")]));
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_directory_and_name() {
+        let shown = format!("{:?}", background(7, "/work/secret-dir", "Secret name"));
+        assert!(shown.contains('7'), "{shown}");
+        assert!(
+            !shown.contains("secret-dir") && !shown.contains("Secret"),
+            "{shown}"
+        );
+    }
+
+    /// A tab owning pid 4202 and a hook record builder for its session.
+    fn hooked_tab() -> (
+        ClaudeTab,
+        impl Fn(&str) -> Record,
+        impl Fn(u32) -> Option<u32>,
+    ) {
         let pid = 4202;
-        let alive = |candidate: u32| (candidate == pid).then_some(1);
-        let mut tab = ClaudeTab::new(pid, true);
-        let record = |cwd: &str| Record {
+        let record = move |cwd: &str| Record {
             session_id: "s2".to_owned(),
             cwd: cwd.to_owned(),
             event: "UserPromptSubmit".to_owned(),
@@ -435,21 +615,86 @@ mod tests {
             title: String::new(),
             pids: vec![pid],
         };
-        let before_hook = Instant::now();
-        tab.ingest(vec![record("/work/start")], alive);
-        let entries = vec![interactive(pid, "/work/after-cd")];
+        let alive = move |candidate: u32| (candidate == pid).then_some(1);
+        (ClaudeTab::new(pid, true), record, alive)
+    }
 
-        // A snapshot started before the hook record was read is older.
-        tab.apply_agent_cwds(&entries, before_hook);
+    /// An instant strictly after every earlier one in the test.
+    fn later() -> Instant {
+        thread::sleep(Duration::from_millis(2));
+        Instant::now()
+    }
+
+    #[test]
+    fn a_listing_from_before_the_hook_change_does_not_apply() {
+        let (mut tab, record, alive) = hooked_tab();
+        let before_hook = Instant::now();
+        thread::sleep(Duration::from_millis(2));
+        tab.ingest(vec![record("/work/start")], alive);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], before_hook);
+        assert_eq!(tab.directory().as_deref(), Some("/work/start"));
+    }
+
+    #[test]
+    fn a_cd_still_follows() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/start")], &alive);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later());
         assert_eq!(tab.directory().as_deref(), Some("/work/start"));
 
-        // A later snapshot wins over the hook.
-        tab.apply_agent_cwds(&entries, Instant::now());
+        // `/cd`: the listing changes and no hook fires.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
         assert_eq!(tab.directory().as_deref(), Some("/work/after-cd"));
 
-        // A later hook record wins over that snapshot.
-        tab.ingest(vec![record("/work/hook-later")], alive);
-        tab.apply_agent_cwds(&entries, before_hook);
+        // A later hook move wins; the unchanged listing does not undo it.
+        tab.ingest(vec![record("/work/hook-later")], &alive);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
         assert_eq!(tab.directory().as_deref(), Some("/work/hook-later"));
+
+        // The next `/cd` follows again.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/second-cd")], later());
+        assert_eq!(tab.directory().as_deref(), Some("/work/second-cd"));
+    }
+
+    #[test]
+    fn a_persistent_hook_and_listing_disagreement_does_not_alternate() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/root/sub")], &alive);
+        let listing = [interactive(4202, "/work/root")];
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            tab.apply_agent_cwds(&listing, later());
+            seen.push(tab.directory().unwrap());
+            tab.ingest(vec![record("/work/root/sub")], &alive);
+            seen.push(tab.directory().unwrap());
+        }
+        // The first sighting differs from the hook directory and applies once;
+        // the next hook record takes it back and the listing never applies
+        // again.
+        assert_eq!(seen[0], "/work/root");
+        assert!(
+            seen[1..].iter().all(|cwd| cwd == "/work/root/sub"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_hook_after_a_newer_listing_steps_back_at_most_once() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/a")], &alive);
+        let listing = [interactive(4202, "/work/b")];
+        tab.apply_agent_cwds(&listing, later());
+        assert_eq!(tab.directory().as_deref(), Some("/work/b"));
+
+        // A stale record still naming the old directory is read late.
+        tab.ingest(vec![record("/work/a")], &alive);
+        assert_eq!(tab.directory().as_deref(), Some("/work/a"));
+        for _ in 0..5 {
+            tab.apply_agent_cwds(&listing, later());
+            assert_eq!(tab.directory().as_deref(), Some("/work/a"));
+        }
+        // A real change in the listing still follows.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/c")], later());
+        assert_eq!(tab.directory().as_deref(), Some("/work/c"));
     }
 }

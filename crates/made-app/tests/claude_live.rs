@@ -222,7 +222,7 @@ impl Live {
         fs::write(
             &shim,
             format!(
-                "#!/bin/sh\nprintf 'argc=%s' \"$#\" >> '{log}'\nfor a in \"$@\"; do printf ' [%s]' \"$a\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nexec '{real}' \"$@\"\n",
+                "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\nprintf 'argc=%s' \"$#\" >> '{log}'\nfor a in \"$@\"; do printf ' [%s]' \"$a\" >> '{log}'; done\nprintf '\\n' >> '{log}'\nexec '{real}' \"$@\"\n",
                 log = shim_log.display(),
                 real = real.display()
             ),

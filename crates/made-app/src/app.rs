@@ -2474,6 +2474,9 @@ impl AppModel {
             }
             workbench.shutdown();
         }
+        for state in self.app_states.iter_mut() {
+            state.shutdown();
+        }
         self.poll_remote_closes();
         let _ = made_platform::host_platform().cleanup();
     }

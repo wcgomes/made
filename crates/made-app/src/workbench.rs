@@ -5840,7 +5840,7 @@ mod tests {
         probe.terminal_target = TerminalTarget::Tui(GROK);
         assert!(
             probe.grok_follow_running(),
-            "a living Grok target counts even when another label owns the title"
+            "a living Grok target counts regardless of the tab label"
         );
 
         probe.terminal_target = TerminalTarget::Shell;
