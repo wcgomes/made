@@ -22,11 +22,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
+use super::agents::{cwd_for_pid, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
@@ -653,6 +654,9 @@ struct Session {
     chain: Vec<u32>,
     id: String,
     cwd: String,
+    /// When `cwd` last changed, from a hook record or an agents snapshot. The
+    /// newer of the two sources wins.
+    cwd_changed_at: Option<Instant>,
     hook: ClaudeActivity,
     title: String,
     /// Orders sessions by their latest start, prompt or directory change.
@@ -796,6 +800,7 @@ impl ClaudeTab {
                     chain: Vec::new(),
                     id: record.session_id.clone(),
                     cwd: String::new(),
+                    cwd_changed_at: None,
                     hook: ClaudeActivity::Idle,
                     title: String::new(),
                     recency: 0,
@@ -813,6 +818,7 @@ impl ClaudeTab {
         session.chain.clone_from(&record.pids);
         if moved {
             session.cwd = record.cwd;
+            session.cwd_changed_at = Some(Instant::now());
         }
         if let Some(status) = record.status {
             session.hook = status.into();
@@ -833,6 +839,26 @@ impl ClaudeTab {
     fn touch(&mut self, index: usize) {
         self.next_recency += 1;
         self.sessions[index].recency = self.next_recency;
+    }
+
+    /// Apply the working directories a `claude agents --json` run that started
+    /// at `observed_at` reported. A session takes its process's directory when
+    /// it differs from the current one and no hook record changed the
+    /// directory after the run started; the change counts as a move.
+    pub(crate) fn apply_agent_cwds(&mut self, entries: &[AgentCwd], observed_at: Instant) {
+        for index in 0..self.sessions.len() {
+            let session = &mut self.sessions[index];
+            let Some(cwd) = cwd_for_pid(entries, session.anchor) else {
+                continue;
+            };
+            let newer = session.cwd_changed_at.is_none_or(|at| observed_at > at);
+            if !newer || session.cwd == cwd {
+                continue;
+            }
+            session.cwd = cwd.to_owned();
+            session.cwd_changed_at = Some(observed_at);
+            self.touch(index);
+        }
     }
 
     /// Drop sessions whose Claude Code process has exited. Returns whether any

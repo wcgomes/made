@@ -321,6 +321,15 @@ impl TabState for ClaudeTabState {
             runtime.liveness_checked_at = now;
             runtime.tab.check_liveness(&mut parent_of);
         }
+        // Claude Code fires no hook for `/cd`: follow it through the agents
+        // snapshot while this local tab owns a live session.
+        if !io.remote && runtime.tab.session_count() > 0 {
+            if let Some(snapshot) = super::agents::demand() {
+                runtime
+                    .tab
+                    .apply_agent_cwds(&snapshot.entries, snapshot.started_at);
+            }
+        }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);
         } else if runtime.present_since.take().is_some() {
