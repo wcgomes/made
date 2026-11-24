@@ -41,7 +41,7 @@ Claude Code is the third integrated TUI. Made learns about it through two indepe
 
 ## Presence, precedence and presentation
 
-- **Precedence.** Explorer root: OpenCode > Claude Code > Grok > shell. Tab presentation: OpenCode active > Claude Code present > Grok open > folder. Locally Claude Code outranks Grok because a running Claude Code is in the foreground of its tab. Remotely the SSH-10 order is kept, so remote Claude Code yields to Grok; this is a recorded follow-up to harmonize once `grok-native-hook` has archived.
+- **Precedence.** Explorer root: OpenCode > Claude Code > Grok > shell. Tab presentation: OpenCode active > Claude Code present > Grok open > folder. Locally Claude Code outranks Grok because a running Claude Code is in the foreground of its tab. Remotely the SSH-10 order is kept, so remote Claude Code yields to Grok; harmonizing them is a recorded follow-up, unblocked since `grok-native-hook` archived on 2026-11-23.
 - **Dots.** Protocol status wins over hook-derived status, which wins over idle. A finished turn shows idle; there is no new unread treatment.
 - **Tooltip title.** The terminal's own window title, sanitized and capped at 120 characters, read only while a `claude-code` protocol status is live in that tab because the structured status proves which program owns the title. Otherwise the hook session title, otherwise `Claude Code`. A window title never feeds cwd, status or identity; see [security](../security.md) and [Layout and controls](../ui/layout-and-controls.md).
 

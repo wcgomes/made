@@ -60,4 +60,5 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 ## CI invocation
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.
+- `made-app` tests run on Windows only in the `windows-2025` entry of the `ci.yml` `cargo test --workspace` matrix. [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) runs targeted package tests (platform contract, PTY, the hook crates) plus smoke, never `made-app` tests.
 - Workflow: [`ci.yml`](../../.github/workflows/ci.yml).

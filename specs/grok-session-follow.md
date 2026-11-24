@@ -24,7 +24,11 @@ While Grok runs in a Made terminal tab, Made MUST treat `$GROK_HOME/active_sessi
 
 ### Requirement: Grok status hook
 
-Made MUST ship the Grok plugin at `plugins/grok-made`. The user removes it with `grok plugin uninstall grok-made --confirm`. Made MUST NOT hand-edit the user's Grok `config.toml`. The plugin MUST append one JSON line per session event to `$GROK_HOME/made-grok-status.jsonl`, read one JSON value without waiting for stdin to close, and exit successfully without denying a tool or a prompt. Made MUST apply only lines appended after Made starts. Each line MUST carry the session id, directory, event, and status `idle`, `working`, `attention`, or `error`.
+Made MUST ship the Grok plugin at `plugins/grok-made`. The user removes it with `grok plugin uninstall grok-made --confirm`. Made MUST NOT hand-edit the user's Grok `config.toml`. The plugin's session-status hook MUST be a native executable built for the operating system and CPU architecture of the machine where that plugin copy is installed, and running it MUST NOT require Python or any other interpreter, language runtime, or separately installed package on that machine. The supported hook platforms are the local client targets macOS arm64, macOS x64, Linux glibc x64 and Windows x64, and the remote targets of SSH-09, Linux glibc x86_64/aarch64 and macOS x86_64/arm64. The plugin MUST register the hook for exactly these Grok events and matchers, each with a 5-second timeout: `SessionStart`, `UserPromptSubmit`, `PreToolUse` and `PostToolUse` matching `ask_user_question|AskUserQuestion|AskQuestion`, `Stop`, `StopFailure`, `StopCancelled`, `Notification` matching `idle_prompt|permission_prompt`, and `SessionEnd`.
+
+On each run the hook MUST read one JSON value from standard input without waiting for standard input to close, waiting at most about two seconds in total; leading whitespace MUST be ignored, and invalid UTF-8 bytes MUST be decoded as replacement characters rather than abort reading. If no complete value arrives within that bound, input ends first, or the first value is not a JSON object, the hook MUST write no line. In the rules below, a field's text is its value when that value is a non-empty string and is otherwise empty, and the first of several named fields with non-empty text wins. The event name is the text of `hookEventName` or `hook_event_name`, compared case-insensitively with `-` treated as `_`. The notification type is the text of `notificationType` or `notification_type`, compared case-insensitively. The tool is an asking tool when the text of `toolName` or `tool_name`, compared case-insensitively, is `ask_user_question`, `askuserquestion` or `askquestion`. A stop is still active when `stopHookActive` or `stop_hook_active` is present with a value other than `false`, `null`, a numeric zero such as `0` or `0.0`, an empty string, an empty array or an empty object. The status MUST be the first match of these rules, in order: event `session_start` or `sessionstart` is `idle`; event `user_prompt_submit` or `userpromptsubmit` is `working`; event `pre_tool_use` or `pretooluse` with an asking tool is `attention`; event `post_tool_use` or `posttooluse` with an asking tool is `working`; notification type `permission_prompt` is `attention`; notification type `idle_prompt` is `idle`; event `stop_failure` or `stopfailure` is `error`; event `stop_cancelled`, `stopcancelled`, `session_end` or `sessionend` is `idle`; event `stop` is `working` when the stop is still active and `idle` otherwise. Input matching no rule MUST write no line.
+
+For a matched status the hook MUST append exactly one line, a UTF-8 JSON object followed by a newline, to `$GROK_HOME/made-grok-status.jsonl`, where `GROK_HOME` is used when set to a non-empty value and `~/.grok` under the running user's home directory is used otherwise, creating the missing parent directory, and MUST append each line with a single write so concurrent hook runs never interleave partial lines when that log is on a local filesystem; a log on a network filesystem has no such guarantee. The object MUST carry exactly these fields: `at`, the UTC time the line is written at second precision formatted `YYYY-MM-DDTHH:MM:SSZ`; `sessionId`, the text of `sessionId` or `session_id`; `pid`, the integer process id of the hook process's parent, which is the Grok process that ran the hook, and any launch indirection introduced by this change MUST NOT change which process that is; `cwd`, the text of `cwd`; `event`, the event name text exactly as received; `notification`, the notification type text exactly as received; and `status`, one of `idle`, `working`, `attention` or `error`. Absent text fields MUST be written as empty strings. The hook MUST write nothing to standard output and MUST exit with status 0 for every input and every failure, including malformed input, an unwritable log and any internal error, so it never denies, blocks or alters a tool or a prompt. Made MUST apply only lines appended after Made starts.
 
 #### Scenario: Session start and prompt move the explorer immediately
 
@@ -50,15 +54,69 @@ Made MUST ship the Grok plugin at `plugins/grok-made`. The user removes it with 
 - When each receives its own prompt, question, or stop
 - Then each dot follows only that session's events
 
+#### Scenario: Every registered event maps to its status
+
+- Given the installed native hook
+- When the hook receives each registered event in both camelCase and snake_case field spellings, including `Stop` with and without an active stop hook, `PreToolUse` and `PostToolUse` for an asking tool, `Notification` for `permission_prompt` and `idle_prompt`, and a notification type that matches no rule
+- Then each mapped input appends one line whose `status` equals the status the rules above give, and the unmatched input appends no line
+
+#### Scenario: Line carries exactly the seven fields
+
+- Given `GROK_HOME` is unset and a Grok process runs the hook for a prompt event carrying `sessionId` `s1`, `cwd` `/work/a` and `hookEventName` `UserPromptSubmit`
+- When the hook runs
+- Then `~/.grok/made-grok-status.jsonl` gains one line whose object has exactly `at` in UTC `YYYY-MM-DDTHH:MM:SSZ` form, `sessionId` `s1`, `pid` equal to that Grok process's id, `cwd` `/work/a`, `event` `UserPromptSubmit`, `notification` empty and `status` `working`, and with `GROK_HOME` set to a non-empty directory the same line goes to that directory's `made-grok-status.jsonl`, creating the directory if missing
+
+#### Scenario: Standard input left open
+
+- Given Grok writes one complete JSON event object to the hook's standard input and keeps standard input open
+- When the hook runs
+- Then it appends the line and exits with status 0 without waiting for standard input to close, and well within the 5-second timeout
+
+#### Scenario: Malformed, empty or late input writes nothing
+
+- Given hook runs whose standard input is closed empty, stays open with no data, carries truncated JSON, carries invalid JSON, or carries a JSON array or string instead of an object
+- When each run ends
+- Then no line is appended, the hook writes nothing to standard output, it exits with status 0, and runs whose input never completes finish after about two seconds
+
+#### Scenario: Failures never deny
+
+- Given the log directory cannot be created or the log file cannot be written
+- When the hook runs for a mapped event
+- Then it writes nothing to standard output, exits with status 0, and the tool or prompt proceeds unchanged
+
+#### Scenario: Concurrent hook runs append whole lines
+
+- Given several Grok sessions whose hooks run at the same moment against the same `made-grok-status.jsonl` on a local filesystem
+- When each hook appends its line
+- Then the log gains one complete, parseable line per run and no line is interleaved with another
+
+#### Scenario: No Python on the machine
+
+- Given a supported local or remote machine with no `python`, `python3` or other interpreter installed or on PATH, and the plugin installed there
+- When Grok sessions start, receive prompts and questions, stop and end
+- Then the hook appends the same lines the Python hook appended on a machine with Python, except that a valid multibyte UTF-8 character split across two reads stays intact instead of becoming replacement characters, and session follow, dots and diagnostics behave as with Python present
+
 ### Requirement: Shipped Grok plugin install
 
-After PATH detection reports grok, Made MUST ensure the shipped `plugins/grok-made` package is installed by running `grok plugin install <absolute shipped path> --trust` with the grok executable that lookup found. The shipped package is the `plugins/grok-made` directory beside `plugins/opencode-made`, in the development repository or the install-root copy in a release, and `<absolute shipped path>` is that directory's absolute path. That command is not part of launching Grok and is not a hand edit of `config.toml`. Made MUST compare the `version` field of the shipped `plugin.json` with the `version` field of the installed grok-made `plugin.json` as dotted numeric versions. Equal versions MUST skip the install command. A missing grok-made install, or an installed version lower than the shipped version, MUST run that command. An installed version higher than the shipped version MUST be left in place. The version check and the install command MUST be separate from the metadata-only PATH lookup and MUST NOT block shell, explorer, or Grok startup. Supplying a catalog to the menu without running PATH detection MUST NOT install the plugin. If the install command fails, Made MUST still let the user start Grok, and Made MUST record for Grok session follow that session-status hooks are unavailable. Made MUST NOT hand-edit the user's Grok `config.toml` and MUST NOT pass OpenCode's plugin environment to Grok.
+After PATH detection reports grok, Made MUST ensure the shipped `plugins/grok-made` package is installed by running `grok plugin install <absolute shipped path> --trust` with the grok executable that lookup found. In a release, the shipped package is the install-root `plugins/grok-made` copy beside `plugins/opencode-made`. In a development run, the shipped package is the build-staged copy of the repository's `plugins/grok-made` that contains the built hook; the repository's `plugins/grok-made` holds source only and MUST NOT itself be installed. `<absolute shipped path>` is the shipped package directory's absolute path, and a missing shipped package MUST be treated as an install failure. The shipped package MUST contain the session-status hook executable built for the operating system and CPU architecture Made runs on, so the copy that `grok plugin install` installs runs on that machine without any interpreter, runtime or other prerequisite, and Grok MUST be able to run that installed hook through the plugin's hook registration on every supported local platform. The shipped package MUST NOT contain a Python hook, any other interpreted hook, or any test file. The shipped `plugin.json` `version` is governed by the bundled-manifest version rule of the release-distribution contract (REL-02) and is not otherwise constrained here. That command is not part of launching Grok and is not a hand edit of `config.toml`. Made MUST compare the `version` field of the shipped `plugin.json` with the `version` field of the installed grok-made `plugin.json` as dotted numeric versions. Equal versions MUST skip the install command. A missing grok-made install, or an installed version lower than the shipped version, MUST run that command. An installed version higher than the shipped version MUST be left in place. The version check and the install command MUST be separate from the metadata-only PATH lookup and MUST NOT block shell, explorer, or Grok startup. Supplying a catalog to the menu without running PATH detection MUST NOT install the plugin. If the install command fails, Made MUST still let the user start Grok, and Made MUST record for Grok session follow that session-status hooks are unavailable. Made MUST NOT hand-edit the user's Grok `config.toml` and MUST NOT pass OpenCode's plugin environment to Grok.
 
 #### Scenario: Missing or older plugin is installed
 
 - Given PATH detection reports grok and grok-made is missing or its installed `plugin.json` version is lower than the shipped version
 - When Made ensures the shipped plugin
 - Then it runs `grok plugin install` with the absolute path of the shipped `plugins/grok-made` and `--trust`, and it does not hand-edit `config.toml`
+
+#### Scenario: Shipped package matches the host
+
+- Given Made installed on macOS arm64, macOS x64, Linux x64 or Windows x64 with no Python installed
+- When Made installs the shipped plugin and a Grok session started afterwards submits a prompt
+- Then the installed hook is the executable built for that host, it runs, and its line moves the explorer and shows working
+
+#### Scenario: Development run installs only the staged copy
+
+- Given a development run whose build staged a copy of `plugins/grok-made` with the built hook, and a variant where that staged copy is missing
+- When Made ensures the shipped plugin
+- Then the staged copy's absolute path is passed to `grok plugin install`, the repository's source `plugins/grok-made` is never passed, and in the missing variant Made runs no install command and records that session-status hooks are unavailable while Grok still starts
 
 #### Scenario: Same version skips install
 
