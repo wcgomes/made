@@ -1802,6 +1802,7 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.scroll = scroll_style();
         style.animation_time = 0.12;
     });
+    crate::render::install_terminal_font(ctx);
     install_icon_loader(ctx);
 }
 

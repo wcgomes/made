@@ -9,3 +9,4 @@
 - [0007: GitHub Releases and Velopack](0007-github-releases-velopack-unsigned.md) — releases, auto-update, unsigned — Release channel, updater, unsigned builds, single version source.
 - [0008: Claude Code via OSC 7501 and Session Plugin](0008-claude-code-osc7501-session-plugin.md) — OSC 7501, plugin, window-title — Two-channel Claude Code integration, rejected alternatives, bounded title rule.
 - [0009: Static Integration Modules](0009-static-integration-modules.md) — trait list, ranks, follow policy — Compile-time integration modules, not a plugin system.
+- [0010: Bundled DejaVu Terminal Font](0010-bundled-dejavu-terminal-font.md) — terminal font, DejaVu, glyph coverage — Bundled DejaVu Sans Mono plus Iosevka symbols for the terminal grid.

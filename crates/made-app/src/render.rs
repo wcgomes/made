@@ -2,7 +2,7 @@
 //!
 //! The terminal is not an egui text widget. [`GridRenderer`] converts an owned
 //! [`TerminalSnapshot`] into cached, grouped glyph runs, and [`paint_grid`]
-//! draws those runs with a monospace font. Rows are rebuilt only when the
+//! draws those runs with the terminal font. Rows are rebuilt only when the
 //! terminal version, the damage set, the selection, the palette, or the grid
 //! size changes.
 //!
@@ -10,24 +10,43 @@
 //! dependency, so the renderer tests run headlessly. `paint_grid` is the only
 //! function that needs an egui [`Painter`].
 //!
-//! # Font fallback
+//! # Terminal font and fallback
 //!
-//! egui's bundled default fonts provide the monospace grid, Latin text, and
-//! emoji. The `system_fonts` eframe feature additionally asks the platform's
-//! font fallback (through a cross-platform provider, not Made's platform crate)
-//! for an installed face when a glyph is missing, so CJK and other scripts have
-//! a real chance to render. If no face is available, egui draws its replacement
+//! Cells are drawn and measured with the [`TERMINAL_FONT_FAMILY`] family on
+//! every OS. Its first face is a bundled subset of DejaVu Sans Mono: Latin,
+//! Greek, Cyrillic, punctuation, arrows, math, box drawing, blocks, geometric
+//! shapes, dingbats, and most Claude Code status marks. Its advance sets the
+//! cell (0.602 em). The second is a bundled Iosevka Term Extended subset of
+//! symbols DejaVu lacks, such as U+23F5, U+23FA, U+23BF, and Powerline, with a
+//! 0.6 em advance. egui's bundled Hack, Ubuntu-Light, and icon faces follow for
+//! anything else. Every glyph in the two bundled terminal faces has one cell
+//! advance. The UI families do not change.
+//!
+//! The `system_fonts` eframe feature additionally asks the platform's font
+//! fallback (through a cross-platform provider, not Made's platform crate) for
+//! an installed face when a glyph is missing, so CJK and other scripts have a
+//! real chance to render. If no face is available, egui draws its replacement
 //! glyph inside the cell width reported by the emulator, so grid geometry stays
 //! correct and the TUI is not corrupted. The emulator's per-code-point width
 //! behavior and this replacement-glyph fallback are the documented v1 limits.
 //!
-//! Box drawing, block elements, and braille are not taken from that font.
+//! A fallback face has its own advance and baseline. Each non-ASCII glyph is
+//! centered in its cells, shrunk when wider than them, and moved to the
+//! primary face's baseline, so a symbol neither hugs the left edge, spills
+//! into the next column, nor rides above the text. An Iosevka symbol is
+//! 0.03 pt narrower than the cell at 13 pt, so it is centered, not shrunk.
+//!
+//! Box drawing, block elements, and braille are not taken from the font.
 //! The cell-glyph painter draws them as geometry fitted to the cell, then clips
 //! the ink, so a mark cannot cover the next column or merge into a solid rectangle.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Galley, Painter, Pos2,
+    Rect, Stroke, Vec2,
+};
 
 use crate::cell_glyphs::{self, Span};
 use made_terminal::{
@@ -38,13 +57,60 @@ use made_terminal::{
 /// Default terminal font size in points.
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
 
+/// Name of the egui font family that draws and measures terminal cells.
+pub const TERMINAL_FONT_FAMILY: &str = "terminal";
+
+/// Bundled terminal faces, in fallback order, as (font data key, bytes).
+/// `scripts/subset-terminal-fonts.sh` subsets both to one-cell glyphs.
+pub(crate) const TERMINAL_FACES: [(&str, &[u8]); 2] = [
+    (
+        "DejaVuSansMono",
+        include_bytes!("../assets/terminal-font/DejaVuSansMono.ttf"),
+    ),
+    (
+        "IosevkaTermExtended-Symbols",
+        include_bytes!("../assets/terminal-font/IosevkaTermExtended-Symbols.ttf"),
+    ),
+];
+
+/// The terminal grid font at `size` points.
+pub fn terminal_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(TERMINAL_FONT_FAMILY.into()))
+}
+
+/// Register the [`TERMINAL_FONT_FAMILY`] family: DejaVu Sans Mono, the
+/// Iosevka Term Extended symbols subset, then egui's monospace chain (Hack and
+/// its fallbacks). The UI families are unchanged. Call once per context,
+/// before terminal text is laid out.
+pub fn install_terminal_font(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    let mut family = Vec::new();
+    for (name, bytes) in TERMINAL_FACES {
+        fonts
+            .font_data
+            .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+        family.push(name.to_owned());
+    }
+    family.extend(
+        fonts
+            .families
+            .get(&FontFamily::Monospace)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts
+        .families
+        .insert(FontFamily::Name(TERMINAL_FONT_FAMILY.into()), family);
+    ctx.set_fonts(fonts);
+}
+
 /// Padding between the pane edge and the first cell.
 pub const TERMINAL_PADDING: f32 = 8.0;
 
 /// Width reserved at the right edge for the scrollbar.
 pub const SCROLLBAR_WIDTH: f32 = 8.0;
 
-/// Cell metrics derived from the active monospace font.
+/// Cell metrics derived from the terminal font.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CellMetrics {
     /// Advance width of one narrow cell, in points.
@@ -71,12 +137,12 @@ impl CellMetrics {
         }
     }
 
-    /// Measure the host monospace font through egui's font atlas.
+    /// Measure the terminal font through egui's font atlas.
     ///
     /// This only needs a font atlas, not a GPU surface, so it is safe to call
     /// from a headless egui context.
     pub fn from_context(ctx: &egui::Context, font_size: f32) -> Self {
-        let font_id = FontId::monospace(font_size);
+        let font_id = terminal_font(font_size);
         let width = ctx.fonts_mut(|fonts| fonts.glyph_width(&font_id, 'M'));
         let height = ctx.fonts_mut(|fonts| fonts.row_height(&font_id));
         let width = if width > 0.0 { width } else { font_size * 0.6 };
@@ -811,9 +877,10 @@ pub fn paint_grid(
     palette: &GridPalette,
 ) {
     let painter = painter.with_clip_rect(grid_rect);
-    let font = FontId::monospace(options.font_size);
+    let font = terminal_font(options.font_size);
     let metrics = options.metrics;
     let ppp = painter.pixels_per_point();
+    let mut reference_baseline = None;
 
     for row in rows {
         let y = row_top(origin.y, row.row, metrics.height, ppp);
@@ -865,20 +932,39 @@ pub fn paint_grid(
                         // filled, so a later highlight cannot cover this edge.
                         let text = &run.text[*start..*end];
                         let bold = synthetic_bold_offset(span, run.style.bold);
+                        let span_width =
+                            if run.wide { run.cells } else { 1 } as f32 * metrics.width;
                         for (range, x) in
                             text_glyph_places(origin.x, *col, text, run.wide, metrics.width, ppp)
                         {
                             let pos = Pos2::new(x, y);
                             let glyph = &text[range];
-                            painter.text(pos, Align2::LEFT_TOP, glyph, font.clone(), color);
-                            if let Some(offset) = bold {
-                                painter.text(
-                                    pos + offset,
-                                    Align2::LEFT_TOP,
-                                    glyph,
+                            if glyph.is_ascii() {
+                                painter.text(pos, Align2::LEFT_TOP, glyph, font.clone(), color);
+                                if let Some(offset) = bold {
+                                    painter.text(
+                                        pos + offset,
+                                        Align2::LEFT_TOP,
+                                        glyph,
+                                        font.clone(),
+                                        color,
+                                    );
+                                }
+                                continue;
+                            }
+                            let reference = *reference_baseline.get_or_insert_with(|| {
+                                galley_baseline(&painter.layout_no_wrap(
+                                    "M".to_owned(),
                                     font.clone(),
                                     color,
-                                );
+                                ))
+                            });
+                            let (galley, offset) =
+                                fit_glyph(&painter, glyph, &font, color, span_width, reference);
+                            let pos = pos + offset;
+                            painter.galley(pos, Arc::clone(&galley), color);
+                            if let Some(offset) = bold {
+                                painter.galley(pos + offset, galley, color);
                             }
                         }
                     }
@@ -1003,6 +1089,83 @@ fn text_glyph_places(
         col += 1;
     }
     places
+}
+
+/// Lay out one non-ASCII glyph and place it in its cells.
+///
+/// Returns the galley and its offset from the cell's top-left corner. A glyph
+/// wider than `span_width` is laid out again at a smaller size.
+fn fit_glyph(
+    painter: &Painter,
+    glyph: &str,
+    font: &FontId,
+    color: Color32,
+    span_width: f32,
+    reference_baseline: f32,
+) -> (Arc<Galley>, Vec2) {
+    let mut galley = painter.layout_no_wrap(glyph.to_owned(), font.clone(), color);
+    let scale = glyph_scale(galley.size().x, span_width);
+    if scale < 1.0 {
+        galley = painter.layout_no_wrap(
+            glyph.to_owned(),
+            FontId::new(shrunk_size(font.size, scale), font.family.clone()),
+            color,
+        );
+    }
+    let offset = glyph_offset(
+        galley.size().x,
+        galley_baseline(&galley),
+        span_width,
+        reference_baseline,
+        painter.pixels_per_point(),
+    );
+    (galley, offset)
+}
+
+/// Steps a shrunk fallback glyph's font size snaps to, in points, so varied
+/// oversized glyphs share a few font sizes instead of one each.
+const SHRUNK_SIZE_STEP: f32 = 0.25;
+
+/// `size * scale` rounded down to [`SHRUNK_SIZE_STEP`]. Rounding down keeps
+/// the glyph inside its cells; the result is never below one step.
+fn shrunk_size(size: f32, scale: f32) -> f32 {
+    ((size * scale / SHRUNK_SIZE_STEP).floor() * SHRUNK_SIZE_STEP).max(SHRUNK_SIZE_STEP)
+}
+
+/// Baseline of a one-line galley, from its top.
+fn galley_baseline(galley: &Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or(0.0)
+}
+
+/// Font-size factor that fits `advance` into `span_width`. An overflow under
+/// 1% is rounding of the cell advance, so a bundled glyph is never shrunk.
+fn glyph_scale(advance: f32, span_width: f32) -> f32 {
+    if advance > span_width * 1.01 {
+        span_width / advance
+    } else {
+        1.0
+    }
+}
+
+/// Offset that centers a glyph of `advance` in its cells and puts its
+/// baseline on the reference baseline, snapped to the device pixel. A glyph
+/// from the primary face has the cell advance and baseline, so it does not move.
+fn glyph_offset(
+    advance: f32,
+    baseline: f32,
+    span_width: f32,
+    reference_baseline: f32,
+    pixels_per_point: f32,
+) -> Vec2 {
+    let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+    Vec2::new(
+        snap((span_width - advance).max(0.0) * 0.5),
+        snap(reference_baseline - baseline),
+    )
 }
 
 /// Second draw for synthetic bold. Geometric marks return none so a 1px
@@ -1366,6 +1529,125 @@ mod tests {
         let with_next = cell_glyphs::layout_spans(0, 2, "か\u{3099}b", false);
         assert_eq!(with_next.len(), 1);
         assert_eq!(with_next[0].cols(), 2);
+    }
+
+    #[test]
+    fn fallback_glyph_offset_centers_and_matches_the_baseline() {
+        let ppp = 2.0;
+        let cell = 7.82666;
+        // A bundled glyph has the cell advance and the reference baseline.
+        assert_eq!(glyph_offset(cell, 12.0, cell, 12.0, ppp), Vec2::ZERO);
+        // U+23F5 from STIX Two Math: narrower and 1.5pt high (measured).
+        let offset = glyph_offset(6.54, 8.5, cell, 10.0, ppp);
+        assert_eq!(offset, Vec2::new(0.5, 1.5));
+        for value in [offset.x, offset.y] {
+            assert_eq!((value * ppp).fract(), 0.0, "{value} is off the device grid");
+        }
+        // Wide cells center a narrower CJK or emoji advance.
+        assert_eq!(glyph_offset(13.0, 10.0, 2.0 * cell, 10.0, ppp).x, 1.5);
+
+        assert_eq!(glyph_scale(cell, cell), 1.0);
+        assert_eq!(glyph_scale(6.54, cell), 1.0);
+        // U+2713 from STIX Two Math is 1.29 cells wide (measured).
+        let scale = glyph_scale(10.05, cell);
+        assert!(scale < 1.0 && (10.05 * scale - cell).abs() < 1e-4);
+        assert_eq!(glyph_scale(0.0, cell), 1.0);
+        // The shrunk size snaps down to the step, so it still fits.
+        let size = shrunk_size(DEFAULT_FONT_SIZE, scale);
+        assert_eq!(size, 10.0);
+        assert!(size <= DEFAULT_FONT_SIZE * scale);
+        for scale in [0.5, 0.777, 0.9, 0.99] {
+            let size = shrunk_size(DEFAULT_FONT_SIZE, scale);
+            assert_eq!(
+                (size / SHRUNK_SIZE_STEP).fract(),
+                0.0,
+                "{size} is off the step"
+            );
+            assert!(
+                size <= DEFAULT_FONT_SIZE * scale
+                    && size > DEFAULT_FONT_SIZE * scale - SHRUNK_SIZE_STEP
+            );
+        }
+        assert_eq!(shrunk_size(DEFAULT_FONT_SIZE, 0.001), SHRUNK_SIZE_STEP);
+        assert_eq!(
+            glyph_scale(cell + 0.05, cell),
+            1.0,
+            "rounding is not overflow"
+        );
+    }
+
+    #[test]
+    fn foreign_face_glyph_fits_its_cell_and_bundled_glyph_stays() {
+        let ctx = egui::Context::default();
+        install_terminal_font(&ctx);
+        let mono = terminal_font(DEFAULT_FONT_SIZE);
+        // The proportional face stands in for a system fallback face: its
+        // advances and baseline differ from the bundled terminal face.
+        let foreign = FontId::proportional(DEFAULT_FONT_SIZE);
+        let mut results = Vec::new();
+        let mut input = egui::RawInput::default();
+        if let Some(viewport) = input.viewports.get_mut(&input.viewport_id) {
+            viewport.native_pixels_per_point = Some(2.0);
+        }
+        let mut output = ctx.run_ui(input, |ui| {
+            assert_eq!(ui.ctx().pixels_per_point(), 2.0);
+            let painter = ui.painter();
+            let cell = painter.layout_no_wrap("M".to_owned(), mono.clone(), Color32::WHITE);
+            let reference = galley_baseline(&cell);
+            let width = cell.size().x;
+            for (glyph, font) in [
+                ("\u{00B7}", &mono),
+                ("W", &foreign),
+                ("i", &foreign),
+                ("\u{2014}", &foreign),
+            ] {
+                let (galley, offset) =
+                    fit_glyph(painter, glyph, font, Color32::WHITE, width, reference);
+                let natural = painter
+                    .layout_no_wrap(glyph.to_owned(), font.clone(), Color32::WHITE)
+                    .size()
+                    .x;
+                results.push((
+                    glyph,
+                    natural,
+                    galley.size().x,
+                    offset,
+                    galley_baseline(&galley) + offset.y - reference,
+                    width,
+                ));
+            }
+        });
+        output.textures_delta.clear();
+        let (_, natural, advance, offset, baseline, width) = results[0];
+        assert_eq!(offset, Vec2::ZERO, "a bundled glyph keeps its place");
+        assert_eq!((natural, advance), (width, width));
+        assert_eq!(baseline, 0.0);
+        for (glyph, natural, advance, offset, baseline, width) in &results[1..] {
+            assert!(
+                *advance <= width + 1e-3,
+                "{glyph:?} is {advance} wide in a {width} cell"
+            );
+            let left = offset.x;
+            let right = width - advance - offset.x;
+            assert!(
+                left >= 0.0 && right >= -0.5,
+                "{glyph:?} spills: {left} {right}"
+            );
+            // Each side may round by half a device pixel.
+            assert!(
+                (left - right).abs() <= 0.5 + 1e-3,
+                "{glyph:?} is not centered: {left} {right}"
+            );
+            assert!(
+                baseline.abs() <= 0.25 + 1e-3,
+                "{glyph:?} baseline off by {baseline}"
+            );
+            if natural > width {
+                assert!(advance < natural, "{glyph:?} was not shrunk");
+            }
+        }
+        assert!(results[1].1 > results[1].5, "W is wider than a cell");
+        assert!(results[2].1 < results[2].5, "i is narrower than a cell");
     }
 
     #[test]

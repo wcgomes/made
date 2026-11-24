@@ -205,7 +205,10 @@ fn run(args: cli::LaunchArgs) -> ExitCode {
     let result = eframe::run_native(
         "Made",
         made_app::app::native_options(),
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            // Queued before the first pass, so the first terminal frame is
+            // laid out and measured with the terminal font.
+            made_app::render::install_terminal_font(&cc.egui_ctx);
             // A normal GUI session must not share the launching console: its
             // Ctrl+C or close would end Made. CLI actions and smoke runs keep
             // it for their output. Done once the window exists so a creation

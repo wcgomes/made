@@ -2,8 +2,15 @@
 //!
 //! Box drawing, block elements, braille, dingbat crosses, and the OpenCode
 //! spinner squares (U+25A0, U+2B1D) are drawn to the cell instead of the
-//! monospace font. Font glyphs for those ranges overflow the cell or shatter
-//! a one-pixel mark on the bundled face and on macOS fallback fonts.
+//! terminal font. Geometry snapped to the device pixel keeps lines joined and
+//! a one-pixel mark whole at any cell size. Font glyphs for those ranges
+//! overflowed the cell or shattered that mark on the earlier monospace face
+//! and on macOS fallback fonts, and the terminal faces have no braille.
+//!
+//! The Claude Code marks (U+23F5, U+23FA, U+23BF, the U+2722-U+273D spinner
+//! asterisks, U+276E, U+276F, and the check, ballot, and circle marks) are font
+//! text: DejaVu Sans Mono or the bundled Iosevka symbols face has each one at
+//! the cell advance, inside the cell.
 
 use eframe::egui::{self, pos2, vec2, Color32, Painter, Pos2, Rect, Stroke};
 
@@ -313,10 +320,12 @@ fn spinner_square(ch: char) -> Option<Graphic> {
     }
 }
 
-/// Dingbat crosses. The bundled monospace face has U+00D7 but not these, so a
-/// system fallback draws a stray box where a tab close "x" should be.
+/// Dingbat crosses U+2715 and U+2716. Hack has U+00D7 but not these, so a
+/// system fallback drew a stray box where OpenCode's tab close "x" should be.
+/// The drawn cross keeps that close mark inset. The ballot crosses U+2717 and
+/// U+2718 are font text: DejaVu Sans Mono draws them inside the cell.
 fn is_cross(ch: char) -> bool {
-    matches!(ch, '\u{2715}' | '\u{2716}' | '\u{2717}' | '\u{2718}')
+    matches!(ch, '\u{2715}' | '\u{2716}')
 }
 
 fn paint_cross(painter: &Painter, rect: Rect, fg: Color32) {
@@ -1199,8 +1208,6 @@ mod tests {
         assert_eq!(spans[0].cols(), 1);
         assert_eq!(spans[1].col(), 5);
         assert!(matches!(classify('\u{2716}'), Some(Graphic::Cross)));
-        assert!(matches!(classify('\u{2717}'), Some(Graphic::Cross)));
-        assert!(matches!(classify('\u{2718}'), Some(Graphic::Cross)));
     }
 
     #[test]
@@ -1382,14 +1389,99 @@ mod tests {
         }
     }
 
+    /// Claude Code TUI symbols the terminal font must cover.
+    const CLAUDE_CODE_SYMBOLS: [char; 27] = [
+        '\u{23F5}', '\u{23FA}', '\u{23BF}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}',
+        '\u{273D}', '\u{276F}', '\u{276E}', '\u{00B7}', '\u{2713}', '\u{2714}', '\u{2717}',
+        '\u{2718}', '\u{25CF}', '\u{25D0}', '\u{25D1}', '\u{25CB}', '\u{2026}', '\u{2190}',
+        '\u{2191}', '\u{2192}', '\u{2193}', '\u{26A0}', '\u{2605}', '\u{2606}',
+    ];
+
     #[test]
-    fn bundled_monospace_has_a_multiplication_sign() {
+    fn bundled_faces_cover_the_claude_code_symbols_at_the_cell_advance() {
+        let font = crate::render::terminal_font(13.0);
         let ctx = egui::Context::default();
+        crate::render::install_terminal_font(&ctx);
+        let mut cell_width = 0.0;
+        let mut row_height = 0.0;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                cell_width = fonts.glyph_width(&font, 'M');
+                row_height = fonts.row_height(&font);
+            });
+        });
+        output.textures_delta.clear();
+        // DejaVu Sans Mono's 1233/2048 em sets the cell.
+        assert!((cell_width - 7.83).abs() < 0.01, "cell is {cell_width}");
+        // Its hhea ascent and descent (1901 and -483 of 2048) at 13pt, each
+        // rounded by egui to 1/32 pt: 12.0625 + 3.0625.
+        assert_eq!(row_height, 15.125);
+
+        // Only the bundled faces, so a glyph found here comes from neither Hack,
+        // whose advance equals DejaVu's, nor a system face.
+        let bundled = egui::FontFamily::Name("bundled-terminal".into());
+        let mut definitions = egui::FontDefinitions::empty();
+        for (name, bytes) in crate::render::TERMINAL_FACES {
+            definitions.font_data.insert(
+                name.to_owned(),
+                std::sync::Arc::new(egui::FontData::from_static(bytes)),
+            );
+            definitions
+                .families
+                .entry(bundled.clone())
+                .or_default()
+                .push(name.to_owned());
+        }
+        let ctx = egui::Context::default();
+        ctx.set_fonts(definitions);
+        let font = egui::FontId::new(13.0, bundled);
+        let mut misfits = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                // An Iosevka symbol is 0.6 em, 0.3% under the cell: it is
+                // centered, never shrunk.
+                misfits = CLAUDE_CODE_SYMBOLS
+                    .into_iter()
+                    .filter(|&ch| {
+                        let width = fonts.glyph_width(&font, ch);
+                        !fonts.has_glyph(&font, ch)
+                            || !(cell_width * 0.99..=cell_width * 1.01).contains(&width)
+                    })
+                    .collect();
+            });
+        });
+        output.textures_delta.clear();
+        assert!(misfits.is_empty(), "not at the cell advance: {misfits:?}");
+    }
+
+    #[test]
+    fn claude_code_symbols_are_font_text_in_one_cell() {
+        for ch in CLAUDE_CODE_SYMBOLS {
+            assert!(classify(ch).is_none(), "{ch} is font text");
+            let spans = layout_spans(3, 1, &ch.to_string(), false);
+            assert!(
+                matches!(
+                    spans[..],
+                    [Span::Text {
+                        col: 3,
+                        cols: 1,
+                        ..
+                    }]
+                ),
+                "{ch} keeps its one cell"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_font_has_a_multiplication_sign() {
+        let ctx = egui::Context::default();
+        crate::render::install_terminal_font(&ctx);
         let mut has = false;
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             has = ui
                 .ctx()
-                .fonts_mut(|fonts| fonts.has_glyph(&egui::FontId::monospace(13.0), '×'));
+                .fonts_mut(|fonts| fonts.has_glyph(&crate::render::terminal_font(13.0), '×'));
         });
         output.textures_delta.clear();
         assert!(has, "the OpenCode tab close mark needs its own geometry");
