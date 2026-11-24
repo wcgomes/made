@@ -584,7 +584,6 @@ pub struct Workbench {
     last_tick_active: bool,
     benchmark_frames: bool,
     pending_notice: Option<(String, Instant)>,
-    last_title: Option<String>,
     remote: Option<RemoteTab>,
     remote_preview: RemotePreviewView,
     remote_explorer_cache: crate::explorer_view::RemoteExplorerCache,
@@ -894,7 +893,6 @@ impl Workbench {
             last_tick_active: false,
             benchmark_frames: false,
             pending_notice: None,
-            last_title: None,
             remote,
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
@@ -3996,10 +3994,6 @@ impl Workbench {
             );
         }
 
-        if self.visible {
-            self.update_window_title(ctx);
-        }
-
         let recent_activity =
             now.saturating_duration_since(self.last_activity) < Duration::from_millis(250);
         let sampleable = self.last_tick_active;
@@ -4764,29 +4758,6 @@ impl Workbench {
             failed: self.git_status.failed && self.git_status.snapshot.is_none(),
             loading,
         });
-    }
-
-    fn update_window_title(&mut self, ctx: &egui::Context) {
-        let workspace = self
-            .plan
-            .as_ref()
-            .map(|plan| plan.workspace.display_name().to_owned())
-            .unwrap_or_else(|| "workspace unavailable".to_owned());
-        let terminal_title = self
-            .terminal
-            .as_ref()
-            .and_then(TerminalPane::title)
-            .map(|title| sanitize_display(title.trim(), 160))
-            .filter(|title| !title.is_empty());
-        let title = match terminal_title {
-            Some(title) => format!("{title} — {BASE_TITLE}"),
-            None => format!("{BASE_TITLE} — {workspace}"),
-        };
-        let title = sanitize_copy_text(&title, self.token(), 220);
-        if self.last_title.as_deref() != Some(title.as_str()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.last_title = Some(title);
-        }
     }
 
     /// Terminate the child, stop the bridge, verify config immutability, and
@@ -5829,7 +5800,6 @@ mod tests {
             last_tick_active: false,
             benchmark_frames: false,
             pending_notice: None,
-            last_title: None,
             remote: None,
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
@@ -5868,7 +5838,6 @@ mod tests {
         );
 
         probe.terminal_target = TerminalTarget::Tui(GROK);
-        probe.last_title = Some("OpenCode".to_owned());
         assert!(
             probe.grok_follow_running(),
             "a living Grok target counts even when another label owns the title"
