@@ -323,13 +323,20 @@ impl TabState for ClaudeTabState {
         }
         // Claude Code fires no hook for `/cd`: follow it through the agents
         // snapshot while this local tab owns a live session.
-        if !io.remote && runtime.tab.session_count() > 0 {
-            if let Some(snapshot) = super::agents::demand() {
-                runtime
-                    .tab
-                    .apply_agent_cwds(&snapshot.entries, snapshot.started_at);
-            }
+        let snapshot = (!io.remote && runtime.tab.session_count() > 0)
+            .then(super::agents::demand)
+            .flatten();
+        if let Some(snapshot) = &snapshot {
+            runtime
+                .tab
+                .apply_agent_cwds(&snapshot.entries, snapshot.started_at);
         }
+        // A background session opened from the agent view is named only by
+        // the window title.
+        let entries = snapshot
+            .as_deref()
+            .map_or(&[][..], |snapshot| snapshot.entries.as_slice());
+        runtime.tab.apply_attached_title(entries, terminal.title());
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);
         } else if runtime.present_since.take().is_some() {

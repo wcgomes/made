@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
-use super::agents::{cwd_for_pid, AgentCwd};
+use super::agents::{background_cwd_for_title, cwd_for_pid, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
@@ -676,6 +676,9 @@ pub struct ClaudeTab {
     /// Ids of sessions that ended, newest last. Records still in flight after
     /// a session's end are ignored.
     closed: Vec<String>,
+    /// Directory of the background session the window title names while it is
+    /// attached from the agent view. Untrusted and unvalidated.
+    attached: Option<String>,
 }
 
 impl ClaudeTab {
@@ -691,6 +694,7 @@ impl ClaudeTab {
             protocol: None,
             status_seen: false,
             closed: Vec::new(),
+            attached: None,
         }
     }
 
@@ -861,6 +865,25 @@ impl ClaudeTab {
         }
     }
 
+    /// Follow a background session opened from the agent view. Only while a
+    /// live owned session hosts it and a protocol status is live (when the
+    /// window title is trusted for the tooltip), a `window_title` that names
+    /// exactly one background entry attaches that entry's directory; anything
+    /// else detaches it.
+    pub(crate) fn apply_attached_title(
+        &mut self,
+        entries: &[AgentCwd],
+        window_title: Option<&str>,
+    ) {
+        self.attached = if self.protocol.is_some() && !self.sessions.is_empty() {
+            window_title
+                .and_then(|title| background_cwd_for_title(entries, title))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+    }
+
     /// Drop sessions whose Claude Code process has exited. Returns whether any
     /// session was dropped.
     ///
@@ -994,9 +1017,15 @@ impl ClaudeTab {
         pick(false).or_else(|| pick(true))
     }
 
-    /// The working directory of the most recent live owned session, exactly as
-    /// the hook reported it. Callers validate it before use.
+    /// The working directory of the background session attached from the agent
+    /// view while one is, otherwise of the most recent live owned session,
+    /// exactly as reported. Callers validate it before use.
     pub fn directory(&self) -> Option<String> {
+        if !self.sessions.is_empty() {
+            if let Some(attached) = &self.attached {
+                return Some(attached.clone());
+            }
+        }
         let session = &self.sessions[self.latest()?];
         (!session.cwd.is_empty()).then(|| session.cwd.clone())
     }

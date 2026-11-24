@@ -9,8 +9,14 @@
 //! owned Claude Code pids. Every failure leaves the previous snapshot in place,
 //! and the worker stops once no tab has asked for a snapshot for a while.
 //!
-//! Only `pid`, `cwd` and `kind` are deserialized; every other field of the
-//! output is skipped without being copied, and nothing is logged.
+//! A background session opened from Claude Code's agent view runs under the
+//! Claude Code daemon, not under the tab, so it is never matched by pid. While
+//! the tab's host session shows a live status, the tab's window title names the
+//! attached session: a title that equals the `name` of exactly one background
+//! entry selects that entry's directory ([`background_cwd_for_title`]).
+//!
+//! Only `pid`, `cwd`, `kind` and `name` are deserialized; every other field of
+//! the output is skipped without being copied, and nothing is logged.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -23,7 +29,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use super::follow::MAX_TITLE_CHARS;
 use crate::integrations::CLAUDE_CODE;
+use crate::sanitize::sanitize_display;
 
 /// Interval between the starts of two runs.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -43,6 +51,11 @@ pub(crate) struct AgentCwd {
     pub pid: u32,
     /// Untrusted and unvalidated, exactly like a hook record's `cwd`.
     pub cwd: String,
+    /// A background (agent-view) session: matched only by name, never by pid.
+    pub background: bool,
+    /// The session name normalized by [`normalize_title`]; kept only for
+    /// background sessions. Untrusted display text, never logged.
+    pub name: String,
 }
 
 /// The output of one successful run.
@@ -61,31 +74,78 @@ struct RawAgent {
     cwd: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Parse `claude agents --json` output, or `None` when it is not a JSON array
-/// of agents. Background (agent-view) sessions and entries without a pid or a
-/// directory are dropped.
+/// of agents. Entries without a pid or a directory are dropped.
 pub(crate) fn parse_agents(json: &[u8]) -> Option<Vec<AgentCwd>> {
     let raw: Vec<RawAgent> = serde_json::from_slice(json).ok()?;
     Some(
         raw.into_iter()
-            .filter(|agent| agent.kind.as_deref() != Some("background"))
             .filter_map(|agent| {
                 let pid = agent.pid.filter(|pid| *pid != 0)?;
                 let cwd = agent.cwd.filter(|cwd| !cwd.is_empty())?;
-                Some(AgentCwd { pid, cwd })
+                let background = agent.kind.as_deref() == Some("background");
+                let name = match agent.name.as_deref() {
+                    Some(name) if background => normalize_title(name),
+                    _ => String::new(),
+                };
+                Some(AgentCwd {
+                    pid,
+                    cwd,
+                    background,
+                    name,
+                })
             })
             .collect(),
     )
 }
 
-/// The directory `entries` report for the Claude Code process `pid`.
+/// The directory `entries` report for the Claude Code process `pid`. A
+/// background session never matches by pid.
 pub(crate) fn cwd_for_pid(entries: &[AgentCwd], pid: u32) -> Option<&str> {
     entries
         .iter()
-        .find(|entry| entry.pid == pid)
+        .find(|entry| !entry.background && entry.pid == pid)
         .map(|entry| entry.cwd.as_str())
+}
+
+/// Whether `c` is a status glyph Claude Code may put before its window title:
+/// a Braille spinner frame (U+2800 to U+28FF), a Dingbats star or asterisk
+/// (U+2700 to U+27BF, such as `✳` and `✻`), a middle dot or a bullet.
+fn is_title_glyph(c: char) -> bool {
+    matches!(c, '\u{2800}'..='\u{28FF}' | '\u{2700}'..='\u{27BF}' | '·' | '•' | '●')
+}
+
+/// A window title or session name reduced to the text that is compared:
+/// sanitized and capped exactly as the tooltip title is, then every leading
+/// status glyph and whitespace character removed, then trailing whitespace
+/// removed.
+pub(crate) fn normalize_title(text: &str) -> String {
+    sanitize_display(text, MAX_TITLE_CHARS)
+        .trim_start_matches(|c: char| c.is_whitespace() || is_title_glyph(c))
+        .trim_end()
+        .to_owned()
+}
+
+/// The directory of the one background session whose name equals the
+/// normalized `title`. An empty title, no match or more than one background
+/// session with that name gives `None`; interactive sessions never match.
+pub(crate) fn background_cwd_for_title<'a>(
+    entries: &'a [AgentCwd],
+    title: &str,
+) -> Option<&'a str> {
+    let title = normalize_title(title);
+    if title.is_empty() {
+        return None;
+    }
+    let mut matches = entries
+        .iter()
+        .filter(|entry| entry.background && entry.name == title);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first.cwd.as_str())
 }
 
 struct Poller {
@@ -216,10 +276,10 @@ mod tests {
         let entries = parse_agents(OUTPUT.as_bytes()).expect("a JSON array");
         assert_eq!(
             entries,
-            vec![AgentCwd {
-                pid: 4202,
-                cwd: "/work/after-cd".to_owned(),
-            }]
+            vec![
+                background(4101, "/work/background", "n"),
+                interactive(4202, "/work/after-cd"),
+            ]
         );
         assert_eq!(cwd_for_pid(&entries, 4202), Some("/work/after-cd"));
         // A background session never matches, nor does a pid with no cwd.
@@ -235,8 +295,123 @@ mod tests {
     fn real_claude_agents_output_parses() {
         let entries = run_agents().expect("claude agents --json ran and parsed");
         let pids: Vec<u32> = entries.iter().map(|entry| entry.pid).collect();
-        eprintln!("interactive agent pids: {pids:?}");
+        eprintln!("agent pids: {pids:?}");
         assert!(entries.iter().all(|entry| !entry.cwd.is_empty()));
+    }
+
+    fn interactive(pid: u32, cwd: &str) -> AgentCwd {
+        AgentCwd {
+            pid,
+            cwd: cwd.to_owned(),
+            background: false,
+            name: String::new(),
+        }
+    }
+
+    fn background(pid: u32, cwd: &str, name: &str) -> AgentCwd {
+        AgentCwd {
+            pid,
+            cwd: cwd.to_owned(),
+            background: true,
+            name: normalize_title(name),
+        }
+    }
+
+    #[test]
+    fn a_title_selects_exactly_one_background_session() {
+        let entries = vec![
+            background(90172, "/work/spec", "Spec grok-native-hook pendências"),
+            background(90173, "/work/other", "Other task"),
+        ];
+        assert_eq!(
+            background_cwd_for_title(&entries, "Spec grok-native-hook pendências"),
+            Some("/work/spec")
+        );
+    }
+
+    #[test]
+    fn a_glyph_prefixed_title_matches_its_session() {
+        let entries = vec![background(90172, "/work/spec", "Spec task")];
+        for title in [
+            "✳ Spec task",
+            "⠂ Spec task",
+            "✻  Spec task  ",
+            " · Spec task",
+        ] {
+            assert_eq!(
+                background_cwd_for_title(&entries, title),
+                Some("/work/spec"),
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_that_names_no_background_session_matches_nothing() {
+        let entries = vec![background(90172, "/work/spec", "Spec task")];
+        assert_eq!(background_cwd_for_title(&entries, "Claude Code"), None);
+        assert_eq!(background_cwd_for_title(&entries, "Spec"), None);
+        assert_eq!(background_cwd_for_title(&entries, "✳ "), None);
+        assert_eq!(background_cwd_for_title(&[], "Spec task"), None);
+    }
+
+    #[test]
+    fn duplicate_background_names_match_nothing() {
+        let entries = vec![
+            background(1, "/work/a", "Same name"),
+            background(2, "/work/b", "Same name"),
+        ];
+        assert_eq!(background_cwd_for_title(&entries, "Same name"), None);
+    }
+
+    #[test]
+    fn an_interactive_session_with_the_same_name_is_ignored() {
+        // The parser keeps no name for an interactive session.
+        let parsed =
+            parse_agents(br#"[{"pid":1,"cwd":"/work/a","kind":"interactive","name":"Shared"}]"#)
+                .unwrap();
+        assert_eq!(background_cwd_for_title(&parsed, "Shared"), None);
+        let both = vec![parsed[0].clone(), background(2, "/work/b", "Shared")];
+        assert_eq!(background_cwd_for_title(&both, "Shared"), Some("/work/b"));
+        // A background entry never matches by pid.
+        assert_eq!(cwd_for_pid(&both, 2), None);
+    }
+
+    #[test]
+    fn the_attached_background_directory_falls_back_when_the_title_changes() {
+        use made_terminal::{ProtocolEvent, ProtocolState};
+        let pid = 4202;
+        let alive = |candidate: u32| (candidate == pid).then_some(1);
+        let mut tab = ClaudeTab::new(pid, true);
+        tab.ingest(
+            vec![Record {
+                session_id: "host".to_owned(),
+                cwd: "/work/host".to_owned(),
+                event: "SessionStart".to_owned(),
+                status: Some(HookStatus::Idle),
+                title: String::new(),
+                pids: vec![pid],
+            }],
+            alive,
+        );
+        let entries = vec![
+            interactive(pid, "/work/host"),
+            background(90172, "/work/spec", "Spec task"),
+        ];
+
+        // Without a live status the title is not trusted.
+        tab.apply_attached_title(&entries, Some("✳ Spec task"));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+
+        tab.note_protocol(ProtocolEvent::Status {
+            state: ProtocolState::Working,
+        });
+        tab.apply_attached_title(&entries, Some("✳ Spec task"));
+        assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
+
+        // The title changes: the host session's directory applies again.
+        tab.apply_attached_title(&entries, Some("✳ Claude Code"));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
     }
 
     #[test]
@@ -262,10 +437,7 @@ mod tests {
         };
         let before_hook = Instant::now();
         tab.ingest(vec![record("/work/start")], alive);
-        let entries = vec![AgentCwd {
-            pid,
-            cwd: "/work/after-cd".to_owned(),
-        }];
+        let entries = vec![interactive(pid, "/work/after-cd")];
 
         // A snapshot started before the hook record was read is older.
         tab.apply_agent_cwds(&entries, before_hook);
