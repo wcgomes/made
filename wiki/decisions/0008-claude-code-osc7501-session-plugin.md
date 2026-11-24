@@ -1,6 +1,6 @@
 # 0008: Claude Code via OSC 7501 and a Session-Only Plugin
 
-**Status:** Accepted; implemented in the active change [`claude-code-integration`](../../specs/changes/claude-code-integration/spec.md). Windows and macOS hook behavior is `UNVERIFIED`.
+**Status:** Accepted; implemented and archived as [`20261124-claude-code-integration`](../../specs/changes/archive/20261124-claude-code-integration/spec.md), realized in [`specs/claude-code-session-follow.md`](../../specs/claude-code-session-follow.md). Windows and macOS hook behavior is `UNVERIFIED`.
 
 ## Context
 
@@ -41,4 +41,4 @@ Use two independent, fail-open channels and join them per tab inside Made. Detai
 
 Phase 0 ran 86 runs against claude 2.1.319 to find why reporting sometimes did not enable. With the probe reply written after the DA1 reply, 17 of 54 runs enabled regardless of plugin count, hook count, sync or async, entry order, a nonexistent or duplicated second entry, or no plugin. With an in-order responder 19 of 19 enabled, and a DA1-first control enabled 9 of 13. The earlier "two plugin directories never enable 7501" observation was an artifact of the spike responder's order, not a Claude Code limit.
 
-See [`design.md`](../../specs/changes/claude-code-integration/design.md) and [`proposal.md`](../../specs/changes/claude-code-integration/proposal.md), and the [security model](../security.md).
+See [`design.md`](../../specs/changes/archive/20261124-claude-code-integration/design.md) and [`proposal.md`](../../specs/changes/archive/20261124-claude-code-integration/proposal.md), and the [security model](../security.md).

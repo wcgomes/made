@@ -1,6 +1,6 @@
 # Claude Code
 
-Claude Code is the third integrated TUI. Made learns about it through two independent, fail-open channels and joins them per tab: status from the OSC 7501 Program Status Protocol, and identity plus directory from a session-only plugin. Neither is required; with both missing the tab is a plain shell tab. The normative contract is [`specs/changes/claude-code-integration/spec.md`](../../specs/changes/claude-code-integration/spec.md) (it becomes `specs/claude-code-session-follow.md` at archive); rationale and alternatives are in [ADR 0008](../decisions/0008-claude-code-osc7501-session-plugin.md) and [`design.md`](../../specs/changes/claude-code-integration/design.md). Windows and macOS hook behavior is `UNVERIFIED`.
+Claude Code is the third integrated TUI. Made learns about it through two independent, fail-open channels and joins them per tab: status from the OSC 7501 Program Status Protocol, and identity plus directory from a session-only plugin. Neither is required; with both missing the tab is a plain shell tab. The normative contract is [`specs/claude-code-session-follow.md`](../../specs/claude-code-session-follow.md); rationale and alternatives are in [ADR 0008](../decisions/0008-claude-code-osc7501-session-plugin.md) and the archived [`design.md`](../../specs/changes/archive/20261124-claude-code-integration/design.md). Windows and macOS hook behavior is `UNVERIFIED`.
 
 ## Catalog and launch
 
@@ -72,6 +72,6 @@ For a registered SSH server the `+` flow offers `Claude Code SSH` when that serv
 
 ## Evidence
 
-Phase 0 on claude 2.1.319 (86 runs) traced the intermittent failure to enable reporting to reply ordering, not plugin count; see [ADR 0008](../decisions/0008-claude-code-osc7501-session-plugin.md) for the numbers. Not covered by tests that need no live `claude`: macOS and Windows hook launcher behavior and the Windows separator, left `UNVERIFIED`.
+Phase 0 on claude 2.1.319 (86 runs) traced the intermittent failure to enable reporting to reply ordering, not plugin count; see [ADR 0008](../decisions/0008-claude-code-osc7501-session-plugin.md) for the numbers. Not covered by tests that need no live `claude`: macOS and Windows hook launcher behavior and the Windows separator, left `UNVERIFIED`. Live acceptance on claude 2.1.319 (Linux/WSL) never saw `CwdChanged` fire, so a live working-directory change is also `UNVERIFIED`; fixture tests cover it and the directory rule does not depend on that event.
 
 Related: [Grok](grok.md), [OpenCode bridge](opencode.md), [Terminal-first runtime](../runtime/terminal-first.md).
