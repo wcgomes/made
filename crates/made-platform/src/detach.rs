@@ -402,11 +402,19 @@ pub fn own_process_group(command: &mut std::process::Command) -> &mut std::proce
 /// group it leads when it was started with [`own_process_group`], then reap
 /// it. Made's own process group is never signalled. On Windows only the child
 /// itself is killed.
+///
+/// The group is signalled again right after the reap: a process the child
+/// forked while the first signal was delivered can miss it and would keep the
+/// child's output open. That second signal is safe: while the group still has
+/// a live member its id cannot be reused, and an empty group makes it fail
+/// with `ESRCH`, unless the id was reused in the instant since the reap.
 pub fn kill_child_and_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     kill_foreign_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
+    #[cfg(unix)]
+    kill_foreign_group(child.id());
 }
 
 /// Kill what is left of the process group led by `pid`, a child started with
