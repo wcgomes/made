@@ -82,7 +82,7 @@ Made MUST observe the active OpenCode v2 session identity and working directory 
 
 ### Requirement: Shell Directory Follow
 
-For supported launch-local shell integration, Made MUST follow real directory changes in bash, zsh, fish and PowerShell, including paths with spaces and non-ASCII characters, without requiring user configuration edits. Directory reports MUST be validated as local absolute paths, bounded, and treated as untrusted data, never commands. Made MUST NOT scrape prompts or titles, or inject commands into an already-running shell to discover cwd. Hooks MUST be scoped to that shell launch, preserve existing startup/profile behavior and prompt hooks, and leave user shell files byte-for-byte unchanged. If a shell, launch mode or policy cannot safely support reporting, Made MUST keep the terminal usable at the latest known cwd or initial folder and explain the capability in Diagnostics without claiming live follow. cmd MUST have this explicit fallback unless a safe reporting mechanism is demonstrated; receiving OSC 7 alone MUST NOT be described as guaranteed cmd or arbitrary-shell integration.
+For supported launch-local shell integration, Made MUST follow real directory changes in bash, zsh, fish and PowerShell, including paths with spaces and non-ASCII characters, without requiring user configuration edits. Directory reports MUST be validated as local absolute paths, bounded, and treated as untrusted data, never commands. To discover cwd, Made MUST NOT scrape prompts or titles and MUST NOT inject commands into an already-running shell, and a window title MUST NOT be used as a cwd source. This clause is scoped to cwd discovery; the only window-title read that feeds Claude Code tab presentation or identity is the bounded Claude Code tooltip title allowed by `Claude Code privacy and observation boundary` in `specs/claude-code-session-follow.md`, which is never used for cwd. Hooks MUST be scoped to that shell launch, preserve existing startup/profile behavior and prompt hooks, and leave user shell files byte-for-byte unchanged. If a shell, launch mode or policy cannot safely support reporting, Made MUST keep the terminal usable at the latest known cwd or initial folder and explain the capability in Diagnostics without claiming live follow. cmd MUST have this explicit fallback unless a safe reporting mechanism is demonstrated; receiving OSC 7 alone MUST NOT be described as guaranteed cmd or arbitrary-shell integration.
 
 #### Scenario: Real shell directory change
 
@@ -748,19 +748,19 @@ Diagnostics logs MUST be bounded and retained as one active log plus one previou
 
 ### Requirement: V1 Scope Boundary
 
-Made MUST support OpenCode v2 and the Grok Build session follow defined by `specs/grok-session-follow.md`. The `+` menu MUST be where OpenCode and Grok are offered, each only when it is detected on PATH. Made MUST NOT integrate with any other agent TUI. Made MUST NOT require remote, SSH, or WSL-hosted OpenCode or Grok. Made MUST NOT provide an AI or chat UI that replaces either TUI. Made MUST NOT create, remove, merge, or orchestrate worktrees. Made MUST NOT require a separate OpenCode or Grok server process.
+Made MUST support OpenCode v2, the Grok Build session follow defined by `specs/grok-session-follow.md`, and the Claude Code integration defined by `specs/claude-code-session-follow.md`. The `+` menu MUST be where OpenCode, Grok and Claude Code are offered, each only when it is detected on PATH. Made MUST NOT integrate with any other agent TUI. Made MUST NOT require remote, SSH, or WSL-hosted OpenCode, Grok or Claude Code. Made MUST NOT provide an AI or chat UI that replaces any of these TUIs. Made MUST NOT create, remove, merge, or orchestrate worktrees. Made MUST NOT require a separate OpenCode, Grok or Claude Code server process.
 
 #### Scenario: Unsupported agent not offered
 
 - Given the `+` menu
 - When the user looks for agent integrations
-- Then OpenCode and Grok are the only agent rows the menu can offer, and Claude Code, Codex, ACP, and any other agent integration are not presented
+- Then OpenCode, Grok and Claude Code are the only agent rows the menu can offer, and Codex, ACP, and any other agent integration are not presented
 
 #### Scenario: No replacement chat UI
 
 - Given the Made interface
 - When the user looks for an AI or chat surface
-- Then no AI or chat UI replaces the OpenCode or Grok TUI
+- Then no AI or chat UI replaces the OpenCode, Grok or Claude Code TUI
 
 #### Scenario: Worktree lifecycle remains outside Made
 
@@ -770,6 +770,6 @@ Made MUST support OpenCode v2 and the Grok Build session follow defined by `spec
 
 #### Scenario: Direct launch
 
-- Given a user wants to use OpenCode or Grok with Made
+- Given a user wants to use OpenCode, Grok or Claude Code with Made
 - When they run that command directly in the Made terminal
 - Then follow works without Made starting a separate server or attach process, and the `+` menu does not replace that direct launch

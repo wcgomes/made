@@ -150,17 +150,23 @@ After PATH detection reports grok, Made MUST ensure the shipped `plugins/grok-ma
 
 ### Requirement: Grok tab dots
 
-When OpenCode is not connected in a workspace tab and that tab has open Grok sessions, the tab MUST paint one status dot per open Grok session using the same size, placement, cap of eight, pulse, colors, tooltip summary, and accessible-name summary as OpenCode session dots. Working is busy, attention and error are attention, and idle is idle. A session present only in the inventory, before any hook event, MUST show idle. While OpenCode is not active, a tab whose target is a running Grok TUI, or a shell tab with open Grok sessions, MUST use the label `Grok Build` and the official 16px `grok.svg` mark in the leading icon slot, even before a session exists. Its tooltip MUST be the session summary when sessions exist and MUST omit the workspace path. When that Grok is no longer running and the tab has no open Grok sessions, the label and leading icon MUST return to the folder label and terminal glyph. If OpenCode is active, the label, leading icon, and dots MUST stay OpenCode's even when Grok sessions exist.
+When OpenCode is not connected in a workspace tab, Claude Code is not present there as `specs/claude-code-session-follow.md` defines, and that tab has open Grok sessions, the tab MUST paint one status dot per open Grok session using the same size, placement, cap of eight, pulse, colors, tooltip summary, and accessible-name summary as OpenCode session dots. Working is busy, attention and error are attention, and idle is idle. A session present only in the inventory, before any hook event, MUST show idle. While OpenCode is not active and Claude Code is not present, a tab whose target is a running Grok TUI, or a shell tab with open Grok sessions, MUST use the label `Grok Build` and the official 16px `grok.svg` mark in the leading icon slot, even before a session exists. Its tooltip MUST be the session summary when sessions exist and MUST omit the workspace path. When that Grok is no longer running and the tab has no open Grok sessions, the label and leading icon MUST return to the folder label and terminal glyph, unless Claude Code is present, in which case `specs/claude-code-session-follow.md` owns them. If OpenCode is active, the label, leading icon, and dots MUST stay OpenCode's even when Grok sessions exist. If OpenCode is not active and Claude Code is present, the label, leading icon, and dots MUST be Claude Code's even when Grok sessions exist.
 
 #### Scenario: Dots match session state
 
-- Given a Grok tab whose sessions are working, waiting on a question, and idle
+- Given a Grok tab whose sessions are working, waiting on a question, and idle, with no Claude Code present
 - When the workspace tab is displayed
 - Then it shows a pulsing busy dot, a yellow attention dot, and a neutral idle dot, the label is `Grok Build`, the leading icon is the official `grok.svg` mark, and the tooltip counts those three categories without the workspace path
 
+#### Scenario: Claude Code takes over and hands back the tab
+
+- Given a shell tab showing `Grok Build` with two open Grok sessions
+- When the user starts Claude Code in that tab, and later Claude Code exits while both Grok sessions stay open
+- Then while Claude Code is present the label, leading icon and dots are Claude Code's, and after it exits the tab shows `Grok Build`, the official mark and the two Grok dots again
+
 ### Requirement: Grok yields to OpenCode and returns to the shell
 
-A connected OpenCode session MUST keep the explorer root and the workspace-tab dots. Grok MUST NOT replace them. While OpenCode is not connected, an open Grok session's directory MUST win over the shell directory. When no Grok session remains open for that terminal, the explorer MUST return to the shell directory. Selecting an already-open Grok session, with no new attach and no new prompt, MUST NOT move the explorer.
+A connected OpenCode session MUST keep the explorer root and the workspace-tab dots. Grok MUST NOT replace them. A live owned Claude Code session directory, as `specs/claude-code-session-follow.md` defines, MUST also keep the explorer root over Grok, and Grok MUST NOT replace it. While OpenCode is not connected and the tab has no live owned Claude Code session, an open Grok session's directory MUST win over the shell directory. When no Grok session remains open for that terminal and no OpenCode or Claude Code source applies, the explorer MUST return to the shell directory. Selecting an already-open Grok session, with no new attach and no new prompt, MUST NOT move the explorer.
 
 #### Scenario: OpenCode remains first
 
@@ -168,9 +174,15 @@ A connected OpenCode session MUST keep the explorer root and the workspace-tab d
 - When Grok events arrive
 - Then the explorer root and the tab dots stay on OpenCode
 
+#### Scenario: Claude Code outranks Grok for the root
+
+- Given a live owned Claude Code session and an open Grok session in the same tab, with the explorer on the Claude Code session directory
+- When a Grok session attaches or receives a prompt
+- Then the explorer stays on the Claude Code session directory, and when Claude Code exits the explorer moves to the open Grok session's directory
+
 #### Scenario: Grok exit restores the shell
 
-- Given the explorer is following a Grok session
+- Given the explorer is following a Grok session and no OpenCode or Claude Code source applies
 - When that terminal no longer has an open Grok session
 - Then the explorer returns to the shell directory
 
@@ -182,7 +194,7 @@ A connected OpenCode session MUST keep the explorer root and the workspace-tab d
 
 ### Requirement: Catalog-driven new-tab menu
 
-The `+` control MUST keep the tooltip and accessible name Open folder, and its behavior MUST be driven by the integrated-TUI catalog rather than by a special case for one program. Detecting a catalog entry MUST be a metadata-only PATH lookup that never spawns the program, never checks a version, and never installs a plugin, and that lookup MUST NOT delay shell or explorer startup. Empty and relative PATH segments MUST be ignored. When no integrated TUI is detected, `+` MUST open the folder picker and MUST show no menu. When any integrated TUI is detected, `+` MUST open a menu whose first row is Terminal, using the existing terminal glyph and the existing folder-picker flow, then one row for each detected integrated TUI in catalog order. Catalog order MUST be OpenCode, then Grok, and a program that is not on PATH MUST be omitted. Choosing a TUI row MUST start that executable's absolute path directly as the child of a new home-directory tab, with no shell first and no folder picker, and the current tab MUST keep running. Made MUST NOT launch an integrated TUI unless the user chooses its row. The OpenCode row MUST keep the vendored 16px opencode.svg and MUST keep its existing launch, including its per-launch plugin configuration injection, follow, and dots. The Grok row label MUST be Grok Build, and its 16px leading slot MUST paint the official mark in `grok.svg` (the two paths from https://grok.com/images/favicon.svg, fill #FCFCFC, viewBox "56 56 400 400") rather than the terminal glyph. Choosing Grok MUST launch grok's absolute path with the single argument `dashboard`. That launch MUST NOT inject plugin configuration, including OpenCode's plugin environment, and MUST NOT write the user's Grok config. Claude Code and Codex MUST stay out of the catalog. Typing grok in a shell MUST remain valid, MUST NOT be replaced by the menu, and MUST NOT be given the `dashboard` argument.
+The `+` control MUST keep the tooltip and accessible name Open folder, and its behavior MUST be driven by the integrated-TUI catalog rather than by a special case for one program. Detecting a catalog entry MUST be a metadata-only PATH lookup that never spawns the program, never checks a version, and never installs a plugin, and that lookup MUST NOT delay shell or explorer startup. Empty and relative PATH segments MUST be ignored. When no integrated TUI is detected, `+` MUST open the folder picker and MUST show no menu. When any integrated TUI is detected, `+` MUST open a menu whose first row is Terminal, using the existing terminal glyph and the existing folder-picker flow, then one row for each detected integrated TUI in catalog order. Catalog order MUST be OpenCode, then Grok, then Claude Code, and a program that is not on PATH MUST be omitted. Choosing a TUI row MUST start that executable's absolute path directly as the child of a new home-directory tab, with no shell first and no folder picker, and the current tab MUST keep running. Made MUST NOT launch an integrated TUI unless the user chooses its row. The OpenCode row MUST keep the vendored 16px opencode.svg and MUST keep its existing launch, including its per-launch plugin configuration injection, follow, and dots. The Grok row label MUST be Grok Build, and its 16px leading slot MUST paint the official mark in `grok.svg` (the two paths from https://grok.com/images/favicon.svg, fill #FCFCFC, viewBox "56 56 400 400") rather than the terminal glyph. Choosing Grok MUST launch grok's absolute path with the single argument `dashboard`. That launch MUST NOT inject plugin configuration, including OpenCode's plugin environment and Made's Claude Code plugin entry, and MUST NOT write the user's Grok config. The Claude Code row's label, mark and launch are owned by `specs/claude-code-session-follow.md`. Codex and any other agent TUI MUST stay out of the catalog. Typing grok in a shell MUST remain valid, MUST NOT be replaced by the menu, and MUST NOT be given the `dashboard` argument.
 
 #### Scenario: No detected TUI opens the folder picker
 
@@ -192,15 +204,15 @@ The `+` control MUST keep the tooltip and accessible name Open folder, and its b
 
 #### Scenario: Catalog menu lists detected TUIs in order
 
-- Given OpenCode and Grok are both on PATH
+- Given OpenCode, Grok and Claude Code are all on PATH
 - When the user activates `+`
-- Then the menu is Terminal, then OpenCode, then Grok, and the `+` tooltip and accessible name stay Open folder
+- Then the menu is Terminal, then OpenCode, then Grok, then Claude Code, and the `+` tooltip and accessible name stay Open folder
 
 #### Scenario: Only Grok is installed
 
-- Given Grok is on PATH and OpenCode is not
+- Given Grok is on PATH and neither OpenCode nor Claude Code is
 - When the user activates `+`
-- Then the menu is Terminal, then Grok, and OpenCode is omitted
+- Then the menu is Terminal, then Grok, and OpenCode and Claude Code are omitted
 
 #### Scenario: Grok row uses the official mark
 
@@ -218,7 +230,7 @@ The `+` control MUST keep the tooltip and accessible name Open folder, and its b
 
 - Given a tab is running and Grok is on PATH
 - When the user chooses Grok
-- Then Made starts grok's absolute path plus the argument `dashboard` directly as the child of a new home-directory tab, with no shell first and no folder picker, the current tab keeps running, that launch does not inject plugin configuration or write the user's Grok config, and typing grok in a shell is not given that argument
+- Then Made starts grok's absolute path plus the argument `dashboard` directly as the child of a new home-directory tab, with no shell first and no folder picker, the current tab keeps running, that launch does not inject plugin configuration, OpenCode's plugin environment or Made's Claude Code plugin entry, and does not write the user's Grok config, and typing grok in a shell is not given that argument
 
 #### Scenario: Terminal row still opens the folder picker
 
@@ -243,6 +255,12 @@ The `+` control MUST keep the tooltip and accessible name Open folder, and its b
 - Given Grok is on PATH
 - When the user types grok in a shell tab and does not choose the Grok row
 - Then Made does not launch Grok on its own, and that shell session remains a valid way to start Grok
+
+#### Scenario: Other agents stay out
+
+- Given Codex or another agent TUI is on PATH
+- When the user activates `+`
+- Then no row is shown for it
 
 ### Requirement: Grok Build diagnostics row
 
