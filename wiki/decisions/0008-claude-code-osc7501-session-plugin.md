@@ -26,7 +26,7 @@ Use two independent, fail-open channels and join them per tab inside Made. Detai
 - **`claude plugin install`:** persists into user configuration and affects Claude Code outside Made.
 - **`--plugin-dir` on the direct launch:** misses a shell-typed `claude`, and the contract forbids adding arguments.
 - **Title glyph parsing** (`✳` idle, `◐`/`◑` working): unstructured and version-fragile.
-- **`claude agents --json`:** works, but spawns `claude` on a poll, which the metadata-only detection rule avoids. Out of contract. *Note (2026-11-24):* adopted for explorer follow after `/cd` was observed to fire no hook on claude 2.1.331; it is polled about once a second only while a tab has a live owned session, without a shell and with a 2 s timeout, and detection itself still never spawns `claude`.
+- **`claude agents --json`:** works, but spawns `claude` on a poll, which the metadata-only detection rule avoids. Out of contract. *Note (2026-11-24):* adopted for explorer follow after `/cd` was observed to fire no hook on claude 2.1.331; it runs without a shell and with a 2 s timeout, and detection itself still never spawns `claude`. *Note (2026-11-25):* the fixed ~1 s poll cost about 7% of a core and was replaced by short bursts of runs triggered by input submitted to, or a title change in, a tab owning a live session; a watcher on `~/.claude/sessions` was rejected (internal format, a 0600 `.key` secret in the same directory, and Made never opens `~/.claude/**`). See [explorer follow](../integration/claude-code.md#explorer-follow).
 
 ## Consequences
 
