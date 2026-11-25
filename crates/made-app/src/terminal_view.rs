@@ -118,8 +118,15 @@ impl PendingInput {
 }
 
 /// Leaves the alternate screen and resets the input and display modes a
-/// full-screen program may leave set when it exits.
-const LEAVE_PROGRAM_MODES: &[u8] = b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<99u";
+/// full-screen program may leave set when it exits: the scroll region and
+/// origin mode (with the cursor kept where it is), autowrap, attributes,
+/// cursor visibility and shape, cursor and keypad application modes, mouse
+/// and focus reporting, bracketed paste and the window title.
+const LEAVE_PROGRAM_MODES: &[u8] = b"\x1b[?1049l\x1b7\x1b[?6l\x1b[r\x1b8\x1b[?7h\x1b[0m\x1b[?25h\x1b[0 q\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]2;\x07";
+
+/// Longest wait for output a finished child printed before its exit was
+/// reported.
+const EXIT_OUTPUT_DRAIN: Duration = Duration::from_millis(100);
 
 /// Initial grid used before the first layout pass.
 pub const DEFAULT_ROWS: usize = 36;
@@ -668,7 +675,8 @@ impl TerminalPane {
         }
 
         self.encoder.set_modes(self.core.input_modes());
-        self.title = self.core.title();
+        // An empty title (OSC 2 with no text) clears it.
+        self.title = self.core.title().filter(|title| !title.is_empty());
         self.note_cwd_after_feed();
 
         if self.exit.is_some()
@@ -1207,11 +1215,16 @@ impl TerminalPane {
         target: TerminalTarget,
         log: &mut DiagnosticLog,
     ) -> Result<(), PtyError> {
-        // A finished child reports its exit on every later poll, so the drain
-        // stops at the first event that is not output.
-        while let Some(made_terminal::PtyEvent::Data(data)) = self.poll_io() {
-            self.output_bytes = self.output_bytes.saturating_add(data.len() as u64);
-            self.core.feed(&data);
+        // The exit can be reported before the reader forwarded the child's
+        // last bytes: read on until the output closes, briefly.
+        if let Some(pty) = self.pty.as_ref() {
+            let deadline = Instant::now() + EXIT_OUTPUT_DRAIN;
+            while let Ok(made_terminal::PtyEvent::Data(data)) =
+                pty.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                self.output_bytes = self.output_bytes.saturating_add(data.len() as u64);
+                self.core.feed(&data);
+            }
         }
         self.terminate(log);
         let options = options.with_size(self.options.size);
@@ -1222,7 +1235,7 @@ impl TerminalPane {
         self.reset_for_new_child(pty);
         // Reports the old child made are not the new child's.
         self.cwd_reports_seen = self.core.cwd_report_count();
-        self.title = self.core.title();
+        self.title = None;
         self.cwd = self.core.cwd().map(Path::to_path_buf);
         log.record(
             LogLevel::Info,
@@ -2617,6 +2630,56 @@ mod tests {
         // clears them without blocking the UI.
         pane.terminate(&mut log);
         assert!(!pane.has_pending_input());
+    }
+
+    /// Pump `pane` until `done` holds.
+    #[cfg(unix)]
+    fn pump_until(pane: &mut TerminalPane, done: impl Fn(&TerminalPane) -> bool) {
+        let mut log = DiagnosticLog::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(pane) && Instant::now() < deadline {
+            pane.pump(&mut log);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done(pane), "{}", pane.screen_text());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relaunch_in_place_resets_the_scroll_region_and_keeps_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let stand_in = |script: &str| {
+            PtyOptions::new(temp.path())
+                .with_shell("/bin/sh")
+                .with_args(["-c", script])
+        };
+        // The old child leaves a scroll region of rows 3-5 with the cursor on
+        // its last row.
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            stand_in("printf '\\033[3;5r\\033[4;1Hhint\\n'; exit 0")
+                .with_size(made_platform::PtySize { rows: 24, cols: 80 }),
+        )
+        .expect("spawn the old child");
+        pump_until(&mut pane, |pane| pane.exit_status().is_some());
+        let mut log = DiagnosticLog::new();
+        pane.relaunch_in_place(
+            &platform,
+            stand_in("printf 'L1\\nL2\\nL3\\nL4\\nL5\\nL6\\n'; sleep 5"),
+            TerminalTarget::Shell,
+            &mut log,
+        )
+        .expect("relaunch in place");
+        pump_until(&mut pane, |pane| pane.screen_text().contains("L6"));
+        let screen = pane.screen_text();
+        // Inside a leftover region every new line would scroll rows 3-5 and
+        // push the earlier lines out.
+        for line in ["hint", "L1", "L2", "L3", "L4", "L5", "L6"] {
+            assert!(screen.contains(line), "{line} is missing:\n{screen}");
+        }
+        assert!(screen.find("hint") < screen.find("L1"), "{screen}");
+        pane.terminate(&mut log);
     }
 
     #[test]

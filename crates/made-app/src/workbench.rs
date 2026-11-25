@@ -1222,7 +1222,9 @@ impl Workbench {
             &self.platform,
             launch_pty_options(
                 &self.platform,
-                made_terminal::PtyOptions::new(&self.terminal_cwd),
+                TerminalTarget::Shell
+                    .pty_options(self.terminal_cwd.clone(), std::ffi::OsStr::new(""))
+                    .expect("the shell is always available"),
                 size,
                 &contributions,
             ),
@@ -1237,7 +1239,9 @@ impl Workbench {
                 &self.platform,
                 launch_pty_options(
                     &self.platform,
-                    made_terminal::PtyOptions::new(&fallback),
+                    TerminalTarget::Shell
+                        .pty_options(fallback.clone(), std::ffi::OsStr::new(""))
+                        .expect("the shell is always available"),
                     size,
                     &contributions,
                 ),
@@ -5446,10 +5450,6 @@ impl Drop for ShellRootWorker {
     }
 }
 
-/// Give a local terminal a UTF-8 `LC_CTYPE` when the environment it would get
-/// has no UTF-8 locale. An app started from Finder inherits no `LANG`, and
-/// macOS `/bin/bash` 3.2 then drops typed accented characters. Windows consoles
-/// do not use POSIX locales and are left as they are.
 /// The PTY options of a local terminal launch: `options` at `size` with the
 /// integrations' `contributions` and a UTF-8 character type.
 fn launch_pty_options(
@@ -5470,6 +5470,10 @@ fn launch_pty_options(
     with_utf8_ctype(platform, apply_contributions(contributions, options))
 }
 
+/// Give a local terminal a UTF-8 `LC_CTYPE` when the environment it would get
+/// has no UTF-8 locale. An app started from Finder inherits no `LANG`, and
+/// macOS `/bin/bash` 3.2 then drops typed accented characters. Windows consoles
+/// do not use POSIX locales and are left as they are.
 fn with_utf8_ctype(
     platform: &dyn Platform,
     options: made_terminal::PtyOptions,
@@ -6207,6 +6211,36 @@ mod tests {
         let terminal = probe.terminal.as_ref().unwrap();
         assert_eq!(terminal.options().cwd, launch);
         assert_eq!(probe.explorer_root(), Some(launch.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_that_exits_right_after_printing_keeps_that_output_and_no_title() {
+        if in_isolated_child("a_tui_that_exits_right_after_printing_keeps_that_output_and_no_title")
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let followed = temp.path().join("followed");
+        std::fs::create_dir_all(&followed).unwrap();
+        // No pause before the exit: the exit may be reported before the
+        // reader forwarded the last bytes.
+        let mut probe = exiting_tui(
+            temp.path(),
+            &followed,
+            "printf '\\033]2;TUI-TITLE\\007exit-marker\\n'; exit 0",
+        );
+        tick_until(&mut probe, is_shell_tab);
+        // Later pumps read the title back from the emulator.
+        let ctx = egui::Context::default();
+        for _ in 0..5 {
+            probe.tick(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let terminal = probe.terminal.as_ref().unwrap();
+        let screen = terminal.screen_text();
+        assert!(screen.contains("exit-marker"), "{screen}");
+        assert_eq!(terminal.title(), None, "the TUI's title is cleared");
     }
 
     /// Tick until the stand-in TUI ran `script` to its end, then once more.
