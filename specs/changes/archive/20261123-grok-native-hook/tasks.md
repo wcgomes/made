@@ -2,7 +2,7 @@
 
 Readiness: `analyze` must pass before implementation; review runs `verify` against the persisted spec.
 
-Task IDs are stable because `specs/changes/add-release-auto-update/tasks.md` cites them; where a later ID is listed earlier, the list order is the dependency order. Tasks 2.6 through 6.3 land in a single merge to main.
+Task IDs are stable because `specs/changes/archive/20261125-add-release-auto-update/tasks.md` cites them; where a later ID is listed earlier, the list order is the dependency order. Tasks 2.6 through 6.3 land in a single merge to main.
 
 ## 0. Verify Grok facts (0.1 gates 1.5, 2.5, 2.6 and 6.1; 0.2 gates 3.1, 3.3 and all remote work in phases 4 and 5; 0.3 gates 1.9)
 - [x] 0.1 [P] Verify how Grok on Windows resolves a hooks.json `command` of `bin/made-grok-status` against `bin/made-grok-status.exe`, using real grok on a Windows runner when available, otherwise documented Grok evidence; record the result and the chosen branch in the decision index; with neither real grok nor documentation, select the generated Windows hooks.json branch (path: specs/changes/grok-native-hook/proposal.md)

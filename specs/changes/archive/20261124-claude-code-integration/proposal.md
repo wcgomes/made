@@ -90,6 +90,6 @@ Conflicts and overlaps flagged, not resolved here:
 - **REL-03 (installed layout):** the installed layout MUST contain `plugins/claude-code-made` with its manifest (`.claude-plugin/plugin.json`), `hooks/hooks.json`, README and the executable native hook `bin/made-claude-status` (`bin/made-claude-status.exe` on Windows) for the release target, resolved from the install root without download.
 - **REL-04 (no prerequisite):** the bundled-plugin rule covers `claude-code-made`: its hook is a native executable that needs no interpreter or other prerequisite and keeps its executable bit.
 
-Application depends on archive order: if `add-release-auto-update` archives first, this change adds a MODIFIED REL-03/REL-04 entry (carrying these clauses) before its own archive; otherwise the clauses are handed to that change's archive. `specs/changes/add-release-auto-update/` is not edited by this change.
+Application depends on archive order: if `add-release-auto-update` archives first, this change adds a MODIFIED REL-03/REL-04 entry (carrying these clauses) before its own archive; otherwise the clauses are handed to that change's archive. `specs/changes/archive/20261125-add-release-auto-update/` is not edited by this change.
 
 Outcome at archive (2026-11-24): `add-release-auto-update` was still active, so no REL-03/REL-04 entry is added here; the two clauses above are handed to that change's archive.
