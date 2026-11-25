@@ -82,7 +82,7 @@ Made MUST observe the active OpenCode v2 session identity and working directory 
 
 ### Requirement: Shell Directory Follow
 
-For supported launch-local shell integration, Made MUST follow real directory changes in bash, zsh, fish and PowerShell, including paths with spaces and non-ASCII characters, without requiring user configuration edits. Directory reports MUST be validated as local absolute paths, bounded, and treated as untrusted data, never commands. To discover cwd, Made MUST NOT scrape prompts or titles and MUST NOT inject commands into an already-running shell, and a window title MUST NOT be used as a cwd source. This clause is scoped to cwd discovery; the only window-title read that feeds Claude Code tab presentation or identity is the bounded Claude Code tooltip title allowed by `Claude Code privacy and observation boundary` in `specs/claude-code-session-follow.md`, which is never used for cwd. Hooks MUST be scoped to that shell launch, preserve existing startup/profile behavior and prompt hooks, and leave user shell files byte-for-byte unchanged. If a shell, launch mode or policy cannot safely support reporting, Made MUST keep the terminal usable at the latest known cwd or initial folder and explain the capability in Diagnostics without claiming live follow. cmd MUST have this explicit fallback unless a safe reporting mechanism is demonstrated; receiving OSC 7 alone MUST NOT be described as guaranteed cmd or arbitrary-shell integration.
+For supported launch-local shell integration, Made MUST follow real directory changes in bash, zsh, fish and PowerShell, including paths with spaces and non-ASCII characters, without requiring user configuration edits. Directory reports MUST be validated as local absolute paths, bounded, and treated as untrusted data, never commands. To discover cwd, Made MUST NOT scrape prompts or titles and MUST NOT inject commands into an already-running shell, and a window title MUST NOT be used as a cwd source. This clause is scoped to cwd discovery; the only window-title read that feeds Claude Code tab presentation or identity is the bounded Claude Code tooltip title allowed by `Claude Code privacy and observation boundary` in `specs/claude-code-session-follow.md`, which never supplies a cwd: its single exception only selects, by exact normalized name, one of the background sessions listed by `claude agents --json`, whose directory comes from that listing (`Claude Code agent-view session follow`). Hooks MUST be scoped to that shell launch, preserve existing startup/profile behavior and prompt hooks, and leave user shell files byte-for-byte unchanged. If a shell, launch mode or policy cannot safely support reporting, Made MUST keep the terminal usable at the latest known cwd or initial folder and explain the capability in Diagnostics without claiming live follow. cmd MUST have this explicit fallback unless a safe reporting mechanism is demonstrated; receiving OSC 7 alone MUST NOT be described as guaranteed cmd or arbitrary-shell integration.
 
 #### Scenario: Real shell directory change
 
@@ -116,7 +116,7 @@ For supported launch-local shell integration, Made MUST follow real directory ch
 
 ### Requirement: Independent Workspace Tabs
 
-Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state including the connected view directory, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. No tab persistence across app restart is required.
+Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state including the connected view directory, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. When a local tab's terminal child exits with status 0 and neither its output nor its monitor failed, Made MUST NOT show an exit banner. A tab whose terminal child is a TUI, whether launched from the `+` menu or at startup, MUST then start the interactive shell Made starts for a plain terminal tab in the same terminal pane, keeping the screen and scrollback the TUI left (for example its last printed lines) above the new prompt, leaving the alternate screen and the input modes the TUI set, and using the pane's current size. The shell MUST start in the tab's current explorer root, after the directory reports the TUI made before it exited are applied, or in the tab's launch folder when that root is no longer a usable directory. The exited TUI's per-terminal integration state and its directory follow MUST be released, so no status, session dots or follow of that TUI attach to the new shell, and the tab presents as a plain terminal tab; state carried by a session channel, such as OpenCode's connection, active session and session map, is released when the integration observes the disconnect, a moment later. A plain shell tab whose shell exits with status 0 MUST close exactly as its close action closes it, including returning to the folder picker when it was the last tab. A non-zero exit, a signal, a monitor or output failure, or output that closes without an exit status MUST keep the tab open with the exit banner that names the program and what ended it, and its Restart action. Remote (SSH) tabs are not covered by this rule and keep their exit banner and Reconnect action. No tab persistence across app restart is required.
 
 #### Scenario: Open and switch independent workspaces
 
@@ -141,6 +141,24 @@ Made MUST let users open an additional workspace folder in a new tab, switch wor
 - Given a single workspace tab
 - When the user closes it
 - Then its resources are released and Made returns to the folder picker without launching another shell or OpenCode
+
+#### Scenario: TUI exits cleanly
+
+- Given a local tab whose terminal child is a TUI whose explorer follows folder F and which prints a last line, and in another run F is removed before the TUI exits
+- When the TUI exits with status 0
+- Then the same pane keeps that last line above a new interactive shell in F (in the tab's launch folder in the other run) at the pane's size, off the alternate screen, shows no exit banner, presents the plain terminal label and glyph, and keeps no status, session dots or directory follow of the exited TUI once its integrations observe the exit
+
+#### Scenario: Shell exits cleanly
+
+- Given two local tabs with running shells
+- When the user runs `exit` in one, and later in the remaining tab
+- Then each tab closes exactly as its close action closes it, the other tab stays live, and closing the last tab returns to the folder picker
+
+#### Scenario: Unclean exit keeps the banner
+
+- Given a local shell tab and a local TUI tab
+- When the child exits non-zero or by a signal, its monitor or output fails, or its output closes without an exit status
+- Then the tab stays open with the exit banner that names the program and what ended it, and its Restart action
 
 #### Scenario: Hidden workspaces remain current and bounded
 

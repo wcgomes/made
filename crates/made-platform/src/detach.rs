@@ -386,6 +386,69 @@ fn output_is_opencode_v2(output: &[u8]) -> bool {
         })
 }
 
+/// Start the child of `command` as the leader of its own process group, so
+/// [`kill_child_and_group`] and [`kill_reaped_child_group`] reach the processes
+/// it starts that stay in that group. Does nothing on Windows.
+pub fn own_process_group(command: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+/// Kill `child`, which has not been reaped yet, together with the process
+/// group it leads when it was started with [`own_process_group`], then reap
+/// it. Made's own process group is never signalled. On Windows only the child
+/// itself is killed.
+///
+/// The group is signalled again right after the reap: a process the child
+/// forked while the first signal was delivered can miss it and would keep the
+/// child's output open. That second signal is safe: while the group still has
+/// a live member its id cannot be reused, and an empty group makes it fail
+/// with `ESRCH`, unless the id was reused in the instant since the reap.
+pub fn kill_child_and_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    kill_foreign_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    #[cfg(unix)]
+    kill_foreign_group(child.id());
+}
+
+/// Kill what is left of the process group led by `pid`, a child started with
+/// [`own_process_group`] that has already been reaped: processes it started
+/// that still hold its output open. Made's own process group is never
+/// signalled. Does nothing on Windows.
+///
+/// Safe only while some process of that group is still alive, so the group id
+/// cannot have been reused; a reader still blocked on the child's output
+/// implies that, unless the holder is a descendant that left the group (for
+/// example with `setsid`), which this does not reach.
+pub fn kill_reaped_child_group(pid: u32) {
+    #[cfg(unix)]
+    kill_foreign_group(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// SIGKILL the process group `pgid`, unless it is Made's own.
+#[cfg(unix)]
+fn kill_foreign_group(pgid: u32) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
+        return;
+    }
+    // SAFETY: a negative pid names the process group. ESRCH means it is gone.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: libc::c_int) {
     let Ok(pid) = libc::pid_t::try_from(pid) else {

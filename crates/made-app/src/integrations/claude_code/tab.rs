@@ -307,6 +307,7 @@ impl TabState for ClaudeTabState {
         } else {
             Vec::new()
         };
+        let had_sessions = runtime.tab.session_count() > 0;
         let mut parents = None;
         let mut parent_of = |pid: u32| -> Option<u32> {
             parents
@@ -320,6 +321,29 @@ impl TabState for ClaudeTabState {
         if tick_due {
             runtime.liveness_checked_at = now;
             runtime.tab.check_liveness(&mut parent_of);
+        }
+        // Claude Code fires no hook for `/cd`: follow it through the agents
+        // snapshot while this local tab owns a live session.
+        let submitted = terminal.take_input_submitted();
+        let listed = !io.remote && runtime.tab.session_count() > 0;
+        let snapshot = listed.then(super::agents::latest).flatten();
+        if let Some(snapshot) = &snapshot {
+            runtime
+                .tab
+                .apply_agent_cwds(&snapshot.entries, snapshot.started_at, snapshot.burst);
+        }
+        // A background session opened from the agent view is named only by
+        // the window title.
+        let title_changed = runtime.tab.apply_attached_title(
+            snapshot
+                .as_deref()
+                .map(|snapshot| snapshot.entries.as_slice()),
+            terminal.title(),
+        );
+        // A `/cd` is submitted input, and an agent-view switch changes the
+        // title: only these and a session start start a burst of listings.
+        if listed && (!had_sessions || submitted || title_changed) {
+            runtime.tab.note_trigger(super::agents::trigger());
         }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);

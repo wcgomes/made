@@ -6,11 +6,16 @@
 //! `made-claude-hook/tests/status.rs::payload_content_never_reaches_the_record`
 //! against the real hook binary. This file proves the Made side: unique markers
 //! that a spool record carries in fields Made must not read never reach any
-//! state, log, tooltip input or report; window-title text never drives status,
-//! identity or directory; and Made opens no listener or connection and touches
-//! no Claude Code transcript, session, IDE lockfile or configuration path.
+//! state, log, tooltip input or report; window-title text is only compared to
+//! the `name` of the background sessions a `claude agents --json` snapshot
+//! lists, to select one, and is never used as a path, status or identity; and
+//! Made opens no listener or connection and itself touches no Claude Code
+//! transcript, session, IDE lockfile or configuration path: Claude Code state
+//! is read only through the `claude agents --json` subprocess.
 
+use made_app::integrations::claude_code::agents::parse_agents;
 use made_app::integrations::claude_code::follow::{parse_record, ClaudeActivity, ClaudeTab};
+use made_terminal::{ProtocolEvent, ProtocolState};
 
 const MARKERS: [&str; 5] = [
     "MARKER-PROMPT-7f3a",
@@ -76,6 +81,61 @@ fn content_fields_never_reach_a_parsed_record_or_the_tab_state() {
     assert_no_markers(&tab.tooltip_title(None), "the tooltip title");
     assert_no_markers(&format!("{:?}", tab.dots()), "the dots");
     assert_no_markers(&format!("{:?}", tab.directory()), "the directory");
+}
+
+#[test]
+fn window_title_only_selects_a_listed_background_session_by_name() {
+    let mut tab = ClaudeTab::new(10, false);
+    let record = parse_record(&record_with_markers(
+        "/work",
+        "SessionStart",
+        "idle",
+        &[99, 20, 10],
+    ))
+    .expect("record");
+    tab.ingest(vec![record], tree);
+    tab.note_protocol(ProtocolEvent::Status {
+        state: ProtocolState::Working,
+    });
+    // The owned session's process and one background session, as a
+    // `claude agents --json` snapshot lists them.
+    let snapshot = parse_agents(
+        br#"[{"pid":20,"cwd":"/work","kind":"interactive","name":"host"},
+            {"pid":30,"cwd":"/work/spec","kind":"background","name":"Spec task"}]"#,
+    )
+    .expect("a snapshot");
+    let before = (tab.dots(), tab.directory(), tab.session_count());
+    assert_eq!(before.1.as_deref(), Some("/work"));
+
+    // A title that names no listed background session, or looks like a path
+    // (even a listed one), changes nothing.
+    for window_title in [
+        "TITLE-MARKER-7f3a",
+        "\u{2733} Working",
+        "host",
+        "/tmp/elsewhere",
+        "/work/spec",
+        "\u{2733} /work/spec",
+        "~/elsewhere",
+        "Spec",
+    ] {
+        tab.apply_attached_title(Some(&snapshot), Some(window_title));
+        assert_eq!(
+            (tab.dots(), tab.directory(), tab.session_count()),
+            before,
+            "{window_title:?} must not change status, identity or directory"
+        );
+    }
+
+    // Positive control: the exact name of the one listed background session
+    // selects that session's listed directory, and nothing else changes.
+    tab.apply_attached_title(Some(&snapshot), Some("\u{2733} Spec task"));
+    assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
+    assert_eq!((tab.dots(), tab.session_count()), (before.0, before.2));
+
+    // A listing without that session detaches it.
+    tab.apply_attached_title(Some(&[]), Some("\u{2733} Spec task"));
+    assert_eq!(tab.directory(), before.1);
 }
 
 #[test]
@@ -244,7 +304,9 @@ mod running_tab {
 
     /// Re-run `name` in a child with an isolated home, a fake `claude` that
     /// prints a window title and then a protocol status once the trigger file
-    /// exists, and the shipped plugin staged beside the test executable.
+    /// exists (and for `claude agents` only appends a line to
+    /// `$HOME/agents-runs` and lists nothing), and the shipped plugin staged
+    /// beside the test executable.
     fn isolated(name: &str) -> bool {
         if std::env::var_os(CHILD).is_some() {
             return false;
@@ -256,7 +318,9 @@ mod running_tab {
         fs::write(
             &claude,
             format!(
-                "#!/bin/sh\nprintf '\\033]0;{TITLE} /tmp\\007'\n\
+                "#!/bin/sh\n\
+                 [ \"$1\" = agents ] && {{ echo run >> \"$HOME/agents-runs\"; printf '[]'; exit 0; }}\n\
+                 printf '\\033]0;{TITLE} /tmp\\007'\n\
                  while [ ! -f \"${TRIGGER}\" ]; do sleep 0.05; done\n\
                  printf '\\033]7501;state=working:app=claude-code\\007'\nsleep 30\n"
             ),
@@ -528,8 +592,28 @@ mod running_tab {
             }
         }
 
-        // Made never tried to read any Claude Code configuration, session,
-        // transcript or IDE lockfile path.
+        // Submitted input with an owned session live runs `claude agents
+        // --json`, so the check below covers the listing path too.
+        let mut input_log = made_app::DiagnosticLog::new();
+        workbench.terminal_mut().unwrap().send_key(
+            made_terminal::Key::Enter,
+            made_terminal::Modifiers::default(),
+            &mut input_log,
+        );
+        let runs = home.join("agents-runs");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runs.exists() && Instant::now() < deadline {
+            tick(&mut workbench, 1);
+        }
+        tick(&mut workbench, 120);
+        assert!(
+            fs::read_to_string(&runs).is_ok_and(|text| text.lines().count() >= 1),
+            "`claude agents --json` ran"
+        );
+
+        // Made itself never tried to read any Claude Code configuration,
+        // session, transcript or IDE lockfile path, even with an owned session
+        // live and `claude agents --json` having run.
         for fifo in &fifos {
             assert!(
                 !someone_is_reading(fifo),

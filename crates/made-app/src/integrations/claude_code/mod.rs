@@ -1,5 +1,6 @@
 //! Claude Code integration.
 
+pub mod agents;
 pub mod diagnostics;
 pub mod follow;
 pub mod launch;

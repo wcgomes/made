@@ -13619,7 +13619,11 @@ fn a_direct_claude_code_tab_is_branded_before_any_status() {
         .next()
         .expect("isolated bin");
     let claude = bin.join("claude");
-    std::fs::write(&claude, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::write(
+        &claude,
+        "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\nsleep 30\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
@@ -13921,6 +13925,15 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
     if isolated("a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry") {
         return;
     }
+    // The OpenCode child must stay alive: a TUI that exits cleanly is
+    // replaced by a shell before its launch could be inspected.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join("bin");
+        let executable = bin.join("opencode");
+        fs::write(&executable, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
     let (mut headless, first) = menu_model(&root, &[OPENCODE, CLAUDE_CODE]);
@@ -14149,4 +14162,183 @@ fn claude_content_markers_never_reach_the_tooltip_diagnostics_report_or_log() {
         assert_clean(&file, "the integration log");
         assert!(!file.contains(TITLE_MARKER));
     }
+}
+
+// ---- Terminal child exit ----
+
+/// Replace the isolated fake `opencode` with one that runs `body`.
+#[cfg(unix)]
+fn fake_opencode(body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = PathBuf::from(std::env::var_os("HOME").expect("isolated home")).join("bin");
+    let executable = bin.join("opencode");
+    fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Open a home tab whose PTY child is the fake `opencode`, beside a shell tab.
+#[cfg(unix)]
+fn opencode_tab(root: &Path) -> (Headless, WorkspaceId) {
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        AppOptions::new().with_compatible_tuis([OPENCODE]),
+    );
+    let shell_id = open_workspace(&mut model, root);
+    model.begin_tui_workspace(OPENCODE);
+    model.ensure_workbench();
+    let id = model.active_workspace_id().expect("OpenCode tab");
+    assert_ne!(id, shell_id);
+    (Headless::new(model, 1280.0, 800.0), id)
+}
+
+/// Spec `TUI exits cleanly`: a TUI that exits cleanly leaves its tab on a
+/// live shell with no exit banner and no TUI branding.
+#[cfg(unix)]
+#[test]
+fn a_tui_that_exits_cleanly_leaves_a_live_shell_without_a_banner() {
+    if isolated("a_tui_that_exits_cleanly_leaves_a_live_shell_without_a_banner") {
+        return;
+    }
+    fake_opencode("exit 0");
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "project", "main.rs");
+    let (mut headless, id) = opencode_tab(&root);
+    headless.pump_until(|model| {
+        model.workspace(id).is_some_and(|workbench| {
+            workbench.terminal_target() == TerminalTarget::Shell
+                && workbench
+                    .terminal()
+                    .is_some_and(made_app::TerminalPane::is_running)
+        })
+    });
+    let terminal = headless.model.workspace(id).unwrap().terminal().unwrap();
+    assert!(terminal.exit_status().is_none());
+    assert_eq!(terminal.options().shell, None, "the plain terminal shell");
+    let explorer_root = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer_root()
+        .map(Path::to_path_buf);
+    assert_eq!(
+        Some(terminal.options().cwd.clone()),
+        explorer_root,
+        "the shell starts in the explorer root"
+    );
+    headless.render();
+    let output = headless.render();
+    let text = output_text(&output);
+    assert!(!text.contains("exited"), "{text}");
+    assert!(!text.contains("Restart"), "{text}");
+    let tab = headless.response(workspace_tab_id(id)).rect;
+    assert!(
+        text_rects(&output, "OpenCode", 55.0)
+            .into_iter()
+            .all(|rect| !tab.contains_rect(rect)),
+        "the tab no longer carries the OpenCode label"
+    );
+    assert_eq!(headless.model.workspace_count(), 2);
+}
+
+/// Spec `Unclean exit keeps the banner`: a TUI that exits non-zero keeps the exit
+/// banner with Restart.
+#[cfg(unix)]
+#[test]
+fn a_tui_that_exits_non_zero_keeps_the_restart_banner() {
+    if isolated("a_tui_that_exits_non_zero_keeps_the_restart_banner") {
+        return;
+    }
+    fake_opencode("exit 3");
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "project", "main.rs");
+    let (mut headless, id) = opencode_tab(&root);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.exit_status().is_some())
+    });
+    headless.render();
+    let text = output_text(&headless.render());
+    assert!(text.contains("OpenCode exited (exit code 3)."), "{text}");
+    assert!(text.contains("Restart OpenCode"), "{text}");
+    assert_eq!(
+        headless.model.workspace(id).unwrap().terminal_target(),
+        TerminalTarget::Tui(OPENCODE)
+    );
+    assert_eq!(headless.model.workspace_count(), 2);
+}
+
+/// Spec `Shell exits cleanly`: `exit` in a shell tab closes it as its close
+/// action does, and closing the last tab returns to the picker.
+#[cfg(unix)]
+#[test]
+fn a_shell_that_exits_cleanly_closes_its_tab() {
+    if isolated("a_shell_that_exits_cleanly_closes_its_tab") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let first_root = fixture_workspace(temp.path(), "first", "main.rs");
+    let second_root = fixture_workspace(temp.path(), "second", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let first = open_workspace(&mut model, &first_root);
+    let second = open_workspace(&mut model, &second_root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    for id in [first, second] {
+        headless.pump_until(|model| {
+            model
+                .workspace(id)
+                .and_then(Workbench::terminal)
+                .is_some_and(made_app::TerminalPane::is_running)
+        });
+    }
+    type_terminal_command(headless.model.workspace_mut(second).unwrap(), "exit");
+    headless.pump_until(|model| model.workspace(second).is_none());
+    assert_eq!(headless.model.workspace_count(), 1);
+    assert_eq!(headless.model.active_workspace_id(), Some(first));
+    assert!(headless
+        .model
+        .workspace(first)
+        .and_then(Workbench::terminal)
+        .is_some_and(made_app::TerminalPane::is_running));
+
+    type_terminal_command(headless.model.workspace_mut(first).unwrap(), "exit");
+    headless.pump_until(|model| model.workspace_count() == 0);
+    assert!(
+        headless.model.is_picker(),
+        "the last tab closes to the picker"
+    );
+}
+
+/// Spec `Unclean exit keeps the banner`: a shell that exits non-zero keeps its tab and
+/// the exit banner with Restart.
+#[cfg(unix)]
+#[test]
+fn a_shell_that_exits_non_zero_keeps_the_restart_banner() {
+    if isolated("a_shell_that_exits_non_zero_keeps_the_restart_banner") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "project", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running)
+    });
+    type_terminal_command(headless.model.workspace_mut(id).unwrap(), "exit 3");
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::terminal)
+            .is_some_and(|terminal| terminal.exit_status().is_some())
+    });
+    headless.render();
+    let text = output_text(&headless.render());
+    assert!(text.contains("Shell exited (exit code 3)."), "{text}");
+    assert!(text.contains("Restart shell"), "{text}");
+    assert_eq!(headless.model.workspace_count(), 1);
 }

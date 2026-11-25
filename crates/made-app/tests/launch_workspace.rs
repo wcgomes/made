@@ -497,7 +497,11 @@ fn isolated_claude_launch(name: &str) -> bool {
     fs::create_dir(&bin).unwrap();
     for program in ["claude", "grok", "opencode"] {
         let path = bin.join(program);
-        fs::write(&path, "#!/bin/sh\nsleep 30\n").unwrap();
+        fs::write(
+            &path,
+            "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\nsleep 30\n",
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let tmp = home.path().join("tmp");

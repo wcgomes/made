@@ -334,11 +334,56 @@ impl TabState for GrokTabState {
         TabReport::default()
     }
 
+    /// Drop the sessions of the terminal that went away, so neither their
+    /// dots nor a provisional restore carry over to the next terminal.
+    fn teardown(&mut self) {
+        self.sessions.clear();
+        self.file_newest_id = None;
+        self.clear_provisional_slot();
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_drops_the_sessions_and_the_provisional_move_of_the_terminal() {
+        let mut state = GrokTabState::new();
+        state.sessions.push(GrokLiveSession {
+            id: "open".to_owned(),
+            cwd: PathBuf::from("/tmp"),
+            opened_at: "2024-01-01T00:00:01Z".to_owned(),
+            activity: SessionActivity::Busy,
+            touched: Instant::now(),
+        });
+        state.file_newest_id = Some("open".to_owned());
+        state.provisional_id = Some("provisional".to_owned());
+        state.provisional_cwd = Some(PathBuf::from("/tmp/provisional"));
+        state.restore_root = Some(PathBuf::from("/tmp/restore"));
+        let log_offset = state.log_offset;
+
+        state.teardown();
+        assert!(state.tab_activities().is_empty(), "no dots survive");
+        assert!(!state.follow_running(TerminalTarget::Shell, true));
+        assert_eq!(state.file_newest_id, None);
+        assert_eq!(state.provisional_id, None);
+        assert_eq!(state.provisional_cwd, None);
+        assert_eq!(state.restore_root, None);
+        assert_eq!(
+            state.log_offset, log_offset,
+            "the global hook log is not re-read"
+        );
+        // Idempotent.
+        state.teardown();
+        assert!(state.tab_activities().is_empty());
     }
 }

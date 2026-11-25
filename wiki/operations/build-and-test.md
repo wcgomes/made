@@ -86,6 +86,24 @@ Phase 0 gate (historical; Linux, OpenCode v2, Node 24, tmux):
 
 The spike harness was removed after the gate passed. Outcomes are preserved in the [Phase 0 gate record](../records/20261025-phase-0-gate.md), with integration details in [OpenCode bridge](../integration/opencode.md). The gate was integration evidence, not an app UI/revision pass.
 
+## Test a release build locally
+
+`cargo run --release` starts `target/release/made-app` with no `plugins/` directory next to the binary, so the integrations show degraded. To test the installed layout, build the three binaries in release and stage them the way [release CI](release-ci.md) does. The stage directory must not exist yet; the script refuses to overwrite it.
+
+```bash
+TARGET="$(rustc -vV | sed -n 's/^host: //p')"   # e.g. aarch64-apple-darwin
+cargo build --release --locked -p made-app --target "$TARGET"
+cargo build --release --locked -p made-grok-hook --target "$TARGET"
+cargo build --release --locked -p made-claude-hook --target "$TARGET"
+python3 .github/scripts/stage-desktop-package.py --profile release --target "$TARGET" \
+  --app "target/$TARGET/release/made-app" \
+  --hook "target/$TARGET/release/made-grok-status" \
+  --claude-hook "target/$TARGET/release/made-claude-status" \
+  --stage dist/stage
+```
+
+On Windows the binaries end in `.exe`. Run `dist/stage/made-app` from a normal terminal, for example `open -a Terminal dist/stage/made-app` on macOS, never from inside a Claude Code session: the inherited `CLAUDE_*` variables (such as `CLAUDE_CODE_CHILD_SESSION`) make a nested Claude Code disable transcripts and the agent view, which invalidates Claude Code integration tests.
+
 ## Environment switches
 
 | Variable / switch | Effect |

@@ -9,9 +9,14 @@
 //!
 //! Records are metadata only: session id, working directory, event kind, a
 //! derived status, an optional sanitized session title and the hook's process
-//! ancestry. Nothing else of the hook payload ever reaches this module, and
-//! the terminal window title is read only through [`ClaudeTab::tooltip_title`]
-//! while a protocol status is live.
+//! ancestry. Nothing else of the hook payload ever reaches this module.
+//!
+//! The terminal window title is shown only through [`ClaudeTab::tooltip_title`]
+//! while a protocol status is live. Otherwise it is only compared, in
+//! [`ClaudeTab::apply_attached_title`], to the `name` of the background
+//! sessions a `claude agents --json` snapshot lists, to select one of them; it
+//! is never used as a path, a status or an identity. Claude Code state is read
+//! only through that subprocess: Made itself opens nothing under `~/.claude`.
 
 use std::collections::hash_map::RandomState;
 use std::fs::{self, File, OpenOptions};
@@ -22,11 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
+use super::agents::{background_cwd_for_name, cwd_for_pid, normalize_title, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
@@ -653,6 +659,9 @@ struct Session {
     chain: Vec<u32>,
     id: String,
     cwd: String,
+    /// When a hook record last changed `cwd`. An agents snapshot applies only
+    /// when its run started after this.
+    hook_moved_at: Option<Instant>,
     hook: ClaudeActivity,
     title: String,
     /// Orders sessions by their latest start, prompt or directory change.
@@ -672,6 +681,18 @@ pub struct ClaudeTab {
     /// Ids of sessions that ended, newest last. Records still in flight after
     /// a session's end are ignored.
     closed: Vec<String>,
+    /// Directory of the background session the window title names while it is
+    /// attached from the agent view. Untrusted and unvalidated.
+    attached: Option<String>,
+    /// The window title last seen, normalized by [`normalize_title`].
+    /// Untrusted display text, never logged.
+    window_title: String,
+    /// The directory the latest counted agents listing gave for each owned
+    /// Claude Code pid, and this tab's own trigger that a listing already
+    /// answered for it. Untrusted and unvalidated.
+    listed: Vec<(u32, String, Option<u64>)>,
+    /// The burst of this tab's latest own trigger.
+    own_trigger: Option<u64>,
 }
 
 impl ClaudeTab {
@@ -687,7 +708,16 @@ impl ClaudeTab {
             protocol: None,
             status_seen: false,
             closed: Vec::new(),
+            attached: None,
+            window_title: String::new(),
+            listed: Vec::new(),
+            own_trigger: None,
         }
+    }
+
+    /// Record that this tab triggered agents burst `burst`.
+    pub(crate) fn note_trigger(&mut self, burst: u64) {
+        self.own_trigger = Some(burst);
     }
 
     /// Follow a relaunched terminal process. Sessions of the old process are
@@ -796,6 +826,7 @@ impl ClaudeTab {
                     chain: Vec::new(),
                     id: record.session_id.clone(),
                     cwd: String::new(),
+                    hook_moved_at: None,
                     hook: ClaudeActivity::Idle,
                     title: String::new(),
                     recency: 0,
@@ -813,6 +844,7 @@ impl ClaudeTab {
         session.chain.clone_from(&record.pids);
         if moved {
             session.cwd = record.cwd;
+            session.hook_moved_at = Some(Instant::now());
         }
         if let Some(status) = record.status {
             session.hook = status.into();
@@ -833,6 +865,96 @@ impl ClaudeTab {
     fn touch(&mut self, index: usize) {
         self.next_recency += 1;
         self.sessions[index].recency = self.next_recency;
+    }
+
+    /// Apply the working directories a `claude agents --json` run that started
+    /// at `observed_at`, serving trigger burst `burst`, reported. A listing
+    /// counts only when the run started after the last hook record that
+    /// changed the session's directory; an earlier run is ignored and not
+    /// remembered. Of the listings that count, the first for a process from a
+    /// burst no older than this tab's latest own trigger ([`Self::note_trigger`])
+    /// is compared with the session's current directory; any other applies
+    /// only when it differs from the directory the previous counted listing
+    /// gave for that process (on the first sighting, from the session's current
+    /// directory). An applied listing counts as a move. A listing that keeps
+    /// disagreeing with the hook so applies at most once per trigger of this
+    /// tab, never per hook record nor for another tab's trigger.
+    pub(crate) fn apply_agent_cwds(
+        &mut self,
+        entries: &[AgentCwd],
+        observed_at: Instant,
+        burst: u64,
+    ) {
+        let sessions = &self.sessions;
+        self.listed
+            .retain(|(pid, _, _)| sessions.iter().any(|session| session.anchor == *pid));
+        for index in 0..self.sessions.len() {
+            let anchor = self.sessions[index].anchor;
+            let Some(cwd) = cwd_for_pid(entries, anchor) else {
+                continue;
+            };
+            let session = &self.sessions[index];
+            if session.hook_moved_at.is_some_and(|at| observed_at <= at) {
+                continue;
+            }
+            // The first counted listing answering this tab's own trigger.
+            let answers = self.own_trigger.filter(|own| burst >= *own);
+            let changed = match self.listed.iter_mut().find(|(pid, _, _)| *pid == anchor) {
+                Some((_, seen, answered))
+                    if seen == cwd && (answers.is_none() || *answered == answers) =>
+                {
+                    false
+                }
+                Some((_, seen, answered)) => {
+                    cwd.clone_into(seen);
+                    if answers.is_some() {
+                        *answered = answers;
+                    }
+                    true
+                }
+                None => {
+                    self.listed.push((anchor, cwd.to_owned(), answers));
+                    true
+                }
+            };
+            let session = &mut self.sessions[index];
+            if !changed || session.cwd == cwd {
+                continue;
+            }
+            session.cwd = cwd.to_owned();
+            self.touch(index);
+        }
+    }
+
+    /// Follow a background session opened from the agent view. A fresh agents
+    /// listing (`entries`) attaches the directory of the one background entry
+    /// the `window_title` names, or detaches when it names none. Without a
+    /// listing the selection stays while the normalized title stays the same;
+    /// a title change detaches it. The title is compared and kept only while a
+    /// live owned session hosts it and a protocol status is live (when the
+    /// window title is trusted for the tooltip); otherwise nothing is attached
+    /// and the kept title is forgotten, so the title counts as changed once it
+    /// is trusted again. Returns whether the normalized title changed.
+    pub fn apply_attached_title(
+        &mut self,
+        entries: Option<&[AgentCwd]>,
+        window_title: Option<&str>,
+    ) -> bool {
+        if self.protocol.is_none() || self.sessions.is_empty() {
+            self.attached = None;
+            self.window_title.clear();
+            return false;
+        }
+        let title = window_title.map(normalize_title).unwrap_or_default();
+        let changed = title != self.window_title;
+        if changed {
+            self.window_title = title;
+            self.attached = None;
+        }
+        if let Some(entries) = entries {
+            self.attached = background_cwd_for_name(entries, &self.window_title).map(str::to_owned);
+        }
+        changed
     }
 
     /// Drop sessions whose Claude Code process has exited. Returns whether any
@@ -968,9 +1090,16 @@ impl ClaudeTab {
         pick(false).or_else(|| pick(true))
     }
 
-    /// The working directory of the most recent live owned session, exactly as
-    /// the hook reported it. Callers validate it before use.
+    /// The working directory of the background session attached from the agent
+    /// view while one is and a protocol status is live, otherwise of the most
+    /// recent live owned session, exactly as reported. Callers validate it
+    /// before use.
     pub fn directory(&self) -> Option<String> {
+        if !self.sessions.is_empty() && self.protocol.is_some() {
+            if let Some(attached) = &self.attached {
+                return Some(attached.clone());
+            }
+        }
         let session = &self.sessions[self.latest()?];
         (!session.cwd.is_empty()).then(|| session.cwd.clone())
     }

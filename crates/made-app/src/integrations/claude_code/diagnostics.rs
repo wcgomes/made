@@ -180,6 +180,10 @@ impl AppState for ClaudeAppState {
         }
     }
 
+    fn shutdown(&mut self) {
+        super::agents::shutdown();
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

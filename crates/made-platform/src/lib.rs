@@ -3119,6 +3119,7 @@ pub use detach::{
     remote_path_from_bytes, remote_program_version_supported, remote_target,
     spawn_detached_command,
 };
+pub use detach::{kill_child_and_group, kill_reaped_child_group, own_process_group};
 pub use process::{process_parent, process_parent_map};
 pub use shell_integration::{
     local_cmd_prompt_cwd, local_cwd_path, ShellCwdCapability, ShellLaunchPlan,

@@ -607,6 +607,10 @@ pub trait AppState: Any {
     /// opens afterwards.
     fn notify_workspace(&self, _workspace: &mut WorkspaceNotices<'_>) {}
 
+    /// The app shuts down, after every workspace did: stop app-wide work this
+    /// state's integration started.
+    fn shutdown(&mut self) {}
+
     /// This state as `Any`.
     fn as_any(&self) -> &dyn Any;
 

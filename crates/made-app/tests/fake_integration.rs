@@ -446,6 +446,59 @@ const ABOVE_ENTRY: IntegrationRef = &ABOVE;
 
 const CHILD_ENV: &str = "MADE_FAKE_INTEGRATION_CHILD";
 
+/// Longest an isolated child test may run before it is killed and fails.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the child's output may still take once it has exited or been
+/// killed.
+const CHILD_OUTPUT_GRACE: Duration = Duration::from_secs(5);
+
+/// Run `command` to completion within `timeout`, killing it when it overruns.
+/// Returns its exit status (`None` when it was killed) with its standard output
+/// and error, which are cut short when a leftover process keeps them open.
+fn output_within(
+    command: &mut Command,
+    timeout: Duration,
+) -> (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>) {
+    use std::io::Read;
+    use std::process::Stdio;
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+        receiver
+    };
+    let stdout = read(Box::new(child.stdout.take().unwrap()));
+    let stderr = read(Box::new(child.stderr.take().unwrap()));
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let grace = Instant::now() + CHILD_OUTPUT_GRACE;
+    let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+        receiver
+            .recv_timeout(grace.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    };
+    (status, collect(stdout), collect(stderr))
+}
+
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -470,10 +523,11 @@ fn isolated(name: &str) -> bool {
         executable(&bin.join(program), "#!/bin/sh\nsleep 30\n");
     }
     // Claude Code records its process id and environment, then stays alive
-    // until the test asks it to exit.
+    // until the test asks it to exit. The `claude agents --json` poll exits at
+    // once with no side effect.
     executable(
         &bin.join("claude"),
-        "#!/bin/sh\necho $$ > \"$HOME/claude-pid\"\nenv > \"$HOME/claude-env.txt\"\nwhile [ ! -e \"$HOME/claude-exit\" ]; do sleep 0.1; done\n",
+        "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\necho $$ > \"$HOME/claude-pid\"\nenv > \"$HOME/claude-env.txt\"\nwhile [ ! -e \"$HOME/claude-exit\" ]; do sleep 0.1; done\n",
     );
     // The shipped Claude Code hook, so a Claude Code tab binds a spool.
     let shipped = made_platform::install_root_from_current_executable(
@@ -495,7 +549,8 @@ fn isolated(name: &str) -> bool {
     });
     let paths = std::iter::once(bin).chain(host);
     let plugins = support::StagedPlugins::stage("fake-integration");
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args(["--exact", name, "--nocapture"])
         .env(CHILD_ENV, "1")
         .env("HOME", home.path())
@@ -512,14 +567,18 @@ fn isolated(name: &str) -> bool {
             made_platform::PLUGIN_DIR_ENV,
             plugins.package("opencode-made"),
         )
-        .env_remove(made_bridge::config::CONFIG_CONTENT_ENV)
-        .output()
-        .unwrap();
+        .env_remove(made_bridge::config::CONFIG_CONTENT_ENV);
+    let (status, stdout, stderr) = output_within(&mut command, CHILD_TIMEOUT);
     assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.is_some_and(|status| status.success()),
+        "{name} {}\n{}\n{}",
+        if status.is_some() {
+            "failed"
+        } else {
+            "timed out and was killed"
+        },
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     );
     true
 }
