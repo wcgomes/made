@@ -1216,12 +1216,19 @@ impl TerminalPane {
         log: &mut DiagnosticLog,
     ) -> Result<(), PtyError> {
         // The exit can be reported before the reader forwarded the child's
-        // last bytes: read on until the output closes, briefly.
+        // last bytes: read on until the output closes, briefly. A process the
+        // child left behind may hold the PTY open and keep writing, so the
+        // deadline ends the drain even while output keeps arriving.
         if let Some(pty) = self.pty.as_ref() {
             let deadline = Instant::now() + EXIT_OUTPUT_DRAIN;
-            while let Ok(made_terminal::PtyEvent::Data(data)) =
-                pty.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let Ok(made_terminal::PtyEvent::Data(data)) = pty.recv_timeout(remaining) else {
+                    break;
+                };
                 self.output_bytes = self.output_bytes.saturating_add(data.len() as u64);
                 self.core.feed(&data);
             }
@@ -2644,6 +2651,88 @@ mod tests {
         assert!(done(pane), "{}", pane.screen_text());
     }
 
+    /// Output of a child that reported its exit while a process it left
+    /// behind keeps writing: the marker, then a line every millisecond.
+    struct PacedWriter {
+        marker_sent: bool,
+    }
+
+    impl Read for PacedWriter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let line: &[u8] = if std::mem::replace(&mut self.marker_sent, true) {
+                std::thread::sleep(Duration::from_millis(1));
+                b"tick\n"
+            } else {
+                b"drain-marker\n"
+            };
+            buf[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    /// Output of a child whose exit was reported while a quiet process it
+    /// left behind holds the terminal open.
+    struct QuietHolder;
+
+    impl Read for QuietHolder {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(0)
+        }
+    }
+
+    /// Spawn a child printing `output`, whose exit is already reported, and
+    /// time the in-place relaunch.
+    fn relaunch_past(output: fn() -> Box<dyn Read + Send>) -> (TerminalPane, Duration) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut platform = test_platform(&temp, TestClipboardState::default());
+        platform.output = output;
+        let mut pane = spawn_test_pane(&platform);
+        // Let the reader start forwarding.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut log = DiagnosticLog::new();
+        let started = Instant::now();
+        pane.relaunch_in_place(
+            &platform,
+            PtyOptions::new(&platform.paths.temp_dir),
+            TerminalTarget::Shell,
+            &mut log,
+        )
+        .expect("relaunch in place");
+        let elapsed = started.elapsed();
+        pane.terminate(&mut log);
+        (pane, elapsed)
+    }
+
+    /// Scrollback and screen text.
+    fn all_text(pane: &TerminalPane) -> String {
+        let mut lines: Vec<String> = pane
+            .core
+            .history(SCROLLBACK_LINES)
+            .into_iter()
+            .map(|line| line.text)
+            .collect();
+        lines.push(pane.screen_text());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn relaunch_in_place_stops_draining_a_writer_left_behind() {
+        let (pane, elapsed) = relaunch_past(|| Box::new(PacedWriter { marker_sent: false }));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert!(all_text(&pane).contains("drain-marker"));
+
+        // A writer as fast as it can go.
+        let (_, elapsed) = relaunch_past(|| Box::new(io::repeat(b'y')));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn relaunch_in_place_stops_waiting_for_a_quiet_holder() {
+        let (_, elapsed) = relaunch_past(|| Box::new(QuietHolder));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn relaunch_in_place_resets_the_scroll_region_and_keeps_the_cursor() {
@@ -3117,6 +3206,8 @@ mod tests {
         clipboard: Arc<Mutex<TestClipboardState>>,
         paths: AppPaths,
         writes: Arc<Mutex<Vec<u8>>>,
+        /// What each spawned child prints.
+        output: fn() -> Box<dyn Read + Send>,
     }
 
     impl Platform for TestPlatform {
@@ -3149,17 +3240,19 @@ mod tests {
         fn spawn_pty(&self, _request: &PtyRequest) -> Result<Box<dyn PtySession>, PlatformError> {
             Ok(Box::new(TestPtySession {
                 writes: self.writes.clone(),
+                output: self.output,
             }))
         }
     }
 
     struct TestPtySession {
         writes: Arc<Mutex<Vec<u8>>>,
+        output: fn() -> Box<dyn Read + Send>,
     }
 
     impl PtySession for TestPtySession {
         fn take_reader(&self) -> Result<Box<dyn Read + Send>, PlatformError> {
-            Ok(Box::new(io::empty()))
+            Ok((self.output)())
         }
 
         fn take_writer(&self) -> Result<Box<dyn Write + Send>, PlatformError> {
@@ -3227,6 +3320,7 @@ mod tests {
             clipboard: Arc::new(Mutex::new(clipboard)),
             paths: test_app_paths(temp.path()),
             writes: Arc::new(Mutex::new(Vec::new())),
+            output: || Box::new(io::empty()),
         }
     }
 

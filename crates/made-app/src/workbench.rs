@@ -1222,9 +1222,7 @@ impl Workbench {
             &self.platform,
             launch_pty_options(
                 &self.platform,
-                TerminalTarget::Shell
-                    .pty_options(self.terminal_cwd.clone(), std::ffi::OsStr::new(""))
-                    .expect("the shell is always available"),
+                made_terminal::PtyOptions::new(&self.terminal_cwd),
                 size,
                 &contributions,
             ),
@@ -1239,9 +1237,7 @@ impl Workbench {
                 &self.platform,
                 launch_pty_options(
                     &self.platform,
-                    TerminalTarget::Shell
-                        .pty_options(fallback.clone(), std::ffi::OsStr::new(""))
-                        .expect("the shell is always available"),
+                    made_terminal::PtyOptions::new(&fallback),
                     size,
                     &contributions,
                 ),
