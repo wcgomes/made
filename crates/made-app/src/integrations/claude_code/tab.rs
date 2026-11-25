@@ -343,7 +343,7 @@ impl TabState for ClaudeTabState {
         // A `/cd` is submitted input, and an agent-view switch changes the
         // title: only these and a session start start a burst of listings.
         if listed && (!had_sessions || submitted || title_changed) {
-            super::agents::trigger();
+            runtime.tab.note_trigger(super::agents::trigger());
         }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);

@@ -688,9 +688,11 @@ pub struct ClaudeTab {
     /// Untrusted display text, never logged.
     window_title: String,
     /// The directory the latest counted agents listing gave for each owned
-    /// Claude Code pid, and the trigger burst of that listing. Untrusted and
-    /// unvalidated.
-    listed: Vec<(u32, String, u64)>,
+    /// Claude Code pid, and this tab's own trigger that a listing already
+    /// answered for it. Untrusted and unvalidated.
+    listed: Vec<(u32, String, Option<u64>)>,
+    /// The burst of this tab's latest own trigger.
+    own_trigger: Option<u64>,
 }
 
 impl ClaudeTab {
@@ -709,7 +711,13 @@ impl ClaudeTab {
             attached: None,
             window_title: String::new(),
             listed: Vec::new(),
+            own_trigger: None,
         }
+    }
+
+    /// Record that this tab triggered agents burst `burst`.
+    pub(crate) fn note_trigger(&mut self, burst: u64) {
+        self.own_trigger = Some(burst);
     }
 
     /// Follow a relaunched terminal process. Sessions of the old process are
@@ -863,13 +871,14 @@ impl ClaudeTab {
     /// at `observed_at`, serving trigger burst `burst`, reported. A listing
     /// counts only when the run started after the last hook record that
     /// changed the session's directory; an earlier run is ignored and not
-    /// remembered. Of the listings that count, the first of each burst for a
-    /// process is compared with the session's current directory; a later one
-    /// in the same burst applies only when it differs from the directory the
-    /// previous counted listing gave for that process. An applied listing
-    /// counts as a move. A listing that keeps disagreeing with the hook so
-    /// applies at most once per burst, that is per user trigger, never per
-    /// hook record.
+    /// remembered. Of the listings that count, the first for a process from a
+    /// burst no older than this tab's latest own trigger ([`Self::note_trigger`])
+    /// is compared with the session's current directory; any other applies
+    /// only when it differs from the directory the previous counted listing
+    /// gave for that process (on the first sighting, from the session's current
+    /// directory). An applied listing counts as a move. A listing that keeps
+    /// disagreeing with the hook so applies at most once per trigger of this
+    /// tab, never per hook record nor for another tab's trigger.
     pub(crate) fn apply_agent_cwds(
         &mut self,
         entries: &[AgentCwd],
@@ -888,15 +897,23 @@ impl ClaudeTab {
             if session.hook_moved_at.is_some_and(|at| observed_at <= at) {
                 continue;
             }
+            // The first counted listing answering this tab's own trigger.
+            let answers = self.own_trigger.filter(|own| burst >= *own);
             let changed = match self.listed.iter_mut().find(|(pid, _, _)| *pid == anchor) {
-                Some((_, seen, seen_burst)) if *seen_burst == burst && seen == cwd => false,
-                Some((_, seen, seen_burst)) => {
+                Some((_, seen, answered))
+                    if seen == cwd && (answers.is_none() || *answered == answers) =>
+                {
+                    false
+                }
+                Some((_, seen, answered)) => {
                     cwd.clone_into(seen);
-                    *seen_burst = burst;
+                    if answers.is_some() {
+                        *answered = answers;
+                    }
                     true
                 }
                 None => {
-                    self.listed.push((anchor, cwd.to_owned(), burst));
+                    self.listed.push((anchor, cwd.to_owned(), answers));
                     true
                 }
             };

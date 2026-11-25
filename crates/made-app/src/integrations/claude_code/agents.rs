@@ -239,10 +239,12 @@ pub(crate) fn latest() -> Option<Arc<AgentSnapshot>> {
 }
 
 /// Schedule a burst of runs for a tab with a live owned session, starting the
-/// worker when it is not running. Never blocks on the command.
-pub(crate) fn trigger() {
+/// worker when it is not running, and return the burst's id. Never blocks on
+/// the command.
+pub(crate) fn trigger() -> u64 {
     let mut poller = poller();
     poller.burst += 1;
+    let burst = poller.burst;
     schedule_burst(&mut poller.due, Instant::now());
     if !poller.running {
         let generation = GENERATION.load(Ordering::Acquire);
@@ -254,6 +256,7 @@ pub(crate) fn trigger() {
             poller.worker = Some(worker);
         }
     }
+    burst
 }
 
 /// Replace the pending runs in `due` with a burst triggered at `now`. A run
@@ -1056,6 +1059,7 @@ mod tests {
         let (mut tab, record, alive) = hooked_tab();
         tab.ingest(vec![record("/work/w")], &alive);
         // Burst 1 (Enter after `/cd /work/a`) lists A.
+        tab.note_trigger(1);
         tab.apply_agent_cwds(&[interactive(4202, "/work/a")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/a"));
         // Long after that burst a hook record moves the session to W; nothing
@@ -1063,6 +1067,7 @@ mod tests {
         tab.ingest(vec![record("/work/w")], &alive);
         assert_eq!(tab.directory().as_deref(), Some("/work/w"));
         // `/cd /work/a` and Enter: burst 2 lists A again, which follows.
+        tab.note_trigger(2);
         tab.apply_agent_cwds(&[interactive(4202, "/work/a")], later(), 2);
         assert_eq!(tab.directory().as_deref(), Some("/work/a"));
     }
@@ -1074,6 +1079,7 @@ mod tests {
         let listing = [interactive(4202, "/work/y")];
         let mut seen = Vec::new();
         for burst in [1, 1, 1, 2, 2, 2] {
+            tab.note_trigger(burst);
             tab.apply_agent_cwds(&listing, later(), burst);
             seen.push(tab.directory().unwrap());
             tab.ingest(vec![record("/work/x")], &alive);
@@ -1087,6 +1093,27 @@ mod tests {
             (0..seen.len()).filter(|index| y(*index)).count() == 2,
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn another_tabs_bursts_never_step_a_persistent_disagreement() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/x")], &alive);
+        let listing = [interactive(4202, "/work/y")];
+        // Tab 1's own trigger steps once.
+        tab.note_trigger(1);
+        tab.apply_agent_cwds(&listing, later(), 1);
+        assert_eq!(tab.directory().as_deref(), Some("/work/y"));
+        tab.ingest(vec![record("/work/x")], &alive);
+        // Tab 2 triggers bursts 2 to 6; tab 1 only sees their snapshots.
+        for burst in 2..=6 {
+            tab.apply_agent_cwds(&listing, later(), burst);
+            assert_eq!(tab.directory().as_deref(), Some("/work/x"), "{burst}");
+            tab.ingest(vec![record("/work/x")], &alive);
+        }
+        // A real `/cd` in tab 1 still follows from another tab's burst.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/z")], later(), 7);
+        assert_eq!(tab.directory().as_deref(), Some("/work/z"));
     }
 
     #[test]
