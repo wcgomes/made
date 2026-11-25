@@ -1171,6 +1171,65 @@ impl Workbench {
         }
     }
 
+    /// Whether this local shell tab's shell exited cleanly, so the tab closes
+    /// as its close action closes it.
+    pub fn shell_exited_cleanly(&self) -> bool {
+        self.terminal_target == TerminalTarget::Shell
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(TerminalPane::exited_cleanly)
+    }
+
+    /// Replace a directly launched TUI that exited cleanly with the plain
+    /// shell, started in the folder the tab was following, or in its launch
+    /// folder when that one is no longer usable. The per-terminal integration
+    /// state and the TUI's own directory follow go with it.
+    fn replace_cleanly_exited_tui(&mut self) {
+        let TerminalTarget::Tui(tui) = self.terminal_target else {
+            return;
+        };
+        if !self
+            .terminal
+            .as_ref()
+            .is_some_and(TerminalPane::exited_cleanly)
+        {
+            return;
+        }
+        let launch_folder = self.plan.as_ref().map_or_else(
+            || self.terminal_cwd.clone(),
+            |plan| plan.terminal_cwd().to_path_buf(),
+        );
+        let cwd = self
+            .explorer_root()
+            .filter(|root| usable_directory(root))
+            .map_or(launch_folder, Path::to_path_buf);
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!(
+                "terminal {} exited cleanly; starting a shell",
+                self.terminal_target.log_label()
+            ),
+        );
+        if let Some(mut terminal) = self.terminal.take() {
+            terminal.terminate(self.diag.log_mut());
+        }
+        self.teardown_tab_states();
+        self.terminal_target = TerminalTarget::Shell;
+        self.terminal_cwd = cwd;
+        self.integration.set_terminal_cwd(&self.terminal_cwd);
+        let released = self.follow.as_mut().map(|follow| {
+            follow.set_terminal_cwd(&self.terminal_cwd);
+            follow.follow_directory(tui, None)
+        });
+        if let Some(outcome) = released {
+            if outcome.root_switched || self.explorer_generation_mismatch(outcome.generation) {
+                self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
+            }
+        }
+        self.start_terminal();
+    }
+
     /// Poll every integration state whose turn it is: all of them but the
     /// session-channel owner on a local tab, those that declare it on a remote
     /// tab. A directory report goes to the follow coordinator and its outcome
@@ -3858,6 +3917,7 @@ impl Workbench {
             }
         }
         self.metrics.record_hidden_output(hidden_output_bytes);
+        self.replace_cleanly_exited_tui();
 
         let cwd_change = self
             .terminal
@@ -5893,6 +5953,142 @@ mod tests {
             !probe.grok_follow_running(),
             "dropping the confirmed session must leave the hook-only row not running"
         );
+    }
+
+    /// A local tab whose directly launched Claude Code child is `/bin/sh -c
+    /// script`, started in `launch` while the explorer follows `followed`.
+    #[cfg(unix)]
+    fn exiting_tui(launch: &Path, followed: &Path, script: &str) -> GrokRunningProbe {
+        use crate::integrations::CLAUDE_CODE;
+        let plan = LaunchPlan::open(launch, crate::workspace::WorkspaceSource::Picker).unwrap();
+        let mut follow = SessionFollowCoordinator::from_launch_plan(&plan)
+            .unwrap()
+            .with_integrations(PRODUCT);
+        assert!(
+            follow
+                .follow_directory(CLAUDE_CODE, Some(followed))
+                .root_switched
+        );
+        let target = TerminalTarget::Tui(CLAUDE_CODE);
+        let mut workbench = idle_workbench(target, None);
+        workbench.terminal_cwd = plan.terminal_cwd().to_path_buf();
+        workbench.plan = Some(plan);
+        workbench.follow = Some(follow);
+        workbench.prepare_launches();
+        let options = made_terminal::PtyOptions::new(launch)
+            .with_shell("/bin/sh")
+            .with_args(["-c", script]);
+        let pane = TerminalPane::spawn(&workbench.platform, options)
+            .expect("stand-in TUI")
+            .with_target(target);
+        workbench.notify_spawned(pane.pid());
+        workbench.terminal = Some(pane);
+        GrokRunningProbe { workbench }
+    }
+
+    /// Tick until `done` holds.
+    #[cfg(unix)]
+    fn tick_until(workbench: &mut Workbench, done: impl Fn(&Workbench) -> bool) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(workbench) && Instant::now() < deadline {
+            workbench.tick(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done(workbench), "the tab did not reach the expected state");
+    }
+
+    /// A temporary directory outside `TMPDIR`: parallel unit tests swap
+    /// `TMPDIR` for a directory they delete when they finish.
+    #[cfg(unix)]
+    fn stable_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in("/tmp").unwrap()
+    }
+
+    #[cfg(unix)]
+    fn is_shell_tab(workbench: &Workbench) -> bool {
+        workbench.terminal_target == TerminalTarget::Shell
+            && workbench
+                .terminal
+                .as_ref()
+                .is_some_and(TerminalPane::is_running)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_that_exits_cleanly_becomes_a_shell_in_the_followed_folder() {
+        let temp = stable_tempdir();
+        let launch = temp.path().join("launch");
+        let followed = temp.path().join("followed");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&followed).unwrap();
+        let followed = followed.canonicalize().unwrap();
+        let mut probe = exiting_tui(&launch, &followed, "sleep 0.3; exit 0");
+        let tui_pid = probe.terminal.as_ref().and_then(TerminalPane::pid);
+        // Only the exited TUI's own branding is asserted: unit tests share a
+        // process environment that other integrations may read.
+        let claude = probe
+            .integrations
+            .iter()
+            .position(|entry| *entry == crate::integrations::CLAUDE_CODE)
+            .unwrap();
+        assert!(
+            probe.presentation_of(claude).is_some(),
+            "the running TUI brands its tab"
+        );
+
+        tick_until(&mut probe, is_shell_tab);
+        let terminal = probe.terminal.as_ref().unwrap();
+        assert_ne!(terminal.pid(), tui_pid, "a new child runs");
+        assert!(terminal.exit_status().is_none(), "no exit banner");
+        assert_eq!(terminal.options().shell, None, "the plain terminal shell");
+        assert!(terminal.options().args.is_empty());
+        assert_eq!(terminal.options().cwd, followed);
+        assert_eq!(probe.explorer_root(), Some(followed.as_path()));
+        assert!(
+            probe.presentation_of(claude).is_none(),
+            "no Claude Code status survives on the shell"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_whose_followed_folder_is_gone_restarts_the_shell_in_the_launch_folder() {
+        let temp = stable_tempdir();
+        let launch = temp.path().join("launch");
+        let followed = temp.path().join("followed");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&followed).unwrap();
+        let launch = launch.canonicalize().unwrap();
+        let mut probe = exiting_tui(&launch, &followed.canonicalize().unwrap(), "exit 0");
+        std::fs::remove_dir(&followed).unwrap();
+
+        tick_until(&mut probe, is_shell_tab);
+        let terminal = probe.terminal.as_ref().unwrap();
+        assert_eq!(terminal.options().cwd, launch);
+        assert_eq!(probe.explorer_root(), Some(launch.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_that_exits_non_zero_keeps_its_exit_state() {
+        let temp = stable_tempdir();
+        let followed = temp.path().join("followed");
+        std::fs::create_dir_all(&followed).unwrap();
+        let mut probe = exiting_tui(temp.path(), &followed, "exit 3");
+        tick_until(&mut probe, |workbench| {
+            workbench
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.exit_status().is_some())
+        });
+        let ctx = egui::Context::default();
+        probe.tick(&ctx);
+        let terminal = probe.terminal.as_ref().unwrap();
+        assert_eq!(terminal.exit_status().map(|status| status.code), Some(3));
+        assert!(!terminal.exited_cleanly());
+        assert!(matches!(probe.terminal_target, TerminalTarget::Tui(_)));
+        assert!(!probe.shell_exited_cleanly());
     }
 
     #[test]

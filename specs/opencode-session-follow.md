@@ -116,7 +116,7 @@ For supported launch-local shell integration, Made MUST follow real directory ch
 
 ### Requirement: Independent Workspace Tabs
 
-Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state including the connected view directory, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. No tab persistence across app restart is required.
+Made MUST let users open an additional workspace folder in a new tab, switch workspace tabs, and close a tab in the same native window. Each tab MUST own its shell/process lifecycle, terminal state, explorer/root generations, shell cwd, bridge/connection state including the connected view directory, OpenCode session map, preview selection/mode, explorer visibility/width and focus state. Switching tabs MUST retain live shell and OpenCode processes and MUST NOT leak cwd, preview content, selection, connection state, shortcuts or focus between tabs. Workspace tab and optional OpenCode session-map presentation are owned by the UI spec; this requirement owns tab lifecycle, ownership, and isolation. Closing a tab MUST terminate/reap only its owned processes and release its watcher, bridge, queues, secrets and bootstrap resources; late results MUST NOT reach a surviving or newly created tab. Closing the last tab MUST return to the folder picker. When a local tab's terminal child exits with status 0 and neither its output nor its monitor failed, Made MUST NOT show an exit banner. A tab whose terminal was launched directly as a TUI from the `+` menu MUST then replace that TUI in the same tab with the interactive shell Made starts for a plain terminal tab, started in the tab's current explorer root, or in the tab's launch folder when that root is no longer a usable directory; the exited TUI's per-terminal integration state and its directory follow MUST be released, so no status, session dots or follow of that TUI attach to the new shell, and the tab presents as a plain terminal tab. A plain shell tab whose shell exits with status 0 MUST close exactly as its close action closes it, including returning to the folder picker when it was the last tab. A non-zero exit, a signal, a monitor or output failure, or output that closes without an exit status MUST keep the tab open with the exit banner that names the program and what ended it, and its Restart action. Remote (SSH) tabs are not covered by this rule and keep their exit banner and Reconnect action. No tab persistence across app restart is required.
 
 #### Scenario: Open and switch independent workspaces
 
@@ -141,6 +141,24 @@ Made MUST let users open an additional workspace folder in a new tab, switch wor
 - Given a single workspace tab
 - When the user closes it
 - Then its resources are released and Made returns to the folder picker without launching another shell or OpenCode
+
+#### Scenario: TUI exits cleanly
+
+- Given a local tab launched directly as a TUI whose explorer follows folder F, and in another run F is removed before the TUI exits
+- When the TUI exits with status 0
+- Then the same tab runs a new interactive shell in F (in the tab's launch folder in the other run), shows no exit banner, presents the plain terminal label and glyph, and keeps no status, session dots or directory follow of the exited TUI
+
+#### Scenario: Shell exits cleanly
+
+- Given two local tabs with running shells
+- When the user runs `exit` in one, and later in the remaining tab
+- Then each tab closes exactly as its close action closes it, the other tab stays live, and closing the last tab returns to the folder picker
+
+#### Scenario: Unclean exit keeps the banner
+
+- Given a local shell tab and a local TUI tab
+- When the child exits non-zero or by a signal, its monitor or output fails, or its output closes without an exit status
+- Then the tab stays open with the exit banner that names the program and what ended it, and its Restart action
 
 #### Scenario: Hidden workspaces remain current and bounded
 

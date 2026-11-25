@@ -2339,6 +2339,15 @@ impl AppModel {
         for (_, workbench) in &mut self.workspaces {
             workbench.tick(ctx);
         }
+        let exited: Vec<WorkspaceId> = self
+            .workspaces
+            .iter()
+            .filter(|(_, workbench)| workbench.shell_exited_cleanly())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in exited {
+            self.close_workspace(id);
+        }
         self.push_integration_diagnostics();
         self.poll_updates(ctx);
         if ctx.input(|input| input.viewport().close_requested()) {

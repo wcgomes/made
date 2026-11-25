@@ -545,6 +545,15 @@ impl TerminalPane {
         self.exit.as_ref()
     }
 
+    /// Whether the child exited with status 0 and neither its output nor its
+    /// monitor failed. A signal, a non-zero code or an output closed without
+    /// a status is not a clean exit.
+    pub fn exited_cleanly(&self) -> bool {
+        self.monitor_error.is_none()
+            && self.read_error.is_none()
+            && self.exit.as_ref().is_some_and(ExitStatus::success)
+    }
+
     /// Monitor-thread failure, distinct from a normal exit.
     pub fn monitor_error(&self) -> Option<&str> {
         self.monitor_error.as_deref()
