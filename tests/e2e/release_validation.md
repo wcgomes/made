@@ -1,6 +1,6 @@
 # Release acceptance (add-release-auto-update, tasks 9.1 to 9.3)
 
-Contract: `specs/changes/add-release-auto-update/`. This file records, per target, what was executed against
+Contract: `specs/changes/archive/20261125-add-release-auto-update/`, realized in `specs/release-distribution.md`. This file records, per target, what was executed against
 published releases and what was not. A combination that was not executed is labelled `UNVERIFIED` with its reason;
 nothing here certifies a combination that did not run.
 
@@ -40,7 +40,8 @@ until run on real machines.
 ## Iteration releases (task 9.2)
 
 Iteration releases are temporary test releases cut under the rollout plan; their notes say so, and the coordinator
-deletes them before the final `v0.1.0` re-release.
+deletes them before the final `v0.1.0` re-release. All of them, and their tags, are deleted: on 2026-11-25 the
+repository lists only the final `v0.1.0` and `v0.1.1` releases.
 
 | Tag | Release | release.yml run | Installed smoke | Upgrade check | Notes |
 |---|---|---|---|---|---|
@@ -55,6 +56,63 @@ deletes them before the final `v0.1.0` re-release.
 | `v0.1.8` | https://github.com/wcgomes/made/releases/tag/v0.1.8 | [42122383704](https://github.com/wcgomes/made/actions/runs/42122383704) (success) | `CI-release` pass on all seven | `CI-upgrade` 0.1.7 → 0.1.8 pass on all twelve (Windows setup, macOS arm64/x64 `.pkg` and `.zip`, Linux AppImage; automatic checks on and off). Windows printed "Handed off to helper process …: Made 0.1.8 is being installed and the apply is not complete yet", and the next `--update` printed "Last command-line apply: installed Made 0.1.8" | Branch CI green on the same head (2fe1073; Linux display smoke needed one re-run after an `apt` mirror stall). The publish gate re-ran on the draft, `latest` was set explicitly and the newest-release check passed; `SHA256SUMS` (14 entries) matches GitHub's asset digests |
 | `v0.1.9` | https://github.com/wcgomes/made/releases/tag/v0.1.9 | [42130151982](https://github.com/wcgomes/made/actions/runs/42130151982) (success, attempt 2) | `CI-release` pass on all seven; the AppImage check on Ubuntu 22.04 and 24.04 found the target `~/.cache/made/appimage-0.1.9-3d891ab9899b3928` (per user, version and build), refused a target owned by another user, a group/other-writable target and a symlink, and replaced an extraction with a file cut short and one with most files missing, then started | `CI-upgrade` 0.1.8 → 0.1.9 pass on all twelve (Windows setup, macOS arm64/x64 `.pkg` and `.zip`, Linux AppImage; automatic checks on and off) | Branch CI green on the same head (65b7f4a). Attempt 1 stopped before anything was built or published: the macOS x64 companion job's tests passed but its artifact upload failed with `ENOTFOUND` (runner network outage); only the failed jobs were re-run |
 
+## Final `v0.1.0` re-release (task 9.2)
+
+| Tag | Release | release.yml run | Installed smoke | Upgrade check | Notes |
+|---|---|---|---|---|---|
+| `v0.1.0` | https://github.com/wcgomes/made/releases/tag/v0.1.0 | [42142416024](https://github.com/wcgomes/made/actions/runs/42142416024) (success, head 8b922e9) | `CI-release` pass on all seven | First-release exemption reported (job "First-release exemption" success; upgrade jobs skipped) | Published 2026-11-06T01:48:57Z with 15 assets after the iteration releases and tags were deleted; notes carry no temporary-release label |
+
 ## Second release from the final `v0.1.0` (task 9.3)
 
-UNVERIFIED: the final `v0.1.0` re-release and its successor are dispatched separately after review.
+`v0.1.1` is the second published release counted from the final `v0.1.0`. It was published on 2026-11-25 (17:56:12Z)
+as Latest, not a prerelease, with 15 assets: 6 end-user downloads named `made-0.1.1-<os>-<arch>`, 4 full packages,
+4 feeds and `SHA256SUMS`. Supporting pull requests: [#14](https://github.com/wcgomes/made/pull/14) bumps every version
+site to 0.1.1; [#15](https://github.com/wcgomes/made/pull/15) fixed a flaky macOS x64 explorer timing test found
+along the way.
+
+release.yml run [45641014543](https://github.com/wcgomes/made/actions/runs/45641014543):
+
+- Attempt 1: gate, build and pack, and six of seven installed-smoke jobs passed; `Installed smoke (osx-arm64 pkg on
+  macos-15)` was cancelled, so the publish job and the upgrade check were skipped and nothing was published.
+- Attempt 2 (failed jobs only): that smoke job passed; publish waited for maintainer approval in the protected
+  `release` environment and published at 17:56:12Z; the post-publish upgrade check (task 7.12) then ran 0.1.0 → 0.1.1.
+- Attempt 3 (failed jobs only): one re-run of the two upgrade jobs that did not run for infrastructure reasons; both passed and the run concluded `success`. Result: the upgrade check passed on all twelve jobs (Windows setup, macOS arm64 and x64 `.pkg` and `.zip`, Linux AppImage; automatic checks on and off).
+
+Post-publish upgrade check (task 7.12), `CI-upgrade` 0.1.0 → 0.1.1:
+
+| Job | Attempt | Result |
+|---|---|---|
+| Find the previous and latest releases | 2 | pass (`PREVIOUS=v0.1.0`, `LATEST=v0.1.1`) |
+| First-release exemption | 2 | skipped (two published releases) |
+| Upgrade setup on windows-2025 (automatic checks on) | 2 | pass; hand-off to the apply helper, then "Last command-line apply: installed Made 0.1.1" |
+| Upgrade setup on windows-2025 (automatic checks off) | 2 | pass |
+| Upgrade pkg on macos-15 (automatic checks off) | 2 | pass |
+| Upgrade pkg on macos-15 (automatic checks on) | 2 | infrastructure failure: `gh release download v0.1.0` returned "release not found" for the existing release before anything was installed |
+| Upgrade pkg on macos-15 (automatic checks on) | 3 | pass (job 139412348335) |
+| Upgrade zip on macos-15 (automatic checks on) | 2 | pass |
+| Upgrade zip on macos-15 (automatic checks off) | 2 | cancelled after 16 minutes queued without a runner; no step ran |
+| Upgrade zip on macos-15 (automatic checks off) | 3 | pass (job 139412348267) |
+| Upgrade pkg on macos-15-intel (automatic checks on) | 2 | pass |
+| Upgrade pkg on macos-15-intel (automatic checks off) | 2 | pass |
+| Upgrade zip on macos-15-intel (automatic checks on) | 2 | pass |
+| Upgrade zip on macos-15-intel (automatic checks off) | 2 | pass |
+| Upgrade appimage on ubuntu-24.04 (automatic checks on) | 2 | pass |
+| Upgrade appimage on ubuntu-24.04 (automatic checks off) | 2 | pass |
+
+Each passing job installed the previous release per-user from the production repository with app data seeded
+(`preferences.json` with the REL-10 choice, `ssh-servers.json`), ran `--update` and then `--update --apply` through the
+same update client, host allowlist and verification as About, and asserted `--version` 0.1.1, preserved app data and the
+seeded REL-10 choice, the REL-03 layout and the production `update_repo` smoke marker.
+
+In-app upgrade on real machines:
+
+| Target | Evidence |
+|---|---|
+| macOS (architecture unspecified) | Maintainer report, 2026-11-25: the in-app auto-update from an installed 0.1.0 to 0.1.1 succeeded on their own machine. The machine is macOS, probably Apple silicon, but the architecture and install form were not stated. No separate report on whether SSH records and settings were preserved: UNVERIFIED by hand, covered only by `CI-upgrade` |
+| Other macOS architecture and install form | UNVERIFIED by hand; covered only by `CI-upgrade` |
+| Windows x64 | UNVERIFIED: no manual in-app upgrade; covered only by `CI-upgrade` |
+| Linux x64 AppImage | UNVERIFIED: no manual in-app upgrade; covered only by `CI-upgrade` |
+
+The About-path restart (`Restart to update`, relaunch as the new version) was exercised only by the maintainer's macOS
+update; preservation of SSH server records and settings across an in-app update is shown only by `CI-upgrade`, which
+drives the command-line entry rather than About.

@@ -44,7 +44,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - Fallbacks:
     - A rename breaks updates: keep Velopack's names only for files the feed references and rename the rest. If an end-user download is feed-referenced, return to the user.
     - Any kill point leaves no launchable version: this is release-blocking and returns to the user.
-- [x] 1.8 Record each probe outcome (pass or chosen fallback), the confirmed Velopack crate version and API names, the observed request and redirect hosts that form the REL-08 allowlist, whether the request is observable at the transport layer or else the full header set sent, including `User-Agent`, and the per-OS swap atomicity in the Decision index. Route any behavior-changing fallback into spec.md (path: specs/changes/add-release-auto-update/proposal.md)
+- [x] 1.8 Record each probe outcome (pass or chosen fallback), the confirmed Velopack crate version and API names, the observed request and redirect hosts that form the REL-08 allowlist, whether the request is observable at the transport layer or else the full header set sent, including `User-Agent`, and the per-OS swap atomicity in the Decision index. Route any behavior-changing fallback into spec.md (path: specs/changes/archive/20261125-add-release-auto-update/proposal.md)
 
 ## Checkpoint
 - [x] Every probe 1.2 to 1.7 has a recorded outcome; no "return to the user" outcome remains unresolved; `analyze` rerun if any fallback changed behavior
@@ -68,7 +68,9 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 2.7 Run the version checker and the 2.1 and 2.4 tests on every push to main and every pull request; land after `grok-native-hook` 2.2 (path: .github/workflows/ci.yml)
 
 ## Checkpoint
-- [ ] verify REL-02 "One action bumps every version site" (2.4) and "Plugin manifest drifts in a pull request" (2.1 fixtures plus a CI run failing on a drift branch); `check-versions.py` passes on the repository
+- [x] verify REL-02 "One action bumps every version site" (2.4) and "Plugin manifest drifts in a pull request" (2.1 fixtures plus a CI run failing on a drift branch); `check-versions.py` passes on the repository
+  - Evidence (2026-11-25): `test_bump_version.py` and the 2.1 fixtures in `test_check_versions.py` (each site mismatch names site and versions; a workspace-only hand edit fails for every site left behind) pass in the `Version sites and release scripts` job of every CI run, including main CI run 45640974003 on c2f3a6c; PR #14 used `scripts/bump-version.sh 0.1.1` and the release gate accepted v0.1.1; `check-versions.py` on the repository prints `versions agree: 0.1.1`.
+  - Deviation: no CI run on a drift branch was made. Instead, `check-versions.py --root` on a copy of c2f3a6c with `plugins/grok-made/plugin.json` set to 0.1.2 exited 1 with "plugins/grok-made/plugin.json version 0.1.2 differs from the workspace version 0.1.1", and that same script is the CI step `Check that every version site agrees`.
 
 ## 3. Shared staging and self-contained builds
 - [x] 3.1 Write failing tests for shared staging. For debug and release profiles, given fake build outputs, the staged tree has (path: .github/scripts/test_stage_desktop_package.py):
@@ -231,12 +233,21 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   Any failure leaves only the draft. Confirm 7.6 passes.
 
 ## Checkpoint
-- [ ] verify:
+- [x] verify:
   - REL-01 "Checksums cover every asset", "One target fails" (forced failure on a test tag in a fork), "Re-run on a published tag", "Version not newer than the latest release refused", "Re-run after a failed run", "Prerelease tag refused" and "Non-tag pushes publish nothing";
   - REL-02 "Tag and workspace version mismatch" and "Tag refused on plugin mismatch";
   - REL-03 "Release blocked by a broken layout";
   - REL-08 verification of a real downloaded package during 7.11;
   - REL-12 "Post-publish upgrade check" (exemption path on the first release), "Command-line upgrade uses the same path", "GUI startup refused during command-line apply" and "Command-line apply refused while Made runs" (with 5.7).
+  - Evidence (2026-11-25), recorded in `tests/e2e/release_validation.md`:
+    - checksums: iteration v0.1.0 `sha256sum -c` OK, v0.1.6 and v0.1.8 `SHA256SUMS` match GitHub's asset digests;
+    - one target fails: v0.1.1 run 45641014543 attempt 1, where one installed-smoke target was cancelled, skipped publish and published nothing; also v0.1.3 and v0.1.4, cancelled with nothing published. Deviation: no forced failure on a test tag in a fork was run;
+    - re-run on a published tag and version not newer: iteration v0.1.0 gate re-run (run 42073343557 attempt 2) refused with "already published" and "not greater than the newest published stable release";
+    - re-run after a failed run, prerelease tag refused, and both REL-02 tag scenarios: `test_release_gate.py` and `test_check_versions.py` in CI (draft discarded, prerelease refused, any site disagreement refused, tag mismatch names both versions); v0.1.9 attempt 2 published after a failed attempt 1;
+    - non-tag pushes: `release.yml` runs only on `v*` tags (`test_release_workflow.py`), and only tag runs ever created releases;
+    - REL-03 broken layout: `smoke-installed.py` fails on any miss and publish needs every smoke job (`test_release_workflow.py`); attempt 1 above shows a non-passing smoke target blocking publish;
+    - REL-08: every `CI-upgrade` job downloads and verifies a real published package ("0.1.1 is downloaded and verified");
+    - REL-12: final v0.1.0 run 42142416024 reported the first-release exemption; the command-line upgrade passes in `CI-upgrade` on every target; GUI refusal during apply is covered by 11.3 tests; a running instance refused the apply in the iteration v0.1.1 macOS `.pkg` jobs ("Made is running from this install") and in 5.7 tests.
 
 ## 8. Documentation
 - [x] 8.1 Replace the "no installers … auto-update" statement in the README (path: README.md) with:
@@ -270,6 +281,8 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - installed-layout launch with components resolved.
 - [x] 9.2 After user approval, push iteration tags `v0.1.0`, `v0.1.1`, ... in the production repository as implementation needs, with notes labelled as temporary test releases, and record each release URL and per-target evidence. After verification, and only once the Phase 11 checkpoint passes and the REL-01 approval gate is configured, follow the rollout plan: delete all iteration releases, then their tags, re-release `v0.1.0` from the final commit, and record its evidence (path: tests/e2e/release_validation.md)
 - [ ] 9.3 At the second published release counted from the final `v0.1.0`, confirm the 7.12 upgrade check passed and verify the in-app upgrade from the first on every target with SSH records and settings preserved (path: tests/e2e/release_validation.md)
+  - Evidence (2026-11-25): v0.1.1 is the second release, published as Latest; the 7.12 upgrade check (run 45641014543) passed on all twelve jobs, after one re-run of two jobs that failed for infrastructure reasons, as `tests/e2e/release_validation.md` records; the maintainer reported a successful in-app update 0.1.0 → 0.1.1 on their own macOS machine (architecture unspecified).
+  - Not ticked: no manual in-app upgrade on Windows, Linux or the other macOS architecture and install form, and no manual report on SSH records and settings; those are covered only by `CI-upgrade`.
 
 ## Checkpoint
 - [ ] verify:
@@ -280,6 +293,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
   - REL-05 all scenarios;
   - REL-09 "Interrupted apply";
   - REL-12 "Post-publish upgrade check", "Failed upgrade check" (if one occurs) and "Upgrade from the previous release" at the second release.
+  - Not ticked (2026-11-25): REL-01 "Tag produces a complete release", REL-02 version (`--version` and the smoke line), REL-03 installed-layout scenarios on hosted runners, REL-09 "Interrupted apply" (CI-probe kill points) and REL-12 "Post-publish upgrade check" have evidence. REL-04 fresh-machine scenarios and "Optional tools absent", all REL-05 scenarios, About and Diagnostics version display beyond the maintainer's macOS update, and "Upgrade from the previous release" on every target remain `UNVERIFIED` manual checks, as `tests/e2e/release_validation.md` records.
 
 ## 10. Cleanup
 - [x] 10.1 Remove the probe crate after the 1.8 outcomes are recorded and Phase 7 is green (path: tests/release-probe/Cargo.toml)
@@ -310,7 +324,7 @@ Phase 1 probes must finish, and any fallback that changes observable behavior mu
 - [x] 11.6 Show the recorded helper outcome in the diagnostics detail; confirm 11.5 passes (path: crates/made-app/src/diagnostics.rs)
 - [x] 11.7 Write failing tests for AppImage extraction privacy: unit cases, plus an AppImage-level runtime test that launches the built AppImage against pre-planted entries (a directory owned by another user, a user-owned directory with any `077` bit set, a symlink). None is executed from and the symlink is not followed; the outcome is a fresh private directory or a clear exit, per the M2 decision. Enforcement may need a wrapper inside the AppImage (path: .github/scripts/test_linux_appimage_runtime.py)
 - [x] 11.8 Implement the private extract-and-run target per the M2 decision; confirm 11.7 passes (path: .github/scripts/linux-appimage-runtime.py)
-- [x] 11.9 Fill the M2 AppImage extraction decision and confirm the hand-off record (path: specs/changes/add-release-auto-update/proposal.md)
+- [x] 11.9 Fill the M2 AppImage extraction decision and confirm the hand-off record (path: specs/changes/archive/20261125-add-release-auto-update/proposal.md)
 - [x] 11.10 Make the Windows upgrade check poll `--update` until it no longer reports "apply in progress", within a bounded wait that fails the upgrade check on timeout, then assert the recorded helper outcome and the new version (path: .github/workflows/upgrade-check.yml)
 
 ## Checkpoint
