@@ -47,6 +47,13 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - The 10k-row selection guard is 16 ms on Windows and macOS x86_64 debug runners and 5 ms on Linux/macOS arm64; the product contract remains frame p95 below 16.667 ms. Treat the test guard as runner headroom, not the product budget.
 - Sources: [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) `hover_until_text`, [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs), [Performance](../performance.md).
 
+## Terminal view selection tests
+
+- Selection and copy tests in `terminal_view.rs` must not run the user's real shell. Tests drain PTY output into the grid only through the first frame's resize pump (`TerminalPane::resize` pumps, then returns early on an unchanged size), so shell startup output that arrives later (macOS `/bin/bash` prints a blank line before its zsh notice) can blank the selected cells. An empty selection copies nothing (`copy_selection` returns `None`); that is correct product behavior, not the bug.
+- Use the `spawn_quiet_pane` test helper: on unix it runs `/bin/sh` with `stty -echo`, waits for a `ready` marker, then clears screen and scrollback before the test feeds text. Windows still uses the native shell.
+- In made-terminal (`alacritty_terminal` 0.26), ED 2 (`ESC[2J`) moves the screen into scrollback and a later taller resize pulls those lines back into view; send ED 3 (`ESC[3J`) as well to blank a test grid before a resize.
+- Source/Test: [`terminal_view.rs`](../../crates/made-app/src/terminal_view.rs) `resize`, `copy_selection`, `spawn_quiet_pane`.
+
 ## Windows watched-root deletion
 
 - Recursive deletion can fail with a sharing violation while a watcher handle is open even though `notify` uses `FILE_SHARE_DELETE`. The unavailable-root test renames the root on Windows and deletes recursively on Unix; this simulates loss of the watched path without weakening product cleanup.
@@ -61,4 +68,5 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.
 - `made-app` tests run on Windows only in the `windows-2025` entry of the `ci.yml` `cargo test --workspace` matrix. [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) runs targeted package tests (platform contract, PTY, the hook crates) plus smoke, never `made-app` tests.
+- Clippy runs only on Linux (`ubuntu-24.04` lint job). Locally on macOS, `cargo clippy --workspace --all-targets --locked -- -D warnings` fails with dead-code errors in [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) for items used only under `#[cfg(target_os = "linux")]`; that is a host difference, not a regression.
 - Workflow: [`ci.yml`](../../.github/workflows/ci.yml).
