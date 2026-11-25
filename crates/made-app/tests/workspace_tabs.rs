@@ -1068,7 +1068,9 @@ fn isolated_real_bash_cd_follows_hidden_tabs_without_painting() {
         &format!("printf alive > '{}'", marker.display()),
     );
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !marker.exists() && Instant::now() < deadline {
+    while std::fs::read_to_string(&marker).ok().as_deref() != Some("alive")
+        && Instant::now() < deadline
+    {
         model.logic(&ctx);
         std::thread::sleep(Duration::from_millis(5));
     }
