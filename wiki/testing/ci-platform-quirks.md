@@ -44,7 +44,7 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 ## Timing and budgets
 
 - egui creates tooltip areas one pass after hover; loaded runners need retries until the exact text appears. Retry readiness, never relax the assertion.
-- The 10k-row selection guard is 16 ms on Windows and macOS x86_64 debug runners and 5 ms on Linux/macOS arm64; the product contract remains frame p95 below 16.667 ms. Treat the test guard as runner headroom, not the product budget.
+- The 10k-row selection guard (median of three p95 batches) is 16 ms on Windows debug runners and 5 ms on Linux and macOS arm64. macOS x86_64 has no timing assertion and only reports the p95 to stderr, because the hosted `macos-15-intel` runner swung from about 5.5 to 16 to 26 ms on unchanged code; the no-rebuild assertion still guards every platform. The product contract remains frame p95 below 16.667 ms. Treat the test guard as runner headroom, not the product budget.
 - Sources: [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) `hover_until_text`, [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs), [Performance](../performance.md).
 
 ## Terminal view selection tests
