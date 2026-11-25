@@ -1829,7 +1829,28 @@ impl TerminalPane {
         ui.painter().rect_filled(thumb, 3.0, thumb_color);
     }
 
+    /// Whether a local child's end is, or may still turn out to be, a clean
+    /// exit, which the workbench answers by replacing or closing the pane.
+    /// The output closes a moment before the exit is reported, so an ended
+    /// output whose child has not been reaped yet counts as pending.
+    fn clean_exit_pending(&self) -> bool {
+        if self.target.is_remote() || self.monitor_error.is_some() || self.read_error.is_some() {
+            return false;
+        }
+        let status = self
+            .exit
+            .clone()
+            .or_else(|| self.pty.as_ref().and_then(PtyProcess::exit_status));
+        match status {
+            Some(status) => status.success(),
+            None => self.eof,
+        }
+    }
+
     fn paint_shell_state(&mut self, ui: &mut Ui, grid_rect: Rect, output: &mut TerminalUiOutput) {
+        if self.clean_exit_pending() {
+            return;
+        }
         let label = self.target.program_label();
         let message = if let Some(error) = &self.monitor_error {
             Some(format!("{label} monitor failed: {error}"))
@@ -3665,6 +3686,99 @@ mod tests {
         });
         frame.textures_delta.clear();
         (output.expect("terminal rendered"), frame)
+    }
+
+    #[cfg(unix)]
+    fn frame_text(output: &egui::FullOutput) -> String {
+        fn visit(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => {
+                    text.push_str(&shape.galley.job.text);
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| visit(shape, text)),
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            visit(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    /// Render a pane whose stand-in child runs `script`, once its output
+    /// closed, then again once its exit is recorded.
+    #[cfg(unix)]
+    fn exit_frames(script: &str, target: TerminalTarget) -> (String, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(
+            &platform,
+            PtyOptions::new(temp.path())
+                .with_shell("/bin/sh")
+                .with_args(["-c", script]),
+        )
+        .expect("spawn the stand-in")
+        .with_target(target);
+        let ctx = egui::Context::default();
+        let mut metrics = Metrics::new();
+        let mut log = DiagnosticLog::new();
+        let mut render = |pane: &mut TerminalPane| {
+            let (_, frame) = run_terminal_frame_capture(
+                &ctx,
+                pane,
+                &platform,
+                &mut metrics,
+                &mut log,
+                Vec::new(),
+            );
+            frame_text(&frame)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pump_log = DiagnosticLog::new();
+        while !pane.eof && pane.exit.is_none() && Instant::now() < deadline {
+            pane.pump(&mut pump_log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let closed = render(&mut pane);
+        while pane.exit.is_none() && Instant::now() < deadline {
+            pane.pump(&mut pump_log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let exited = render(&mut pane);
+        pane.terminate(&mut pump_log);
+        (closed, exited)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_exit_never_paints_the_exit_banner() {
+        for target in [
+            TerminalTarget::Shell,
+            TerminalTarget::Tui(crate::integrations::CLAUDE_CODE),
+        ] {
+            let (closed, exited) = exit_frames("printf 'bye\\n'; exit 0", target);
+            for text in [closed, exited] {
+                for banner in ["exited", "output closed", "Restart"] {
+                    assert!(!text.contains(banner), "{target:?}: {text}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unclean_exit_paints_the_exit_banner() {
+        let (_, exited) = exit_frames("exit 3", TerminalTarget::Shell);
+        assert!(exited.contains("Shell exited (exit code 3)."), "{exited}");
+        assert!(exited.contains("Restart shell"), "{exited}");
+        let (_, exited) = exit_frames(
+            "kill -9 $$",
+            TerminalTarget::Tui(crate::integrations::CLAUDE_CODE),
+        );
+        assert!(exited.contains("Claude Code exited ("), "{exited}");
+        assert!(exited.contains("Restart Claude Code"), "{exited}");
     }
 
     fn has_large_rect_fill(output: &egui::FullOutput, fill: egui::Color32) -> bool {
