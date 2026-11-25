@@ -1484,6 +1484,10 @@ mod tests {
 
     #[test]
     fn instance_registration_is_seen_and_released() {
+        // A concurrent forking test would hold the lock descriptors below.
+        let _fork = crate::FORK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let installation = Installation {
             root: dir.path().into(),

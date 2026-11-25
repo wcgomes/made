@@ -171,6 +171,21 @@ pub fn attach_parent_console() {
     windows::attach_parent_console();
 }
 
+/// On macOS, when launched from Finder or the Dock, replace launchd's minimal
+/// `PATH` with the login shell's plus well-known install directories (see
+/// `macos::adopt_login_shell_path`). Must run before any thread starts. Does
+/// nothing on other platforms.
+pub fn adopt_login_shell_path() {
+    #[cfg(target_os = "macos")]
+    macos::adopt_login_shell_path();
+}
+
+/// Serializes unit tests that fork (a `pre_exec` spawn) with tests that check
+/// an `flock` is released: a forked child holds every descriptor, close-on-exec
+/// ones included, until it execs.
+#[cfg(all(test, any(target_os = "macos", feature = "desktop")))]
+pub(crate) static FORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Release the console attached by [`attach_parent_console`] before the GUI
 /// session starts, so the launching terminal's Ctrl+C or close cannot end
 /// Made. Does nothing on other platforms.
