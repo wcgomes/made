@@ -1,6 +1,6 @@
 # Release and CI
 
-Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. The five CI workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; `release.yml` and `upgrade-check.yml` are covered by the [release record](../records/20261106-v0-1-0-release.md); see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. The five CI workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; `release.yml` and `upgrade-check.yml` are covered by the [v0.1.0](../records/20261106-v0-1-0-release.md) and [v0.1.1](../records/20261125-v0-1-1-release.md) release records; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -62,6 +62,15 @@ Releases are produced only by pushing a `v<major>.<minor>.<patch>` tag; branch p
 6. A failed upgrade check is remedied by publishing a fixed, newer release. The failing release is never modified or replaced.
 
 If the gate refuses the tag, read its message, fix the sites with the bump script (through a pull request) or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
+
+### Transient runner failures
+
+GitHub-hosted runners fail release and upgrade jobs for reasons unrelated to Made. Observed during [v0.1.1](../records/20261125-v0-1-1-release.md):
+
+- A `macos-15` (arm64) job sits queued without a runner and is cancelled after about 16 to 18 minutes ("The job was not acquired by Runner ... even after multiple attempts").
+- `gh release download` reports "release not found" for an existing release.
+
+Rerun only the failed jobs: `gh run rerun <run-id> --failed`. For `release.yml` this is safe on the same tag: no re-tag is needed, and nothing is published until the publish job succeeds. If publish already ran, the rerun repeats only the failed upgrade jobs; an infrastructure failure there is not the failed upgrade check of step 6.
 
 ### Repository settings
 

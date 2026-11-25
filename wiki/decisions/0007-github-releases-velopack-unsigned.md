@@ -26,4 +26,4 @@ Made shipped only unsigned debug development artifacts that were not installers 
 
 ## Evidence
 
-[`specs/changes/add-release-auto-update/proposal.md`](../../specs/changes/add-release-auto-update/proposal.md), [`tests/e2e/release_validation.md`](../../tests/e2e/release_validation.md), [release record](../records/20261106-v0-1-0-release.md).
+[`specs/release-distribution.md`](../../specs/release-distribution.md), [`tests/e2e/release_validation.md`](../../tests/e2e/release_validation.md), [v0.1.0 record](../records/20261106-v0-1-0-release.md), [v0.1.1 record](../records/20261125-v0-1-1-release.md).
