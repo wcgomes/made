@@ -2848,12 +2848,8 @@ mod tests {
     fn click_does_not_select_or_copy_and_a_drag_to_another_cell_does() {
         let temp = tempfile::tempdir().unwrap();
         let platform = made_platform::host_platform();
-        let mut pane = TerminalPane::spawn(
-            &platform,
-            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
-        )
-        .unwrap();
         let mut log = DiagnosticLog::new();
+        let mut pane = spawn_quiet_pane(&platform, temp.path(), &mut log);
         let mut metrics = Metrics::new();
         let ctx = terminal_context();
         let _ = run_terminal_frame(
@@ -2967,31 +2963,10 @@ mod tests {
     fn typing_clears_an_existing_terminal_selection() {
         let temp = tempfile::tempdir().unwrap();
         let platform = made_platform::host_platform();
-        // A real shell keeps drawing its prompt and echoing input on its own
-        // schedule, and that output lands in the same grid the test selects
-        // from. On a slow runner it can arrive between `mark` and the copy and
-        // overwrite or clear the marked cells. A silent child removes the race.
-        let mut options =
-            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 });
-        if cfg!(unix) {
-            options = options
-                .with_shell("/bin/sh")
-                .with_args(["-c", "stty -echo; printf ready; exec sleep 30"]);
-        }
-        let mut pane = TerminalPane::spawn(&platform, options).unwrap();
         let mut log = DiagnosticLog::new();
+        let mut pane = spawn_quiet_pane(&platform, temp.path(), &mut log);
         let mut metrics = Metrics::new();
         let ctx = terminal_context();
-        if cfg!(unix) {
-            // The child has disabled echo once its marker reaches the pane, so
-            // nothing else will ever be written to the grid.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while pane.output_bytes() == 0 {
-                assert!(Instant::now() < deadline, "the quiet child never started");
-                let _ = pane.pump(&mut log);
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
         let _ = run_terminal_frame(
             &ctx,
             &mut pane,
@@ -3104,12 +3079,8 @@ mod tests {
     fn shift_drag_in_a_mouse_reporting_tui_selects_locally() {
         let temp = tempfile::tempdir().unwrap();
         let platform = made_platform::host_platform();
-        let mut pane = TerminalPane::spawn(
-            &platform,
-            PtyOptions::new(temp.path()).with_size(made_platform::PtySize { rows: 24, cols: 80 }),
-        )
-        .unwrap();
         let mut log = DiagnosticLog::new();
+        let mut pane = spawn_quiet_pane(&platform, temp.path(), &mut log);
         let mut metrics = Metrics::new();
         let ctx = terminal_context();
         let _ = run_terminal_frame(
@@ -3643,6 +3614,43 @@ mod tests {
             }
             pane.terminate(&mut log);
         }
+    }
+
+    /// Spawn a pane whose grid only ever receives what the test feeds it.
+    ///
+    /// A real shell draws its startup output and prompt on its own schedule,
+    /// and that output lands in the same grid the test selects from. Whether
+    /// it reaches the grid before or after the test feeds its own text depends
+    /// on runner load, and it can leave the selected cells blank (macOS bash
+    /// starts with an empty line before its zsh notice) or overwrite them. On
+    /// unix a silent child removes the race: once its whole marker reaches the
+    /// pane it has disabled echo and will never write to the grid again, so
+    /// the marker is cleared and the cursor homed before the test feeds text.
+    fn spawn_quiet_pane(
+        platform: &dyn made_platform::Platform,
+        dir: &std::path::Path,
+        log: &mut DiagnosticLog,
+    ) -> TerminalPane {
+        let mut options =
+            PtyOptions::new(dir).with_size(made_platform::PtySize { rows: 24, cols: 80 });
+        if cfg!(unix) {
+            options = options
+                .with_shell("/bin/sh")
+                .with_args(["-c", "stty -echo; printf ready; exec sleep 30"]);
+        }
+        let mut pane = TerminalPane::spawn(platform, options).expect("spawn test child");
+        if cfg!(unix) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !pane.screen_text().contains("ready") {
+                assert!(Instant::now() < deadline, "the quiet child never started");
+                let _ = pane.pump(log);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // ED 2 moves the screen into scrollback, which a taller first
+            // frame would pull back into view, so ED 3 drops it too.
+            pane.core.feed(b"\x1b[2J\x1b[3J\x1b[H");
+        }
+        pane
     }
 
     /// A headless context with the terminal font family installed, as
