@@ -304,8 +304,9 @@ mod running_tab {
 
     /// Re-run `name` in a child with an isolated home, a fake `claude` that
     /// prints a window title and then a protocol status once the trigger file
-    /// exists (and exits at once, touching nothing, for `claude agents`), and
-    /// the shipped plugin staged beside the test executable.
+    /// exists (and for `claude agents` only appends a line to
+    /// `$HOME/agents-runs` and lists nothing), and the shipped plugin staged
+    /// beside the test executable.
     fn isolated(name: &str) -> bool {
         if std::env::var_os(CHILD).is_some() {
             return false;
@@ -317,7 +318,8 @@ mod running_tab {
         fs::write(
             &claude,
             format!(
-                "#!/bin/sh\n[ \"$1\" = agents ] && exit 0\n\
+                "#!/bin/sh\n\
+                 [ \"$1\" = agents ] && {{ echo run >> \"$HOME/agents-runs\"; printf '[]'; exit 0; }}\n\
                  printf '\\033]0;{TITLE} /tmp\\007'\n\
                  while [ ! -f \"${TRIGGER}\" ]; do sleep 0.05; done\n\
                  printf '\\033]7501;state=working:app=claude-code\\007'\nsleep 30\n"
@@ -590,9 +592,28 @@ mod running_tab {
             }
         }
 
+        // Submitted input with an owned session live runs `claude agents
+        // --json`, so the check below covers the listing path too.
+        let mut input_log = made_app::DiagnosticLog::new();
+        workbench.terminal_mut().unwrap().send_key(
+            made_terminal::Key::Enter,
+            made_terminal::Modifiers::default(),
+            &mut input_log,
+        );
+        let runs = home.join("agents-runs");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runs.exists() && Instant::now() < deadline {
+            tick(&mut workbench, 1);
+        }
+        tick(&mut workbench, 120);
+        assert!(
+            fs::read_to_string(&runs).is_ok_and(|text| text.lines().count() >= 1),
+            "`claude agents --json` ran"
+        );
+
         // Made itself never tried to read any Claude Code configuration,
         // session, transcript or IDE lockfile path, even with an owned session
-        // live and a title change, which runs `claude agents --json`.
+        // live and `claude agents --json` having run.
         for fifo in &fifos {
             assert!(
                 !someone_is_reading(fifo),

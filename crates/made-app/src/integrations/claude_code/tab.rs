@@ -307,6 +307,7 @@ impl TabState for ClaudeTabState {
         } else {
             Vec::new()
         };
+        let had_sessions = runtime.tab.session_count() > 0;
         let mut parents = None;
         let mut parent_of = |pid: u32| -> Option<u32> {
             parents
@@ -329,7 +330,7 @@ impl TabState for ClaudeTabState {
         if let Some(snapshot) = &snapshot {
             runtime
                 .tab
-                .apply_agent_cwds(&snapshot.entries, snapshot.started_at);
+                .apply_agent_cwds(&snapshot.entries, snapshot.started_at, snapshot.burst);
         }
         // A background session opened from the agent view is named only by
         // the window title.
@@ -340,8 +341,8 @@ impl TabState for ClaudeTabState {
             terminal.title(),
         );
         // A `/cd` is submitted input, and an agent-view switch changes the
-        // title: only these start a burst of listings.
-        if listed && (submitted || title_changed) {
+        // title: only these and a session start start a burst of listings.
+        if listed && (!had_sessions || submitted || title_changed) {
             super::agents::trigger();
         }
         if runtime.tab.present() {

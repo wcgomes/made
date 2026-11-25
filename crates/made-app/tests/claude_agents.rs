@@ -202,13 +202,17 @@ fn agents_are_listed_only_after_input_or_a_title_change() {
     };
     write_atomic(&listing, &format!("[{}]", interactive(&root)));
 
-    // A live owned session, known only from its hook record.
-    writeln!(
-        fs::OpenOptions::new().append(true).open(&spool).unwrap(),
-        r#"{{"sessionId":"s1","cwd":{:?},"event":"SessionStart","status":"idle","title":"","pids":[4000000,{pane_pid}]}}"#,
-        root.display().to_string()
-    )
-    .unwrap();
+    // A live owned session, known only from its hook records.
+    let hook = |event: &str, cwd: &Path| {
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&spool).unwrap(),
+            r#"{{"sessionId":"s1","cwd":{:?},"event":{event:?},"status":"idle","title":"","pids":[4000000,{pane_pid}]}}"#,
+            cwd.display().to_string()
+        )
+        .unwrap();
+    };
+    assert_eq!(runs(&home), 0, "nothing lists agents before a session");
+    hook("SessionStart", &root);
     harness.tick_until(Duration::from_secs(5), |workbench| {
         claude_code::tab(workbench)
             .is_some_and(|tab| tab.session_count() > 0 && tab.protocol_live())
@@ -216,18 +220,26 @@ fn agents_are_listed_only_after_input_or_a_title_change() {
     let root_text = root.display().to_string();
     assert_eq!(harness.directory(), Some(root_text));
 
-    // No trigger, no listing.
-    harness.tick_for(Duration::from_secs(1));
-    assert_eq!(runs(&home), 0, "nothing lists agents without a trigger");
+    // The session start lists once in a burst; then, with no trigger, nothing.
+    harness.tick_for(Duration::from_millis(2600));
+    let after_start = runs(&home);
+    assert!(
+        (1..=3).contains(&after_start),
+        "the session start runs one burst: {after_start}"
+    );
+    harness.tick_for(Duration::from_secs(5));
+    assert_eq!(runs(&home), after_start, "no listing without a trigger");
 
     // `/cd`: the listing moves and no hook fires. Enter lists it in time.
     write_atomic(&listing, &format!("[{}]", interactive(&after_cd)));
-    let mut log = DiagnosticLog::new();
-    harness.workbench.terminal_mut().unwrap().send_key(
-        made_terminal::Key::Enter,
-        made_terminal::Modifiers::default(),
-        &mut log,
-    );
+    let enter = |harness: &mut Harness| {
+        harness.workbench.terminal_mut().unwrap().send_key(
+            made_terminal::Key::Enter,
+            made_terminal::Modifiers::default(),
+            &mut DiagnosticLog::new(),
+        );
+    };
+    enter(&mut harness);
     let after_cd_text = after_cd.display().to_string();
     let took = harness.tick_until(Duration::from_secs(3), |workbench| {
         claude_code::tab(workbench).and_then(|tab| tab.directory()) == Some(after_cd_text.clone())
@@ -241,12 +253,31 @@ fn agents_are_listed_only_after_input_or_a_title_change() {
     harness.tick_for(Duration::from_millis(2600));
     let after_burst = runs(&home);
     assert!(
-        (1..=3).contains(&after_burst),
-        "one burst of at most three runs: {after_burst}"
+        (after_start + 1..=after_start + 3).contains(&after_burst),
+        "one burst of at most three runs: {after_start} -> {after_burst}"
     );
     harness.tick_for(Duration::from_secs(6));
     assert_eq!(runs(&home), after_burst, "no listing while idle");
     assert_eq!(harness.directory(), Some(after_cd_text.clone()));
+
+    // Long after that burst a hook record moves the session back to the
+    // root, and nothing lists it. A `/cd` to the directory the last listing
+    // named still follows on Enter.
+    hook("UserPromptSubmit", &root);
+    harness.tick_until(Duration::from_secs(3), |workbench| {
+        workbench.explorer_root() == Some(root.as_path())
+    });
+    enter(&mut harness);
+    let took = harness.tick_until(Duration::from_secs(3), |workbench| {
+        workbench.explorer_root() == Some(after_cd.as_path())
+    });
+    assert!(
+        took < Duration::from_secs(1),
+        "followed `/cd` back in {took:?}"
+    );
+    harness.tick_for(Duration::from_millis(2600));
+    let after_back = runs(&home);
+    assert!(after_back > after_burst, "{after_burst} -> {after_back}");
 
     // An agent-view switch names a background session in the title.
     write_atomic(
@@ -272,8 +303,8 @@ fn agents_are_listed_only_after_input_or_a_title_change() {
     harness.tick_for(Duration::from_millis(2600));
     let after_title = runs(&home);
     assert!(
-        (after_burst + 1..=after_burst + 3).contains(&after_title),
-        "{after_burst} -> {after_title}"
+        (after_back + 1..=after_back + 3).contains(&after_title),
+        "{after_back} -> {after_title}"
     );
     harness.tick_for(Duration::from_secs(6));
     assert_eq!(runs(&home), after_title, "no listing while idle");

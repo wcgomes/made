@@ -463,7 +463,8 @@ impl TerminalPane {
     }
 
     /// Whether user input containing a line break (Enter, or a paste with a
-    /// newline) was written since the last call.
+    /// newline) was written since the last call. Taking it clears it, so it
+    /// has a single consumer.
     pub fn take_input_submitted(&mut self) -> bool {
         std::mem::take(&mut self.input_submitted)
     }

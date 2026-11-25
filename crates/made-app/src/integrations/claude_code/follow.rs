@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
-use super::agents::{background_cwd_for_title, cwd_for_pid, normalize_title, AgentCwd};
+use super::agents::{background_cwd_for_name, cwd_for_pid, normalize_title, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
@@ -687,9 +687,10 @@ pub struct ClaudeTab {
     /// The window title last seen, normalized by [`normalize_title`].
     /// Untrusted display text, never logged.
     window_title: String,
-    /// The directory the latest agents snapshot listed for each owned Claude
-    /// Code pid. Untrusted and unvalidated.
-    listed: Vec<(u32, String)>,
+    /// The directory the latest counted agents listing gave for each owned
+    /// Claude Code pid, and the trigger burst of that listing. Untrusted and
+    /// unvalidated.
+    listed: Vec<(u32, String, u64)>,
 }
 
 impl ClaudeTab {
@@ -859,19 +860,25 @@ impl ClaudeTab {
     }
 
     /// Apply the working directories a `claude agents --json` run that started
-    /// at `observed_at` reported. A listing counts only when the run started
-    /// after the last hook record that changed the session's directory; an
-    /// earlier run is ignored and not remembered. Of the listings that count,
-    /// only a change is applied: a session takes its process's listed
-    /// directory when it differs from the directory the previous counted
-    /// listing gave for that process (on the first sighting, from the session's
-    /// current directory). The change counts as a move. A listing that keeps
-    /// disagreeing with the hook never applies again, so the two sources
-    /// cannot alternate.
-    pub(crate) fn apply_agent_cwds(&mut self, entries: &[AgentCwd], observed_at: Instant) {
+    /// at `observed_at`, serving trigger burst `burst`, reported. A listing
+    /// counts only when the run started after the last hook record that
+    /// changed the session's directory; an earlier run is ignored and not
+    /// remembered. Of the listings that count, the first of each burst for a
+    /// process is compared with the session's current directory; a later one
+    /// in the same burst applies only when it differs from the directory the
+    /// previous counted listing gave for that process. An applied listing
+    /// counts as a move. A listing that keeps disagreeing with the hook so
+    /// applies at most once per burst, that is per user trigger, never per
+    /// hook record.
+    pub(crate) fn apply_agent_cwds(
+        &mut self,
+        entries: &[AgentCwd],
+        observed_at: Instant,
+        burst: u64,
+    ) {
         let sessions = &self.sessions;
         self.listed
-            .retain(|(pid, _)| sessions.iter().any(|session| session.anchor == *pid));
+            .retain(|(pid, _, _)| sessions.iter().any(|session| session.anchor == *pid));
         for index in 0..self.sessions.len() {
             let anchor = self.sessions[index].anchor;
             let Some(cwd) = cwd_for_pid(entries, anchor) else {
@@ -881,14 +888,15 @@ impl ClaudeTab {
             if session.hook_moved_at.is_some_and(|at| observed_at <= at) {
                 continue;
             }
-            let changed = match self.listed.iter_mut().find(|(pid, _)| *pid == anchor) {
-                Some((_, seen)) if seen == cwd => false,
-                Some((_, seen)) => {
+            let changed = match self.listed.iter_mut().find(|(pid, _, _)| *pid == anchor) {
+                Some((_, seen, seen_burst)) if *seen_burst == burst && seen == cwd => false,
+                Some((_, seen, seen_burst)) => {
                     cwd.clone_into(seen);
+                    *seen_burst = burst;
                     true
                 }
                 None => {
-                    self.listed.push((anchor, cwd.to_owned()));
+                    self.listed.push((anchor, cwd.to_owned(), burst));
                     true
                 }
             };
@@ -905,26 +913,29 @@ impl ClaudeTab {
     /// listing (`entries`) attaches the directory of the one background entry
     /// the `window_title` names, or detaches when it names none. Without a
     /// listing the selection stays while the normalized title stays the same;
-    /// a title change detaches it. The selection applies only while a live
-    /// owned session hosts it and a protocol status is live (when the window
-    /// title is trusted for the tooltip). Returns whether the normalized title
-    /// changed.
+    /// a title change detaches it. The title is compared and kept only while a
+    /// live owned session hosts it and a protocol status is live (when the
+    /// window title is trusted for the tooltip); otherwise nothing is attached
+    /// and the kept title is forgotten, so the title counts as changed once it
+    /// is trusted again. Returns whether the normalized title changed.
     pub fn apply_attached_title(
         &mut self,
         entries: Option<&[AgentCwd]>,
         window_title: Option<&str>,
     ) -> bool {
+        if self.protocol.is_none() || self.sessions.is_empty() {
+            self.attached = None;
+            self.window_title.clear();
+            return false;
+        }
         let title = window_title.map(normalize_title).unwrap_or_default();
         let changed = title != self.window_title;
         if changed {
             self.window_title = title;
             self.attached = None;
         }
-        if self.sessions.is_empty() {
-            self.attached = None;
-        } else if let Some(entries) = entries {
-            self.attached =
-                background_cwd_for_title(entries, &self.window_title).map(str::to_owned);
+        if let Some(entries) = entries {
+            self.attached = background_cwd_for_name(entries, &self.window_title).map(str::to_owned);
         }
         changed
     }

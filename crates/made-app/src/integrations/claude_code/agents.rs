@@ -4,21 +4,25 @@
 //! directory at the next prompt. `claude agents --json` reports every running
 //! session's process id and current working directory immediately. Nothing
 //! runs it on a timer: a tab with a live owned session [`trigger`]s a short
-//! burst of runs ([`BURST`]) when its user submits input or its window title
-//! changes, the two moments a `/cd` or an agent-view switch can happen. One
-//! app-wide worker thread does the runs (never through a shell, never two at
-//! once, in its own process group that is killed after a short timeout, when
-//! the worker is stopped, or when the output stays held open after the run
-//! exits) and publishes the latest snapshot; tabs match it to their owned
-//! Claude Code pids. Every failure leaves the previous snapshot in place, a
-//! snapshot older than a few seconds is not used, and the worker stops once no
-//! burst run is pending or the app shuts down ([`shutdown`]).
+//! burst of runs ([`BURST`]) when a session starts, its user submits input or
+//! its window title changes, the moments a `/cd` or an agent-view switch can
+//! happen. One app-wide worker thread does the runs (never through a shell,
+//! never two at once, never two starts closer than [`MIN_RUN_GAP`], in its own
+//! process group that is killed after a short timeout, when the worker is
+//! stopped, or when the output stays held open after the run exits) and
+//! publishes the latest snapshot, tagged with the burst it served; tabs match
+//! it to their owned Claude Code pids. Every failure leaves the previous
+//! snapshot in place, a snapshot older than a few seconds is not used, and the
+//! worker stops once no burst run is pending or the app shuts down
+//! ([`shutdown`]).
 //!
 //! A background session opened from Claude Code's agent view runs under the
 //! Claude Code daemon, not under the tab, so it is never matched by pid. While
 //! the tab's host session shows a live status, the tab's window title names the
 //! attached session: a title that equals the `name` of exactly one background
-//! entry selects that entry's directory ([`background_cwd_for_title`]).
+//! entry selects that entry's directory ([`background_cwd_for_name`]). The
+//! selection outlives the snapshot that made it while the title stays the
+//! same; a title change detaches it.
 //!
 //! Each array entry is decoded on its own, so a malformed entry drops only
 //! itself. Only `pid`, `cwd`, `kind` and `name` are kept; every other field is
@@ -47,6 +51,10 @@ const BURST: [Duration; 3] = [
     Duration::from_millis(700),
     Duration::from_secs(2),
 ];
+
+/// Shortest time between the starts of two runs, so triggers that keep
+/// arriving never run `claude` back to back.
+const MIN_RUN_GAP: Duration = Duration::from_millis(500);
 
 /// Longest a run may take before it is killed and ignored.
 const RUN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -91,6 +99,8 @@ impl fmt::Debug for AgentCwd {
 pub(crate) struct AgentSnapshot {
     /// When the run started: the reported directories are at least this new.
     pub started_at: Instant,
+    /// The trigger burst the run served.
+    pub burst: u64,
     pub entries: Vec<AgentCwd>,
 }
 
@@ -159,20 +169,17 @@ pub(crate) fn normalize_title(text: &str) -> String {
         .to_owned()
 }
 
-/// The directory of the one background session whose name equals the
-/// normalized `title`. An empty title, no match or more than one background
-/// session with that name gives `None`; interactive sessions never match.
-pub(crate) fn background_cwd_for_title<'a>(
-    entries: &'a [AgentCwd],
-    title: &str,
-) -> Option<&'a str> {
-    let title = normalize_title(title);
-    if title.is_empty() {
+/// The directory of the one background session whose name equals `name`, a
+/// window title already normalized by [`normalize_title`]. An empty name, no
+/// match or more than one background session with that name gives `None`;
+/// interactive sessions never match.
+pub(crate) fn background_cwd_for_name<'a>(entries: &'a [AgentCwd], name: &str) -> Option<&'a str> {
+    if name.is_empty() {
         return None;
     }
     let mut matches = entries
         .iter()
-        .filter(|entry| entry.background && entry.name == title);
+        .filter(|entry| entry.background && entry.name == name);
     let first = matches.next()?;
     matches.next().is_none().then_some(first.cwd.as_str())
 }
@@ -181,6 +188,10 @@ struct Poller {
     /// When the pending runs are due, earliest first. The worker stops once it
     /// is empty.
     due: Vec<Instant>,
+    /// Bumped by every [`trigger`]: the burst a run started now serves.
+    burst: u64,
+    /// When the latest run started.
+    last_started: Option<Instant>,
     running: bool,
     worker: Option<JoinHandle<()>>,
     /// The output reader of the latest run. No run starts while it is alive.
@@ -190,6 +201,8 @@ struct Poller {
 
 static POLLER: Mutex<Poller> = Mutex::new(Poller {
     due: Vec::new(),
+    burst: 0,
+    last_started: None,
     running: false,
     worker: None,
     reader: None,
@@ -229,6 +242,7 @@ pub(crate) fn latest() -> Option<Arc<AgentSnapshot>> {
 /// worker when it is not running. Never blocks on the command.
 pub(crate) fn trigger() {
     let mut poller = poller();
+    poller.burst += 1;
     schedule_burst(&mut poller.due, Instant::now());
     if !poller.running {
         let generation = GENERATION.load(Ordering::Acquire);
@@ -252,6 +266,13 @@ fn schedule_burst(due: &mut Vec<Instant>, now: Instant) {
     if let Some(earliest) = earliest.filter(|earliest| *earliest < due[0]) {
         due.insert(0, earliest);
     }
+}
+
+/// When the next run may start: its due time, but no sooner than
+/// [`MIN_RUN_GAP`] after the latest start. `None` when no run is pending.
+fn next_start(due: &[Instant], last_started: Option<Instant>) -> Option<Instant> {
+    let next = *due.first()?;
+    Some(last_started.map_or(next, |last| next.max(last + MIN_RUN_GAP)))
 }
 
 /// Remove every run in `due` that is due at `now`; they are served by one run.
@@ -295,7 +316,7 @@ fn work(generation: u64) {
             if stop() {
                 return;
             }
-            let Some(&next) = poller.due.first() else {
+            let Some(next) = next_start(&poller.due, poller.last_started) else {
                 poller.running = false;
                 return;
             };
@@ -304,18 +325,21 @@ fn work(generation: u64) {
                 Err(next - now)
             } else {
                 take_due(&mut poller.due, now);
-                Ok(poller.reader.as_ref().is_none_or(JoinHandle::is_finished))
+                let idle = poller.reader.as_ref().is_none_or(JoinHandle::is_finished);
+                if idle {
+                    poller.last_started = Some(now);
+                }
+                Ok(idle.then_some((now, poller.burst)))
             }
         };
         match run {
             // A newer trigger may move the next run earlier: wait in steps.
             Err(wait) => pause(wait.min(STEP), &stop),
-            Ok(false) => {}
-            Ok(true) => {
-                let started_at = Instant::now();
+            Ok(None) => {}
+            Ok(Some((started_at, burst))) => {
                 let mut reader = None;
                 let entries = run_agents(&mut reader, &stop);
-                if !publish(&mut poller(), &stop, reader, entries, started_at) {
+                if !publish(&mut poller(), &stop, reader, entries, started_at, burst) {
                     return;
                 }
             }
@@ -332,6 +356,7 @@ fn publish(
     reader: Option<JoinHandle<()>>,
     entries: Option<Vec<AgentCwd>>,
     started_at: Instant,
+    burst: u64,
 ) -> bool {
     if stop() {
         return false;
@@ -340,6 +365,7 @@ fn publish(
     if let Some(entries) = entries {
         poller.snapshot = Some(Arc::new(AgentSnapshot {
             started_at,
+            burst,
             entries,
         }));
     }
@@ -587,6 +613,7 @@ mod tests {
             started_at: Instant::now()
                 .checked_sub(age)
                 .expect("the clock has run long enough"),
+            burst: 0,
             entries: Vec::new(),
         };
         assert!(is_fresh(&snapshot(Duration::ZERO)));
@@ -614,6 +641,8 @@ mod tests {
     fn a_stopped_worker_leaves_the_poller_state_alone() {
         let mut poller = Poller {
             due: Vec::new(),
+            burst: 0,
+            last_started: None,
             running: true,
             worker: None,
             reader: None,
@@ -626,7 +655,8 @@ mod tests {
             &|| true,
             Some(finished()),
             entries(),
-            Instant::now()
+            Instant::now(),
+            1
         ));
         assert!(poller.reader.is_none() && poller.snapshot.is_none());
         assert!(publish(
@@ -634,7 +664,8 @@ mod tests {
             &|| false,
             Some(finished()),
             entries(),
-            Instant::now()
+            Instant::now(),
+            1
         ));
         assert!(poller.reader.is_some() && poller.snapshot.is_some());
     }
@@ -657,6 +688,11 @@ mod tests {
         }
     }
 
+    /// The background directory a raw window title selects.
+    fn for_title<'a>(entries: &'a [AgentCwd], title: &str) -> Option<&'a str> {
+        background_cwd_for_name(entries, &normalize_title(title))
+    }
+
     #[test]
     fn a_title_selects_exactly_one_background_session() {
         let entries = vec![
@@ -664,7 +700,7 @@ mod tests {
             background(90173, "/work/other", "Other task"),
         ];
         assert_eq!(
-            background_cwd_for_title(&entries, "Spec grok-native-hook pendências"),
+            for_title(&entries, "Spec grok-native-hook pendências"),
             Some("/work/spec")
         );
     }
@@ -678,21 +714,17 @@ mod tests {
             "✻  Spec task  ",
             " · Spec task",
         ] {
-            assert_eq!(
-                background_cwd_for_title(&entries, title),
-                Some("/work/spec"),
-                "{title}"
-            );
+            assert_eq!(for_title(&entries, title), Some("/work/spec"), "{title}");
         }
     }
 
     #[test]
     fn a_title_that_names_no_background_session_matches_nothing() {
         let entries = vec![background(90172, "/work/spec", "Spec task")];
-        assert_eq!(background_cwd_for_title(&entries, "Claude Code"), None);
-        assert_eq!(background_cwd_for_title(&entries, "Spec"), None);
-        assert_eq!(background_cwd_for_title(&entries, "✳ "), None);
-        assert_eq!(background_cwd_for_title(&[], "Spec task"), None);
+        assert_eq!(for_title(&entries, "Claude Code"), None);
+        assert_eq!(for_title(&entries, "Spec"), None);
+        assert_eq!(for_title(&entries, "✳ "), None);
+        assert_eq!(for_title(&[], "Spec task"), None);
     }
 
     #[test]
@@ -701,7 +733,7 @@ mod tests {
             background(1, "/work/a", "Same name"),
             background(2, "/work/b", "Same name"),
         ];
-        assert_eq!(background_cwd_for_title(&entries, "Same name"), None);
+        assert_eq!(for_title(&entries, "Same name"), None);
     }
 
     #[test]
@@ -710,9 +742,9 @@ mod tests {
         let parsed =
             parse_agents(br#"[{"pid":1,"cwd":"/work/a","kind":"interactive","name":"Shared"}]"#)
                 .unwrap();
-        assert_eq!(background_cwd_for_title(&parsed, "Shared"), None);
+        assert_eq!(for_title(&parsed, "Shared"), None);
         let both = vec![parsed[0].clone(), background(2, "/work/b", "Shared")];
-        assert_eq!(background_cwd_for_title(&both, "Shared"), Some("/work/b"));
+        assert_eq!(for_title(&both, "Shared"), Some("/work/b"));
         // A background entry never matches by pid.
         assert_eq!(cwd_for_pid(&both, 2), None);
     }
@@ -739,14 +771,15 @@ mod tests {
             background(90172, "/work/spec", "Spec task"),
         ];
 
-        // Without a live status the title is not trusted.
-        assert!(tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
+        // Without a live status the title is neither compared nor kept.
+        assert!(!tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/host"));
 
+        // Once trusted, the title counts as changed.
         tab.note_protocol(ProtocolEvent::Status {
             state: ProtocolState::Working,
         });
-        assert!(!tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
+        assert!(tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
 
         // The title changes: the host session's directory applies again.
@@ -792,13 +825,17 @@ mod tests {
             assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
         }
 
-        // A protocol clear hides the selection without losing it.
+        // A protocol clear drops the selection; once the status is live
+        // again the title counts as changed, so a burst lists it again.
         tab.note_protocol(ProtocolEvent::Clear { bare: false });
+        assert!(!tab.apply_attached_title(None, Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/host"));
         tab.note_protocol(ProtocolEvent::Status {
             state: ProtocolState::Idle,
         });
-        assert!(!tab.apply_attached_title(None, Some("✳ Spec task")));
+        assert!(tab.apply_attached_title(None, Some("✳ Spec task")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+        assert!(!tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
 
         // A title change detaches at once, before any listing.
@@ -853,6 +890,23 @@ mod tests {
                 at(start, 1850),
                 at(start, 3150)
             ]
+        );
+    }
+
+    #[test]
+    fn run_starts_keep_a_minimum_gap() {
+        let start = Instant::now();
+        assert_eq!(next_start(&[], Some(start)), None);
+        assert_eq!(next_start(&[at(start, 200)], None), Some(at(start, 200)));
+        // A run due 200 ms after the latest start waits for the gap.
+        assert_eq!(
+            next_start(&[at(start, 200)], Some(start)),
+            Some(at(start, 500))
+        );
+        // A burst's own runs are already far enough apart.
+        assert_eq!(
+            next_start(&[at(start, 700)], Some(at(start, 200))),
+            Some(at(start, 700))
         );
     }
 
@@ -913,7 +967,7 @@ mod tests {
         let before_hook = Instant::now();
         thread::sleep(Duration::from_millis(2));
         tab.ingest(vec![record("/work/start")], alive);
-        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], before_hook);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], before_hook, 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/start"));
     }
 
@@ -921,16 +975,16 @@ mod tests {
     fn a_cd_listed_first_by_a_run_from_before_a_hook_move_still_follows() {
         let (mut tab, record, alive) = hooked_tab();
         tab.ingest(vec![record("/work/start")], &alive);
-        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later(), 1);
         // A run starts, `/cd` happens, then a hook record moves the session
         // before that run's snapshot is applied.
         let in_flight = later();
         thread::sleep(Duration::from_millis(2));
         tab.ingest(vec![record("/work/hook")], &alive);
-        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], in_flight);
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], in_flight, 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/hook"));
         // The next run lists the same directory: it is still a change.
-        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/after-cd"));
     }
 
@@ -938,20 +992,20 @@ mod tests {
     fn a_cd_still_follows() {
         let (mut tab, record, alive) = hooked_tab();
         tab.ingest(vec![record("/work/start")], &alive);
-        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/start")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/start"));
 
         // `/cd`: the listing changes and no hook fires.
-        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/after-cd"));
 
         // A later hook move wins; the unchanged listing does not undo it.
         tab.ingest(vec![record("/work/hook-later")], &alive);
-        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/after-cd")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/hook-later"));
 
         // The next `/cd` follows again.
-        tab.apply_agent_cwds(&[interactive(4202, "/work/second-cd")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/second-cd")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/second-cd"));
     }
 
@@ -962,7 +1016,7 @@ mod tests {
         let listing = [interactive(4202, "/work/root")];
         let mut seen = Vec::new();
         for _ in 0..5 {
-            tab.apply_agent_cwds(&listing, later());
+            tab.apply_agent_cwds(&listing, later(), 1);
             seen.push(tab.directory().unwrap());
             tab.ingest(vec![record("/work/root/sub")], &alive);
             seen.push(tab.directory().unwrap());
@@ -982,18 +1036,85 @@ mod tests {
         let (mut tab, record, alive) = hooked_tab();
         tab.ingest(vec![record("/work/a")], &alive);
         let listing = [interactive(4202, "/work/b")];
-        tab.apply_agent_cwds(&listing, later());
+        tab.apply_agent_cwds(&listing, later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/b"));
 
         // A stale record still naming the old directory is read late.
         tab.ingest(vec![record("/work/a")], &alive);
         assert_eq!(tab.directory().as_deref(), Some("/work/a"));
         for _ in 0..5 {
-            tab.apply_agent_cwds(&listing, later());
+            tab.apply_agent_cwds(&listing, later(), 1);
             assert_eq!(tab.directory().as_deref(), Some("/work/a"));
         }
         // A real change in the listing still follows.
-        tab.apply_agent_cwds(&[interactive(4202, "/work/c")], later());
+        tab.apply_agent_cwds(&[interactive(4202, "/work/c")], later(), 1);
         assert_eq!(tab.directory().as_deref(), Some("/work/c"));
+    }
+
+    #[test]
+    fn a_cd_back_to_a_listed_directory_after_a_hook_move_follows() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/w")], &alive);
+        // Burst 1 (Enter after `/cd /work/a`) lists A.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/a")], later(), 1);
+        assert_eq!(tab.directory().as_deref(), Some("/work/a"));
+        // Long after that burst a hook record moves the session to W; nothing
+        // lists it.
+        tab.ingest(vec![record("/work/w")], &alive);
+        assert_eq!(tab.directory().as_deref(), Some("/work/w"));
+        // `/cd /work/a` and Enter: burst 2 lists A again, which follows.
+        tab.apply_agent_cwds(&[interactive(4202, "/work/a")], later(), 2);
+        assert_eq!(tab.directory().as_deref(), Some("/work/a"));
+    }
+
+    #[test]
+    fn a_persistent_disagreement_steps_at_most_once_per_burst() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/x")], &alive);
+        let listing = [interactive(4202, "/work/y")];
+        let mut seen = Vec::new();
+        for burst in [1, 1, 1, 2, 2, 2] {
+            tab.apply_agent_cwds(&listing, later(), burst);
+            seen.push(tab.directory().unwrap());
+            tab.ingest(vec![record("/work/x")], &alive);
+            seen.push(tab.directory().unwrap());
+        }
+        // Burst 1 and burst 2 each step to the listing once; every hook record
+        // takes it back, and the other runs of a burst never apply.
+        let y = |index: usize| seen[index] == "/work/y";
+        assert!(y(0) && y(6), "{seen:?}");
+        assert!(
+            (0..seen.len()).filter(|index| y(*index)).count() == 2,
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_new_burst_hook_records_never_bring_the_listing_back() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/x")], &alive);
+        let listing = [interactive(4202, "/work/y")];
+        tab.apply_agent_cwds(&listing, later(), 1);
+        assert_eq!(tab.directory().as_deref(), Some("/work/y"));
+        for _ in 0..5 {
+            tab.ingest(vec![record("/work/x")], &alive);
+            // The same snapshot is applied again every frame.
+            tab.apply_agent_cwds(&listing, later(), 1);
+            assert_eq!(tab.directory().as_deref(), Some("/work/x"));
+        }
+    }
+
+    #[test]
+    fn identical_listings_within_one_burst_apply_at_most_once() {
+        let (mut tab, record, alive) = hooked_tab();
+        tab.ingest(vec![record("/work/x")], &alive);
+        let listing = [interactive(4202, "/work/y")];
+        tab.apply_agent_cwds(&listing, later(), 7);
+        assert_eq!(tab.directory().as_deref(), Some("/work/y"));
+        tab.ingest(vec![record("/work/x")], &alive);
+        for _ in 0..3 {
+            tab.apply_agent_cwds(&listing, later(), 7);
+            assert_eq!(tab.directory().as_deref(), Some("/work/x"));
+        }
     }
 }
