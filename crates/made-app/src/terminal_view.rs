@@ -3616,8 +3616,6 @@ mod tests {
         }
     }
 
-    /// A headless context with the terminal font family installed, as
-    /// `theme::install` does for the app.
     /// Spawn a pane whose grid only ever receives what the test feeds it.
     ///
     /// A real shell draws its startup output and prompt on its own schedule,
@@ -3625,8 +3623,9 @@ mod tests {
     /// it reaches the grid before or after the test feeds its own text depends
     /// on runner load, and it can leave the selected cells blank (macOS bash
     /// starts with an empty line before its zsh notice) or overwrite them. On
-    /// unix a silent child removes the race: once its marker reaches the pane
-    /// it has disabled echo and will never write to the grid again.
+    /// unix a silent child removes the race: once its whole marker reaches the
+    /// pane it has disabled echo and will never write to the grid again, so
+    /// the marker is cleared and the cursor homed before the test feeds text.
     fn spawn_quiet_pane(
         platform: &dyn made_platform::Platform,
         dir: &std::path::Path,
@@ -3642,15 +3641,20 @@ mod tests {
         let mut pane = TerminalPane::spawn(platform, options).expect("spawn test child");
         if cfg!(unix) {
             let deadline = Instant::now() + Duration::from_secs(10);
-            while pane.output_bytes() == 0 {
+            while !pane.screen_text().contains("ready") {
                 assert!(Instant::now() < deadline, "the quiet child never started");
                 let _ = pane.pump(log);
                 std::thread::sleep(Duration::from_millis(2));
             }
+            // ED 2 moves the screen into scrollback, which a taller first
+            // frame would pull back into view, so ED 3 drops it too.
+            pane.core.feed(b"\x1b[2J\x1b[3J\x1b[H");
         }
         pane
     }
 
+    /// A headless context with the terminal font family installed, as
+    /// `theme::install` does for the app.
     fn terminal_context() -> egui::Context {
         let ctx = egui::Context::default();
         crate::render::install_terminal_font(&ctx);
