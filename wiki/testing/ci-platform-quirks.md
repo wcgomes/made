@@ -44,8 +44,15 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 ## Timing and budgets
 
 - egui creates tooltip areas one pass after hover; loaded runners need retries until the exact text appears. Retry readiness, never relax the assertion.
-- The 10k-row selection guard is 16 ms on Windows and macOS x86_64 debug runners and 5 ms on Linux/macOS arm64; the product contract remains frame p95 below 16.667 ms. Treat the test guard as runner headroom, not the product budget.
+- The 10k-row selection guard (median of three p95 batches) is 16 ms on Windows debug runners and 5 ms on Linux and macOS arm64. macOS x86_64 has no timing assertion and only reports the p95 to stderr, because the hosted `macos-15-intel` runner swung from about 5.5 to 16 to 26 ms on unchanged code; the no-rebuild assertion still guards every platform. The product contract remains frame p95 below 16.667 ms. Treat the test guard as runner headroom, not the product budget.
 - Sources: [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) `hover_until_text`, [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs), [Performance](../performance.md).
+
+## Terminal view selection tests
+
+- Selection and copy tests in `terminal_view.rs` must not run the user's real shell. Tests drain PTY output into the grid only through the first frame's resize pump (`TerminalPane::resize` pumps, then returns early on an unchanged size), so whether shell startup output lands in the grid depends on whether it arrives before that first frame; macOS `/bin/bash`'s leading blank line before its zsh notice can then blank the selected cells. An empty selection copies nothing (`copy_selection` returns `None`); that is correct product behavior, not the bug.
+- Use the `spawn_quiet_pane` test helper: on unix it runs `/bin/sh` with `stty -echo`, waits for a `ready` marker, then clears screen and scrollback before the test feeds text. Windows still uses the native shell.
+- In made-terminal (`alacritty_terminal` 0.26), ED 2 (`ESC[2J`) moves the screen into scrollback and a later taller resize pulls those lines back into view; send ED 3 (`ESC[3J`) as well to blank a test grid before a resize.
+- Source/Test: [`terminal_view.rs`](../../crates/made-app/src/terminal_view.rs) `resize`, `copy_selection`, `spawn_quiet_pane`.
 
 ## Windows watched-root deletion
 
@@ -61,4 +68,5 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.
 - `made-app` tests run on Windows only in the `windows-2025` entry of the `ci.yml` `cargo test --workspace` matrix. [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) runs targeted package tests (platform contract, PTY, the hook crates) plus smoke, never `made-app` tests.
+- Clippy runs only on Linux (`ubuntu-24.04` lint job). Locally on macOS, `cargo clippy --workspace --all-targets --locked -- -D warnings` fails with dead-code errors in [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) for items used only under `#[cfg(target_os = "linux")]`; that is a host difference, not a regression.
 - Workflow: [`ci.yml`](../../.github/workflows/ci.yml).
