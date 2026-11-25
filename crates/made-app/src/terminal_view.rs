@@ -117,6 +117,10 @@ impl PendingInput {
     }
 }
 
+/// Leaves the alternate screen and resets the input and display modes a
+/// full-screen program may leave set when it exits.
+const LEAVE_PROGRAM_MODES: &[u8] = b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[<99u";
+
 /// Initial grid used before the first layout pass.
 pub const DEFAULT_ROWS: usize = 36;
 /// Initial grid used before the first layout pass.
@@ -1178,8 +1182,58 @@ impl TerminalPane {
     ) -> Result<(), PtyError> {
         self.terminate(log);
         let pty = PtyProcess::spawn(platform, self.options.clone())?;
-        self.pty = Some(pty);
         self.core = TerminalCore::with_size(self.core.size(), SCROLLBACK_LINES);
+        self.reset_for_new_child(pty);
+        self.cwd_reports_seen = 0;
+        self.title = None;
+        self.cwd = None;
+        log.record(
+            LogLevel::Info,
+            format!("terminal {} relaunched", self.target.log_label()),
+        );
+        Ok(())
+    }
+
+    /// Start `options` as `target` in this pane after its child exited,
+    /// keeping the screen and scrollback the old child left. Output still
+    /// queued from that child is shown first, and the modes it may have left
+    /// set (alternate screen, mouse and keyboard reporting, bracketed paste,
+    /// hidden cursor) are reset before the new child starts at the pane's
+    /// current size.
+    pub fn relaunch_in_place(
+        &mut self,
+        platform: &dyn Platform,
+        options: PtyOptions,
+        target: TerminalTarget,
+        log: &mut DiagnosticLog,
+    ) -> Result<(), PtyError> {
+        // A finished child reports its exit on every later poll, so the drain
+        // stops at the first event that is not output.
+        while let Some(made_terminal::PtyEvent::Data(data)) = self.poll_io() {
+            self.output_bytes = self.output_bytes.saturating_add(data.len() as u64);
+            self.core.feed(&data);
+        }
+        self.terminate(log);
+        let options = options.with_size(self.options.size);
+        let pty = PtyProcess::spawn(platform, options.clone())?;
+        self.core.feed(LEAVE_PROGRAM_MODES);
+        self.options = options;
+        self.target = target;
+        self.reset_for_new_child(pty);
+        // Reports the old child made are not the new child's.
+        self.cwd_reports_seen = self.core.cwd_report_count();
+        self.title = self.core.title();
+        self.cwd = self.core.cwd().map(Path::to_path_buf);
+        log.record(
+            LogLevel::Info,
+            format!("terminal {} started in place", self.target.log_label()),
+        );
+        Ok(())
+    }
+
+    /// Attach a freshly spawned child and clear what belonged to the old one.
+    fn reset_for_new_child(&mut self, pty: PtyProcess) {
+        self.pty = Some(pty);
         self.encoder = InputEncoder::new(self.core.input_modes());
         self.exit = None;
         self.monitor_error = None;
@@ -1199,16 +1253,14 @@ impl TerminalPane {
         self.input_echo = None;
         self.recent_typed_text.clear();
         self.cwd_changed_at = None;
-        self.cwd_reports_seen = 0;
         self.focus_on_next_frame = true;
-        self.title = None;
-        self.cwd = None;
         self.renderer.invalidate_all();
-        log.record(
-            LogLevel::Info,
-            format!("terminal {} relaunched", self.target.log_label()),
-        );
-        Ok(())
+    }
+
+    /// Visible screen text.
+    #[cfg(test)]
+    pub(crate) fn screen_text(&self) -> String {
+        self.core.screen_text()
     }
 
     /// Draw the terminal and process input.

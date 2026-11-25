@@ -1039,20 +1039,15 @@ impl Workbench {
             return;
         };
         let (contributions, composed) = self.prepare_launches();
-        // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
-        // An interactive terminal must not inherit that, or the first failed
-        // prompt hook exits the shell while the workspace is still open.
-        let mut options = options
-            .with_size(PtySize {
+        let options = launch_pty_options(
+            &self.platform,
+            options,
+            PtySize {
                 rows: DEFAULT_ROWS as u16,
                 cols: DEFAULT_COLS as u16,
-            })
-            .with_channel_capacity(256)
-            .without_env("SHELLOPTS")
-            .without_env("BASH_ENV")
-            .without_env("ENV");
-        options = apply_contributions(&contributions, options);
-        options = with_utf8_ctype(&self.platform, options);
+            },
+            &contributions,
+        );
 
         match TerminalPane::spawn(&self.platform, options.clone()) {
             Ok(pane) => {
@@ -1070,13 +1065,7 @@ impl Workbench {
                 self.terminal = Some(pane);
                 self.terminal_error = None;
                 if !composed {
-                    self.diag.log_mut().record(
-                        LogLevel::Warn,
-                        format!(
-                            "terminal {} started with the original environment (no Made configuration)",
-                            self.terminal_target.log_label()
-                        ),
-                    );
+                    self.note_unconfigured_launch();
                 }
             }
             Err(first_error) => {
@@ -1085,14 +1074,8 @@ impl Workbench {
                 let fallback = fallback_terminal_cwd();
                 if fallback != self.terminal_cwd {
                     if let Some(retry) = self.terminal_target.pty_options(fallback.clone(), &path) {
-                        let mut retry = retry
-                            .with_size(options.size)
-                            .with_channel_capacity(256)
-                            .without_env("SHELLOPTS")
-                            .without_env("BASH_ENV")
-                            .without_env("ENV");
-                        retry = apply_contributions(&contributions, retry);
-                        retry = with_utf8_ctype(&self.platform, retry);
+                        let retry =
+                            launch_pty_options(&self.platform, retry, options.size, &contributions);
                         if let Ok(pane) = TerminalPane::spawn(&self.platform, retry) {
                             let pane = pane.with_target(self.terminal_target);
                             self.diag.log_mut().record(
@@ -1181,21 +1164,28 @@ impl Workbench {
                 .is_some_and(TerminalPane::exited_cleanly)
     }
 
-    /// Replace a directly launched TUI that exited cleanly with the plain
-    /// shell, started in the folder the tab was following, or in its launch
-    /// folder when that one is no longer usable. The per-terminal integration
-    /// state and the TUI's own directory follow go with it.
+    fn note_unconfigured_launch(&mut self) {
+        self.diag.log_mut().record(
+            LogLevel::Warn,
+            format!(
+                "terminal {} started with the original environment (no Made configuration)",
+                self.terminal_target.log_label()
+            ),
+        );
+    }
+
+    /// Replace a TUI that exited cleanly with the plain shell in the same
+    /// pane, so the TUI's last output stays above the new prompt. The shell
+    /// starts in the folder the tab was following, or in its launch folder
+    /// when that one is no longer usable. The per-terminal integration state
+    /// and the TUI's own directory follow go with the TUI.
     fn replace_cleanly_exited_tui(&mut self) {
         let TerminalTarget::Tui(tui) = self.terminal_target else {
             return;
         };
-        if !self
-            .terminal
-            .as_ref()
-            .is_some_and(TerminalPane::exited_cleanly)
-        {
+        let Some(mut terminal) = self.terminal.take_if(|terminal| terminal.exited_cleanly()) else {
             return;
-        }
+        };
         let launch_folder = self.plan.as_ref().map_or_else(
             || self.terminal_cwd.clone(),
             |plan| plan.terminal_cwd().to_path_buf(),
@@ -1211,12 +1201,10 @@ impl Workbench {
                 self.terminal_target.log_label()
             ),
         );
-        if let Some(mut terminal) = self.terminal.take() {
-            terminal.terminate(self.diag.log_mut());
-        }
         self.teardown_tab_states();
         self.terminal_target = TerminalTarget::Shell;
         self.terminal_cwd = cwd;
+        self.last_osc7_cwd = None;
         self.integration.set_terminal_cwd(&self.terminal_cwd);
         let released = self.follow.as_mut().map(|follow| {
             follow.set_terminal_cwd(&self.terminal_cwd);
@@ -1227,7 +1215,65 @@ impl Workbench {
                 self.switch_root(outcome.root, outcome.generation, RootSwitchOrigin::Session);
             }
         }
-        self.start_terminal();
+
+        let (contributions, composed) = self.prepare_launches();
+        let size = terminal.options().size;
+        let mut started = terminal.relaunch_in_place(
+            &self.platform,
+            launch_pty_options(
+                &self.platform,
+                made_terminal::PtyOptions::new(&self.terminal_cwd),
+                size,
+                &contributions,
+            ),
+            self.terminal_target,
+            self.diag.log_mut(),
+        );
+        // The folder may have disappeared since it was checked. Retry once in
+        // the documented safe fallback directory, as a new tab does.
+        let fallback = fallback_terminal_cwd();
+        if started.is_err() && fallback != self.terminal_cwd {
+            started = terminal.relaunch_in_place(
+                &self.platform,
+                launch_pty_options(
+                    &self.platform,
+                    made_terminal::PtyOptions::new(&fallback),
+                    size,
+                    &contributions,
+                ),
+                self.terminal_target,
+                self.diag.log_mut(),
+            );
+            if started.is_ok() {
+                self.diag.log_mut().record(
+                    LogLevel::Warn,
+                    "terminal shell started in the fallback directory",
+                );
+                self.terminal_cwd = fallback;
+                self.integration.set_terminal_cwd(&self.terminal_cwd);
+                if let Some(follow) = self.follow.as_mut() {
+                    follow.set_terminal_cwd(&self.terminal_cwd);
+                }
+            }
+        }
+        match started {
+            Ok(()) => {
+                self.notify_spawned(terminal.pid());
+                self.terminal = Some(terminal);
+                self.terminal_error = None;
+                if !composed {
+                    self.note_unconfigured_launch();
+                }
+            }
+            Err(error) => {
+                let detail = format!("terminal shell could not start: {error}");
+                self.diag.log_mut().record(LogLevel::Error, detail.clone());
+                self.terminal_error = Some(detail);
+                for state in self.tab_states.iter_mut() {
+                    state.on_launch_failed();
+                }
+            }
+        }
     }
 
     /// Poll every integration state whose turn it is: all of them but the
@@ -3917,7 +3963,6 @@ impl Workbench {
             }
         }
         self.metrics.record_hidden_output(hidden_output_bytes);
-        self.replace_cleanly_exited_tui();
 
         let cwd_change = self
             .terminal
@@ -4011,6 +4056,9 @@ impl Workbench {
         self.poll_shell_root_revalidation(now);
         self.maybe_schedule_shell_root_revalidation(now);
         self.poll_integrations(now);
+        // After the integrations applied what the TUI reported before it
+        // exited.
+        self.replace_cleanly_exited_tui();
 
         self.try_send_pending_worktree();
         if self.poll_worktree() {
@@ -5402,6 +5450,26 @@ impl Drop for ShellRootWorker {
 /// has no UTF-8 locale. An app started from Finder inherits no `LANG`, and
 /// macOS `/bin/bash` 3.2 then drops typed accented characters. Windows consoles
 /// do not use POSIX locales and are left as they are.
+/// The PTY options of a local terminal launch: `options` at `size` with the
+/// integrations' `contributions` and a UTF-8 character type.
+fn launch_pty_options(
+    platform: &dyn Platform,
+    options: made_terminal::PtyOptions,
+    size: PtySize,
+    contributions: &[EnvContribution],
+) -> made_terminal::PtyOptions {
+    // A parent script (CI bash -e, for example) exports SHELLOPTS=errexit.
+    // An interactive terminal must not inherit that, or the first failed
+    // prompt hook exits the shell while the workspace is still open.
+    let options = options
+        .with_size(size)
+        .with_channel_capacity(256)
+        .without_env("SHELLOPTS")
+        .without_env("BASH_ENV")
+        .without_env("ENV");
+    with_utf8_ctype(platform, apply_contributions(contributions, options))
+}
+
 fn with_utf8_ctype(
     platform: &dyn Platform,
     options: made_terminal::PtyOptions,
@@ -5995,14 +6063,63 @@ mod tests {
             workbench.tick(&ctx);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(done(workbench), "the tab did not reach the expected state");
+        assert!(
+            done(workbench),
+            "the tab did not reach the expected state: target {:?}, terminal {:?}, error {:?}, log {:?}",
+            workbench.terminal_target,
+            workbench.terminal,
+            workbench.terminal_error,
+            workbench
+                .diag
+                .log()
+                .entries()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
-    /// A temporary directory outside `TMPDIR`: parallel unit tests swap
-    /// `TMPDIR` for a directory they delete when they finish.
+    const EXIT_TEST_CHILD_ENV: &str = "MADE_WORKBENCH_EXIT_TEST_CHILD";
+
+    /// Run the test `name` of this module again in a child process with a
+    /// temporary home and `TMPDIR` and `/bin/sh` as the shell, so the shell
+    /// reads none of the developer's startup files and no sibling test swaps
+    /// the environment under it. Returns `true` in the parent after the child
+    /// passed.
     #[cfg(unix)]
-    fn stable_tempdir() -> tempfile::TempDir {
-        tempfile::tempdir_in("/tmp").unwrap()
+    fn in_isolated_child(name: &str) -> bool {
+        if std::env::var_os(EXIT_TEST_CHILD_ENV).is_some() {
+            return false;
+        }
+        // Not under `TMPDIR`: a sibling test may point it at a directory it
+        // deletes while the child still runs.
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let tmp = home.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("workbench::tests::{name}"),
+                "--nocapture",
+            ])
+            .env(EXIT_TEST_CHILD_ENV, "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TMPDIR", &tmp)
+            .env(made_platform::SHELL_ENV, "/bin/sh")
+            .env_remove("SHELL")
+            .env_remove("ENV")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     #[cfg(unix)]
@@ -6015,27 +6132,33 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn no_presentation(workbench: &Workbench) -> bool {
+        (0..workbench.integrations.len()).all(|index| workbench.presentation_of(index).is_none())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_tui_that_exits_cleanly_becomes_a_shell_in_the_followed_folder() {
-        let temp = stable_tempdir();
+        if in_isolated_child("a_tui_that_exits_cleanly_becomes_a_shell_in_the_followed_folder") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
         let launch = temp.path().join("launch");
         let followed = temp.path().join("followed");
         std::fs::create_dir_all(&launch).unwrap();
         std::fs::create_dir_all(&followed).unwrap();
         let followed = followed.canonicalize().unwrap();
-        let mut probe = exiting_tui(&launch, &followed, "sleep 0.3; exit 0");
-        let tui_pid = probe.terminal.as_ref().and_then(TerminalPane::pid);
-        // Only the exited TUI's own branding is asserted: unit tests share a
-        // process environment that other integrations may read.
-        let claude = probe
-            .integrations
-            .iter()
-            .position(|entry| *entry == crate::integrations::CLAUDE_CODE)
-            .unwrap();
-        assert!(
-            probe.presentation_of(claude).is_some(),
-            "the running TUI brands its tab"
+        // The TUI prints its last line on the normal screen, then leaves a
+        // frame on the alternate screen with bracketed paste on.
+        let mut probe = exiting_tui(
+            &launch,
+            &followed,
+            "printf 'resume-hint\\n'; printf '\\033[?1049h\\033[?2004hTUI-FRAME'; sleep 0.3; exit 0",
         );
+        let tui_pid = probe.terminal.as_ref().and_then(TerminalPane::pid);
+        assert!(!no_presentation(&probe), "the running TUI brands its tab");
+        let mut log = crate::diagnostics::DiagnosticLog::new();
+        probe.terminal.as_mut().unwrap().resize(30, 100, &mut log);
 
         tick_until(&mut probe, is_shell_tab);
         let terminal = probe.terminal.as_ref().unwrap();
@@ -6044,17 +6167,34 @@ mod tests {
         assert_eq!(terminal.options().shell, None, "the plain terminal shell");
         assert!(terminal.options().args.is_empty());
         assert_eq!(terminal.options().cwd, followed);
+        assert_eq!(
+            terminal.options().size,
+            made_platform::PtySize {
+                rows: 30,
+                cols: 100
+            },
+            "the shell starts at the pane's size"
+        );
+        assert!(!terminal.alternate_screen(), "the TUI frame is gone");
+        let screen = terminal.screen_text();
+        assert!(screen.contains("resume-hint"), "{screen}");
+        assert!(!screen.contains("TUI-FRAME"), "{screen}");
         assert_eq!(probe.explorer_root(), Some(followed.as_path()));
         assert!(
-            probe.presentation_of(claude).is_none(),
-            "no Claude Code status survives on the shell"
+            no_presentation(&probe),
+            "no integration status survives on the shell"
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn a_tui_whose_followed_folder_is_gone_restarts_the_shell_in_the_launch_folder() {
-        let temp = stable_tempdir();
+        if in_isolated_child(
+            "a_tui_whose_followed_folder_is_gone_restarts_the_shell_in_the_launch_folder",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
         let launch = temp.path().join("launch");
         let followed = temp.path().join("followed");
         std::fs::create_dir_all(&launch).unwrap();
@@ -6069,26 +6209,48 @@ mod tests {
         assert_eq!(probe.explorer_root(), Some(launch.as_path()));
     }
 
+    /// Tick until the stand-in TUI ran `script` to its end, then once more.
     #[cfg(unix)]
-    #[test]
-    fn a_tui_that_exits_non_zero_keeps_its_exit_state() {
-        let temp = stable_tempdir();
+    fn tui_after_exit(script: &str) -> GrokRunningProbe {
+        let temp = tempfile::tempdir().unwrap();
         let followed = temp.path().join("followed");
         std::fs::create_dir_all(&followed).unwrap();
-        let mut probe = exiting_tui(temp.path(), &followed, "exit 3");
+        let mut probe = exiting_tui(temp.path(), &followed, script);
         tick_until(&mut probe, |workbench| {
             workbench
                 .terminal
                 .as_ref()
                 .is_some_and(|terminal| terminal.exit_status().is_some())
         });
-        let ctx = egui::Context::default();
-        probe.tick(&ctx);
+        probe.tick(&egui::Context::default());
+        probe
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_that_exits_non_zero_keeps_its_exit_state() {
+        if in_isolated_child("a_tui_that_exits_non_zero_keeps_its_exit_state") {
+            return;
+        }
+        let probe = tui_after_exit("exit 3");
         let terminal = probe.terminal.as_ref().unwrap();
         assert_eq!(terminal.exit_status().map(|status| status.code), Some(3));
         assert!(!terminal.exited_cleanly());
         assert!(matches!(probe.terminal_target, TerminalTarget::Tui(_)));
         assert!(!probe.shell_exited_cleanly());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tui_killed_by_a_signal_keeps_its_exit_state() {
+        if in_isolated_child("a_tui_killed_by_a_signal_keeps_its_exit_state") {
+            return;
+        }
+        let probe = tui_after_exit("kill -9 $$");
+        let terminal = probe.terminal.as_ref().unwrap();
+        assert!(terminal.exit_status().is_some());
+        assert!(!terminal.exited_cleanly());
+        assert!(matches!(probe.terminal_target, TerminalTarget::Tui(_)));
     }
 
     #[test]
