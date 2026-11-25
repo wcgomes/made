@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use made_terminal::{ProtocolEvent, ProtocolState};
 use serde::Deserialize;
 
-use super::agents::{background_cwd_for_title, cwd_for_pid, AgentCwd};
+use super::agents::{background_cwd_for_title, cwd_for_pid, normalize_title, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
@@ -684,6 +684,9 @@ pub struct ClaudeTab {
     /// Directory of the background session the window title names while it is
     /// attached from the agent view. Untrusted and unvalidated.
     attached: Option<String>,
+    /// The window title last seen, normalized by [`normalize_title`].
+    /// Untrusted display text, never logged.
+    window_title: String,
     /// The directory the latest agents snapshot listed for each owned Claude
     /// Code pid. Untrusted and unvalidated.
     listed: Vec<(u32, String)>,
@@ -703,6 +706,7 @@ impl ClaudeTab {
             status_seen: false,
             closed: Vec::new(),
             attached: None,
+            window_title: String::new(),
             listed: Vec::new(),
         }
     }
@@ -897,19 +901,32 @@ impl ClaudeTab {
         }
     }
 
-    /// Follow a background session opened from the agent view. Only while a
-    /// live owned session hosts it and a protocol status is live (when the
-    /// window title is trusted for the tooltip), a `window_title` that names
-    /// exactly one background entry attaches that entry's directory; anything
-    /// else detaches it.
-    pub fn apply_attached_title(&mut self, entries: &[AgentCwd], window_title: Option<&str>) {
-        self.attached = if self.protocol.is_some() && !self.sessions.is_empty() {
-            window_title
-                .and_then(|title| background_cwd_for_title(entries, title))
-                .map(str::to_owned)
-        } else {
-            None
-        };
+    /// Follow a background session opened from the agent view. A fresh agents
+    /// listing (`entries`) attaches the directory of the one background entry
+    /// the `window_title` names, or detaches when it names none. Without a
+    /// listing the selection stays while the normalized title stays the same;
+    /// a title change detaches it. The selection applies only while a live
+    /// owned session hosts it and a protocol status is live (when the window
+    /// title is trusted for the tooltip). Returns whether the normalized title
+    /// changed.
+    pub fn apply_attached_title(
+        &mut self,
+        entries: Option<&[AgentCwd]>,
+        window_title: Option<&str>,
+    ) -> bool {
+        let title = window_title.map(normalize_title).unwrap_or_default();
+        let changed = title != self.window_title;
+        if changed {
+            self.window_title = title;
+            self.attached = None;
+        }
+        if self.sessions.is_empty() {
+            self.attached = None;
+        } else if let Some(entries) = entries {
+            self.attached =
+                background_cwd_for_title(entries, &self.window_title).map(str::to_owned);
+        }
+        changed
     }
 
     /// Drop sessions whose Claude Code process has exited. Returns whether any
@@ -1046,10 +1063,11 @@ impl ClaudeTab {
     }
 
     /// The working directory of the background session attached from the agent
-    /// view while one is, otherwise of the most recent live owned session,
-    /// exactly as reported. Callers validate it before use.
+    /// view while one is and a protocol status is live, otherwise of the most
+    /// recent live owned session, exactly as reported. Callers validate it
+    /// before use.
     pub fn directory(&self) -> Option<String> {
-        if !self.sessions.is_empty() {
+        if !self.sessions.is_empty() && self.protocol.is_some() {
             if let Some(attached) = &self.attached {
                 return Some(attached.clone());
             }

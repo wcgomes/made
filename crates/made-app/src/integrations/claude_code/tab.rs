@@ -323,9 +323,9 @@ impl TabState for ClaudeTabState {
         }
         // Claude Code fires no hook for `/cd`: follow it through the agents
         // snapshot while this local tab owns a live session.
-        let snapshot = (!io.remote && runtime.tab.session_count() > 0)
-            .then(super::agents::demand)
-            .flatten();
+        let submitted = terminal.take_input_submitted();
+        let listed = !io.remote && runtime.tab.session_count() > 0;
+        let snapshot = listed.then(super::agents::latest).flatten();
         if let Some(snapshot) = &snapshot {
             runtime
                 .tab
@@ -333,10 +333,17 @@ impl TabState for ClaudeTabState {
         }
         // A background session opened from the agent view is named only by
         // the window title.
-        let entries = snapshot
-            .as_deref()
-            .map_or(&[][..], |snapshot| snapshot.entries.as_slice());
-        runtime.tab.apply_attached_title(entries, terminal.title());
+        let title_changed = runtime.tab.apply_attached_title(
+            snapshot
+                .as_deref()
+                .map(|snapshot| snapshot.entries.as_slice()),
+            terminal.title(),
+        );
+        // A `/cd` is submitted input, and an agent-view switch changes the
+        // title: only these start a burst of listings.
+        if listed && (submitted || title_changed) {
+            super::agents::trigger();
+        }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);
         } else if runtime.present_since.take().is_some() {

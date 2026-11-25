@@ -119,7 +119,7 @@ fn window_title_only_selects_a_listed_background_session_by_name() {
         "~/elsewhere",
         "Spec",
     ] {
-        tab.apply_attached_title(&snapshot, Some(window_title));
+        tab.apply_attached_title(Some(&snapshot), Some(window_title));
         assert_eq!(
             (tab.dots(), tab.directory(), tab.session_count()),
             before,
@@ -129,12 +129,12 @@ fn window_title_only_selects_a_listed_background_session_by_name() {
 
     // Positive control: the exact name of the one listed background session
     // selects that session's listed directory, and nothing else changes.
-    tab.apply_attached_title(&snapshot, Some("\u{2733} Spec task"));
+    tab.apply_attached_title(Some(&snapshot), Some("\u{2733} Spec task"));
     assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
     assert_eq!((tab.dots(), tab.session_count()), (before.0, before.2));
 
-    // Without a snapshot the same title selects nothing.
-    tab.apply_attached_title(&[], Some("\u{2733} Spec task"));
+    // A listing without that session detaches it.
+    tab.apply_attached_title(Some(&[]), Some("\u{2733} Spec task"));
     assert_eq!(tab.directory(), before.1);
 }
 
@@ -592,7 +592,7 @@ mod running_tab {
 
         // Made itself never tried to read any Claude Code configuration,
         // session, transcript or IDE lockfile path, even with an owned session
-        // live, which starts the `claude agents --json` poll.
+        // live and a title change, which runs `claude agents --json`.
         for fifo in &fifos {
             assert!(
                 !someone_is_reading(fifo),

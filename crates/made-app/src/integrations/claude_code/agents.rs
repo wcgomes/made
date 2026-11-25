@@ -2,14 +2,17 @@
 //!
 //! Claude Code fires no hook for `/cd`, so the hook spool only learns the new
 //! directory at the next prompt. `claude agents --json` reports every running
-//! session's process id and current working directory immediately. While a
-//! tab has a live owned session, one app-wide worker thread runs it about once
-//! a second (never through a shell, never two runs at once, in its own process
-//! group that is killed after a short timeout, when the worker is stopped, or
-//! when the output stays held open after the run exits) and publishes the latest snapshot; tabs match it to their owned Claude Code
-//! pids. Every failure leaves the previous snapshot in place, a snapshot older
-//! than a few seconds is not used, and the worker stops once no tab has asked
-//! for a snapshot for a while or the app shuts down ([`shutdown`]).
+//! session's process id and current working directory immediately. Nothing
+//! runs it on a timer: a tab with a live owned session [`trigger`]s a short
+//! burst of runs ([`BURST`]) when its user submits input or its window title
+//! changes, the two moments a `/cd` or an agent-view switch can happen. One
+//! app-wide worker thread does the runs (never through a shell, never two at
+//! once, in its own process group that is killed after a short timeout, when
+//! the worker is stopped, or when the output stays held open after the run
+//! exits) and publishes the latest snapshot; tabs match it to their owned
+//! Claude Code pids. Every failure leaves the previous snapshot in place, a
+//! snapshot older than a few seconds is not used, and the worker stops once no
+//! burst run is pending or the app shuts down ([`shutdown`]).
 //!
 //! A background session opened from Claude Code's agent view runs under the
 //! Claude Code daemon, not under the tab, so it is never matched by pid. While
@@ -38,14 +41,15 @@ use super::follow::MAX_TITLE_CHARS;
 use crate::integrations::CLAUDE_CODE;
 use crate::sanitize::sanitize_display;
 
-/// Interval between the starts of two runs.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// When the runs of one burst are due, measured from its [`trigger`].
+const BURST: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(700),
+    Duration::from_secs(2),
+];
 
 /// Longest a run may take before it is killed and ignored.
 const RUN_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// The worker stops when no tab asked for a snapshot for this long.
-const IDLE_AFTER: Duration = Duration::from_secs(3);
 
 /// A snapshot whose run started longer ago than this is not used.
 const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(5);
@@ -174,7 +178,9 @@ pub(crate) fn background_cwd_for_title<'a>(
 }
 
 struct Poller {
-    demanded_at: Option<Instant>,
+    /// When the pending runs are due, earliest first. The worker stops once it
+    /// is empty.
+    due: Vec<Instant>,
     running: bool,
     worker: Option<JoinHandle<()>>,
     /// The output reader of the latest run. No run starts while it is alive.
@@ -183,7 +189,7 @@ struct Poller {
 }
 
 static POLLER: Mutex<Poller> = Mutex::new(Poller {
-    demanded_at: None,
+    due: Vec::new(),
     running: false,
     worker: None,
     reader: None,
@@ -211,11 +217,19 @@ fn is_fresh(snapshot: &AgentSnapshot) -> bool {
     snapshot.started_at.elapsed() <= MAX_SNAPSHOT_AGE
 }
 
-/// Keep the worker running for a tab with a live owned session, and return
-/// the latest snapshot unless it is too old. Never blocks on the command.
-pub(crate) fn demand() -> Option<Arc<AgentSnapshot>> {
+/// The latest snapshot unless it is too old. Starts nothing.
+pub(crate) fn latest() -> Option<Arc<AgentSnapshot>> {
+    poller()
+        .snapshot
+        .clone()
+        .filter(|snapshot| is_fresh(snapshot))
+}
+
+/// Schedule a burst of runs for a tab with a live owned session, starting the
+/// worker when it is not running. Never blocks on the command.
+pub(crate) fn trigger() {
     let mut poller = poller();
-    poller.demanded_at = Some(Instant::now());
+    schedule_burst(&mut poller.due, Instant::now());
     if !poller.running {
         let generation = GENERATION.load(Ordering::Acquire);
         if let Ok(worker) = thread::Builder::new()
@@ -226,20 +240,36 @@ pub(crate) fn demand() -> Option<Arc<AgentSnapshot>> {
             poller.worker = Some(worker);
         }
     }
-    poller
-        .snapshot
-        .clone()
-        .filter(|snapshot| is_fresh(snapshot))
+}
+
+/// Replace the pending runs in `due` with a burst triggered at `now`. A run
+/// already due before the burst's first one is kept, so triggers that keep
+/// arriving never postpone every run; runs are never stacked.
+fn schedule_burst(due: &mut Vec<Instant>, now: Instant) {
+    let earliest = due.first().copied();
+    due.clear();
+    due.extend(BURST.iter().map(|offset| now + *offset));
+    if let Some(earliest) = earliest.filter(|earliest| *earliest < due[0]) {
+        due.insert(0, earliest);
+    }
+}
+
+/// Remove every run in `due` that is due at `now`; they are served by one run.
+/// Returns whether any was.
+fn take_due(due: &mut Vec<Instant>, now: Instant) -> bool {
+    let count = due.partition_point(|at| *at <= now);
+    due.drain(..count);
+    count > 0
 }
 
 /// Stop the worker, killing the process group of its in-flight run, and wait
-/// a bounded time for it to exit. A later [`demand`] starts a new worker.
+/// a bounded time for it to exit. A later [`trigger`] starts a new worker.
 pub(crate) fn shutdown() {
     let worker = {
         let mut poller = poller();
         GENERATION.fetch_add(1, Ordering::AcqRel);
         poller.running = false;
-        poller.demanded_at = None;
+        poller.due.clear();
         poller.snapshot = None;
         poller.worker.take()
     };
@@ -255,36 +285,41 @@ pub(crate) fn shutdown() {
     }
 }
 
+/// Serve the pending burst runs, then stop. A run due while the previous run's
+/// output reader is still alive is skipped.
 fn work(generation: u64) {
     let stop = || stopped(generation);
     loop {
-        let reader_alive = {
+        let run = {
             let mut poller = poller();
             if stop() {
                 return;
             }
-            if poller
-                .demanded_at
-                .is_none_or(|at| at.elapsed() > IDLE_AFTER)
-            {
+            let Some(&next) = poller.due.first() else {
                 poller.running = false;
-                poller.snapshot = None;
                 return;
+            };
+            let now = Instant::now();
+            if next > now {
+                Err(next - now)
+            } else {
+                take_due(&mut poller.due, now);
+                Ok(poller.reader.as_ref().is_none_or(JoinHandle::is_finished))
             }
-            poller
-                .reader
-                .as_ref()
-                .is_some_and(|reader| !reader.is_finished())
         };
-        let started_at = Instant::now();
-        if !reader_alive {
-            let mut reader = None;
-            let entries = run_agents(&mut reader, &stop);
-            if !publish(&mut poller(), &stop, reader, entries, started_at) {
-                return;
+        match run {
+            // A newer trigger may move the next run earlier: wait in steps.
+            Err(wait) => pause(wait.min(STEP), &stop),
+            Ok(false) => {}
+            Ok(true) => {
+                let started_at = Instant::now();
+                let mut reader = None;
+                let entries = run_agents(&mut reader, &stop);
+                if !publish(&mut poller(), &stop, reader, entries, started_at) {
+                    return;
+                }
             }
         }
-        pause(POLL_INTERVAL.saturating_sub(started_at.elapsed()), &stop);
     }
 }
 
@@ -578,7 +613,7 @@ mod tests {
     #[test]
     fn a_stopped_worker_leaves_the_poller_state_alone() {
         let mut poller = Poller {
-            demanded_at: None,
+            due: Vec::new(),
             running: true,
             worker: None,
             reader: None,
@@ -705,18 +740,120 @@ mod tests {
         ];
 
         // Without a live status the title is not trusted.
-        tab.apply_attached_title(&entries, Some("✳ Spec task"));
+        assert!(tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/host"));
 
         tab.note_protocol(ProtocolEvent::Status {
             state: ProtocolState::Working,
         });
-        tab.apply_attached_title(&entries, Some("✳ Spec task"));
+        assert!(!tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
         assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
 
         // The title changes: the host session's directory applies again.
-        tab.apply_attached_title(&entries, Some("✳ Claude Code"));
+        assert!(tab.apply_attached_title(Some(&entries), Some("✳ Claude Code")));
         assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+    }
+
+    #[test]
+    fn an_attached_selection_outlives_its_listing_until_the_title_changes() {
+        use made_terminal::{ProtocolEvent, ProtocolState};
+        let pid = 4202;
+        let alive = |candidate: u32| (candidate == pid).then_some(1);
+        let mut tab = ClaudeTab::new(pid, true);
+        tab.ingest(
+            vec![Record {
+                session_id: "host".to_owned(),
+                cwd: "/work/host".to_owned(),
+                event: "SessionStart".to_owned(),
+                status: Some(HookStatus::Idle),
+                title: String::new(),
+                pids: vec![pid],
+            }],
+            alive,
+        );
+        tab.note_protocol(ProtocolEvent::Status {
+            state: ProtocolState::Working,
+        });
+        let entries = vec![
+            interactive(pid, "/work/host"),
+            background(90172, "/work/spec", "Spec task"),
+        ];
+
+        // A new title with no fresh listing selects nothing yet.
+        assert!(tab.apply_attached_title(None, Some("✳ Spec task")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+        assert!(!tab.apply_attached_title(Some(&entries), Some("✳ Spec task")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
+
+        // The listing goes stale: the same title (a spinner frame is the same
+        // title) keeps the selection.
+        for title in ["✳ Spec task", "⠂ Spec task", "✳ Spec task"] {
+            assert!(!tab.apply_attached_title(None, Some(title)), "{title}");
+            assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
+        }
+
+        // A protocol clear hides the selection without losing it.
+        tab.note_protocol(ProtocolEvent::Clear { bare: false });
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+        tab.note_protocol(ProtocolEvent::Status {
+            state: ProtocolState::Idle,
+        });
+        assert!(!tab.apply_attached_title(None, Some("✳ Spec task")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/spec"));
+
+        // A title change detaches at once, before any listing.
+        assert!(tab.apply_attached_title(None, Some("✳ Claude Code")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+        // Coming back needs a listing again.
+        assert!(tab.apply_attached_title(None, Some("✳ Spec task")));
+        assert_eq!(tab.directory().as_deref(), Some("/work/host"));
+    }
+
+    fn at(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn a_trigger_schedules_one_short_burst() {
+        let start = Instant::now();
+        let mut due = Vec::new();
+        schedule_burst(&mut due, start);
+        assert_eq!(due, vec![at(start, 200), at(start, 700), at(start, 2000)]);
+
+        assert!(!take_due(&mut due, at(start, 199)));
+        assert!(take_due(&mut due, at(start, 200)));
+        assert!(!take_due(&mut due, at(start, 699)));
+        // Runs that fell due together are served by one run.
+        assert!(take_due(&mut due, at(start, 5000)));
+        assert!(due.is_empty(), "the burst is over");
+        assert!(!take_due(&mut due, at(start, 9000)));
+    }
+
+    #[test]
+    fn a_new_trigger_restarts_the_burst_without_stacking_runs() {
+        let start = Instant::now();
+        let mut due = Vec::new();
+        schedule_burst(&mut due, start);
+        assert!(take_due(&mut due, at(start, 200)));
+        assert!(take_due(&mut due, at(start, 700)));
+
+        // Mid-burst: the burst restarts from the new trigger, dropping the run
+        // still pending at 2 s.
+        schedule_burst(&mut due, at(start, 1000));
+        assert_eq!(due, vec![at(start, 1200), at(start, 1700), at(start, 3000)]);
+
+        // Triggers that keep coming never postpone the run already due first.
+        schedule_burst(&mut due, at(start, 1100));
+        schedule_burst(&mut due, at(start, 1150));
+        assert_eq!(
+            due,
+            vec![
+                at(start, 1200),
+                at(start, 1350),
+                at(start, 1850),
+                at(start, 3150)
+            ]
+        );
     }
 
     #[test]
