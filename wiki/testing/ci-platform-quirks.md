@@ -49,7 +49,7 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 
 ## Terminal view selection tests
 
-- Selection and copy tests in `terminal_view.rs` must not run the user's real shell. Tests drain PTY output into the grid only through the first frame's resize pump (`TerminalPane::resize` pumps, then returns early on an unchanged size), so shell startup output that arrives later (macOS `/bin/bash` prints a blank line before its zsh notice) can blank the selected cells. An empty selection copies nothing (`copy_selection` returns `None`); that is correct product behavior, not the bug.
+- Selection and copy tests in `terminal_view.rs` must not run the user's real shell. Tests drain PTY output into the grid only through the first frame's resize pump (`TerminalPane::resize` pumps, then returns early on an unchanged size), so whether shell startup output lands in the grid depends on whether it arrives before that first frame; macOS `/bin/bash`'s leading blank line before its zsh notice can then blank the selected cells. An empty selection copies nothing (`copy_selection` returns `None`); that is correct product behavior, not the bug.
 - Use the `spawn_quiet_pane` test helper: on unix it runs `/bin/sh` with `stty -echo`, waits for a `ready` marker, then clears screen and scrollback before the test feeds text. Windows still uses the native shell.
 - In made-terminal (`alacritty_terminal` 0.26), ED 2 (`ESC[2J`) moves the screen into scrollback and a later taller resize pulls those lines back into view; send ED 3 (`ESC[3J`) as well to blank a test grid before a resize.
 - Source/Test: [`terminal_view.rs`](../../crates/made-app/src/terminal_view.rs) `resize`, `copy_selection`, `spawn_quiet_pane`.
