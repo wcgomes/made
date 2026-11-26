@@ -49,11 +49,9 @@ fn detection_ignores_relative_and_empty_path_entries_and_fails_closed() {
 
 mod shared_helpers {
     use made_remote::claude::{
-        compose_plugin_dirs, normalize_title, parse_agents, parse_record, parse_record_line,
-        AgentCwd, HookStatus, MAX_RECORD_BYTES,
+        normalize_title, parse_agents, parse_record, parse_record_line, AgentCwd, HookStatus,
+        MAX_RECORD_BYTES,
     };
-    use std::ffi::{OsStr, OsString};
-    use std::path::Path;
 
     fn line(fields: &str) -> String {
         format!("{{\"sessionId\":\"s1\",{fields}}}")
@@ -118,8 +116,15 @@ mod shared_helpers {
         assert_eq!(parse_record_line(b"{\"sessionId\":\"s1\",\xff}\n"), None);
     }
 
+    // The `:` list and its absolute paths are Unix ones; the companion that
+    // composes it runs only on Unix servers.
     #[test]
+    #[cfg(unix)]
     fn plugin_dirs_keep_order_add_one_entry_and_skip_an_unsafe_path() {
+        use made_remote::claude::compose_plugin_dirs;
+        use std::ffi::{OsStr, OsString};
+        use std::path::Path;
+
         let shipped = Path::new("/srv/made/plugins/claude-code-made");
         let made = "/srv/made/plugins/claude-code-made";
         let compose =
@@ -313,9 +318,15 @@ mod environment {
         let companion = staged_companion(&locked, Some(0o700));
         let package = locked.join("plugins/claude-code-made");
         std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a mode-000 directory, so the check means nothing there.
+        let enforced = std::fs::read_dir(&package).is_err();
         let unreadable = staged_plugin_dir(&companion);
         std::fs::set_permissions(&package, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(unreadable, None);
+        if enforced {
+            assert_eq!(unreadable, None);
+        } else {
+            eprintln!("skipping unreadable-package assertion when running as root");
+        }
         let user = Environment::from_pairs([(CLAUDE_CODE_PLUGIN_DIRS_ENV, "/u/one")]);
         for target in [LaunchTarget::Shell, LaunchTarget::Claude] {
             let composed = launch_environment(target, None, &user, &spool_path(&root));

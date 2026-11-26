@@ -9290,7 +9290,9 @@ mod tests {
             assert_eq!(brand_key(&bench), Some("opencode"));
         }
 
+        // A host temp directory is a valid remote path only on a Unix host.
         #[test]
+        #[cfg(unix)]
         fn remote_claude_directories_are_validated_on_the_remote_authority_only() {
             use made_remote::protocol::ClaudeActivity as Remote;
 
