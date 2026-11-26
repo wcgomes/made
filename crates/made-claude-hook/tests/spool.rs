@@ -10,7 +10,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use common::{assert_silent, event_json, run_closed, run_event, run_open, Spool};
+use common::{
+    assert_silent, event_json, run_closed, run_event, run_open, tolerate_closed_pipe, Spool,
+};
 use serde_json::json;
 
 const MIB: u64 = 1024 * 1024;
@@ -95,7 +97,8 @@ fn relative_spool_path_writes_nothing() {
         .current_dir(spool.root.path())
         .stdin(std::process::Stdio::piped());
     let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(&stop()).unwrap();
+    // The hook exits before reading standard input on a relative path.
+    tolerate_closed_pipe(child.stdin.take().unwrap().write_all(&stop()));
     assert!(child.wait().unwrap().success());
     assert_eq!(spool.raw(), "");
 }

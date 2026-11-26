@@ -130,7 +130,7 @@ pub fn wait_open(mut child: Child, limit: Duration) -> Option<(Outcome, std::pro
 /// A hook may exit (silently, by contract) before the test finishes writing its
 /// payload; the resulting broken pipe is the hook's valid early exit, not a
 /// test failure. Any other write error is still fatal.
-fn tolerate_closed_pipe(result: std::io::Result<()>) {
+pub fn tolerate_closed_pipe(result: std::io::Result<()>) {
     if let Err(error) = result {
         assert_eq!(
             error.kind(),
