@@ -782,9 +782,17 @@ fn opencode_reason_sentences_follow_the_grok_wording() {
 /// from remote integration loss.
 #[test]
 fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
-    use made_app::diagnostics::remote_opencode_report;
+    use made_app::diagnostics::{remote_opencode_report, RemoteOpenCodeSignals};
     use made_app::remote_workspace::{ConnectionState, IntegrationState as RemoteIntegration};
     use made_remote::protocol::ErrorCode;
+
+    // An OpenCode-capable tab on a server where OpenCode was detected and the
+    // companion reported its OpenCode integration.
+    let signals = RemoteOpenCodeSignals {
+        integration_target: true,
+        detected: true,
+        companion: Some(true),
+    };
 
     // Before the SSH session attaches, the remote integration has not been
     // observed; no host sentence may stand in for it.
@@ -794,6 +802,7 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         ConnectionState::Disconnected,
         RemoteIntegration::Unknown,
         None,
+        signals,
     );
     assert_eq!(report.status, IntegrationStatus::Inactive);
     assert_eq!(report.code, "inactive");
@@ -810,32 +819,29 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         ConnectionState::Connected,
         RemoteIntegration::Connected,
         None,
+        signals,
     );
     assert_eq!(report.status, IntegrationStatus::Connected);
     assert_eq!(report.code, "connected");
     assert_eq!(report.reason, "OpenCode session follow is ready.");
 
-    // The remote integration failed while the transport stayed healthy: the
-    // reason blames the integration, not the transport.
+    // The companion has its OpenCode integration but no plugin has said hello
+    // while the transport stayed healthy: OpenCode is simply not running, in
+    // the local wording, and the transport is not blamed.
     let report = remote_opencode_report(
         true,
         None,
         ConnectionState::Connected,
         RemoteIntegration::Unavailable,
         Some(ErrorCode::Unavailable),
+        signals,
     );
-    assert_eq!(report.status, IntegrationStatus::Degraded);
-    assert_eq!(report.code, "unavailable");
-    assert!(
-        report
-            .reason
-            .contains("remote OpenCode integration is unavailable"),
-        "the reason blames the integration: {}",
-        report.reason
-    );
+    assert_eq!(report.status, IntegrationStatus::Inactive);
+    assert_eq!(report.code, "inactive");
+    assert_eq!(report.reason, "OpenCode is not running.");
     assert!(
         !report.reason.contains("transport"),
-        "an integration failure must not claim a transport failure: {}",
+        "an integration state must not claim a transport failure: {}",
         report.reason
     );
 
@@ -847,6 +853,7 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         ConnectionState::Disconnected,
         RemoteIntegration::Unknown,
         None,
+        signals,
     );
     assert_eq!(report.status, IntegrationStatus::Degraded);
     assert!(
@@ -862,6 +869,7 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         ConnectionState::Disconnected,
         RemoteIntegration::Unknown,
         None,
+        signals,
     );
     assert_eq!(report.status, IntegrationStatus::Degraded);
     assert_eq!(
@@ -2098,5 +2106,88 @@ recent log:\n";
             }
         }
         assert_eq!(out, "");
+    }
+}
+
+/// Connected transport with an unavailable remote OpenCode integration: the
+/// row uses the tab's own launch target, server detection and companion
+/// capability, and is degraded only when OpenCode should be there and is not.
+#[test]
+fn remote_opencode_unavailable_maps_to_the_tab_signals() {
+    use made_app::diagnostics::{remote_opencode_report, RemoteOpenCodeSignals};
+    use made_app::remote_workspace::{ConnectionState, IntegrationState as RemoteIntegration};
+    use made_remote::protocol::ErrorCode;
+
+    let row = |error: Option<ErrorCode>, signals: RemoteOpenCodeSignals| {
+        remote_opencode_report(
+            true,
+            None,
+            ConnectionState::Connected,
+            RemoteIntegration::Unavailable,
+            error,
+            signals,
+        )
+    };
+    let ready = RemoteOpenCodeSignals {
+        integration_target: true,
+        detected: true,
+        companion: Some(true),
+    };
+
+    // Grok and Claude Code launches intentionally carry no OpenCode
+    // integration: not running, never degraded.
+    for detected in [true, false] {
+        let report = row(
+            Some(ErrorCode::Unavailable),
+            RemoteOpenCodeSignals {
+                integration_target: false,
+                detected,
+                companion: Some(false),
+            },
+        );
+        assert_eq!(report.status, IntegrationStatus::Inactive);
+        assert_eq!(report.code, ReasonCode::Inactive.code());
+        assert_eq!(report.reason, ReasonCode::Inactive.message());
+    }
+
+    // OpenCode was not detected on this server.
+    let report = row(
+        Some(ErrorCode::Unavailable),
+        RemoteOpenCodeSignals {
+            detected: false,
+            companion: None,
+            ..ready
+        },
+    );
+    assert_eq!(report.status, IntegrationStatus::Inactive);
+    assert_eq!(report.reason, "OpenCode is not detected on this server.");
+
+    // Companion integration present, no plugin hello yet.
+    let report = row(Some(ErrorCode::Unavailable), ready);
+    assert_eq!(report.status, IntegrationStatus::Inactive);
+    assert_eq!(report.code, ReasonCode::Inactive.code());
+    assert_eq!(report.reason, "OpenCode is not running.");
+
+    // Companion lacks the OpenCode capability, or it is not known yet, or the
+    // integration failed with another code: the degraded sentence stays.
+    for (error, companion) in [
+        (Some(ErrorCode::Unavailable), Some(false)),
+        (Some(ErrorCode::Unavailable), None),
+        (Some(ErrorCode::Io), Some(true)),
+        (None, Some(true)),
+    ] {
+        let report = row(error, RemoteOpenCodeSignals { companion, ..ready });
+        assert_eq!(
+            report.status,
+            IntegrationStatus::Degraded,
+            "{error:?} {companion:?}"
+        );
+        assert!(
+            report
+                .reason
+                .contains("remote OpenCode integration is unavailable"),
+            "the reason blames the integration: {}",
+            report.reason
+        );
     }
 }

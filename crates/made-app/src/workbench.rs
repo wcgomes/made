@@ -254,6 +254,12 @@ struct RemoteTab {
     /// What the tab's own launch probe detected. Absence is undetected; the
     /// host PATH is never consulted for a remote tab.
     grok_detected: bool,
+    /// What the tab's own launch probe detected for OpenCode.
+    opencode_detected: bool,
+    /// The companion's `Capabilities.opencode` for the current attach.
+    companion_opencode: Option<bool>,
+    /// Pending `Capabilities` request sent after the current attach.
+    capabilities_request: Option<u64>,
     // END remote-path
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
@@ -331,6 +337,9 @@ impl RemoteTab {
             update_failed: false,
             // BEGIN remote-path (AIA-02)
             grok_detected: false,
+            opencode_detected: false,
+            companion_opencode: None,
+            capabilities_request: None,
             // END remote-path
             probe: None,
             stage: None,
@@ -727,6 +736,9 @@ impl Workbench {
             update_failed: false,
             // BEGIN remote-path (AIA-02)
             grok_detected: false,
+            opencode_detected: false,
+            companion_opencode: None,
+            capabilities_request: None,
             // END remote-path
             probe: None,
             stage: None,
@@ -2993,6 +3005,7 @@ impl Workbench {
         }
         // The owning tab's own detection feeds its Grok Build diagnostics row.
         remote.grok_detected = capabilities.grok;
+        remote.opencode_detected = capabilities.opencode;
         if let Some(state) =
             crate::integrations::claude_code::tab_state_mut(self.integrations, &mut self.tab_states)
         {
@@ -3292,6 +3305,7 @@ impl Workbench {
             Ok(id) => {
                 remote.client = Some(client);
                 remote.attach_request = Some(id);
+                remote.capabilities_request = None;
                 remote.phase = RemotePhase::AwaitingAttach;
                 remote.detail =
                     "Session opening. Root checks wait until the remote session is attached."
@@ -3352,6 +3366,19 @@ impl Workbench {
                             attach_reply = Some(reply);
                             continue;
                         }
+                        // BEGIN remote-path (AIA-02)
+                        // A failed Capabilities reply leaves the signal unknown.
+                        if remote.capabilities_request == Some(reply.request_id) {
+                            remote.capabilities_request = None;
+                            if let made_remote::protocol::Operation::CapabilitiesResult {
+                                capabilities,
+                            } = &reply.operation
+                            {
+                                remote.companion_opencode = Some(capabilities.opencode);
+                            }
+                            continue;
+                        }
+                        // END remote-path
                         if remote.upload.as_ref().is_some_and(|upload| {
                             upload.begin_id == Some(reply.request_id)
                                 || upload.inflight_chunk == Some(reply.request_id)
@@ -3574,6 +3601,7 @@ impl Workbench {
             remote.companion_provisioned = false;
             remote.client = None;
             remote.attach_request = None;
+            remote.capabilities_request = None;
             remote.deferred_shell_cwd = None;
             remote.holding_input = false;
             remote.upload = None;
@@ -3709,6 +3737,16 @@ impl Workbench {
         }
         remote.attached_once = true;
         remote.phase = RemotePhase::Ready;
+        // BEGIN remote-path (AIA-02)
+        // The companion's own OpenCode capability for this attach feeds the
+        // diagnostics row. Attach never depends on the reply.
+        remote.companion_opencode = None;
+        remote.capabilities_request = remote.client.as_ref().and_then(|client| {
+            client
+                .request(made_remote::protocol::Operation::Capabilities, None)
+                .ok()
+        });
+        // END remote-path
         remote.holding_input = true;
         remote.detail =
             "SSH attached. Applying the remote snapshot before accepting input.".to_owned();
@@ -5105,6 +5143,11 @@ impl Workbench {
             remote.workspace.connection(),
             remote.workspace.integration(),
             remote.workspace.projection().integration_error,
+            crate::diagnostics::RemoteOpenCodeSignals {
+                integration_target: !(remote.grok || remote.claude),
+                detected: remote.opencode_detected,
+                companion: remote.companion_opencode,
+            },
         ))
     }
     // END remote-path
@@ -7500,6 +7543,75 @@ mod tests {
                         .directories
                         .contains_key(session_root)
             });
+        }
+
+        #[test]
+        fn unavailable_session_after_attach_reports_remote_opencode_not_running() {
+            let mut bench = remote_bench();
+            bench.workbench.remote.as_mut().unwrap().opencode_detected = true;
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+
+            let mut capabilities = false;
+            let mut session_unavailable = false;
+            pump_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    match &frame.operation {
+                        Operation::RootValidate { path } => {
+                            bench.reply(&frame, root_result(&frame, path))
+                        }
+                        Operation::List { path } => bench.reply(&frame, listed(path)),
+                        Operation::Capabilities => {
+                            capabilities = true;
+                            bench.reply(
+                                &frame,
+                                Operation::CapabilitiesResult {
+                                    capabilities: made_remote::protocol::Capabilities {
+                                        target: made_remote::protocol::RemoteTarget::LinuxX64,
+                                        tmux: false,
+                                        opencode: true,
+                                        shell_cwd: false,
+                                        helper_version: "test".to_owned(),
+                                        grok: false,
+                                        python3: false,
+                                    },
+                                },
+                            );
+                        }
+                        Operation::SessionState => {
+                            session_unavailable = true;
+                            bench.reply(
+                                &frame,
+                                Operation::Error {
+                                    code: ErrorCode::Unavailable,
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                capabilities
+                    && session_unavailable
+                    && remote.companion_opencode == Some(true)
+                    && remote.workspace.integration() == RemoteIntegrationState::Unavailable
+            });
+
+            let report = bench.workbench.remote_opencode_diagnostics().unwrap();
+            assert_eq!(report.status, IntegrationStatus::Inactive);
+            assert_eq!(report.reason, "OpenCode is not running.");
         }
 
         #[test]
