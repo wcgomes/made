@@ -12,7 +12,7 @@ Replace the Python hook with a small Rust executable, `made-grok-status` (`made-
 
 - Observable behavior is the Python contract: same events, status rules, seven line fields, log path (`made-grok-status.jsonl` under `$GROK_HOME`), bounded stdin read (~2 s), exit 0, empty stdout. Every `status_test.py` case was ported 1:1; `status.py` and `status_test.py` were deleted.
 - The repository `plugins/grok-made` is source only. `.github/scripts/stage-grok-plugin.sh` stages the shipped package (mode 755 hook) for development runs, desktop packages, and remote companion stage sets. A development build never falls back to the repository source.
-- The remote stage set shrank from 11 to 10 artifacts. The hook is built under the same glibc 2.31 / macOS 12 floors as `made-remote`.
+- The remote stage set shrank from 11 to 10 artifacts. The hook is built under the same glibc 2.31 / macOS 12 floors as `made-remote`. *Note (2026-11-26):* the Claude Code package raised it to 14 in v0.1.2; see [Grok SSH](../integration/grok.md#ssh-workspaces).
 - `Capabilities.python3` stays in protocol major 1 as a frozen field, always false and ignored. The `python3-missing` diagnostics state and the python3 PATH probe were removed.
 - Windows `hooks.json` is generated at staging with the `.exe` command name, because Grok's documentation only promises `.exe` resolution.
 - Python remains only as build, CI, and test tooling (`.github/scripts/*.py`); it is not a product prerequisite.

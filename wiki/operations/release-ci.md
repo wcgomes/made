@@ -1,6 +1,6 @@
 # Release and CI
 
-Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. The five CI workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; `release.yml` and `upgrade-check.yml` are covered by the [v0.1.0](../records/20261106-v0-1-0-release.md) and [v0.1.1](../records/20261125-v0-1-1-release.md) release records; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
+Made produces **unsigned development builds** on every push and **unsigned, installable, self-updating releases** from `v*` tags (see [Releases](#releases)). There is no signing, notarization, or package repository. CI proves compilation, contract/PTY tests, smoke markers, and artifact assembly; it does not certify native UX. The five CI workflows were observed green on Linux, macOS arm64/x64, and Windows x64 at the 2026-10-28 snapshot; `release.yml` and `upgrade-check.yml` are covered by the [v0.1.0](../records/20261106-v0-1-0-release.md), [v0.1.1](../records/20261125-v0-1-1-release.md) and [v0.1.2](../records/20261126-v0-1-2-release.md) release records; see [`.github/workflows`](../../.github/workflows) and the [platform matrix](../testing/platform-matrix.md).
 
 ## Workflows
 
@@ -51,6 +51,8 @@ DISPLAY=127.0.0.1:99 LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 \
 Releases are produced only by pushing a `v<major>.<minor>.<patch>` tag; branch pushes and pull requests never create or modify a release. `[workspace.package].version` in `Cargo.toml` is the single version source, and `ci.yml` fails on any drift of the other sites.
 
 ### Bump and release
+
+Every release, including one that only ships companion changes, must bump the version: the client sends the SSH Claude Code operations to any supervisor whose `helper_version` is at least its own, so a same-version supervisor started from older artifacts would pass that gate (accepted residual, see [Claude Code SSH](../integration/claude-code.md#ssh)).
 
 `main` accepts changes only through pull requests, so a release bump is a pull request too:
 
