@@ -1,8 +1,12 @@
 //! macOS platform backend.
 //!
-//! Uses a POSIX PTY through `portable-pty`, standard macOS Library paths, the
+//! Uses a POSIX PTY through `portable-pty` with the child started by
+//! `posix_spawn` (see [`pty_spawn`]), standard macOS Library paths, the
 //! `arboard` clipboard, and the shared IME normalizer. Builds for arm64 and x64
 //! from the same source.
+
+mod pty_spawn;
+pub(crate) use pty_spawn::spawn_pty_child;
 
 use std::env;
 use std::ffi::{OsStr, OsString};

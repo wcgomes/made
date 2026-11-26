@@ -2693,7 +2693,7 @@ fn shell_compatible_cwd(path: &Path) -> PathBuf {
 pub(crate) fn spawn_portable_pty(
     request: &PtyRequest,
 ) -> Result<Box<dyn PtySession>, PlatformError> {
-    use portable_pty::{CommandBuilder, PtySize as PortablePtySize};
+    use portable_pty::PtySize as PortablePtySize;
 
     if request.program.is_empty() {
         return Err(PlatformError::message(
@@ -2711,21 +2711,39 @@ pub(crate) fn spawn_portable_pty(
         })
         .map_err(|err| PlatformError::message(format!("open PTY failed: {err:#}")))?;
 
-    let mut command = CommandBuilder::new(&request.program);
-    command.args(&request.args);
-    command.cwd(shell_compatible_cwd(&request.cwd));
-    command.env_clear();
-    for (key, value) in &request.env {
-        command.env(key, value);
-    }
-    for key in &request.env_remove {
-        command.env_remove(key);
-    }
-
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|err| PlatformError::message(format!("spawn PTY child failed: {err:#}")))?;
+    // macOS: posix_spawn, not portable-pty's fork + pre_exec, whose child can
+    // trap in libSystem's atfork handlers when the parent is multithreaded.
+    #[cfg(target_os = "macos")]
+    let child = {
+        let tty = pair.master.tty_name().ok_or_else(|| {
+            PlatformError::message("spawn PTY child failed: the PTY has no device name")
+        })?;
+        crate::macos::spawn_pty_child(
+            &request.program,
+            &request.args,
+            &shell_compatible_cwd(&request.cwd),
+            &request.env,
+            &request.env_remove,
+            &tty,
+        )
+        .map_err(|err| PlatformError::message(format!("spawn PTY child failed: {err:#}")))?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let child = {
+        let mut command = portable_pty::CommandBuilder::new(&request.program);
+        command.args(&request.args);
+        command.cwd(shell_compatible_cwd(&request.cwd));
+        command.env_clear();
+        for (key, value) in &request.env {
+            command.env(key, value);
+        }
+        for key in &request.env_remove {
+            command.env_remove(key);
+        }
+        pair.slave
+            .spawn_command(command)
+            .map_err(|err| PlatformError::message(format!("spawn PTY child failed: {err:#}")))?
+    };
 
     // The parent must not keep the slave side open, otherwise EOF on the master
     // never arrives after the child exits.
@@ -2737,9 +2755,10 @@ pub(crate) fn spawn_portable_pty(
         .master
         .process_group_leader()
         .or_else(|| pid.map(|pid| pid.min(i32::MAX as u32) as i32));
-    // portable-pty calls setsid() in the child before exec, so the child is
-    // the leader of its own session and its session id equals its pid. This is
-    // the workspace-scoped ownership key used for descendant cleanup.
+    // The child calls setsid() before exec (portable-pty's pre_exec, or
+    // POSIX_SPAWN_SETSID on macOS), so it is the leader of its own session and
+    // its session id equals its pid. This is the workspace-scoped ownership key
+    // used for descendant cleanup.
     #[cfg(unix)]
     let session_id = pid
         .map(|pid| pid.min(i32::MAX as u32) as libc::pid_t)
