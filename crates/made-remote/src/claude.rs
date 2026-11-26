@@ -1410,6 +1410,12 @@ impl Drop for ListingWorker {
 /// shared lock on for its whole life.
 const LISTING_USERS: &str = "listing.users";
 
+/// How long the probe retries the users lock. A child forked by any thread of
+/// a supervisor holds every descriptor, close-on-exec ones included, until it
+/// execs, so a users hold can outlive its supervisor for that moment; a live
+/// supervisor holds it for good.
+const LISTING_USERS_WAIT: Duration = Duration::from_millis(100);
+
 /// Remove the published listing when no supervisor holds the users lock.
 /// Returns the probe's exclusive hold, released by the caller.
 fn remove_unused_listing(dir: &Path) -> Option<fs::File> {
@@ -1418,7 +1424,13 @@ fn remove_unused_listing(dir: &Path) -> Option<fs::File> {
     let file = made_platform::open_regular_file_nofollow(&path, false)
         .ok()
         .or_else(|| made_platform::create_private_file_new(&path, false).ok())?;
-    file.try_lock().ok()?;
+    let deadline = Instant::now() + LISTING_USERS_WAIT;
+    while file.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(STEP);
+    }
     note_access(&dir.join(LISTING_FILE));
     let listing = dir.join(LISTING_FILE);
     if fs::symlink_metadata(&listing).is_ok_and(|meta| meta.is_file()) {
