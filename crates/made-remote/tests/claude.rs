@@ -3,6 +3,27 @@
 use made_platform::Environment;
 use made_remote::grok;
 
+/// Tests that start processes hold this shared; a test that asserts a users
+/// lock was released holds it exclusively. A child forked by any thread of
+/// this binary holds every descriptor, close-on-exec ones included, until it
+/// execs, so it can briefly hold another test's lock.
+#[cfg(unix)]
+static SPAWNS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+#[cfg(unix)]
+fn spawning() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWNS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(unix)]
+fn no_spawns() -> std::sync::RwLockWriteGuard<'static, ()> {
+    SPAWNS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(unix)]
 fn executable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -752,6 +773,7 @@ mod tracker {
 
     #[test]
     fn a_triggered_listing_follows_cd_and_relays_background_entries() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         made_platform::ensure_private_directory(&dir.join("data/remote")).unwrap();
@@ -802,6 +824,7 @@ mod tracker {
     /// their own sequence, so the client never compares the two.
     #[test]
     fn state_replies_take_new_revisions_and_listings_count_their_own() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         made_platform::ensure_private_directory(&dir.join("data/remote")).unwrap();
@@ -847,6 +870,7 @@ mod tracker {
 
     #[test]
     fn a_listing_without_the_sessions_pid_changes_nothing() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         made_platform::ensure_private_directory(&dir.join("data/remote")).unwrap();
@@ -992,6 +1016,7 @@ mod listing {
 
     #[test]
     fn a_trigger_runs_the_detected_claude_directly_in_a_burst() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         let worker = ListingWorker::new(Some(fixture(&dir, OUTPUT)), coordination(&dir));
@@ -1018,6 +1043,7 @@ mod listing {
 
     #[test]
     fn triggers_never_run_in_parallel_across_tabs_and_keep_the_spacing() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         let program = fixture(&dir, OUTPUT);
@@ -1087,6 +1113,7 @@ mod listing {
 
     #[test]
     fn a_run_outlives_its_tab_only_while_another_tab_waits_for_it() {
+        let _spawns = super::spawning();
         // Alone: the tab's teardown kills its run.
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
@@ -1124,6 +1151,7 @@ mod listing {
 
     #[test]
     fn the_published_listing_goes_with_the_last_supervisor_of_the_server_user() {
+        let _spawns = super::no_spawns();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         let program = fixture(&dir, OUTPUT);
@@ -1159,6 +1187,7 @@ mod listing {
 
     #[test]
     fn a_helper_start_without_claude_still_sweeps_a_stale_listing() {
+        let _spawns = super::no_spawns();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         made_platform::ensure_private_directory(&coordination(&dir)).unwrap();
@@ -1187,6 +1216,7 @@ mod listing {
 
     #[test]
     fn every_failure_leaves_the_published_listing_unchanged() {
+        let _spawns = super::spawning();
         for (label, tail) in [
             ("exit", "exit 3"),
             ("malformed", "printf 'not json'"),
@@ -1224,6 +1254,7 @@ mod listing {
 
     #[test]
     fn the_worker_opens_nothing_under_the_remote_claude_home() {
+        let _spawns = super::spawning();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().canonicalize().unwrap();
         let claude_home = dir.join(".claude");
