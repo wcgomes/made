@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::spawn::{env_refs, spawn, wait_pid, FileActions, SpawnRequest};
+use super::spawn::{env_refs, prepare, wait_pid, FileActions, SpawnRequest};
 
 /// Serializes the process-wide `SIGHUP` disposition change in
 /// [`spawn_detached_child`].
@@ -47,6 +47,7 @@ pub(crate) fn spawn_detached_child(
         .filter(|(key, _)| key != "TMUX" && key != "TMUX_PANE")
         .collect();
     let request = SpawnRequest {
+        what: "detached child",
         path: program,
         argv: std::iter::once(program.as_os_str())
             .chain(args.iter().map(OsString::as_os_str))
@@ -54,23 +55,28 @@ pub(crate) fn spawn_detached_child(
         env: env_refs(&env),
         default_signals: &[libc::SIGPIPE],
     };
-    let mut actions = FileActions::new()?;
+    let mut actions = FileActions::new("detached child")?;
     actions.chdir(cwd)?;
     actions.dup2(stdin.as_raw_fd(), 0)?;
     actions.open(1, Path::new("/dev/null"), libc::O_WRONLY)?;
     actions.open(2, Path::new("/dev/null"), libc::O_WRONLY)?;
 
+    let prepared = prepare(&request, actions)?;
+
     // posix_spawn has no attribute that ignores a signal; a child only
     // inherits SIG_IGN from the parent's disposition at spawn time. So SIGHUP
-    // is ignored process-wide for the duration of the posix_spawn call (about a
-    // millisecond) and restored by the guard on every path. During that window
-    // a SIGHUP sent to this process is discarded, and any other child spawned
-    // concurrently by another thread inherits the ignored SIGHUP unless it
-    // resets it (the PTY spawn does). The mutex keeps concurrent detached
-    // spawns from restoring each other's saved disposition.
+    // is ignored process-wide only around the posix_spawn call itself (about a
+    // millisecond; everything else is prepared above), and the guard restores
+    // the saved action on every path. During that window a SIGHUP sent to this
+    // process is discarded, and any other child spawned concurrently by
+    // another thread inherits the ignored SIGHUP unless it resets it (the PTY
+    // spawn does). The restore is unconditional, so a SIGHUP handler that
+    // another thread installed during the window would be reverted to the
+    // saved action; nothing in Made installs one. The mutex keeps concurrent
+    // detached spawns from restoring each other's saved disposition.
     let pid = {
         let _ignored = SighupIgnored::new()?;
-        spawn(&request, &mut actions)?
+        prepared.spawn()?
     };
     Ok(DetachedChild { pid })
 }

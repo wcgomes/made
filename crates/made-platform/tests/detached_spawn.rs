@@ -122,4 +122,8 @@ while [ ! -e "$1.release" ] && [ -e "$1" ]; do sleep 0.05; done
         "the child leads its own session"
     );
     std::fs::write(report.with_extension("release"), b"").unwrap();
+    // spawn_detached_command leaves the runtime directory on success; remove
+    // the one this spawn created. It stays empty, so rmdir succeeds even
+    // while the child still has it as its cwd.
+    std::fs::remove_dir(field("cwd")).unwrap();
 }

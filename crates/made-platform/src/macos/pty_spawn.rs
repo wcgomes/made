@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use portable_pty::{Child, ChildKiller, ExitStatus};
 
-use super::spawn::{env_refs, spawn, wait_pid, FileActions, SpawnRequest};
+use super::spawn::{env_refs, prepare, wait_pid, FileActions, SpawnRequest};
 
 /// Signals `portable-pty` resets to `SIG_DFL` in the child, plus `SIGPIPE`,
 /// which std's spawn also resets. `SIGHUP` must stay here: a detached spawn
@@ -56,12 +56,13 @@ pub(crate) fn spawn_pty_child(
         .chain(args.iter().map(OsString::as_os_str))
         .collect();
     let request = SpawnRequest {
+        what: "PTY child",
         path: &resolved,
         argv,
         env: env_refs(&env),
         default_signals: &DEFAULT_SIGNALS,
     };
-    let mut actions = FileActions::new()?;
+    let mut actions = FileActions::new("PTY child")?;
     actions.chdir(&cwd)?;
     // A session leader that opens a terminal without O_NOCTTY acquires it as
     // its controlling terminal, which replaces portable-pty's TIOCSCTTY.
@@ -69,7 +70,7 @@ pub(crate) fn spawn_pty_child(
     actions.open(0, tty, libc::O_RDWR)?;
     actions.dup2(0, 1)?;
     actions.dup2(0, 2)?;
-    let pid = spawn(&request, &mut actions)?;
+    let pid = prepare(&request, actions)?.spawn()?;
     Ok(Box::new(SpawnedChild { pid, status: None }))
 }
 
