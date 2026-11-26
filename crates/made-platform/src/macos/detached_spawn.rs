@@ -1,0 +1,112 @@
+//! Detached child spawn through `posix_spawn(2)` instead of `fork(2)`.
+//!
+//! The generic Unix path forks with a `pre_exec` closure; see
+//! [`super::spawn`] for why that can kill the child on macOS. The child keeps
+//! that path's setup: a new session with no controlling terminal, stdin from
+//! the caller's pipe, stdout and stderr on `/dev/null`, only those three
+//! descriptors inherited, `SIGHUP` ignored, `SIGPIPE` at its default, an empty
+//! signal mask, and this process's environment minus `TMUX` and `TMUX_PANE`.
+
+use std::ffi::OsString;
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::path::Path;
+use std::sync::Mutex;
+
+use super::spawn::{env_refs, spawn, wait_pid, FileActions, SpawnRequest};
+
+/// Serializes the process-wide `SIGHUP` disposition change in
+/// [`spawn_detached_child`].
+static SIGHUP_IGNORED: Mutex<()> = Mutex::new(());
+
+/// A detached child started by [`spawn_detached_child`].
+#[derive(Debug)]
+pub(crate) struct DetachedChild {
+    pid: libc::pid_t,
+}
+
+impl DetachedChild {
+    pub(crate) fn id(&self) -> u32 {
+        self.pid as u32
+    }
+
+    /// Block until the child exits and reap it.
+    pub(crate) fn wait(&self) {
+        let _ = wait_pid(self.pid, 0);
+    }
+}
+
+/// Start `program` (absolute) with `args`, in `cwd`, reading `stdin`.
+pub(crate) fn spawn_detached_child(
+    program: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    stdin: BorrowedFd<'_>,
+) -> io::Result<DetachedChild> {
+    let env: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| key != "TMUX" && key != "TMUX_PANE")
+        .collect();
+    let request = SpawnRequest {
+        path: program,
+        argv: std::iter::once(program.as_os_str())
+            .chain(args.iter().map(OsString::as_os_str))
+            .collect(),
+        env: env_refs(&env),
+        default_signals: &[libc::SIGPIPE],
+    };
+    let mut actions = FileActions::new()?;
+    actions.chdir(cwd)?;
+    actions.dup2(stdin.as_raw_fd(), 0)?;
+    actions.open(1, Path::new("/dev/null"), libc::O_WRONLY)?;
+    actions.open(2, Path::new("/dev/null"), libc::O_WRONLY)?;
+
+    // posix_spawn has no attribute that ignores a signal; a child only
+    // inherits SIG_IGN from the parent's disposition at spawn time. So SIGHUP
+    // is ignored process-wide for the duration of the posix_spawn call (about a
+    // millisecond) and restored by the guard on every path. During that window
+    // a SIGHUP sent to this process is discarded, and any other child spawned
+    // concurrently by another thread inherits the ignored SIGHUP unless it
+    // resets it (the PTY spawn does). The mutex keeps concurrent detached
+    // spawns from restoring each other's saved disposition.
+    let pid = {
+        let _ignored = SighupIgnored::new()?;
+        spawn(&request, &mut actions)?
+    };
+    Ok(DetachedChild { pid })
+}
+
+/// Ignores `SIGHUP` until dropped, then restores the previous action.
+struct SighupIgnored {
+    previous: libc::sigaction,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SighupIgnored {
+    fn new() -> io::Result<Self> {
+        let lock = SIGHUP_IGNORED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: both sigaction structs are fully initialized; SIG_IGN is a
+        // sentinel, not a function pointer that is called.
+        unsafe {
+            let mut ignore: libc::sigaction = std::mem::zeroed();
+            ignore.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&mut ignore.sa_mask);
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGHUP, &ignore, &mut previous) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                previous,
+                _lock: lock,
+            })
+        }
+    }
+}
+
+impl Drop for SighupIgnored {
+    fn drop(&mut self) {
+        // SAFETY: restores the action saved by `new`.
+        unsafe { libc::sigaction(libc::SIGHUP, &self.previous, std::ptr::null_mut()) };
+    }
+}

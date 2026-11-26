@@ -5,7 +5,10 @@
 //! `arboard` clipboard, and the shared IME normalizer. Builds for arm64 and x64
 //! from the same source.
 
+mod detached_spawn;
 mod pty_spawn;
+mod spawn;
+pub(crate) use detached_spawn::spawn_detached_child;
 pub(crate) use pty_spawn::spawn_pty_child;
 
 use std::env;

@@ -483,7 +483,7 @@ fn close_extra_fds() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn ignore_sighup() -> io::Result<()> {
     // SAFETY: the sigaction is fully initialized before use. SIG_IGN is a
     // sentinel handler, not a function pointer we call. sa_mask is emptied.
@@ -500,7 +500,9 @@ fn ignore_sighup() -> io::Result<()> {
 
 #[cfg(unix)]
 mod unix {
-    use super::{close_extra_fds, ignore_sighup, signal_process_group, PlatformError};
+    #[cfg(not(target_os = "macos"))]
+    use super::ignore_sighup;
+    use super::{close_extra_fds, signal_process_group, PlatformError};
     use crate::PtyRequest;
     use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
@@ -510,7 +512,7 @@ mod unix {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -666,8 +668,6 @@ mod unix {
         args: &[OsString],
         stdin_payload: &[u8],
     ) -> Result<(), PlatformError> {
-        use std::os::unix::process::CommandExt;
-
         if !program.is_absolute() {
             return Err(PlatformError::io(
                 "spawn detached command",
@@ -678,6 +678,60 @@ mod unix {
             ));
         }
         let runtime = create_detach_runtime()?;
+        #[cfg(target_os = "macos")]
+        return spawn_detached_posix(program, args, stdin_payload, runtime);
+        #[cfg(not(target_os = "macos"))]
+        spawn_detached_forked(program, args, stdin_payload, runtime)
+    }
+
+    /// macOS: `posix_spawn`, because a `pre_exec` spawn forks and the forked
+    /// child can trap in libSystem's atfork handlers when this process is
+    /// multithreaded.
+    #[cfg(target_os = "macos")]
+    fn spawn_detached_posix(
+        program: &Path,
+        args: &[OsString],
+        stdin_payload: &[u8],
+        runtime: PathBuf,
+    ) -> Result<(), PlatformError> {
+        use std::os::fd::AsFd;
+
+        let spawned = std::io::pipe().and_then(|(reader, writer)| {
+            let child =
+                crate::macos::spawn_detached_child(program, args, &runtime, reader.as_fd())?;
+            Ok((child, writer))
+        });
+        let (child, mut stdin) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = std::fs::remove_dir(&runtime);
+                return Err(PlatformError::io("spawn detached command", error));
+            }
+        };
+        let write_result = stdin.write_all(stdin_payload).and_then(|()| stdin.flush());
+        drop(stdin);
+        if let Err(error) = write_result {
+            signal_process_group(child.id(), libc::SIGKILL);
+            child.wait();
+            let _ = std::fs::remove_dir(&runtime);
+            return Err(PlatformError::io("write detached stdin", error));
+        }
+        // The child is in a new session. Reap it only if it exits while this
+        // process is still alive; a parent hangup does not signal that session.
+        std::thread::spawn(move || child.wait());
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn spawn_detached_forked(
+        program: &Path,
+        args: &[OsString],
+        stdin_payload: &[u8],
+        runtime: PathBuf,
+    ) -> Result<(), PlatformError> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
         let runtime_c = CString::new(runtime.as_os_str().as_bytes()).map_err(|_| {
             PlatformError::io(
                 "spawn detached command",

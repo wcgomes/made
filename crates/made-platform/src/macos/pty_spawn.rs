@@ -1,35 +1,27 @@
 //! PTY child spawn through `posix_spawn(2)` instead of `fork(2)`.
 //!
-//! `portable-pty` starts the child with `std::process::Command` and a
-//! `pre_exec` closure, which makes std `fork()`. In a multithreaded process,
-//! macOS's `fork()` runs libSystem's atfork child handlers in the child; if
-//! another thread was inside a one-time libSystem initialization at that
-//! moment (for example the first libnotify use), the child's handler waits on
-//! a once-gate whose owner thread does not exist in the child and traps:
-//! `BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt`, seen as
-//! `Illegal instruction: 4` on Intel. The `pre_exec` closure itself also
-//! allocates (`read_dir("/dev/fd")`) between fork and exec.
-//!
-//! `posix_spawn` creates the child in the kernel: no atfork handlers and no
-//! user code run between the parent and the new image. Everything is prepared
-//! in the parent, and the spawn attributes keep the `portable-pty` semantics:
-//! a new session with the PTY as controlling terminal and stdio, only stdio
-//! inherited, the same signals reset to their defaults, and an empty mask.
+//! `portable-pty` starts the child with std's `Command` and a `pre_exec`
+//! closure, which forks; see [`super::spawn`] for why that can kill the child
+//! on macOS. The `pre_exec` closure also allocated (`read_dir("/dev/fd")`)
+//! between fork and exec. The spawn attributes keep the `portable-pty`
+//! semantics: a new session with the PTY as controlling terminal and stdio,
+//! only stdio inherited, the same signals reset to their defaults, and an
+//! empty mask.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use portable_pty::{Child, ChildKiller, ExitStatus};
 
-/// `<spawn.h>`: start the child in a new session (macOS 10.15+). Not exported
-/// by the `libc` crate.
-const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
+use super::spawn::{env_refs, spawn, wait_pid, FileActions, SpawnRequest};
 
 /// Signals `portable-pty` resets to `SIG_DFL` in the child, plus `SIGPIPE`,
-/// which std's spawn also resets.
+/// which std's spawn also resets. `SIGHUP` must stay here: a detached spawn
+/// can briefly ignore it process-wide (see `spawn_detached_child`), and a PTY
+/// child started meanwhile must not inherit that.
 const DEFAULT_SIGNALS: [libc::c_int; 7] = [
     libc::SIGCHLD,
     libc::SIGHUP,
@@ -60,105 +52,25 @@ pub(crate) fn spawn_pty_child(
     let cwd = child_cwd(cwd, &env);
     let resolved = resolve_program(program, &cwd, env_value(&env, "PATH"))?;
 
-    let path = cstring(resolved.into_os_string().into_vec())?;
-    let tty = cstring(tty.as_os_str().as_bytes().to_vec())?;
-    let cwd = cstring(cwd.into_os_string().into_vec())?;
     let argv = std::iter::once(program)
         .chain(args.iter().map(OsString::as_os_str))
-        .map(|arg| cstring(arg.as_bytes().to_vec()))
-        .collect::<io::Result<Vec<_>>>()?;
-    let envp = env
-        .iter()
-        .map(|(key, value)| {
-            let mut entry = key.as_bytes().to_vec();
-            entry.push(b'=');
-            entry.extend_from_slice(value.as_bytes());
-            cstring(entry)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    // execvp's ENOEXEC fallback: a file without a recognized header runs as a
-    // `/bin/sh` script, with argv `sh <path> <args...>` like Apple's execvp.
-    let script_argv = [cstring(b"sh".to_vec())?, path.clone()]
-        .into_iter()
-        .chain(argv.iter().skip(1).cloned())
-        .collect::<Vec<_>>();
-    let argv_ptrs = null_terminated(&argv);
-    let script_argv_ptrs = null_terminated(&script_argv);
-    let envp_ptrs = null_terminated(&envp);
-
-    let mut attrs = SpawnAttrs::new()?;
+        .collect();
+    let request = SpawnRequest {
+        path: &resolved,
+        argv,
+        env: env_refs(&env),
+        default_signals: &DEFAULT_SIGNALS,
+    };
     let mut actions = FileActions::new()?;
-    // SAFETY: every pointer is to a live, NUL-terminated buffer owned above
-    // for the whole call; the attribute and action objects are initialized
-    // and destroyed by their guards.
-    unsafe {
-        let flags = POSIX_SPAWN_SETSID
-            | libc::POSIX_SPAWN_CLOEXEC_DEFAULT
-            | libc::POSIX_SPAWN_SETSIGDEF
-            | libc::POSIX_SPAWN_SETSIGMASK;
-        check(libc::posix_spawnattr_setflags(
-            attrs.as_mut_ptr(),
-            flags as _,
-        ))?;
-        let mut defaults: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut defaults);
-        for signal in DEFAULT_SIGNALS {
-            libc::sigaddset(&mut defaults, signal);
-        }
-        check(libc::posix_spawnattr_setsigdefault(
-            attrs.as_mut_ptr(),
-            &defaults,
-        ))?;
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        check(libc::posix_spawnattr_setsigmask(attrs.as_mut_ptr(), &mask))?;
-
-        // The `_np` form is intentional: the release deployment target is macOS
-        // 12.0, and the unsuffixed posix_spawn_file_actions_addchdir only
-        // exists from macOS 26.
-        check(libc::posix_spawn_file_actions_addchdir_np(
-            actions.as_mut_ptr(),
-            cwd.as_ptr(),
-        ))?;
-        // A session leader that opens a terminal without O_NOCTTY acquires it
-        // as its controlling terminal, which replaces portable-pty's
-        // TIOCSCTTY. POSIX_SPAWN_SETSID runs before the file actions.
-        check(libc::posix_spawn_file_actions_addopen(
-            actions.as_mut_ptr(),
-            0,
-            tty.as_ptr(),
-            libc::O_RDWR,
-            0,
-        ))?;
-        check(libc::posix_spawn_file_actions_adddup2(
-            actions.as_mut_ptr(),
-            0,
-            1,
-        ))?;
-        check(libc::posix_spawn_file_actions_adddup2(
-            actions.as_mut_ptr(),
-            0,
-            2,
-        ))?;
-
-        let mut pid: libc::pid_t = 0;
-        let mut spawn = |program: &CStr, argv: &[*mut libc::c_char]| {
-            libc::posix_spawn(
-                &mut pid,
-                program.as_ptr(),
-                actions.as_mut_ptr(),
-                attrs.as_mut_ptr(),
-                argv.as_ptr(),
-                envp_ptrs.as_ptr(),
-            )
-        };
-        let mut code = spawn(&path, &argv_ptrs);
-        if code == libc::ENOEXEC {
-            code = spawn(c"/bin/sh", &script_argv_ptrs);
-        }
-        check(code)?;
-        Ok(Box::new(SpawnedChild { pid, status: None }))
-    }
+    actions.chdir(&cwd)?;
+    // A session leader that opens a terminal without O_NOCTTY acquires it as
+    // its controlling terminal, which replaces portable-pty's TIOCSCTTY.
+    // POSIX_SPAWN_SETSID runs before the file actions.
+    actions.open(0, tty, libc::O_RDWR)?;
+    actions.dup2(0, 1)?;
+    actions.dup2(0, 2)?;
+    let pid = spawn(&request, &mut actions)?;
+    Ok(Box::new(SpawnedChild { pid, status: None }))
 }
 
 /// `env_clear()` then the request's variables, minus `env_remove`, with
@@ -280,76 +192,6 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
 }
 
-fn cstring(bytes: Vec<u8>) -> io::Result<CString> {
-    CString::new(bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "PTY child argument, path or environment contains a NUL byte",
-        )
-    })
-}
-
-fn null_terminated(values: &[CString]) -> Vec<*mut libc::c_char> {
-    values
-        .iter()
-        .map(|value| value.as_ptr().cast_mut())
-        .chain(std::iter::once(std::ptr::null_mut()))
-        .collect()
-}
-
-/// posix_spawn functions return the error number instead of setting errno.
-fn check(code: libc::c_int) -> io::Result<()> {
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(code))
-    }
-}
-
-struct SpawnAttrs(libc::posix_spawnattr_t);
-
-impl SpawnAttrs {
-    fn new() -> io::Result<Self> {
-        let mut attrs: libc::posix_spawnattr_t = std::ptr::null_mut();
-        // SAFETY: initializes the opaque object the guard destroys on drop.
-        check(unsafe { libc::posix_spawnattr_init(&mut attrs) })?;
-        Ok(Self(attrs))
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawnattr_t {
-        &mut self.0
-    }
-}
-
-impl Drop for SpawnAttrs {
-    fn drop(&mut self) {
-        // SAFETY: initialized in `new` and destroyed exactly once.
-        unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
-    }
-}
-
-struct FileActions(libc::posix_spawn_file_actions_t);
-
-impl FileActions {
-    fn new() -> io::Result<Self> {
-        let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
-        // SAFETY: initializes the opaque object the guard destroys on drop.
-        check(unsafe { libc::posix_spawn_file_actions_init(&mut actions) })?;
-        Ok(Self(actions))
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
-        &mut self.0
-    }
-}
-
-impl Drop for FileActions {
-    fn drop(&mut self) {
-        // SAFETY: initialized in `new` and destroyed exactly once.
-        unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
-    }
-}
-
 /// The spawned PTY child, with the same wait and kill behavior as
 /// `portable-pty`'s `std::process::Child` implementation.
 #[derive(Debug)]
@@ -363,25 +205,12 @@ impl SpawnedChild {
         if let Some(status) = &self.status {
             return Ok(Some(status.clone()));
         }
-        loop {
-            let mut raw = 0;
-            // SAFETY: waits only for this child's pid; `raw` is a valid out
-            // pointer.
-            let result = unsafe { libc::waitpid(self.pid, &mut raw, flags) };
-            if result == 0 {
-                return Ok(None);
-            }
-            if result == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            let status = exit_status(raw);
-            self.status = Some(status.clone());
-            return Ok(Some(status));
-        }
+        let Some(raw) = wait_pid(self.pid, flags)? else {
+            return Ok(None);
+        };
+        let status = exit_status(raw);
+        self.status = Some(status.clone());
+        Ok(Some(status))
     }
 }
 
