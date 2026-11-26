@@ -971,6 +971,23 @@ fn remote_error_code_label(code: made_remote::protocol::ErrorCode) -> &'static s
     }
 }
 
+/// Remote OpenCode diagnostics sentence when the tab's own launch probe did
+/// not detect OpenCode on the server.
+pub const REMOTE_OPENCODE_NOT_DETECTED: &str = "OpenCode is not detected on this server.";
+
+/// What the owning remote tab knows about OpenCode besides its session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteOpenCodeSignals {
+    /// The launch target carries the OpenCode integration (shell or OpenCode).
+    /// Grok and Claude Code launches intentionally have none.
+    pub integration_target: bool,
+    /// The tab's own launch probe detected OpenCode on the server.
+    pub detected: bool,
+    /// The companion's `Capabilities.opencode` for this attach; `None` until
+    /// the reply arrives or when the request failed.
+    pub companion: Option<bool>,
+}
+
 /// Derive the owning remote tab's OpenCode report for the diagnostics pill.
 ///
 /// `attached` reports whether the SSH session is attached, and `failed_detail`
@@ -983,6 +1000,7 @@ pub fn remote_opencode_report(
     transport: RemoteConnectionState,
     integration: RemoteIntegrationState,
     integration_error: Option<made_remote::protocol::ErrorCode>,
+    signals: RemoteOpenCodeSignals,
 ) -> RemoteOpenCodeReport {
     if let Some(detail) = failed_detail {
         return RemoteOpenCodeReport {
@@ -1011,6 +1029,26 @@ pub fn remote_opencode_report(
                 status: IntegrationStatus::Connected,
                 code: ReasonCode::Connected.code(),
                 reason: ReasonCode::Connected.message().to_owned(),
+            }
+        }
+        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable)
+            if !signals.integration_target
+                || (signals.companion == Some(true)
+                    && integration_error == Some(made_remote::protocol::ErrorCode::Unavailable)) =>
+        {
+            RemoteOpenCodeReport {
+                status: IntegrationStatus::Inactive,
+                code: ReasonCode::Inactive.code(),
+                reason: ReasonCode::Inactive.message().to_owned(),
+            }
+        }
+        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable)
+            if !signals.detected =>
+        {
+            RemoteOpenCodeReport {
+                status: IntegrationStatus::Inactive,
+                code: ReasonCode::Inactive.code(),
+                reason: REMOTE_OPENCODE_NOT_DETECTED.to_owned(),
             }
         }
         (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable) => {
