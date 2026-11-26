@@ -104,7 +104,7 @@ OpenCode v2 TUI (user-run child inside the workspace PTY)
      > newest open Grok session directory (local or remote, while OpenCode is not connected)
      > latest shell cwd
   -> explorer root in that tab
-  -> disconnect/exit falls back to the newest open Grok session, then latest shell cwd
+  -> disconnect/exit falls back to the live Claude Code session, then the newest open Grok session, then latest shell cwd
 ```
 
 The authoritative root order and fallback details are defined in [Root precedence](runtime/terminal-first.md#root-precedence). The connected view directory is cleared on disconnect/exit, unsupported integration, session tabs becoming unavailable, or a new connection epoch.
