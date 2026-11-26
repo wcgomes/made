@@ -33,6 +33,10 @@ FILES = (
     "plugins/grok-made/README.md",
     "plugins/grok-made/hooks/hooks.json",
     "plugins/grok-made/hooks/bin/made-grok-status",
+    "plugins/claude-code-made/.claude-plugin/plugin.json",
+    "plugins/claude-code-made/README.md",
+    "plugins/claude-code-made/hooks/hooks.json",
+    "plugins/claude-code-made/bin/made-claude-status",
 )
 MAX_BYTES = 128 * 1024 * 1024
 
@@ -143,12 +147,13 @@ def copy_tree(source: Path, destination: Path) -> None:
     if not made.is_file() or made.stat().st_size <= 0:
         fail(f"copied companion is missing: {made}")
     made.chmod(made.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    hook = destination / "plugins/grok-made/hooks/bin/made-grok-status"
-    if not hook.is_file() or hook.stat().st_size <= 0:
-        fail(f"copied native hook is missing or empty: {hook}")
-    # Workflow artifact download does not preserve modes, so the executable bit
-    # is restored here exactly like the companion's.
-    hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for name in ("plugins/grok-made/hooks/bin/made-grok-status", "plugins/claude-code-made/bin/made-claude-status"):
+        hook = destination / name
+        if not hook.is_file() or hook.stat().st_size <= 0:
+            fail(f"copied native hook is missing or empty: {hook}")
+        # Workflow artifact download does not preserve modes, so the executable
+        # bit is restored here exactly like the companion's.
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def claude_plugin_files(stage: Path, desktop_target: str) -> list[Path]:

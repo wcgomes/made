@@ -247,9 +247,11 @@ jobs:
           cd "$RUNNER_TEMP/ssh-companion"
           sha256sum -c SHA256SUMS
           # Artifact upload/download does not preserve file modes.
-          chmod 755 made-remote plugins/grok-made/hooks/bin/made-grok-status
+          chmod 755 made-remote plugins/grok-made/hooks/bin/made-grok-status \
+            plugins/claude-code-made/bin/made-claude-status
           test -x made-remote
           test -x plugins/grok-made/hooks/bin/made-grok-status
+          test -x plugins/claude-code-made/bin/made-claude-status
           # SHA256SUMS and manifest.json are produced by the same build, so the
           # manifest's target/linkage fields plus the actual ELF identity are
           # what tie the bytes to the expected glibc 2.31 x86_64 companion.
@@ -273,6 +275,17 @@ jobs:
               exit 1
               ;;
           esac
+          # The staged claude-code-made hook is likewise a native executable
+          # for the same target.
+          claude_hook_output="$(file plugins/claude-code-made/bin/made-claude-status)"
+          printf '%s\n' "$claude_hook_output"
+          case "$claude_hook_output" in
+            *"ELF 64-bit LSB"*"x86-64"*) ;;
+            *)
+              echo "made-claude-status is not an x86-64 ELF: $claude_hook_output" >&2
+              exit 1
+              ;;
+          esac
           python3 - <<'PY'
           import json
           import pathlib
@@ -291,7 +304,13 @@ jobs:
                       if item['name'] == 'plugins/grok-made/hooks/bin/made-grok-status')
           hook_path = pathlib.Path('plugins/grok-made/hooks/bin/made-grok-status')
           assert hook['size'] == hook_path.stat().st_size, hook
-          assert len(manifest['files']) == 10, manifest['files']
+          claude_name = 'plugins/claude-code-made/bin/made-claude-status'
+          claude_hook = next(item for item in manifest['files']
+                             if item['name'] == claude_name)
+          claude_path = pathlib.Path(claude_name)
+          assert claude_hook['size'] == claude_path.stat().st_size, claude_hook
+          assert claude_path.stat().st_mode & 0o100, oct(claude_path.stat().st_mode)
+          assert len(manifest['files']) == 14, manifest['files']
           PY
 
       - name: Harness contract tests
@@ -315,6 +334,12 @@ jobs:
         env:
           HOST_COMPANION: ${{ runner.temp }}/ssh-companion/made-remote
         run: python3 parity.py grok-parity --host-companion "$HOST_COMPANION"
+
+      - name: Claude Code parity through real companion entry points
+        working-directory: tests/ssh
+        env:
+          HOST_COMPANION: ${{ runner.temp }}/ssh-companion/made-remote
+        run: python3 parity.py claude-parity --host-companion "$HOST_COMPANION"
 
       - name: Clean up isolated SSH fixtures
         if: always()
@@ -375,10 +400,10 @@ jobs:
             echo '## SSH smoke boundary'
             echo ''
             if [ "$JOB_STATUS" = 'success' ]; then
-              echo '- Certified here: real OpenSSH loopback with isolated HOME, config, and known_hosts; the staged x86_64 glibc 2.31 companion; companion Capabilities; a real 60s owned-SSH loss with the same shell PID on reattach; and Grok fixture parity through real companion entry points.'
+              echo '- Certified here: real OpenSSH loopback with isolated HOME, config, and known_hosts; the staged x86_64 glibc 2.31 companion; companion Capabilities; a real 60s owned-SSH loss with the same shell PID on reattach; and Grok and Claude Code fixture parity through real companion entry points.'
             else
               echo "- NOT certified: this job concluded \`$JOB_STATUS\`. No scenario result from this run is certified, and every claim below remains UNVERIFIED."
             fi
-            echo '- Not certified here: native GUI behavior, real grok or OpenCode executables, auth-fault/netem matrices, or the live multi-host SSH matrix.'
+            echo '- Not certified here: native GUI behavior, real grok, Claude Code or OpenCode executables, auth-fault/netem matrices, or the live multi-host SSH matrix.'
             echo '- Companion provenance: artifact `ssh-companion-x86_64-unknown-linux-gnu` from the glibc 2.31 linux-companion job.'
           } >> "$GITHUB_STEP_SUMMARY"

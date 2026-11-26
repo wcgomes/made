@@ -6,11 +6,9 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::agents::AgentCwd;
 use super::diagnostics::ClaudeDiagnosticsReport;
-use super::diagnostics::{
-    claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
-    ClaudeDiagnosticsPhase,
-};
+use super::diagnostics::{claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase};
 use super::follow::{ready_claude_plugin_dir, shared_instance, ClaudeTab, TabSpool};
 use super::launch::{
     claude_launch_env, shipped_claude_plugin_dir, ClaudeLaunchEnv, CLAUDE_CODE_PLUGIN_DIRS_ENV,
@@ -66,6 +64,13 @@ pub(crate) struct ClaudeTabState {
     /// The directory the last poll handed to the follow coordinator, until
     /// the coordinator's answer arrives.
     reported: Option<Option<PathBuf>>,
+    /// A remote tab's staged Claude Code package state: `None` until the
+    /// server reports it, `Some(false)` when hooks are unavailable there.
+    remote_hooks: Option<bool>,
+    /// The remote tab owned a live session at its last poll.
+    remote_owned: bool,
+    /// A listing trigger detected for the remote tab, until it is sent.
+    remote_trigger: bool,
 }
 
 impl ClaudeTabState {
@@ -79,6 +84,9 @@ impl ClaudeTabState {
             runtime: None,
             launching: None,
             reported: None,
+            remote_hooks: None,
+            remote_owned: false,
+            remote_trigger: false,
         }
     }
 
@@ -99,35 +107,74 @@ impl ClaudeTabState {
         self.remote_detected = detected;
     }
 
+    /// Apply the server's owned-session state to a remote tab: its sessions,
+    /// a fresh agent-view listing (selected by the tab's own `window_title`)
+    /// and whether the staged package is bound for it.
+    pub(crate) fn apply_remote(
+        &mut self,
+        sessions: &[made_remote::protocol::ClaudeSessionInfo],
+        listing: Option<&made_remote::protocol::ClaudeListingResult>,
+        window_title: Option<&str>,
+        hooks: Option<bool>,
+    ) {
+        self.remote_hooks = hooks;
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        runtime.tab.apply_remote_sessions(sessions);
+        if let Some(listing) = listing {
+            let entries: Vec<AgentCwd> = listing
+                .background
+                .iter()
+                .filter_map(|entry| {
+                    Some(AgentCwd {
+                        pid: 0,
+                        cwd: entry.cwd.to_utf8().ok()?.to_owned(),
+                        background: true,
+                        name: entry.name.clone(),
+                    })
+                })
+                .collect();
+            runtime
+                .tab
+                .apply_attached_title(Some(&entries), window_title);
+        }
+    }
+
+    /// Take the listing trigger detected for this remote tab, if any.
+    pub(crate) fn take_remote_trigger(&mut self) -> bool {
+        std::mem::take(&mut self.remote_trigger)
+    }
+
+    /// The remote directory this tab's Claude Code state selects: the
+    /// agent-view selection, else the live owned session's, exactly as the
+    /// server reported it. Callers validate it on the owning server.
+    pub(crate) fn remote_directory(&self) -> Option<String> {
+        self.runtime.as_ref()?.tab.directory()
+    }
+
     /// The Claude Code diagnostics row for this tab, which is `remote` when it
     /// belongs to a remote workspace.
     pub(crate) fn diagnostics(&self, remote: bool) -> ClaudeDiagnosticsReport {
         let runtime = self.runtime.as_ref();
         let present = runtime.is_some_and(|runtime| runtime.tab.present());
-        if remote {
-            // A remote workspace reports its own server's detection and this
-            // tab's presence; the host's plugin and PATH never apply.
-            return remote_claude_diagnostics_row(&ClaudeDiagnosticsInputs {
-                phase: match self.remote_detected {
+        // A remote workspace reports its own server's detection and staged
+        // package with the local states; the host's plugin and PATH never apply.
+        let (phase, plugin_missing) = if remote {
+            (
+                match self.remote_detected {
                     None => ClaudeDiagnosticsPhase::Checking,
                     Some(false) => ClaudeDiagnosticsPhase::NotOnPath,
                     Some(true) => ClaudeDiagnosticsPhase::Available,
                 },
-                plugin_missing: false,
-                present,
-                present_for: runtime
-                    .and_then(|runtime| runtime.present_since)
-                    .map_or(Duration::ZERO, |since| {
-                        Instant::now().saturating_duration_since(since)
-                    }),
-                live_session: false,
-                protocol_observed: runtime
-                    .is_some_and(|runtime| runtime.tab.protocol_status_seen()),
-            });
-        }
+                self.remote_hooks == Some(false),
+            )
+        } else {
+            (self.phase, self.plugin.is_none())
+        };
         claude_diagnostics_row(&ClaudeDiagnosticsInputs {
-            phase: self.phase,
-            plugin_missing: self.plugin.is_none(),
+            phase,
+            plugin_missing,
             present,
             present_for: runtime
                 .and_then(|runtime| runtime.present_since)
@@ -295,9 +342,11 @@ impl TabState for ClaudeTabState {
         runtime.tab.set_child_running(terminal.is_running());
         // One process map serves every ancestry and liveness check of this
         // poll. It is built only when a check needs it, and records stay
-        // queued until the terminal process is known.
-        let tick_due =
-            now.saturating_duration_since(runtime.liveness_checked_at) >= CLAUDE_LIVENESS_INTERVAL;
+        // queued until the terminal process is known. A remote tab's sessions
+        // are owned and checked on its server, never against host processes.
+        let tick_due = !io.remote
+            && now.saturating_duration_since(runtime.liveness_checked_at)
+                >= CLAUDE_LIVENESS_INTERVAL;
         let records = if runtime.tab.root_known() {
             runtime
                 .spool
@@ -345,10 +394,24 @@ impl TabState for ClaudeTabState {
         if listed && (!had_sessions || submitted || title_changed) {
             runtime.tab.note_trigger(super::agents::trigger());
         }
+        // A remote tab's listing runs on its server: the same triggers are
+        // detected here and sent as a bounded trigger with no input or title.
+        if io.remote {
+            let owned = runtime.tab.session_count() > 0;
+            if owned && (!self.remote_owned || submitted || title_changed) {
+                self.remote_trigger = true;
+            }
+            self.remote_owned = owned;
+        }
         if runtime.tab.present() {
             runtime.present_since.get_or_insert(now);
         } else if runtime.present_since.take().is_some() {
             runtime.tab.reset_observations();
+        }
+        // A remote directory goes to the remote workspace, never to the host
+        // follow coordinator.
+        if io.remote {
+            return TabReport::default();
         }
         let directory = runtime.tab.directory().map(PathBuf::from);
         if directory == runtime.applied_directory {
@@ -384,6 +447,8 @@ impl TabState for ClaudeTabState {
 
     fn teardown(&mut self) {
         self.runtime = None;
+        self.remote_owned = false;
+        self.remote_trigger = false;
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -446,6 +511,9 @@ mod tests {
             }),
             launching: None,
             reported: None,
+            remote_hooks: None,
+            remote_owned: false,
+            remote_trigger: false,
         };
         let mut poll = |state: &mut ClaudeTabState, after: Duration| {
             let mut io = TabIo {

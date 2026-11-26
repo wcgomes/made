@@ -721,3 +721,149 @@ fn terminal_output_wakes_the_ui_without_a_poll() {
     let before = woken.load(std::sync::atomic::Ordering::SeqCst);
     wait(|| woken.load(std::sync::atomic::Ordering::SeqCst) > before);
 }
+
+fn claude_snapshot(revision: u64) -> ClaudeSessionSnapshot {
+    ClaudeSessionSnapshot {
+        revision,
+        hooks_available: true,
+        sessions: Vec::new(),
+    }
+}
+
+#[test]
+fn claude_pushes_reach_the_session_sink_and_claude_state_replies_stay_correlated() {
+    let (client, fake) = client();
+    let attach_id = attach(&client);
+    // A push riding the still-pending attach id reaches the sink without
+    // consuming the attach.
+    push(
+        &fake,
+        client.identity(),
+        attach_id,
+        Operation::ClaudeEvent {
+            snapshot: claude_snapshot(1),
+        },
+    );
+    let mut sink = client.session_sink();
+    let mut first = None;
+    wait(|| {
+        first = sink.poll();
+        first.is_some()
+    });
+    assert!(matches!(
+        first.map(|frame| frame.operation),
+        Some(Operation::ClaudeEvent { snapshot }) if snapshot.revision == 1
+    ));
+    assert!(client.is_connected(), "a push must not consume the attach");
+    push(&fake, client.identity(), attach_id, Operation::Attached);
+    let mut attached = false;
+    wait(|| {
+        while let Some(reply) = client.poll_reply() {
+            attached |= matches!(reply.operation, Operation::Attached);
+        }
+        attached
+    });
+    // A listing push rides the attach id too.
+    push(
+        &fake,
+        client.identity(),
+        attach_id,
+        Operation::ClaudeListing {
+            listing: ClaudeListingResult {
+                revision: 2,
+                background: Vec::new(),
+            },
+        },
+    );
+    let mut listing = None;
+    wait(|| {
+        listing = sink.poll();
+        listing.is_some()
+    });
+    assert!(matches!(
+        listing.map(|frame| frame.operation),
+        Some(Operation::ClaudeListing { listing }) if listing.revision == 2
+    ));
+    // The deferred reply to ClaudeState is a correlated reply, never a push.
+    let state = client.request(Operation::ClaudeState, None).unwrap();
+    push(
+        &fake,
+        client.identity(),
+        state,
+        Operation::ClaudeSnapshot {
+            snapshot: claude_snapshot(3),
+        },
+    );
+    let mut correlated = None;
+    wait(|| {
+        while let Some(reply) = client.poll_reply() {
+            if reply.request_id == state {
+                correlated = Some(reply.operation);
+            }
+        }
+        correlated.is_some()
+    });
+    assert!(matches!(
+        correlated,
+        Some(Operation::ClaudeSnapshot { snapshot }) if snapshot.revision == 3
+    ));
+    assert!(
+        sink.poll().is_none(),
+        "correlated replies own their request"
+    );
+    // A trigger is acknowledged like any other bounded request.
+    let trigger = client.request(Operation::ClaudeTrigger, None).unwrap();
+    push(&fake, client.identity(), trigger, Operation::Ack);
+    let mut acked = false;
+    wait(|| {
+        while let Some(reply) = client.poll_reply() {
+            acked |= reply.request_id == trigger && matches!(reply.operation, Operation::Ack);
+        }
+        acked
+    });
+    assert!(client.is_connected());
+}
+
+#[test]
+fn after_reset_only_current_attach_claude_pushes_bypass_the_discard_window() {
+    let (client, fake) = client();
+    let attach_id = attach(&client);
+    push(&fake, client.identity(), attach_id, Operation::Attached);
+    wait(|| client.poll_reply().is_some());
+    let state = client.request(Operation::ClaudeState, None).unwrap();
+    client.reset_pending().unwrap();
+    // A late reply to a discarded ClaudeState stays discarded.
+    push(
+        &fake,
+        client.identity(),
+        state,
+        Operation::ClaudeSnapshot {
+            snapshot: claude_snapshot(9),
+        },
+    );
+    push(
+        &fake,
+        client.identity(),
+        attach_id,
+        Operation::ClaudeEvent {
+            snapshot: claude_snapshot(10),
+        },
+    );
+    let mut sink = client.session_sink();
+    let mut seen = Vec::new();
+    wait(|| {
+        while let Some(frame) = sink.poll() {
+            seen.push(frame);
+        }
+        !seen.is_empty()
+    });
+    assert_eq!(seen.len(), 1, "only the current-attach push survives");
+    assert!(matches!(
+        &seen[0].operation,
+        Operation::ClaudeEvent { snapshot } if snapshot.revision == 10
+    ));
+    thread::sleep(Duration::from_millis(30));
+    assert!(sink.poll().is_none());
+    assert!(client.poll_reply().is_none());
+    assert!(client.is_connected());
+}

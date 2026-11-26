@@ -976,3 +976,251 @@ fn claude_launch_target_is_additive_and_keeps_existing_encodings() {
     .validate()
     .is_ok());
 }
+
+fn claude_session(id: &str, pid: u32) -> ClaudeSessionInfo {
+    ClaudeSessionInfo {
+        session_id: id.to_owned(),
+        pid,
+        cwd: Some(path("/work")),
+        activity: ClaudeActivity::Idle,
+        title: String::new(),
+        recency: 1,
+        nested: false,
+    }
+}
+
+fn claude_snapshot(revision: u64, sessions: Vec<ClaudeSessionInfo>) -> ClaudeSessionSnapshot {
+    ClaudeSessionSnapshot {
+        revision,
+        hooks_available: true,
+        sessions,
+    }
+}
+
+#[test]
+fn claude_state_is_additive_and_pairs_only_with_its_snapshot() {
+    assert_eq!(PROTOCOL_MAJOR, 1);
+    // `Capabilities` is unchanged: no Claude Code field is added.
+    assert!(serde_json::from_value::<Capabilities>(serde_json::json!({
+        "target": "LinuxX64", "tmux": false, "opencode": false, "shell_cwd": false,
+        "helper_version": "1", "grok": false, "python3": false, "claude": true
+    }))
+    .is_err());
+    let request = frame(Operation::ClaudeState);
+    request.validate_request(&path("/project"), None).unwrap();
+    let reply = response(
+        &request,
+        Operation::ClaudeSnapshot {
+            snapshot: claude_snapshot(1, vec![claude_session("s1", 7)]),
+        },
+    );
+    reply.validate_reply(&request).unwrap();
+    let mut progress = ReplyProgress::new(request.clone()).unwrap();
+    progress.accept(&reply).unwrap();
+    progress.finish().unwrap();
+    let mut hostile = reply.clone();
+    hostile.identity.epoch += 1;
+    assert_eq!(
+        hostile.validate_reply(&request),
+        Err(ProtocolError::Identity)
+    );
+    // Pushes are never replies and never client requests.
+    let event = response(
+        &request,
+        Operation::ClaudeEvent {
+            snapshot: claude_snapshot(2, Vec::new()),
+        },
+    );
+    event.validate().unwrap();
+    assert_eq!(
+        event.validate_reply(&request),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    let listing = response(
+        &request,
+        Operation::ClaudeListing {
+            listing: ClaudeListingResult {
+                revision: 3,
+                background: Vec::new(),
+            },
+        },
+    );
+    listing.validate().unwrap();
+    assert_eq!(
+        listing.validate_reply(&request),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    for push in [&event, &listing, &reply] {
+        assert_eq!(
+            frame(push.operation.clone()).validate_request(&path("/project"), None),
+            Err(ProtocolError::UnexpectedResponse)
+        );
+        assert!(ReplyProgress::new(frame(push.operation.clone())).is_err());
+        assert!(!push.operation.is_terminal());
+    }
+}
+
+#[test]
+fn the_claude_listing_trigger_carries_no_input_or_title_bytes() {
+    let trigger = frame(Operation::ClaudeTrigger);
+    trigger.validate_request(&path("/project"), None).unwrap();
+    let encoded = serde_json::to_value(&trigger.operation).unwrap();
+    assert_eq!(encoded, serde_json::json!({ "op": "ClaudeTrigger" }));
+    // A payload is not part of the verb: nothing can ride along.
+    assert!(serde_json::from_value::<Operation>(
+        serde_json::json!({ "op": "ClaudeTrigger", "data": { "input": "secret" } })
+    )
+    .is_err());
+    let ack = response(&trigger, Operation::Ack);
+    ack.validate_reply(&trigger).unwrap();
+    assert!(ReplyProgress::new(trigger.clone()).is_ok());
+    assert!(!trigger.operation.is_terminal());
+}
+
+#[test]
+fn claude_listing_results_relay_only_pid_cwd_and_background_name_cwd() {
+    // The owned pid's listed directory rides the session it belongs to.
+    let session = serde_json::to_value(claude_session("s1", 7)).unwrap();
+    let mut keys: Vec<&str> = session
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "activity",
+            "cwd",
+            "nested",
+            "pid",
+            "recency",
+            "session_id",
+            "title"
+        ]
+    );
+    let listing = ClaudeListingResult {
+        revision: 1,
+        background: vec![ClaudeBackgroundEntry {
+            name: "Spec task".to_owned(),
+            cwd: path("/work/spec"),
+        }],
+    };
+    let encoded = serde_json::to_value(&listing).unwrap();
+    assert_eq!(
+        encoded["background"][0].as_object().unwrap().len(),
+        2,
+        "only name and cwd"
+    );
+    assert_eq!(
+        serde_json::from_value::<ClaudeListingResult>(encoded).unwrap(),
+        listing
+    );
+    // Unknown fields, such as a prompt or a transcript path, are rejected.
+    assert!(
+        serde_json::from_value::<ClaudeBackgroundEntry>(serde_json::json!({
+            "name": "x", "cwd": [47], "prompt": "MARKER"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ClaudeSessionInfo>(serde_json::json!({
+            "session_id": "s", "pid": 1, "activity": "Idle", "recency": 1, "msg": "MARKER"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn claude_frames_are_bounded_and_oversized_ones_are_rejected() {
+    let snapshot = |sessions| {
+        frame(Operation::ClaudeEvent {
+            snapshot: claude_snapshot(1, sessions),
+        })
+    };
+    snapshot(
+        (0..made_bridge::state::MAX_SESSIONS)
+            .map(|i| claude_session(&format!("s{i}"), i as u32 + 1))
+            .collect(),
+    )
+    .validate()
+    .unwrap();
+    assert!(snapshot(
+        (0..=made_bridge::state::MAX_SESSIONS)
+            .map(|i| claude_session(&format!("s{i}"), i as u32 + 1))
+            .collect()
+    )
+    .validate()
+    .is_err());
+    assert!(
+        snapshot(vec![claude_session("a", 1), claude_session("a", 2)])
+            .validate()
+            .is_err()
+    );
+    assert!(snapshot(vec![claude_session("a", 0)]).validate().is_err());
+    for id in [
+        "",
+        "a\nb",
+        &"x".repeat(made_bridge::state::MAX_SESSION_ID_CHARS + 1),
+    ] {
+        assert!(snapshot(vec![claude_session(id, 1)]).validate().is_err());
+    }
+    for title in ["bad\u{7}title".to_owned(), "x".repeat(121)] {
+        let mut session = claude_session("s", 1);
+        session.title = title;
+        assert!(snapshot(vec![session]).validate().is_err());
+    }
+    assert!(frame(Operation::ClaudeSnapshot {
+        snapshot: claude_snapshot(0, Vec::new())
+    })
+    .validate()
+    .is_err());
+    let listing = |background: Vec<ClaudeBackgroundEntry>| {
+        frame(Operation::ClaudeListing {
+            listing: ClaudeListingResult {
+                revision: 1,
+                background,
+            },
+        })
+    };
+    let entry = |name: &str| ClaudeBackgroundEntry {
+        name: name.to_owned(),
+        cwd: path("/work"),
+    };
+    listing(vec![entry("a"); MAX_CLAUDE_BACKGROUND])
+        .validate()
+        .unwrap();
+    assert!(listing(vec![entry("a"); MAX_CLAUDE_BACKGROUND + 1])
+        .validate()
+        .is_err());
+    for name in ["", "a\u{1b}b", &"n".repeat(121)] {
+        assert!(listing(vec![entry(name)]).validate().is_err());
+    }
+    assert!(frame(Operation::ClaudeListing {
+        listing: ClaudeListingResult {
+            revision: 0,
+            background: Vec::new()
+        }
+    })
+    .validate()
+    .is_err());
+    // An oversized frame fails at the codec bound on both sides.
+    let long =
+        RemotePath::new(format!("/{}", "d".repeat(MAX_PATH_BYTES - 1)).into_bytes()).unwrap();
+    let huge = frame(Operation::ClaudeEvent {
+        snapshot: claude_snapshot(
+            1,
+            (0..made_bridge::state::MAX_SESSIONS)
+                .map(|i| ClaudeSessionInfo {
+                    cwd: Some(long.clone()),
+                    ..claude_session(&format!("s{i}"), i as u32 + 1)
+                })
+                .collect(),
+        ),
+    });
+    assert_eq!(encode(&huge), Err(ProtocolError::Limit));
+    let mut oversized = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes().to_vec();
+    oversized.extend_from_slice(b"{");
+    assert!(FrameDecoder::new().push(&oversized).is_err());
+}

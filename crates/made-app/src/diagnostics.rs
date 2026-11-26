@@ -602,6 +602,7 @@ impl Diagnostics {
             ssh_transport: None,
             ssh_integration: None,
             remote_version: None,
+            remote_details: Vec::new(),
             cleanup_unconfirmed: None,
             active_session_id,
             active_session_title,
@@ -802,6 +803,10 @@ pub struct DiagnosticsSnapshot {
     pub ssh_integration: Option<String>,
     /// Companion or probe version.
     pub remote_version: Option<String>,
+    /// Bounded remote-only detail lines of an integration row, such as why
+    /// its hooks are unavailable on this tab. Fixed wording, never session
+    /// data.
+    pub remote_details: Vec<(&'static str, String)>,
     /// Whether remote teardown was unconfirmed.
     pub cleanup_unconfirmed: Option<bool>,
     /// Active session identifier.
@@ -1167,6 +1172,13 @@ impl DiagnosticsSnapshot {
         self.reason_code = report.code;
         self.reason = sanitize_log_text(&redact_hex_secrets(&report.reason));
     }
+
+    /// Record the owning remote tab's remote-only Claude Code reason in the
+    /// sectioned detail; the row sentence keeps the local wording.
+    pub fn set_remote_claude_detail(&mut self, reason: &'static str) {
+        self.remote_details
+            .push(("ssh claude code", reason.to_owned()));
+    }
     // END remote-path
 
     /// Human-readable report suitable for copying into a bug report.
@@ -1245,6 +1257,9 @@ impl DiagnosticsSnapshot {
         }
         if let Some(version) = &self.remote_version {
             push_line(&mut text, "remote version", version);
+        }
+        for (key, detail) in &self.remote_details {
+            push_line(&mut text, key, detail);
         }
         if let Some(true) = self.cleanup_unconfirmed {
             push_line(&mut text, "remote cleanup", "unconfirmed");

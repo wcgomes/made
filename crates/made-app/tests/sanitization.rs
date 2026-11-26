@@ -60,6 +60,7 @@ fn diagnostics_snapshot_and_copy_path_are_sanitized() {
         ssh_transport: None,
         ssh_integration: None,
         remote_version: None,
+        remote_details: Vec::new(),
         cleanup_unconfirmed: None,
         active_session_id: Some("session\n\u{202e}id".to_owned()),
         active_session_title: Some(sanitize_display(&format!("title {HOSTILE}"), 200)),

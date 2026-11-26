@@ -19,6 +19,7 @@
 //!   module is still private. The import is the expected public path once
 //!   platform registers it (task 3.1). No `cfg(target_os)` is added here.
 use crate::{
+    claude::{self, ClaudeSpool, ClaudeTracker, ListingWorker},
     clipboard::Uploads,
     filesystem::Filesystem,
     git::GitRunner,
@@ -510,6 +511,8 @@ pub fn live_terminal_output(bytes: &[u8]) -> Option<Operation> {
     Some(Operation::TerminalOutput { data, done: false })
 }
 
+/// Claude Code state rides the data lane too, so it reaches the client after
+/// the resnapshot frames queued before it, never ahead of the completing one.
 fn is_data(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -517,6 +520,9 @@ fn is_data(operation: &Operation) -> bool {
             | Operation::Listed { .. }
             | Operation::GitResult { .. }
             | Operation::PreviewResult { .. }
+            | Operation::ClaudeSnapshot { .. }
+            | Operation::ClaudeEvent { .. }
+            | Operation::ClaudeListing { .. }
     )
 }
 
@@ -549,6 +555,8 @@ pub fn generation_exempt(operation: &Operation) -> bool {
             | Operation::SessionState
             | Operation::Focus { .. }
             | Operation::GrokState
+            | Operation::ClaudeState
+            | Operation::ClaudeTrigger
             | Operation::UploadBegin { .. }
             | Operation::UploadChunk { .. }
             | Operation::UploadCommit { .. }
@@ -571,6 +579,14 @@ pub struct Supervisor {
     integration: Option<Integration>,
     grok: GrokTracker,
     grok_detected: bool,
+    claude: ClaudeTracker,
+    /// The tab's spool, removed with the supervisor.
+    _claude_spool: Option<ClaudeSpool>,
+    /// A `ClaudeState` request answered once the resnapshot completes.
+    claude_state_pending: Option<WireEnvelope>,
+    /// The current attachment asked for Claude Code state. Pushes start only
+    /// then, so a client that never asks never receives them.
+    claude_subscribed: bool,
     lease: Lease,
     attachment: Option<Attachment>,
     attached_once: bool,
@@ -629,6 +645,27 @@ impl Supervisor {
         let uploads = Uploads::new(data.join("remote/clipboard-images"))?;
         let cwd_sink = CwdReportSink::new(&runtime).map_err(io_error)?;
         let mut launch = launch;
+        // Helper start: spools of supervisors that are gone are swept first;
+        // every live supervisor's spool stays.
+        if let Some(runtime_root) = runtime.parent() {
+            claude::sweep_stale_spools(runtime_root);
+        }
+        // The launch composition bound this tab's spool path; create it before
+        // the child starts, or drop the binding so no hook writes elsewhere.
+        let spool_binding = claude::spool_path(&runtime);
+        let claude_spool = if launch.env.iter().any(|(key, value)| {
+            key == claude::CLAUDE_SPOOL_ENV && Path::new(value) == spool_binding
+        }) {
+            let spool = ClaudeSpool::create(&runtime).ok();
+            if spool.is_none() {
+                launch
+                    .env
+                    .retain(|(key, _)| key != claude::CLAUDE_SPOOL_ENV);
+            }
+            spool
+        } else {
+            None
+        };
         ensure_utf8_locale(&mut launch.env, installed_locales);
         let shell_plan = if matches!(
             first.operation,
@@ -682,6 +719,25 @@ impl Supervisor {
             },
         );
         let grok_detected = grok::detect_on_path(&environment, "grok").is_some();
+        // Claude Code ingestion reads only this tab's spool; the listing runs
+        // the detected claude under the server user's app-owned coordination.
+        let claude_tracker = ClaudeTracker::new(
+            session.pid(),
+            matches!(
+                first.operation,
+                Operation::Open {
+                    target: LaunchTarget::Claude,
+                    ..
+                }
+            ),
+            claude_spool
+                .as_ref()
+                .map(|spool| spool.path().to_path_buf()),
+            Some(ListingWorker::new(
+                grok::detect_on_path(&environment, "claude"),
+                data.join("remote/claude"),
+            )),
+        );
         Ok(Self {
             identity: first.identity.clone(),
             runtime,
@@ -691,6 +747,10 @@ impl Supervisor {
             integration,
             grok: grok_tracker,
             grok_detected,
+            claude: claude_tracker,
+            _claude_spool: claude_spool,
+            claude_state_pending: None,
+            claude_subscribed: false,
             lease: Lease::new(Instant::now()),
             attachment: None,
             attached_once: false,
@@ -793,6 +853,9 @@ impl Supervisor {
             integration.reset_attachment();
         }
         self.grok.reset_attachment();
+        self.claude.reset_attachment();
+        self.claude_state_pending = None;
+        self.claude_subscribed = false;
         self.uploads.pending_abort_all();
         thread::spawn(move || {
             while let Ok(frame) = read_envelope(&mut reader) {
@@ -1009,6 +1072,23 @@ impl Supervisor {
                 .ok_or(ErrorCode::Unavailable)?
                 .state()?,
             GrokState => self.grok.state(),
+            ClaudeState => {
+                self.claude_subscribed = true;
+                // Answered only after the completing resnapshot frame.
+                if !self
+                    .attachment
+                    .as_ref()
+                    .is_some_and(|attachment| attachment.snapshot_closed)
+                {
+                    self.claude_state_pending = Some(request.clone());
+                    return Ok(vec![]);
+                }
+                self.claude.state()
+            }
+            ClaudeTrigger => {
+                self.claude.trigger();
+                Ack
+            }
             Focus { session_id } => {
                 self.integration
                     .as_mut()
@@ -1119,6 +1199,30 @@ impl Supervisor {
             }
         }
         self.flush_attachment();
+        // Claude Code state is kept while detached and reaches the client only
+        // after the completing resnapshot frame, as a fresh snapshot rather
+        // than a replay of what happened meanwhile.
+        let deliver = self.claude_subscribed
+            && self
+                .attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.snapshot_closed);
+        let claude_pushes = self.claude.tick(Instant::now(), deliver);
+        if deliver {
+            if let Some(attachment) = &self.attachment {
+                let identity = attachment.identity.clone();
+                let request = attachment.request;
+                for operation in claude_pushes {
+                    self.enqueue(WireEnvelope::new(identity.clone(), request, operation));
+                }
+            }
+            // The deferred reply follows this pass's pushes on the same lane
+            // and carries a newer revision than any of them.
+            if let Some(request) = self.claude_state_pending.take() {
+                let state = self.claude.state();
+                self.reply(&request, state);
+            }
+        }
         self.observe_pty();
         if self.attachment.is_none() {
             if let Some(integration) = &mut self.integration {

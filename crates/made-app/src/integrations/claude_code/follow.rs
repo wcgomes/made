@@ -30,24 +30,14 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use made_terminal::{ProtocolEvent, ProtocolState};
-use serde::Deserialize;
 
 use super::agents::{background_cwd_for_name, cwd_for_pid, normalize_title, AgentCwd};
 use crate::integrations::shared::process_ancestry::process_belongs_to_with;
 use crate::sanitize::sanitize_display;
 
-/// Most parent hops from a Claude Code process to its tab's terminal process.
-pub const MAX_HOPS: usize = 32;
-
-/// Size the hook never lets a spool exceed. A fully consumed spool with less
-/// than [`MAX_RECORD_BYTES`] of room below it is truncated.
-pub const SPOOL_BOUND: u64 = 1024 * 1024;
-
-/// Largest record, newline included, that is applied.
-pub const MAX_RECORD_BYTES: usize = 4 * 1024;
-
-/// Longest title shown, in characters.
-pub const MAX_TITLE_CHARS: usize = 120;
+pub use made_remote::claude::{
+    parse_record, HookStatus, Record, MAX_HOPS, MAX_RECORD_BYTES, MAX_TITLE_CHARS, SPOOL_BOUND,
+};
 
 /// Interval between spool polls.
 pub const SPOOL_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -78,82 +68,6 @@ pub fn ready_claude_plugin_dir(shipped: Option<&Path>) -> Option<PathBuf> {
         std::env::consts::EXE_SUFFIX
     ));
     made_platform::is_executable_file(&hook).then(|| dir.to_path_buf())
-}
-
-// ---- records ---------------------------------------------------------------
-
-/// The status a hook record derived for its session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HookStatus {
-    Idle,
-    Working,
-    Attention,
-    Error,
-    /// The session ended.
-    Ended,
-}
-
-/// One validated spool record. It carries no prompt, tool or message text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Record {
-    /// Claude Code session id.
-    pub session_id: String,
-    /// Working directory the event reported. Untrusted and unvalidated.
-    pub cwd: String,
-    /// Hook event kind.
-    pub event: String,
-    /// Derived status; `None` keeps the session's current one.
-    pub status: Option<HookStatus>,
-    /// Sanitized session title, empty when the event carried none.
-    pub title: String,
-    /// Ancestor pids of the hook process, nearest first.
-    pub pids: Vec<u32>,
-}
-
-#[derive(Deserialize)]
-struct RawRecord {
-    #[serde(rename = "sessionId")]
-    session_id: String,
-    #[serde(default)]
-    cwd: String,
-    #[serde(default)]
-    event: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    pids: Vec<u32>,
-}
-
-/// Parse one spool line, or `None` when it is malformed.
-///
-/// Only the fields of [`Record`] are deserialized; every other field of the
-/// line is skipped without being copied.
-pub fn parse_record(line: &str) -> Option<Record> {
-    let raw: RawRecord = serde_json::from_str(line).ok()?;
-    if raw.session_id.is_empty() || raw.pids.len() > MAX_HOPS {
-        return None;
-    }
-    let status = match raw.status.as_str() {
-        "" => None,
-        "idle" => Some(HookStatus::Idle),
-        "working" => Some(HookStatus::Working),
-        "attention" => Some(HookStatus::Attention),
-        "error" => Some(HookStatus::Error),
-        "ended" => Some(HookStatus::Ended),
-        _ => return None,
-    };
-    Some(Record {
-        session_id: raw.session_id,
-        cwd: raw.cwd,
-        event: raw.event,
-        status,
-        title: sanitize_display(&raw.title, MAX_TITLE_CHARS)
-            .trim()
-            .to_owned(),
-        pids: raw.pids,
-    })
 }
 
 // ---- reading ---------------------------------------------------------------
@@ -221,13 +135,7 @@ impl SpoolReader {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |index| index + 1);
         for line in bytes[..complete].split_inclusive(|byte| *byte == b'\n') {
-            if line.len() > MAX_RECORD_BYTES {
-                continue;
-            }
-            let Ok(text) = std::str::from_utf8(line) else {
-                continue;
-            };
-            if let Some(record) = parse_record(text.trim_end()) {
+            if let Some(record) = made_remote::claude::parse_record_line(line) {
                 records.push(record);
             }
         }
@@ -666,6 +574,9 @@ struct Session {
     title: String,
     /// Orders sessions by their latest start, prompt or directory change.
     recency: u64,
+    /// A remote session the server found running under another owned
+    /// session. Local sessions derive this from `chain` instead.
+    nested: bool,
 }
 
 /// Claude Code state for one local tab.
@@ -830,6 +741,7 @@ impl ClaudeTab {
                     hook: ClaudeActivity::Idle,
                     title: String::new(),
                     recency: 0,
+                    nested: false,
                 });
                 self.touch_new();
                 self.sessions.len() - 1
@@ -957,6 +869,37 @@ impl ClaudeTab {
         changed
     }
 
+    /// Replace the owned sessions with the server's snapshot for a remote tab.
+    /// Ingestion, ownership and liveness ran on the server; only metadata
+    /// arrives. A directory that is not UTF-8 is kept empty, so it never
+    /// moves the explorer.
+    pub fn apply_remote_sessions(&mut self, sessions: &[made_remote::protocol::ClaudeSessionInfo]) {
+        use made_remote::protocol::ClaudeActivity as Remote;
+        self.sessions = sessions
+            .iter()
+            .map(|session| Session {
+                anchor: session.pid,
+                chain: Vec::new(),
+                id: session.session_id.clone(),
+                cwd: session
+                    .cwd
+                    .as_ref()
+                    .and_then(|cwd| cwd.to_utf8().ok())
+                    .unwrap_or_default()
+                    .to_owned(),
+                hook_moved_at: None,
+                hook: match session.activity {
+                    Remote::Idle => ClaudeActivity::Idle,
+                    Remote::Busy => ClaudeActivity::Busy,
+                    Remote::Attention => ClaudeActivity::Attention,
+                },
+                title: sanitize_display(&session.title, MAX_TITLE_CHARS),
+                recency: session.recency,
+                nested: session.nested,
+            })
+            .collect();
+    }
+
     /// Drop sessions whose Claude Code process has exited. Returns whether any
     /// session was dropped.
     ///
@@ -1066,6 +1009,9 @@ impl ClaudeTab {
     /// Whether `session` runs under another live session of this tab, as a
     /// `claude -p` started by Claude Code does.
     fn is_nested(&self, session: &Session) -> bool {
+        if session.nested {
+            return true;
+        }
         let Some(position) = session.chain.iter().position(|pid| *pid == session.anchor) else {
             return false;
         };

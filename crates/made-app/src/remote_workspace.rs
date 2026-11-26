@@ -8,10 +8,10 @@ use std::{
 };
 
 use made_remote::protocol::{
-    DirectoryEntry, ErrorCode, GitRead, GrokEventKind, GrokSessionEvent, GrokSessionInfo,
-    GrokSessionSnapshot, Identity, Operation, PreviewKind, ProtocolError, RemotePath,
-    ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_IN_FLIGHT, MAX_QUEUED_CHUNKS, MAX_TREE_DEPTH,
-    MAX_TREE_ROWS, RPC_TIMEOUT,
+    ClaudeListingResult, ClaudeSessionSnapshot, DirectoryEntry, ErrorCode, GitRead, GrokEventKind,
+    GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, PreviewKind,
+    ProtocolError, RemotePath, ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_IN_FLIGHT,
+    MAX_QUEUED_CHUNKS, MAX_TREE_DEPTH, MAX_TREE_ROWS, RPC_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,7 @@ pub enum RootSource {
     Shell,
     View,
     Session,
+    Claude,
     Grok,
     Selection,
 }
@@ -117,6 +118,8 @@ pub struct WorkspaceProjection {
     pub focus: Option<(String, bool)>,
     /// Owned remote Grok sessions, independent of the OpenCode integration.
     pub grok: Option<GrokSessionSnapshot>,
+    /// Owned remote Claude Code sessions, relayed by the companion.
+    pub claude: Option<ClaudeSessionSnapshot>,
     pub mode: ExplorerMode,
     pub cleanup_unconfirmed: bool,
 }
@@ -232,7 +235,26 @@ pub struct RemoteWorkspace {
     grok_newest: Option<String>,
     /// Remote cwd the Grok domain currently establishes for root follow.
     grok_root: Option<RemotePath>,
+    /// Monotonic Claude Code snapshot revision within the transport epoch.
+    claude_revision: u64,
+    /// The listings' own monotonic revision within the transport epoch, so a
+    /// listing drained after a newer snapshot reply still applies.
+    claude_listing_revision: u64,
+    /// The latest fresh agent-view listing, until the tab takes it.
+    claude_listing: Option<ClaudeListingResult>,
+    /// Remote cwd the tab's Claude Code state establishes for root follow.
+    claude_root: Option<RemotePath>,
+    /// A Claude Code directory the server rejected; not retried until the
+    /// reported directory changes.
+    claude_rejected: Option<RemotePath>,
+    /// A Claude Code directory whose check failed transiently, retried once
+    /// its backoff has passed.
+    claude_retry: Option<(RemotePath, Instant)>,
 }
+
+/// How long a transiently failed Claude Code directory waits before it is
+/// checked again, like the local liveness retry.
+const CLAUDE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl RemoteWorkspace {
     pub fn new(identity: Identity, root: RemotePath) -> Result<Self, ProtocolError> {
@@ -265,6 +287,7 @@ impl RemoteWorkspace {
                 integration_error: None,
                 focus: None,
                 grok: None,
+                claude: None,
                 mode: ExplorerMode::Files,
                 cleanup_unconfirmed: false,
             },
@@ -281,6 +304,12 @@ impl RemoteWorkspace {
             grok_hooks_ready: None,
             grok_newest: None,
             grok_root: None,
+            claude_revision: 0,
+            claude_listing_revision: 0,
+            claude_listing: None,
+            claude_root: None,
+            claude_rejected: None,
+            claude_retry: None,
         })
     }
     pub fn identity(&self) -> &Identity {
@@ -612,6 +641,106 @@ impl RemoteWorkspace {
         }
     }
 
+    /// Apply relayed Claude Code state: the deferred `ClaudeSnapshot` reply to
+    /// `ClaudeState`, or a `ClaudeEvent`/`ClaudeListing` push under the attach
+    /// id. None consumes pending workspace work. The state is not
+    /// filesystem-generation scoped, so only the tab, authority and epoch must
+    /// match; snapshots (and events) and listings each have their own revision
+    /// sequence, an equal revision is a duplicate that changes nothing and an
+    /// older one is rejected.
+    pub fn accept_claude(&mut self, frame: WireEnvelope) -> Result<(), ProtocolError> {
+        if self.connection != ConnectionState::Connected
+            || frame.identity.authority != self.identity.authority
+            || !frame.identity.tab.authenticates(&self.identity.tab)
+            || frame.identity.epoch != self.identity.epoch
+        {
+            return Err(ProtocolError::Identity);
+        }
+        frame.validate()?;
+        let (last, revision) = match &frame.operation {
+            Operation::ClaudeSnapshot { snapshot } | Operation::ClaudeEvent { snapshot } => {
+                (&mut self.claude_revision, snapshot.revision)
+            }
+            Operation::ClaudeListing { listing } => {
+                (&mut self.claude_listing_revision, listing.revision)
+            }
+            _ => return Err(ProtocolError::UnexpectedResponse),
+        };
+        if revision < *last {
+            return Err(ProtocolError::Identity);
+        }
+        if revision == *last {
+            return Ok(());
+        }
+        *last = revision;
+        match frame.operation {
+            Operation::ClaudeSnapshot { snapshot } | Operation::ClaudeEvent { snapshot } => {
+                self.projection.claude = Some(snapshot);
+            }
+            Operation::ClaudeListing { listing } => self.claude_listing = Some(listing),
+            _ => {}
+        }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// The latest fresh agent-view listing, handed out once.
+    pub fn take_claude_listing(&mut self) -> Option<ClaudeListingResult> {
+        self.claude_listing.take()
+    }
+
+    /// Whether the staged Claude Code package is bound for this tab; unknown
+    /// until the current attachment's first snapshot.
+    pub fn claude_hooks_available(&self) -> Option<bool> {
+        self.projection
+            .claude
+            .as_ref()
+            .map(|snapshot| snapshot.hooks_available)
+    }
+
+    /// The directory the tab's Claude Code state selects (agent view, then the
+    /// owned session), or `None`. It enters the root precedence only through
+    /// server validation; a directory the server rejected is not retried.
+    pub fn set_claude_root(&mut self, directory: Option<RemotePath>) -> Result<(), ProtocolError> {
+        // A directory that ends or changes cancels a pending retry, so an
+        // ended session's directory never comes back.
+        let retrying = self
+            .claude_retry
+            .as_ref()
+            .is_some_and(|(retry, _)| directory.as_ref() == Some(retry));
+        if !retrying {
+            self.claude_retry = None;
+        }
+        if directory.is_none() {
+            self.claude_rejected = None;
+        }
+        if directory == self.claude_root
+            || retrying
+            || (directory.is_some() && directory == self.claude_rejected)
+        {
+            return Ok(());
+        }
+        self.claude_rejected = None;
+        self.claude_retry = None;
+        self.claude_root = directory;
+        if self.connection == ConnectionState::Connected && self.close_state == CloseState::Open {
+            self.follow()?;
+        }
+        Ok(())
+    }
+
+    /// Previous-epoch Claude Code state is never reused; a fresh snapshot
+    /// re-establishes it.
+    fn clear_claude(&mut self) {
+        self.projection.claude = None;
+        self.claude_revision = 0;
+        self.claude_listing_revision = 0;
+        self.claude_listing = None;
+        self.claude_root = None;
+        self.claude_rejected = None;
+        self.claude_retry = None;
+    }
+
     /// Discard all pending requests; no input, focus or upload is replayed.
     pub fn disconnect(&mut self) {
         self.connection = ConnectionState::Disconnected;
@@ -643,6 +772,7 @@ impl RemoteWorkspace {
         self.watch = None;
         self.integration_epoch = 0;
         self.clear_grok();
+        self.clear_claude();
     }
 
     /// Previous-epoch Grok state is never reused; a fresh snapshot re-establishes it.
@@ -677,9 +807,10 @@ impl RemoteWorkspace {
         self.identity.epoch = epoch;
         self.connection = ConnectionState::Connected;
         self.integration = IntegrationState::Unknown;
-        // Previous-epoch Grok state is never reused; the post-attach refresh
-        // re-establishes it from a fresh snapshot.
+        // Previous-epoch Grok and Claude Code state is never reused; the
+        // post-attach refresh re-establishes it from a fresh snapshot.
         self.clear_grok();
+        self.clear_claude();
         self.begin_resnapshot()
     }
 
@@ -816,8 +947,20 @@ impl RemoteWorkspace {
         self.follow_request = None;
     }
 
-    /// Ten-second RPC deadlines are driven by the UI's nonblocking timer.
+    /// Ten-second RPC deadlines are driven by the UI's nonblocking timer, as
+    /// is the retry of a transiently failed Claude Code directory.
     pub fn expire(&mut self, now: Instant) -> Result<Vec<u64>, ProtocolError> {
+        if self
+            .claude_retry
+            .as_ref()
+            .is_some_and(|(_, due)| now >= *due)
+        {
+            self.claude_root = self.claude_retry.take().map(|(directory, _)| directory);
+            if self.connection == ConnectionState::Connected && self.close_state == CloseState::Open
+            {
+                self.follow()?;
+            }
+        }
         let ids: Vec<_> = self
             .pending
             .iter()
@@ -1147,6 +1290,11 @@ impl RemoteWorkspace {
                     }
                 }
             }
+        }
+        // The tab's Claude Code directory outranks Grok and the shell cwd but
+        // never a connected OpenCode session or view.
+        if let Some(directory) = self.claude_root.as_ref() {
+            return Ok((directory.clone(), RootSource::Claude));
         }
         // Owned Grok sessions outrank the validated shell cwd but never a
         // connected OpenCode session or view.
@@ -1594,6 +1742,27 @@ impl RemoteWorkspace {
                     }
                     Purpose::Shell => {
                         self.shell_report = None;
+                    }
+                    // An unusable Claude Code directory never moves the
+                    // explorer: the next holder keeps the root. A missing,
+                    // denied or invalid one is rejected; a transient failure
+                    // is checked again after a backoff.
+                    Purpose::Follow(RootSource::Claude) => {
+                        let directory = self.claude_root.take();
+                        if matches!(
+                            code,
+                            ErrorCode::Unavailable
+                                | ErrorCode::Unauthorized
+                                | ErrorCode::InvalidRequest
+                                | ErrorCode::Unsupported
+                        ) {
+                            self.claude_rejected = directory;
+                        } else {
+                            self.claude_retry = directory
+                                .map(|directory| (directory, Instant::now() + CLAUDE_RETRY));
+                        }
+                        self.follow_request = None;
+                        self.follow()?;
                     }
                     _ => {
                         self.follow_request = None;

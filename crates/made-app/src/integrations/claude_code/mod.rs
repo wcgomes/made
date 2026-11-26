@@ -82,14 +82,10 @@ impl Integration for ClaudeCode {
     }
 }
 
-/// Claude Code brands a tab while it is present, unless OpenCode owns the tab
-/// or a remote tab already presents Grok Build under SSH-10.
-pub(crate) fn workspace_claude_branded(
-    opencode: bool,
-    remote_grok_branded: bool,
-    present: bool,
-) -> bool {
-    !opencode && !remote_grok_branded && present
+/// Claude Code brands a tab while it is present, unless OpenCode owns the
+/// tab. Grok Build yields to it, locally and on a remote tab alike.
+pub(crate) fn workspace_claude_branded(opencode: bool, present: bool) -> bool {
+    !opencode && present
 }
 
 /// Official Claude mark from `assets/claude-code.svg`, outside the Material

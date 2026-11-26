@@ -11,7 +11,8 @@ AppImage marked executable), then fails on any miss:
 - `--smoke-test` passes and its markers report the installed OpenCode plugin,
   a present `made-grok-status`, all four companions, askpass, updates disabled,
   `update_repo=wcgomes/made` and no test-only update seam;
-- the four `remote/<target>` trees match `remote/manifest.json` hashes;
+- the four `remote/<target>` trees match `remote/manifest.json` hashes, each
+  with the 14-artifact companion set and an executable staged Claude Code hook;
 - `plugins/grok-made` holds an executable `made-grok-status` and no Python file;
 - `plugins/claude-code-made` resolves from the install root with its manifest,
   hooks.json, README and an executable `made-claude-status`;
@@ -139,7 +140,7 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         for target in TARGETS:
             records = manifest["targets"][target]["files"]
-            check(len(records) == 10, f"{target} lists the 10-artifact companion set")
+            check(len(records) == 14, f"{target} lists the 14-artifact companion set")
             for record in records:
                 path = exe_dir / "remote" / target / record["name"]
                 check(path.is_file() and sha256(path) == record["sha256"], f"{target}/{record['name']} matches the manifest")
@@ -147,6 +148,7 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
         executables = [exe_dir / "made-app", exe_dir / askpass, grok / "hooks/bin" / hook, claude / "bin" / claude_hook_name]
         executables += [exe_dir / "remote" / t / "made-remote" for t in TARGETS]
         executables += [exe_dir / "remote" / t / "plugins/grok-made/hooks/bin/made-grok-status" for t in TARGETS]
+        executables += [exe_dir / "remote" / t / "plugins/claude-code-made/bin/made-claude-status" for t in TARGETS]
         for path in executables:
             check(path.is_file() and bool(path.stat().st_mode & stat.S_IXUSR), f"{path.name} in {path.parent.name} is executable")
 

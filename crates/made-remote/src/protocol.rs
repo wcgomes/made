@@ -367,6 +367,116 @@ pub struct GrokSessionEvent {
     pub activity: GrokActivity,
 }
 
+/// Most agent-view background entries one Claude Code listing relays.
+pub const MAX_CLAUDE_BACKGROUND: usize = 16;
+/// Longest relayed Claude Code title or background name, in characters.
+pub const MAX_CLAUDE_TITLE_CHARS: usize = 120;
+
+/// Dot status of one owned remote Claude Code session, derived on the server
+/// from its hook records; the same three states as the local dots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeActivity {
+    Idle,
+    Busy,
+    Attention,
+}
+
+/// One live Claude Code session owned by the tab's managed process tree.
+/// Metadata only: no prompt, message, tool or transcript field exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeSessionInfo {
+    pub session_id: String,
+    /// The owned Claude Code process the session's hook ran under.
+    pub pid: u32,
+    /// The session's current remote directory: the latest hook record's, or
+    /// the counted `claude agents --json` listing's for this pid. Never
+    /// canonicalized or opened by either side; the client validates it on the
+    /// owning remote authority before use.
+    #[serde(default)]
+    pub cwd: Option<RemotePath>,
+    pub activity: ClaudeActivity,
+    /// Sanitized hook session title; empty when none was reported.
+    #[serde(default)]
+    pub title: String,
+    /// Orders sessions by their latest start, prompt or directory change.
+    pub recency: u64,
+    /// The session runs under another owned session, as a `claude -p` does.
+    #[serde(default)]
+    pub nested: bool,
+}
+
+/// Complete revisioned owned-session state for one tab, in attachment order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeSessionSnapshot {
+    /// Monotonic within the current connection epoch. Must be positive.
+    pub revision: u64,
+    /// Whether the staged Claude Code package and the tab's spool are bound.
+    pub hooks_available: bool,
+    pub sessions: Vec<ClaudeSessionInfo>,
+}
+impl ClaudeSessionSnapshot {
+    /// Wire-shape validation only; identity, epoch and revision progression
+    /// stay with the envelope and the client.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.revision == 0 || self.sessions.len() > made_bridge::state::MAX_SESSIONS {
+            return Err(ProtocolError::Malformed);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.sessions.len());
+        for session in &self.sessions {
+            if !bounded_session_id(&session.session_id)
+                || !seen.insert(session.session_id.as_str())
+                || session.pid == 0
+                || !bounded_claude_text(&session.title, true)
+            {
+                return Err(ProtocolError::Malformed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One agent-view background session of the latest listing: the normalized
+/// name the client compares with its own terminal title, and its directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeBackgroundEntry {
+    pub name: String,
+    pub cwd: RemotePath,
+}
+
+/// The agent-view part of one fresh `claude agents --json` listing. The
+/// owned pids' listed directories are already applied to the sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeListingResult {
+    /// The listings' own sequence, separate from the snapshots' and
+    /// restarting at 1 after reattach. Must be positive.
+    pub revision: u64,
+    pub background: Vec<ClaudeBackgroundEntry>,
+}
+impl ClaudeListingResult {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.revision == 0
+            || self.background.len() > MAX_CLAUDE_BACKGROUND
+            || self
+                .background
+                .iter()
+                .any(|entry| !bounded_claude_text(&entry.name, false))
+        {
+            return Err(ProtocolError::Malformed);
+        }
+        Ok(())
+    }
+}
+
+fn bounded_claude_text(text: &str, empty_ok: bool) -> bool {
+    (empty_ok || !text.is_empty())
+        && text.chars().count() <= MAX_CLAUDE_TITLE_CHARS
+        && !text.chars().any(char::is_control)
+}
+
 /// Closed verbs and their replies. Content-bearing Debug is deliberately opaque.
 /// Each streamed result keeps the request id, identity and an explicit final bit.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +574,22 @@ pub enum Operation {
     },
     GrokEvent {
         event: GrokSessionEvent,
+    },
+    /// Request the tab's owned remote Claude Code state.
+    ClaudeState,
+    /// Reply to `ClaudeState`.
+    ClaudeSnapshot {
+        snapshot: ClaudeSessionSnapshot,
+    },
+    /// Unsolicited owned-session state change under the attach request id.
+    ClaudeEvent {
+        snapshot: ClaudeSessionSnapshot,
+    },
+    /// A client-detected listing trigger. It carries no input or title bytes.
+    ClaudeTrigger,
+    /// Unsolicited agent-view result of a fresh listing.
+    ClaudeListing {
+        listing: ClaudeListingResult,
     },
     ShellCwd {
         path: RemotePath,
@@ -608,6 +734,10 @@ impl Operation {
                     return Err(ProtocolError::Malformed);
                 }
             }
+            Self::ClaudeSnapshot { snapshot } | Self::ClaudeEvent { snapshot } => {
+                snapshot.validate()?
+            }
+            Self::ClaudeListing { listing } => listing.validate()?,
             Self::UploadResult { path, .. } => {
                 if path.to_utf8()?.chars().any(char::is_control) {
                     return Err(ProtocolError::Path);
@@ -708,6 +838,8 @@ impl WireEnvelope {
             | SessionState
             | Focus { .. }
             | GrokState
+            | ClaudeState
+            | ClaudeTrigger
             | TerminalInput { .. }
             | TerminalResize { .. }
             | UploadBegin { .. }
@@ -741,11 +873,13 @@ impl WireEnvelope {
                 | TerminalInput { .. }
                 | UploadBegin { .. }
                 | UploadChunk { .. }
-                | UploadAbort { .. },
+                | UploadAbort { .. }
+                | ClaudeTrigger,
                 Ack,
             )
             | (SessionState, SessionSnapshot { .. })
-            | (GrokState, GrokSnapshot { .. }) => true,
+            | (GrokState, GrokSnapshot { .. })
+            | (ClaudeState, ClaudeSnapshot { .. }) => true,
             (
                 RootValidate { path: a },
                 RootResult {
@@ -911,6 +1045,8 @@ impl ReplyProgress {
                 | SessionState
                 | Focus { .. }
                 | GrokState
+                | ClaudeState
+                | ClaudeTrigger
                 | TerminalInput { .. }
                 | TerminalResize { .. }
                 | UploadBegin { .. }

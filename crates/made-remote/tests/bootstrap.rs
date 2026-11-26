@@ -45,7 +45,7 @@ mod legacy_stage {
         process::{Command, Output, Stdio},
     };
 
-    pub const ARTIFACTS: [&str; 10] = [
+    pub const ARTIFACTS: [&str; 14] = [
         "made-remote",
         "plugins/opencode-made/package.json",
         "plugins/opencode-made/tui.ts",
@@ -56,7 +56,13 @@ mod legacy_stage {
         "plugins/grok-made/README.md",
         "plugins/grok-made/hooks/hooks.json",
         "plugins/grok-made/hooks/bin/made-grok-status",
+        "plugins/claude-code-made/.claude-plugin/plugin.json",
+        "plugins/claude-code-made/README.md",
+        "plugins/claude-code-made/hooks/hooks.json",
+        "plugins/claude-code-made/bin/made-claude-status",
     ];
+    /// The staged Claude Code session-event hook.
+    pub const CLAUDE_HOOK: &str = "plugins/claude-code-made/bin/made-claude-status";
     pub const UPDATE_REQUIRED: &str = "MADE-STAGE-UPDATE-REQUIRED";
 
     pub fn target() -> &'static str {
@@ -327,6 +333,15 @@ fn legacy_approved_update_swaps_cleans_keeps_the_old_process_and_future_paths() 
     assert!(initial.status.success(), "initial legacy staging failed");
     let destination = destination(&home, "1.0");
     let version_root = version_root(&home, "1.0");
+    assert_eq!(
+        fs::metadata(destination.join(CLAUDE_HOOK))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the staged Claude Code hook is executable"
+    );
     let mut old_process = Command::new(destination.join("made-remote"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -376,6 +391,15 @@ fn legacy_approved_update_swaps_cleans_keeps_the_old_process_and_future_paths() 
             .mode()
             & 0o777,
         0o700
+    );
+    assert_eq!(
+        fs::metadata(destination.join(CLAUDE_HOOK))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the updated Claude Code hook stays executable"
     );
     assert_eq!(
         fs::metadata(destination.join("plugins/opencode-made/tui.ts"))
