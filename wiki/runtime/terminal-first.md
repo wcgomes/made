@@ -20,7 +20,7 @@ The home/`--picker`/explicit-path policy is an accepted product decision; see [A
 
 ## macOS GUI launch PATH
 
-Status: shipped in v0.1.2 (PR #20). v0.1.1 lacks it: a Finder/Dock launch shows no OpenCode, Grok or Claude Code in the catalog, and Claude Code explorer follow (`/cd`, agent view) silently does nothing because the bare-name `claude` lookup fails. That was the root cause of follow not working in v0.1.1 builds; check `PATH` first when a Finder-launched build misses a CLI that works from a terminal.
+Status: shipped in v0.1.2 (PR #20). v0.1.1 lacks it: a Finder/Dock launch shows no OpenCode, Grok or Claude Code in the catalog, and Claude Code explorer follow (`/cd`, agent view) silently does nothing because the bare-name `claude` lookup fails. That was the root cause of follow not working in Finder/Dock-launched v0.1.1 builds (a terminal launch had a full `PATH`); check `PATH` first when a Finder-launched build misses a CLI that works from a terminal.
 
 - A Finder/Dock launch inherits launchd's `PATH` `/usr/bin:/bin:/usr/sbin:/sbin`, which hides user-installed CLIs (`~/.local/bin`, `~/.opencode/bin`, `~/.grok/bin`, Homebrew).
 - First thing in `run()`, `made_platform::adopt_login_shell_path` acts only when `PATH` is unset, empty or exactly that launchd default; terminal launches (at least `path_helper`'s `PATH`), Linux and Windows are untouched.
