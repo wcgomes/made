@@ -21,10 +21,12 @@ use std::path::Path;
 /// by the `libc` crate.
 const POSIX_SPAWN_SETSID: libc::c_int = 0x0400;
 
-/// A child that `spawn` starts: its own session, only the descriptors the
-/// file actions set up, an empty signal mask, and `default_signals` reset to
-/// `SIG_DFL` (other dispositions as inherited from this process).
+/// A child that [`prepare`] readies: its own session, only the descriptors
+/// the file actions set up, an empty signal mask, and `default_signals` reset
+/// to `SIG_DFL` (other dispositions as inherited from this process).
 pub(super) struct SpawnRequest<'a> {
+    /// Names the child in errors, for example `"PTY child"`.
+    pub(super) what: &'static str,
     /// Absolute path of the image to execute.
     pub(super) path: &'a Path,
     /// `argv`, including `argv[0]`.
@@ -34,15 +36,13 @@ pub(super) struct SpawnRequest<'a> {
     pub(super) default_signals: &'a [libc::c_int],
 }
 
-/// Start `request` with `actions` applied in the child after `setsid()`.
-///
-/// Like `execvp`, an image the kernel rejects with `ENOEXEC` is run once more
-/// as a `/bin/sh` script with argv `sh <path> <args...>`, as Apple's execvp
-/// does.
-pub(super) fn spawn(
+/// Build every C string, pointer array and spawn attribute for `request`, so
+/// [`PreparedSpawn::spawn`] does nothing but call `posix_spawn`.
+pub(super) fn prepare(
     request: &SpawnRequest<'_>,
-    actions: &mut FileActions,
-) -> io::Result<libc::pid_t> {
+    actions: FileActions,
+) -> io::Result<PreparedSpawn> {
+    let cstring = |bytes: &[u8]| cstring(request.what, bytes);
     let path = cstring(request.path.as_os_str().as_bytes())?;
     let argv = request
         .argv
@@ -59,18 +59,15 @@ pub(super) fn spawn(
             cstring(&entry)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    // execvp's ENOEXEC fallback: `sh <path> <args...>`, as Apple's execvp.
     let script_argv = [cstring(b"sh")?, path.clone()]
         .into_iter()
         .chain(argv.iter().skip(1).cloned())
         .collect::<Vec<_>>();
-    let argv_ptrs = null_terminated(&argv);
-    let script_argv_ptrs = null_terminated(&script_argv);
-    let envp_ptrs = null_terminated(&envp);
 
     let mut attrs = SpawnAttrs::new()?;
-    // SAFETY: every pointer is to a live, NUL-terminated buffer owned above
-    // for the whole call; the attribute and action objects are initialized
-    // and destroyed by their guards.
+    // SAFETY: the sigsets are initialized before use and the attribute object
+    // is initialized and destroyed by its guard.
     unsafe {
         let flags = POSIX_SPAWN_SETSID
             | libc::POSIX_SPAWN_CLOEXEC_DEFAULT
@@ -92,21 +89,61 @@ pub(super) fn spawn(
         let mut mask: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut mask);
         check(libc::posix_spawnattr_setsigmask(attrs.as_mut_ptr(), &mask))?;
+    }
+    let argv_ptrs = null_terminated(&argv);
+    let script_argv_ptrs = null_terminated(&script_argv);
+    let envp_ptrs = null_terminated(&envp);
+    Ok(PreparedSpawn {
+        path,
+        _argv: argv,
+        _script_argv: script_argv,
+        _envp: envp,
+        argv_ptrs,
+        script_argv_ptrs,
+        envp_ptrs,
+        attrs,
+        actions,
+    })
+}
 
+/// A spawn whose inputs are all built. The pointer arrays point into the
+/// owned `CString`s, whose heap buffers do not move with the struct.
+pub(super) struct PreparedSpawn {
+    path: CString,
+    _argv: Vec<CString>,
+    _script_argv: Vec<CString>,
+    _envp: Vec<CString>,
+    argv_ptrs: Vec<*mut libc::c_char>,
+    script_argv_ptrs: Vec<*mut libc::c_char>,
+    envp_ptrs: Vec<*mut libc::c_char>,
+    attrs: SpawnAttrs,
+    actions: FileActions,
+}
+
+impl PreparedSpawn {
+    /// Start the child with the file actions applied after `setsid()`.
+    ///
+    /// Like `execvp`, an image the kernel rejects with `ENOEXEC` is run once
+    /// more as a `/bin/sh` script.
+    pub(super) fn spawn(mut self) -> io::Result<libc::pid_t> {
         let mut pid: libc::pid_t = 0;
         let mut spawn = |program: &CStr, argv: &[*mut libc::c_char]| {
-            libc::posix_spawn(
-                &mut pid,
-                program.as_ptr(),
-                actions.as_mut_ptr(),
-                attrs.as_mut_ptr(),
-                argv.as_ptr(),
-                envp_ptrs.as_ptr(),
-            )
+            // SAFETY: every pointer is to a live, NUL-terminated buffer owned
+            // by `self`, and the attribute and action objects are initialized.
+            unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    program.as_ptr(),
+                    self.actions.as_mut_ptr(),
+                    self.attrs.as_mut_ptr(),
+                    argv.as_ptr(),
+                    self.envp_ptrs.as_ptr(),
+                )
+            }
         };
-        let mut code = spawn(&path, &argv_ptrs);
+        let mut code = spawn(&self.path, &self.argv_ptrs);
         if code == libc::ENOEXEC {
-            code = spawn(c"/bin/sh", &script_argv_ptrs);
+            code = spawn(c"/bin/sh", &self.script_argv_ptrs);
         }
         check(code)?;
         Ok(pid)
@@ -114,18 +151,19 @@ pub(super) fn spawn(
 }
 
 /// Owned `posix_spawn_file_actions_t`, applied in order in the child.
-pub(super) struct FileActions(libc::posix_spawn_file_actions_t);
+pub(super) struct FileActions(libc::posix_spawn_file_actions_t, &'static str);
 
 impl FileActions {
-    pub(super) fn new() -> io::Result<Self> {
+    /// `what` names the child in errors, as in [`SpawnRequest::what`].
+    pub(super) fn new(what: &'static str) -> io::Result<Self> {
         let mut actions: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
         // SAFETY: initializes the opaque object the guard destroys on drop.
         check(unsafe { libc::posix_spawn_file_actions_init(&mut actions) })?;
-        Ok(Self(actions))
+        Ok(Self(actions, what))
     }
 
     pub(super) fn chdir(&mut self, dir: &Path) -> io::Result<()> {
-        let dir = cstring(dir.as_os_str().as_bytes())?;
+        let dir = cstring(self.1, dir.as_os_str().as_bytes())?;
         // The `_np` form is intentional: the release deployment target is macOS
         // 12.0, and the unsuffixed posix_spawn_file_actions_addchdir only
         // exists from macOS 26. The path is copied into the actions.
@@ -139,7 +177,7 @@ impl FileActions {
         path: &Path,
         flags: libc::c_int,
     ) -> io::Result<()> {
-        let path = cstring(path.as_os_str().as_bytes())?;
+        let path = cstring(self.1, path.as_os_str().as_bytes())?;
         // SAFETY: `path` is NUL-terminated and outlives the call, which copies
         // it into the actions.
         check(unsafe {
@@ -188,11 +226,11 @@ impl Drop for SpawnAttrs {
     }
 }
 
-fn cstring(bytes: &[u8]) -> io::Result<CString> {
+fn cstring(what: &str, bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "child argument, path or environment contains a NUL byte",
+            format!("{what} argument, path or environment contains a NUL byte"),
         )
     })
 }
