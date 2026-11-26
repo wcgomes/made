@@ -104,6 +104,8 @@ python3 .github/scripts/stage-desktop-package.py --profile release --target "$TA
 
 On Windows the binaries end in `.exe`. Run `dist/stage/made-app` from a normal terminal, for example `open -a Terminal dist/stage/made-app` on macOS, never from inside a Claude Code session: the inherited `CLAUDE_*` variables (such as `CLAUDE_CODE_CHILD_SESSION`) make a nested Claude Code disable transcripts and the agent view, which invalidates Claude Code integration tests.
 
+A terminal launch inherits the shell's `PATH` and does not reproduce a macOS Finder/Dock launch (see [macOS GUI launch PATH](../runtime/terminal-first.md#macos-gui-launch-path)). Reproduce one by opening the installed app, or with `env -i HOME="$HOME" SHELL="$SHELL" PATH=/usr/bin:/bin:/usr/sbin:/sbin <binary>`.
+
 ## Environment switches
 
 | Variable / switch | Effect |

@@ -139,6 +139,9 @@ fn show_startup_refusal(message: String) {
 }
 
 fn run(args: cli::LaunchArgs) -> ExitCode {
+    // Finder and Dock launches inherit launchd's minimal PATH; adopt the login
+    // shell's before any thread starts, since it changes the environment.
+    made_platform::adopt_login_shell_path();
     let smoke = args.smoke_test;
     let started_at = Instant::now();
     let updater = Updater::detect().map(Arc::new);
