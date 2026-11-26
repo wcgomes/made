@@ -1320,7 +1320,7 @@ impl ListingWorker {
         let user = match claude {
             Some(_) => listing_user(&coordination),
             None => {
-                drop(remove_unused_listing(&coordination));
+                drop(remove_unused_listing(&coordination, Duration::ZERO));
                 None
             }
         };
@@ -1401,7 +1401,7 @@ impl Drop for ListingWorker {
         }
         // The last supervisor of the server user removes the listing.
         if self.user.take().is_some() {
-            remove_unused_listing(&self.shared.dir);
+            remove_unused_listing(&self.shared.dir, LISTING_USERS_WAIT);
         }
     }
 }
@@ -1410,21 +1410,25 @@ impl Drop for ListingWorker {
 /// shared lock on for its whole life.
 const LISTING_USERS: &str = "listing.users";
 
-/// How long the probe retries the users lock. A child forked by any thread of
-/// a supervisor holds every descriptor, close-on-exec ones included, until it
-/// execs, so a users hold can outlive its supervisor for that moment; a live
-/// supervisor holds it for good.
+/// How long the last supervisor's probe retries the users lock. A child forked
+/// by any thread of a supervisor holds every descriptor, close-on-exec ones
+/// included, until it execs, so a users hold can outlive its supervisor for
+/// that moment; a live supervisor holds it for good. The retry is best effort:
+/// a miss leaves a listing that [`ListingWorker::latest`] ignores once it is
+/// older than [`MAX_LISTING_AGE_MS`] and that the next helper start sweeps.
+/// The start sweep probes once, so a start never waits on a live supervisor.
 const LISTING_USERS_WAIT: Duration = Duration::from_millis(100);
 
-/// Remove the published listing when no supervisor holds the users lock.
-/// Returns the probe's exclusive hold, released by the caller.
-fn remove_unused_listing(dir: &Path) -> Option<fs::File> {
+/// Remove the published listing when no supervisor holds the users lock,
+/// retrying the lock for up to `wait`. Returns the probe's exclusive hold,
+/// released by the caller.
+fn remove_unused_listing(dir: &Path, wait: Duration) -> Option<fs::File> {
     let path = dir.join(LISTING_USERS);
     note_access(&path);
     let file = made_platform::open_regular_file_nofollow(&path, false)
         .ok()
         .or_else(|| made_platform::create_private_file_new(&path, false).ok())?;
-    let deadline = Instant::now() + LISTING_USERS_WAIT;
+    let deadline = Instant::now() + wait;
     while file.try_lock().is_err() {
         if Instant::now() >= deadline {
             return None;
@@ -1442,7 +1446,7 @@ fn remove_unused_listing(dir: &Path) -> Option<fs::File> {
 /// Sweep a listing no live supervisor uses, then hold a shared users lock.
 fn listing_user(dir: &Path) -> Option<fs::File> {
     made_platform::ensure_private_directory(dir).ok()?;
-    drop(remove_unused_listing(dir));
+    drop(remove_unused_listing(dir, Duration::ZERO));
     let path = dir.join(LISTING_USERS);
     let file = made_platform::open_regular_file_nofollow(&path, false).ok()?;
     file.lock_shared().ok()?;
