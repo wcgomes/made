@@ -4,3 +4,4 @@
 - [2026-10-26 V1 Evidence Snapshot](20261026-v1-evidence.md) — tests, Linux, evidence — Current Linux/Xvfb verification and outstanding validation.
 - [2026-11-06 v0.1.0 Release](20261106-v0-1-0-release.md) — release, iterations, UNVERIFIED — v0.1.0 publication, iteration cleanup, and unverified items.
 - [2026-11-25 v0.1.1 Release](20261125-v0-1-1-release.md) — release, upgrade, auto-update — Second release, first real upgrade path, and transient runner reruns.
+- [2026-11-26 v0.1.2 Release](20261126-v0-1-2-release.md) — release, SSH, Claude Code — SSH Claude Code parity, macOS launch PATH, single-attempt publish.

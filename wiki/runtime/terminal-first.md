@@ -20,7 +20,7 @@ The home/`--picker`/explicit-path policy is an accepted product decision; see [A
 
 ## macOS GUI launch PATH
 
-Status: implemented on unmerged branch `fix/macos-gui-path` (2026-11-25); not in any release. Released v0.1.1 lacks it, so a Finder/Dock launch shows no OpenCode, Grok or Claude Code in the catalog and no `claude agents --json` explorer follow.
+Status: shipped in v0.1.2 (PR #20). v0.1.1 lacks it: a Finder/Dock launch shows no OpenCode, Grok or Claude Code in the catalog, and Claude Code explorer follow (`/cd`, agent view) silently does nothing because the bare-name `claude` lookup fails. That was the root cause of follow not working in v0.1.1 builds; check `PATH` first when a Finder-launched build misses a CLI that works from a terminal.
 
 - A Finder/Dock launch inherits launchd's `PATH` `/usr/bin:/bin:/usr/sbin:/sbin`, which hides user-installed CLIs (`~/.local/bin`, `~/.opencode/bin`, `~/.grok/bin`, Homebrew).
 - First thing in `run()`, `made_platform::adopt_login_shell_path` acts only when `PATH` is unset, empty or exactly that launchd default; terminal launches (at least `path_helper`'s `PATH`), Linux and Windows are untouched.
@@ -62,7 +62,7 @@ Precedence is each integration's declared rank (OpenCode 100, Claude Code 200, G
 
 1. A connected OpenCode active session directory wins while an active session exists; an unavailable active directory is shown as unavailable, not replaced by the view directory or shell cwd.
 2. Otherwise, a connected OpenCode view directory selected in the Home/new-session view wins while tabs are enabled, no session is active, and the directory is usable.
-3. Otherwise, while OpenCode is not connected, the directory of this tab's most recent live owned local Claude Code session wins. Remote Claude Code has no session directory.
+3. Otherwise, while OpenCode is not connected, the directory of this tab's most recent live owned Claude Code session (or its agent-view selection) wins, local or remote ([Claude Code SSH](../integration/claude-code.md#ssh)).
 4. Otherwise, the directory of this tab's newest open Grok session wins, local or remote; a prompt in an older Grok session keeps the explorer there.
 5. Otherwise, the latest validated shell cwd wins.
 6. Otherwise, the launch/picker folder or platform-resolved home.

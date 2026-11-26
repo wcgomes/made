@@ -64,6 +64,16 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - Windows CI runners check out files with CRLF line endings because the repository has no `.gitattributes`. Tests that scan source text for multi-line literals or `\n`-joined patterns must normalize `\r\n` or match line by line.
 - The integration neutrality scans do the latter through a line-based `production_part`. Source: [`integration_modules.rs`](../../crates/made-app/tests/integration_modules.rs).
 
+## Hidden files in uploaded artifacts
+
+- `actions/upload-artifact` (v7) omits files and directories whose names start with `.` unless `include-hidden-files: true`. The staged Claude Code plugin keeps its manifest at `.claude-plugin/plugin.json`, so a companion upload without it fails the downstream `sha256sum -c`. Any upload of a staged plugin directory needs the flag.
+- Source: [`ci-ssh-remote.yml`](../../.github/workflows/ci-ssh-remote.yml).
+
+## Root in Linux companion containers
+
+- The glibc 2.31 companion job runs its tests as root in a container, where a mode-000 path stays readable. A permission-denial assertion must first check that the permission is enforced and skip otherwise, as the other unreadable-path tests do. Tests that feed a host temp path as a remote POSIX path, or use the Unix `:` separator, are gated to Unix.
+- Test: [`claude.rs`](../../crates/made-remote/tests/claude.rs).
+
 ## CI invocation
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.

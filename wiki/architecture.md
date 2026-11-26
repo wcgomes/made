@@ -100,7 +100,7 @@ OpenCode v2 TUI (user-run child inside the workspace PTY)
   -> normalized SessionSnapshot
   -> session_follow root precedence: connected active session directory
      > usable connected view directory (tabs enabled, no active session)
-     > most recent live owned Claude Code session directory (local, while OpenCode is not connected)
+     > most recent live owned Claude Code session directory (local or remote, while OpenCode is not connected)
      > newest open Grok session directory (local or remote, while OpenCode is not connected)
      > latest shell cwd
   -> explorer root in that tab
