@@ -117,6 +117,29 @@ class AssembleDesktopPackageTest(unittest.TestCase):
             self.assertTrue((self.stage / name).is_file(), name)
         self.assertTrue((self.stage / "remote/manifest.json").is_file())
 
+    def test_each_companion_set_carries_fourteen_artifacts_and_the_target_claude_hook(self) -> None:
+        self.assertEqual(len(assemble.FILES), 14)
+        for name in CLAUDE_FILES:
+            self.assertIn(name, assemble.FILES)
+        self.run_assembly()
+        for target in assemble.TARGETS:
+            root = self.stage / "remote" / target
+            for name in assemble.FILES:
+                self.assertTrue((root / name).is_file(), f"{target}/{name}")
+            hook = root / "plugins/claude-code-made/bin/made-claude-status"
+            self.assertEqual(hook.read_bytes(), f"{target} plugins/claude-code-made/bin/made-claude-status".encode())
+            if os.name != "nt":
+                self.assertTrue(hook.stat().st_mode & stat.S_IXUSR, target)
+
+    def test_a_ten_artifact_companion_set_fails(self) -> None:
+        root = self.companions / assemble.TARGETS[0]
+        manifest = json.loads((root / "manifest.json").read_text())
+        manifest["files"] = [r for r in manifest["files"] if not r["name"].startswith("plugins/claude-code-made/")]
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        (root / "SHA256SUMS").write_text("".join(f"{r['sha256']}  {r['name']}\n" for r in manifest["files"]))
+        self.assert_refuses("do not match the stage allowlist")
+        self.assertFalse((self.stage / "remote").exists())
+
     def test_missing_claude_plugin_files_fail(self) -> None:
         for name in CLAUDE_FILES:
             with self.subTest(missing=name):

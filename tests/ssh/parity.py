@@ -4,6 +4,9 @@
     --frontend is the explicit remote command implementing the bootstrap; no executable is guessed.
 It must consume v1 frames on stdin and emit only v1 frames on stdout.
 
+The claude-parity mode drives the same entry points with a fixture claude
+that fires the real staged native Claude Code hook (see its section below).
+
 The grok-parity and grok-first-fail modes drive the real companion entry
 points (--probe, --stdio frontend, --supervisor, --install-grok-plugin) over
 the isolated loopback SSH harness with the task-2.42 Grok fixtures. Grok
@@ -1872,6 +1875,8 @@ def staged_artifact_bytes(companion):
             source = pathlib.Path(companion)
         elif name == NATIVE_HOOK_ARTIFACT:
             source = native_hook_path(companion)
+        elif name == CLAUDE_HOOK_ARTIFACT:
+            source = native_claude_hook_path(companion)
         else:
             source = REPO_ROOT / name
         files[name] = source.read_bytes()
@@ -2030,7 +2035,8 @@ def grok_update_in_place(h, fx, workspace, mutation=False):
             path = destination / name
             if not path.is_file() or path.read_bytes() != files_b[name]:
                 raise AssertionError(f'the approved update left the wrong bytes for {name}')
-            expected_mode = 0o700 if name in ('made-remote', NATIVE_HOOK_ARTIFACT) else 0o600
+            expected_mode = (0o700 if name in ('made-remote', NATIVE_HOOK_ARTIFACT,
+                                               CLAUDE_HOOK_ARTIFACT) else 0o600)
             if path.stat().st_mode & 0o777 != expected_mode:
                 raise AssertionError(
                     f'{name} has mode {path.stat().st_mode & 0o777:o}, not '
@@ -2208,17 +2214,931 @@ def run_grok_scenarios(harness, fixture, workspace, mode, only):
     return 0 if counts.get('pass') and not counts.get('fail') else 2
 
 
+# ═══ Claude Code parity (SSH-11, tasks 5.1/5.2) ═════════════════════════════
+#
+# The claude-parity mode drives the real companion entry points (--stdio
+# frontend and its supervisor) over the isolated loopback SSH harness with a
+# fixture `claude`. The fixture never is real Claude Code: it fires the real
+# staged native hook (`made-claude-status`) with crafted payloads, emits status
+# protocol bytes, and answers `agents --json` from a scenario-controlled file.
+# It certifies the companion/protocol surface only; desktop presentation,
+# precedence and diagnostics are model-level (crates/made-app tests), and real
+# claude over SSH is the manual task 5.4.
+
+CLAUDE_ARTIFACTS = (
+    'plugins/claude-code-made/.claude-plugin/plugin.json',
+    'plugins/claude-code-made/README.md',
+    'plugins/claude-code-made/hooks/hooks.json',
+    'plugins/claude-code-made/bin/made-claude-status',
+)
+CLAUDE_HOOK_ARTIFACT = 'plugins/claude-code-made/bin/made-claude-status'
+CLAUDE_MARKER = 'MADE-PRIVACY-MARKER-7f3c'
+CLAUDE_BOUNDARY = ('real loopback SSH, the real companion supervisor and the real staged '
+                   'native hook, driven by a fixture claude (not real Claude Code); desktop '
+                   'presentation, precedence and diagnostics are model-level (crates/made-app '
+                   'tests); native GUI and the live-SSH matrix are not certified here')
+
+CLAUDE_FIXTURE_SCRIPT = r'''#!/bin/sh
+# Fixture claude for the claude-parity loopback scenarios. It is never real
+# Claude Code: it fires the hook Made staged, prints status protocol bytes and
+# answers `agents --json` from a scenario-controlled file. Its own tools may
+# sit outside the fixture PATH (macOS keeps sed and wc in /usr/bin).
+PATH="$PATH:/usr/bin:/bin"
+if [ "$#" = 2 ] && [ "$1" = agents ] && [ "$2" = --json ]; then
+  printf 'argv:%s\n' "$*" >> '__ARGV_LOG__'
+  cat '__AGENTS__' 2>/dev/null || printf '[]\n'
+  exit 0
+fi
+printf 'argv:%s\n' "$*" >> '__ARGV_LOG__'
+printf 'pid=%s\tdirs=%s\tspool=%s\n' "$$" "${CLAUDE_CODE_PLUGIN_DIRS-<unset>}" \
+  "${MADE_CLAUDE_SPOOL-<unset>}" >> '__ENV_LOG__'
+plugin=
+if [ "$1" != --bare ]; then
+  old_ifs=$IFS
+  IFS=:
+  for entry in ${CLAUDE_CODE_PLUGIN_DIRS-}; do
+    case "$entry" in */plugins/claude-code-made) plugin=$entry ;; esac
+  done
+  IFS=$old_ifs
+fi
+ctl='__CTL_DIR__'/$$.ctl
+: > "$ctl"
+printf 'MADE_FIXTURE_CLAUDE:%s\n' "$$"
+seen=0
+while :; do
+  total=$(wc -l < "$ctl" | tr -d ' ')
+  while [ "$seen" -lt "$total" ]; do
+    seen=$((seen + 1))
+    line=$(sed -n "${seen}p" "$ctl")
+    verb=${line%% *}
+    arg=${line#* }
+    case "$verb" in
+      hook) if [ -n "$plugin" ]; then "$plugin/bin/made-claude-status" < "$arg"; fi ;;
+      emit) cat "$arg" ;;
+      cd) cd "$arg" || exit 3 ;;
+      exit) rm -f "$ctl"; exit 0 ;;
+    esac
+  done
+  sleep 0.1
+done
+'''
+
+
+def claude_hook_payload(event, session, cwd, title='', notification=None):
+    """One Claude Code hook payload: the metadata fields the hook copies plus
+    content fields carrying the privacy marker, which must never be copied."""
+    payload = {
+        'hook_event_name': event,
+        'session_id': session,
+        'cwd': cwd,
+        'transcript_path': f'/tmp/{CLAUDE_MARKER}/transcript.jsonl',
+        'prompt': f'prompt {CLAUDE_MARKER}',
+        'message': f'message {CLAUDE_MARKER}',
+        'tool_name': f'tool-{CLAUDE_MARKER}',
+        'tool_input': {'command': f'echo {CLAUDE_MARKER}'},
+    }
+    if title:
+        payload['session_title'] = title
+    if notification:
+        payload['notification_type'] = notification
+    return json.dumps(payload)
+
+
+def native_claude_hook_path(companion):
+    """The native Claude Code hook the host target ships: beside the
+    companion's own staged package (the CI artifact), else a local cargo
+    build. A missing hook is unrun, never a pass."""
+    companion = pathlib.Path(companion)
+    candidates = [companion.parent / CLAUDE_HOOK_ARTIFACT]
+    candidates += [REPO_ROOT / 'target' / profile / 'made-claude-status'
+                   for profile in ('release', 'debug')]
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK) and candidate.stat().st_size > 0:
+            return candidate
+    raise PrerequisiteError(
+        'no native made-claude-status hook beside the companion or in target/; build one '
+        'with `cargo build -p made-claude-hook`. A missing hook is unrun, not a pass')
+
+
+class ClaudeFixture(GrokFixture):
+    """The Grok fixture root plus a fixture claude, its control directory and
+    logs, a seeded remote `~/.claude` and the staged claude-code-made package
+    beside the companion. Everything stays inside the disposable root."""
+
+    def __init__(self, root, companion, hook=None):
+        super().__init__(root, companion)
+        self.hook_binary = pathlib.Path(hook) if hook else None
+        self.claudebin = self.root / 'claudebin'
+        self.claudebin.mkdir(mode=0o700, exist_ok=True)
+        self.ctl_dir = self.root / 'claude-ctl'
+        self.ctl_dir.mkdir(mode=0o700, exist_ok=True)
+        self.payload_dir = self.root / 'claude-payloads'
+        self.payload_dir.mkdir(mode=0o700, exist_ok=True)
+        self.argv_log = self.root / 'claude-argv.log'
+        self.env_log = self.root / 'claude-env.log'
+        self.agents_file = self.root / 'claude-agents.json'
+        script = (CLAUDE_FIXTURE_SCRIPT
+                  .replace('__ARGV_LOG__', str(self.argv_log))
+                  .replace('__ENV_LOG__', str(self.env_log))
+                  .replace('__AGENTS__', str(self.agents_file))
+                  .replace('__CTL_DIR__', str(self.ctl_dir)))
+        claude = self.claudebin / 'claude'
+        claude.write_text(script)
+        claude.chmod(0o755)
+        self.claude_scripts = {'claude': claude}
+        self.payloads = 0
+        self.reset_claude_logs()
+
+    @property
+    def claude_home(self):
+        return self.root / 'home' / '.claude'
+
+    def seed_claude_home(self):
+        """The remote user's own Claude Code configuration and state."""
+        home = self.claude_home
+        (home / 'sessions').mkdir(parents=True, exist_ok=True)
+        (home / 'plugins').mkdir(parents=True, exist_ok=True)
+        (home / 'settings.json').write_text('{"hooks": {}, "statusLine": null}\n')
+        (home / 'sessions' / 'existing.json').write_text('{"id": "existing"}\n')
+        (home / 'plugins' / 'installed_plugins.json').write_text('{"plugins": {}}\n')
+
+    def stage_claude_package(self):
+        """The four shipped claude-code-made artifacts beside the companion, with
+        the native hook for this host target and the SSH-06 hook mode."""
+        hook = self.hook_binary or native_claude_hook_path(self.host_companion)
+        staged = self.companion_dir / 'plugins' / 'claude-code-made'
+        for name in CLAUDE_ARTIFACTS:
+            target = self.companion_dir / name
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            source = hook if name == CLAUDE_HOOK_ARTIFACT else REPO_ROOT / name
+            shutil.copyfile(source, target)
+            target.chmod(0o700 if name == CLAUDE_HOOK_ARTIFACT else 0o644)
+        return staged
+
+    def reset_claude_logs(self):
+        for path in (self.argv_log, self.env_log):
+            path.write_text('')
+        self.set_agents([])
+        for entry in self.ctl_dir.iterdir():
+            entry.unlink()
+
+    def set_agents(self, entries):
+        self.agents_file.write_text(json.dumps(entries))
+
+    def claude_argv(self):
+        return [line[len('argv:'):] for line in self.argv_log.read_text().splitlines()
+                if line.startswith('argv:')]
+
+    def claude_env(self, pid):
+        for line in self.env_log.read_text().splitlines():
+            fields = dict(part.split('=', 1) for part in line.split('\t') if '=' in part)
+            if fields.get('pid') == str(pid):
+                return fields
+        raise AssertionError(f'the fixture claude {pid} logged no environment')
+
+    def claude_prefix(self, claude=True, plugin_dirs=None, extra=None):
+        values = dict(extra or {})
+        if plugin_dirs is not None:
+            values['CLAUDE_CODE_PLUGIN_DIRS'] = plugin_dirs
+        prefix = self.prefix(grok=False, extra=values)
+        if claude:
+            prefix = prefix.replace("PATH='", "PATH='" + str(self.claudebin) + ':', 1) \
+                if "PATH='" in prefix else prefix.replace(
+                    'PATH=', 'PATH=' + str(self.claudebin) + ':', 1)
+        return prefix
+
+    def control(self, pid, verb, arg=''):
+        path = self.ctl_dir / f'{pid}.ctl'
+        deadline = time.monotonic() + 5
+        while not path.exists():
+            if time.monotonic() > deadline:
+                raise AssertionError(f'the fixture claude {pid} has no control file')
+            time.sleep(0.05)
+        with path.open('a') as handle:
+            handle.write(f'{verb} {arg}\n')
+
+    def hook(self, pid, event, session, cwd, title='', notification=None):
+        self.payloads += 1
+        payload = self.payload_dir / f'{self.payloads}.json'
+        payload.write_text(claude_hook_payload(event, session, cwd, title, notification))
+        self.control(pid, 'hook', str(payload))
+
+    def emit(self, pid, data):
+        self.payloads += 1
+        path = self.payload_dir / f'{self.payloads}.bin'
+        path.write_bytes(data)
+        self.control(pid, 'emit', str(path))
+
+
+class ClaudeTab(GrokTab):
+    """One live companion frontend with the Claude Code operations: ClaudeState
+    round trips, ClaudeTrigger acknowledgements, and ClaudeEvent/ClaudeListing
+    pushes collected. Every received frame is kept for the privacy search."""
+
+    def __init__(self, h, fx, workspace, target='Shell', claude=True, plugin_dirs=None,
+                 extra=None, **kwargs):
+        self.claude_on_path = claude
+        self.plugin_dirs = plugin_dirs
+        self.claude_extra = extra
+        self.claude_events = []
+        self.listings = []
+        self.raw = []
+        self.last_claude = None
+        super().__init__(h, fx, workspace, target=target, **kwargs)
+
+    def _connect(self, target, grok, python3, opencode, extra, mode, attach_timeout):
+        prefix = self.fx.claude_prefix(self.claude_on_path, self.plugin_dirs, self.claude_extra)
+        self.process = self.h.ssh_process(self.fx.frontend_command(prefix))
+        self.send, self.wait = protocol(self.process, self.identity)
+        if mode == 'Open':
+            self.send('Open', {'directory': list(os.fsencode(str(self.workspace))),
+                               'target': target, 'rows': 24, 'cols': 80})
+        else:
+            self.send('Attach', {'rows': 24, 'cols': 80})
+        self.wait('Attached', timeout=attach_timeout)
+        self.opened = True
+
+    def receive_frame(self, timeout):
+        frame = super().receive_frame(timeout)
+        self.raw.append(json.dumps(frame))
+        return frame
+
+    def absorb(self, operation):
+        name = operation.get('op')
+        if name == 'ClaudeEvent':
+            self.stream_ops.append(name)
+            self.last_claude = (operation.get('data') or {}).get('snapshot') or {}
+            self.claude_events.append(self.last_claude)
+            return False
+        if name == 'ClaudeListing':
+            self.stream_ops.append(name)
+            self.listings.append((operation.get('data') or {}).get('listing') or {})
+            return False
+        return super().absorb(operation)
+
+    def pump(self, timeout):
+        try:
+            frame = self.receive_frame(timeout)
+        except TimeoutError:
+            return None
+        self.absorb(frame['operation'])
+        return frame
+
+    def claude_state(self, timeout=10):
+        """One ClaudeState round trip: the reply waits for the resnapshot."""
+        request = self.send('ClaudeState')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                frame = self.receive_frame(min(0.25, max(0.01, deadline - time.monotonic())))
+            except TimeoutError:
+                continue
+            operation = frame['operation']
+            if frame.get('request_id') == request and operation.get('op') == 'ClaudeSnapshot':
+                self.last_claude = (operation.get('data') or {}).get('snapshot') or {}
+                return self.last_claude
+            self.absorb(operation)
+        raise TimeoutError('ClaudeState was not answered')
+
+    def trigger(self, timeout=8):
+        request = self.send('ClaudeTrigger')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                frame = self.receive_frame(min(0.25, max(0.01, deadline - time.monotonic())))
+            except TimeoutError:
+                continue
+            if frame.get('request_id') == request and frame['operation'].get('op') == 'Ack':
+                return
+            self.absorb(frame['operation'])
+        raise TimeoutError('ClaudeTrigger was not acknowledged')
+
+    def wait_claude(self, predicate, timeout=8, what='Claude Code state'):
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.last_claude is not None and predicate(self.last_claude):
+                return self.last_claude
+            if time.monotonic() > deadline:
+                raise TimeoutError(f'{what} not reached; last: {self.last_claude!r}')
+            self.pump(min(0.25, max(0.01, deadline - time.monotonic())))
+
+    def wait_listing(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while True:
+            for listing in self.listings:
+                if predicate(listing):
+                    return listing
+            if time.monotonic() > deadline:
+                raise TimeoutError(f'no matching ClaudeListing; listings: {self.listings!r}')
+            self.pump(min(0.25, max(0.01, deadline - time.monotonic())))
+
+    def quiet(self, window):
+        """Collect frames for `window` seconds and return the Claude events seen."""
+        seen = len(self.claude_events)
+        deadline = time.monotonic() + window
+        while time.monotonic() < deadline:
+            self.pump(min(0.25, max(0.01, deadline - time.monotonic())))
+        return self.claude_events[seen:]
+
+    def claude_pid(self, timeout=10):
+        return int(self.wait_terminal(r'MADE_FIXTURE_CLAUDE:([0-9]+)', timeout=timeout).group(1))
+
+    def type_claude(self, command='claude'):
+        """Type a claude command in the remote shell and return the new pid."""
+        before = set(re.findall(r'MADE_FIXTURE_CLAUDE:([0-9]+)',
+                                self.terminal.decode('utf-8', 'replace')))
+        self.type(command + '\n')
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            found = set(re.findall(r'MADE_FIXTURE_CLAUDE:([0-9]+)',
+                                   self.terminal.decode('utf-8', 'replace'))) - before
+            if found:
+                return int(found.pop())
+            self.pump(0.25)
+        raise TimeoutError('the typed claude did not start')
+
+
+def claude_sessions(snapshot):
+    return [(s['session_id'], s['pid'], decode_cwd(s.get('cwd')), s['activity'])
+            for s in (snapshot or {}).get('sessions', [])]
+
+
+def claude_session_cwd(snapshot, session):
+    for entry in (snapshot or {}).get('sessions', []):
+        if entry['session_id'] == session:
+            return decode_cwd(entry.get('cwd'))
+    return None
+
+
+def claude_workdirs(fx, *names):
+    paths = []
+    for name in names:
+        path = fx.root / 'claude-work' / name
+        path.mkdir(parents=True, exist_ok=True)
+        paths.append(str(path))
+    return paths
+
+
+def staged_claude_dir(fx):
+    return str(fx.companion_dir / 'plugins' / 'claude-code-made')
+
+
+def claude_direct_launch(h, fx, workspace):
+    """`Claude Code SSH`: the detected claude starts with no arguments directly
+    as the tab child, its environment has only the staged entry (the remote
+    user has none) plus this tab's spool, no host value travels, and its hook
+    records become an owned session."""
+    os.environ['CLAUDE_CODE_PLUGIN_DIRS'] = '/host-only/plugin'
+    os.environ['MADE_CLAUDE_SPOOL'] = '/host-only/spool'
+    tab = ClaudeTab(h, fx, workspace, target='Claude')
+    try:
+        tab.collect_terminal()
+        pid = tab.claude_pid()
+        if fx.claude_argv() != ['']:
+            raise AssertionError(f'direct launch argv is not empty: {fx.claude_argv()}')
+        env = fx.claude_env(pid)
+        if env['dirs'] != staged_claude_dir(fx):
+            raise AssertionError(f'direct launch plugin dirs: {env["dirs"]}')
+        if ('host-only' in env['spool'] or '/remote/runtime/' not in env['spool']
+                or not env['spool'].endswith('/spool.jsonl')):
+            raise AssertionError(f'direct launch spool binding: {env["spool"]}')
+        state = tab.claude_state()
+        if not state['hooks_available']:
+            raise AssertionError('the staged package is unavailable for the direct tab')
+        (work,) = claude_workdirs(fx, 'direct')
+        fx.hook(pid, 'SessionStart', 'direct-1', work)
+        snapshot = tab.wait_claude(lambda s: claude_session_cwd(s, 'direct-1') == work)
+        if claude_sessions(snapshot)[0][1] != pid:
+            raise AssertionError(f'the direct session is not owned by the child: {snapshot}')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        if pid_alive(h, pid):
+            raise AssertionError('the directly launched claude survived Close')
+        return (f'Open/Claude launched the detected claude with no arguments (pid {pid}), the '
+                f'staged plugin entry and this tab\'s spool only, no host value, and an owned '
+                f'session in {work}; {CLAUDE_BOUNDARY}')
+    finally:
+        os.environ.pop('CLAUDE_CODE_PLUGIN_DIRS', None)
+        os.environ.pop('MADE_CLAUDE_SPOOL', None)
+        close_quietly(tab)
+
+
+def claude_protocol_only_bare(h, fx, workspace):
+    """`claude --bare` loads no plugin: the probe, title and status bytes pass
+    through the remote terminal unchanged, no session is ever owned, and
+    after exit the tab owns nothing."""
+    tab = ClaudeTab(h, fx, workspace)
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude('claude --bare')
+        sequences = [b'\x1b]7501;?\x07', b'\x1b]0;Bare session\x07',
+                     b'\x1b]7501;state=working:app=claude-code\x07',
+                     b'\x1b]7501;state=blocked:app=claude-code\x07',
+                     b'\x1b]7501;state=done:app=claude-code\x07']
+        (work,) = claude_workdirs(fx, 'bare')
+        fx.emit(pid, b''.join(sequences))
+        fx.hook(pid, 'SessionStart', 'bare-1', work)
+        deadline = time.monotonic() + 8
+        while not all(seq in bytes(tab.terminal) for seq in sequences):
+            if time.monotonic() > deadline:
+                raise AssertionError('the status protocol bytes were not relayed verbatim')
+            tab.pump(0.25)
+        events = tab.quiet(2.0)
+        if any(claude_sessions(event) for event in events):
+            raise AssertionError(f'--bare produced an owned session: {events}')
+        fx.control(pid, 'exit')
+        tab.quiet(1.5)
+        if pid_alive(h, pid):
+            raise AssertionError('the bare claude did not exit')
+        if claude_sessions(tab.claude_state()):
+            raise AssertionError('a session survived the bare exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return ('`claude --bare` in a remote shell: probe, title and working/blocked/done bytes '
+                'relayed verbatim through the remote terminal, no owned session, nothing after '
+                'exit; the probe reply, dot and tooltip are model-level; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+
+
+def claude_shell_typed_plugin_dirs(h, fx, workspace):
+    """A shell-typed claude whose remote user already has two plugin entries
+    gets them in order plus Made's single staged entry; Made's entry already
+    present is not added twice; the user's `~/.claude` is untouched."""
+    fx.seed_claude_home()
+    before = tree_fingerprint(fx.claude_home)
+    user = '/u/one:/u/two'
+    tab = ClaudeTab(h, fx, workspace, plugin_dirs=user)
+    again = None
+    try:
+        tab.collect_terminal()
+        pid = tab.type_claude()
+        dirs = fx.claude_env(pid)['dirs']
+        if dirs != user + ':' + staged_claude_dir(fx):
+            raise AssertionError(f'composed plugin dirs: {dirs}')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        already = user + ':' + staged_claude_dir(fx)
+        again = ClaudeTab(h, fx, workspace, plugin_dirs=already)
+        again.collect_terminal()
+        pid = again.type_claude()
+        if fx.claude_env(pid)['dirs'] != already:
+            raise AssertionError('Made\'s entry was added a second time')
+        fx.control(pid, 'exit')
+        if not again.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        if tree_fingerprint(fx.claude_home) != before:
+            raise AssertionError('the remote user\'s ~/.claude changed')
+        return ('shell-typed claude: user entries kept in order plus one staged entry, an '
+                'already-present entry not duplicated, ~/.claude byte-identical; '
+                + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+        close_quietly(again)
+
+
+def claude_hook_follow(h, fx, workspace):
+    """Hook follow without the protocol: session start in another directory,
+    prompt, permission request, stop and a rename move the relayed session
+    directory and drive idle, busy, attention, idle with the sanitized title,
+    each within the SSH-09 two-second budget."""
+    tab = ClaudeTab(h, fx, workspace)
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude()
+        first, second = claude_workdirs(fx, 'follow-a', 'follow-b')
+        budgets = []
+        steps = [
+            (('SessionStart', 'f-1', first), lambda s: claude_session_cwd(s, 'f-1') == first
+             and s['sessions'][0]['activity'] == 'Idle'),
+            (('UserPromptSubmit', 'f-1', second),
+             lambda s: claude_session_cwd(s, 'f-1') == second
+             and s['sessions'][0]['activity'] == 'Busy'),
+            (('PermissionRequest', 'f-1', second),
+             lambda s: s['sessions'][0]['activity'] == 'Attention'),
+            (('Stop', 'f-1', second), lambda s: s['sessions'][0]['activity'] == 'Idle'),
+        ]
+        for (event, session, cwd), predicate in steps:
+            started = time.monotonic()
+            fx.hook(pid, event, session, cwd)
+            tab.wait_claude(predicate, timeout=4, what=event)
+            budgets.append(time.monotonic() - started)
+        started = time.monotonic()
+        fx.hook(pid, 'UserPromptSubmit', 'f-1', second, title='Renamed‮ task\nnow')
+        snapshot = tab.wait_claude(lambda s: s['sessions'][0]['title'].startswith('Renamed'),
+                                   timeout=4, what='rename')
+        budgets.append(time.monotonic() - started)
+        title = snapshot['sessions'][0]['title']
+        if '‮' in title or '\n' in title:
+            raise AssertionError(f'the relayed title is not sanitized: {title!r}')
+        if max(budgets) > 2.0:
+            raise AssertionError(f'a hook move exceeded the two-second budget: {budgets}')
+        fx.control(pid, 'exit')
+        tab.wait_claude(lambda s: not s['sessions'], timeout=4, what='exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return (f'hook follow: directory moves and idle/busy/attention/idle plus the sanitized '
+                f'rename, slowest {max(budgets):.2f}s within the 2s SSH-09 budget (loopback, '
+                f'not the controlled profile); exit removes the session; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+
+
+def claude_cd_via_listing(h, fx, workspace):
+    """`/cd` fires no hook: a client trigger makes the server run the detected
+    claude with exactly `agents --json`, whose listed cwd for the owned pid
+    moves the session; an idle session with no trigger runs no listing."""
+    tab = ClaudeTab(h, fx, workspace)
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude()
+        first, second = claude_workdirs(fx, 'cd-a', 'cd-b')
+        fx.hook(pid, 'SessionStart', 'cd-1', first)
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'cd-1') == first)
+        tab.quiet(3.0)
+        if 'agents --json' in fx.claude_argv():
+            raise AssertionError('a listing ran with no trigger pending')
+        fx.set_agents([{'pid': pid, 'cwd': second, 'kind': 'interactive', 'name': 'cd',
+                        'prompt': CLAUDE_MARKER}])
+        started = time.monotonic()
+        tab.trigger()
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'cd-1') == second, timeout=4,
+                        what='/cd follow')
+        elapsed = time.monotonic() - started
+        runs = [argv for argv in fx.claude_argv() if argv.startswith('agents')]
+        if not runs or set(runs) != {'agents --json'}:
+            raise AssertionError(f'listing argv: {runs}')
+        if elapsed > 2.0:
+            raise AssertionError(f'/cd follow took {elapsed:.2f}s')
+        # The next hook record with the same directory leaves it there.
+        fx.hook(pid, 'UserPromptSubmit', 'cd-1', second)
+        tab.wait_claude(lambda s: s['sessions'][0]['activity'] == 'Busy')
+        if claude_session_cwd(tab.last_claude, 'cd-1') != second:
+            raise AssertionError('the next hook record moved the session away')
+        # Listing failures change nothing: malformed output keeps the hook cwd.
+        fx.agents_file.write_text('not json')
+        tab.trigger()
+        tab.quiet(3.0)
+        if claude_session_cwd(tab.last_claude, 'cd-1') != second:
+            raise AssertionError('a malformed listing changed the session')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return (f'/cd via listing: trigger -> exactly `agents --json` on the server -> owned '
+                f'session moved in {elapsed:.2f}s; no listing while idle; malformed output '
+                f'changed nothing; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+
+
+def claude_agent_view_listing(h, fx, workspace):
+    """A fresh listing relays the agent-view background entries (normalized
+    name and directory only) for the client's title selection."""
+    tab = ClaudeTab(h, fx, workspace)
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude()
+        own, background = claude_workdirs(fx, 'av-own', 'av-bg')
+        fx.hook(pid, 'SessionStart', 'av-1', own)
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'av-1') == own)
+        fx.set_agents([
+            {'pid': pid, 'cwd': own, 'kind': 'interactive', 'name': 'own'},
+            {'pid': pid + 100000, 'cwd': background, 'kind': 'background',
+             'name': '✳ Spec task', 'transcript': CLAUDE_MARKER},
+        ])
+        tab.trigger()
+        listing = tab.wait_listing(lambda l: l.get('background'))
+        entries = [(entry['name'], decode_cwd(entry['cwd'])) for entry in listing['background']]
+        if entries != [('Spec task', background)]:
+            raise AssertionError(f'relayed background entries: {entries}')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return ('agent-view listing: one background entry relayed as normalized name '
+                '`Spec task` plus its directory, nothing else; the title selection is '
+                'model-level; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+
+
+def claude_two_tab_isolation(h, fx, workspace):
+    """Two tabs on one server: each owns only its own process tree's sessions."""
+    tab_a = ClaudeTab(h, fx, workspace)
+    tab_b = None
+    try:
+        tab_a.collect_terminal()
+        tab_a.claude_state()
+        tab_b = ClaudeTab(h, fx, workspace)
+        tab_b.collect_terminal()
+        tab_b.claude_state()
+        pid_a = tab_a.type_claude()
+        pid_b = tab_b.type_claude()
+        dir_a, dir_b = claude_workdirs(fx, 'tab-a', 'tab-b')
+        fx.hook(pid_a, 'SessionStart', 'same-id', dir_a)
+        tab_a.wait_claude(lambda s: claude_session_cwd(s, 'same-id') == dir_a)
+        fx.hook(pid_b, 'SessionStart', 'same-id', dir_b)
+        tab_b.wait_claude(lambda s: claude_session_cwd(s, 'same-id') == dir_b)
+        tab_a.quiet(1.5)
+        if claude_sessions(tab_a.last_claude) != [('same-id', pid_a, dir_a, 'Idle')]:
+            raise AssertionError(f'tab A state crossed tabs: {tab_a.last_claude}')
+        if claude_sessions(tab_b.claude_state()) != [('same-id', pid_b, dir_b, 'Idle')]:
+            raise AssertionError('tab B state crossed tabs')
+        for pid in (pid_a, pid_b):
+            fx.control(pid, 'exit')
+        if not tab_a.close() or not tab_b.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return ('two tabs on one server with the same session id: each owns only its own '
+                'ancestry; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab_a)
+        close_quietly(tab_b)
+
+
+def claude_foreign_and_reparented(h, fx, workspace):
+    """A claude reparented out of the tab's tree (as under a tmux server) and a
+    claude in a separate SSH login with a copied spool binding write to the
+    tab's spool, and neither is claimed."""
+    tab = ClaudeTab(h, fx, workspace)
+    foreign = None
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        own = tab.type_claude()
+        spool = fx.claude_env(own)['spool']
+        fx.control(own, 'exit')
+        tab.quiet(0.5)
+        # Reparented away from the tab's process tree, like a tmux server child.
+        tab.type('(claude > /dev/null 2>&1 &)\n')
+        deadline = time.monotonic() + 10
+        reparented = None
+        while reparented is None:
+            pids = [int(line.split('\t')[0][4:]) for line in fx.env_log.read_text().splitlines()
+                    if line.startswith('pid=')]
+            fresh = [pid for pid in pids if pid != own]
+            reparented = fresh[-1] if fresh else None
+            if reparented is None and time.monotonic() > deadline:
+                raise AssertionError('the reparented claude did not start')
+            tab.pump(0.25)
+        # A separate SSH login of the same server user with the copied binding.
+        foreign = h.ssh_process(fx.claude_prefix(extra={
+            'MADE_CLAUDE_SPOOL': spool,
+            'CLAUDE_CODE_PLUGIN_DIRS': staged_claude_dir(fx)}) + ' claude')
+        foreign_pid = int(re.search(rb'MADE_FIXTURE_CLAUDE:([0-9]+)',
+                                    foreign.stdout.readline()).group(1))
+        dirs = claude_workdirs(fx, 'reparented', 'foreign')
+        fx.hook(reparented, 'SessionStart', 'reparented-1', dirs[0])
+        fx.hook(foreign_pid, 'SessionStart', 'foreign-1', dirs[1])
+        events = tab.quiet(3.0)
+        if any(claude_sessions(event) for event in events) or claude_sessions(tab.claude_state()):
+            raise AssertionError(f'a foreign or reparented session was claimed: {events}')
+        for pid in (reparented, foreign_pid):
+            fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return ('a reparented claude (as under tmux) and a separate-login claude with the '
+                'copied spool binding were claimed by no tab; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+        if foreign is not None and foreign.poll() is None:
+            foreign.kill()
+            foreign.wait(timeout=5)
+
+
+def claude_loss_and_reattach(h, fx, workspace, outage=60.0):
+    """A 60 s transport loss: Claude Code keeps running, its outage records
+    apply on the server, and the reattached client receives one fresh snapshot
+    (revision 1, after the resnapshot) with the current directory and status;
+    no outage record replays individually."""
+    tab = ClaudeTab(h, fx, workspace)
+    fresh = None
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude()
+        before, during = claude_workdirs(fx, 'loss-before', 'loss-during')
+        fx.hook(pid, 'SessionStart', 'loss-1', before)
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'loss-1') == before)
+        epoch = tab.identity['epoch']
+        tab.kill_transport()
+        fx.hook(pid, 'UserPromptSubmit', 'loss-1', before)
+        fx.hook(pid, 'CwdChanged', 'loss-1', during)
+        time.sleep(outage)
+        fresh = ClaudeTab(h, fx, workspace, identity=tab.identity, epoch=epoch + 1,
+                          mode='Attach')
+        if fresh.error is not None:
+            raise AssertionError(f'the reattach failed: {fresh.error}')
+        snapshot = fresh.claude_state(timeout=15)
+        if snapshot['revision'] != 1:
+            raise AssertionError(f'the reattach did not start a fresh revision: {snapshot}')
+        if claude_sessions(snapshot) != [('loss-1', pid, during, 'Busy')]:
+            raise AssertionError(f'the fresh snapshot is not the current state: {snapshot}')
+        if 'TerminalOutput' not in fresh.stream_ops:
+            raise AssertionError('the snapshot arrived before any resnapshot frame')
+        replays = [event for event in fresh.quiet(1.5)
+                   if claude_session_cwd(event, 'loss-1') == before]
+        if replays:
+            raise AssertionError(f'an outage record replayed individually: {replays}')
+        if not pid_alive(h, pid):
+            raise AssertionError('Claude Code did not survive the outage')
+        fx.control(pid, 'exit')
+        if not fresh.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        fresh.opened = False
+        tab.opened = False
+        return (f'a {outage:.0f}s transport loss: the same claude (pid {pid}) kept running, the '
+                f'reattached client got one fresh revision-1 snapshot with the outage '
+                f'directory and busy status after the resnapshot, no replay; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+        close_quietly(fresh)
+
+
+def claude_older_supervisor_and_stage(h, fx, workspace):
+    """Older companion artifacts without the package: shell and claude still
+    start, no entry points at the missing package and the tab reports hooks
+    unavailable. A client that never sends ClaudeState (as an older client
+    attached to this supervisor) receives no Claude Code frame."""
+    shutil.rmtree(fx.companion_dir / 'plugins' / 'claude-code-made', ignore_errors=True)
+    tab = ClaudeTab(h, fx, workspace)
+    quiet = None
+    try:
+        tab.collect_terminal()
+        if tab.claude_state()['hooks_available']:
+            raise AssertionError('hooks reported available without the staged package')
+        pid = tab.type_claude()
+        if fx.claude_env(pid)['dirs'] != '<unset>':
+            raise AssertionError('a plugin entry was added without the staged package')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        fx.stage_claude_package()
+        quiet = ClaudeTab(h, fx, workspace)
+        quiet.collect_terminal()
+        pid = quiet.type_claude()
+        (work,) = claude_workdirs(fx, 'quiet')
+        fx.hook(pid, 'SessionStart', 'quiet-1', work)
+        quiet.quiet(3.0)
+        claude_ops = [op for op in quiet.stream_ops if op.startswith('Claude')]
+        if claude_ops:
+            raise AssertionError(f'a client that never asked received {claude_ops}')
+        fx.control(pid, 'exit')
+        if not quiet.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        return ('companion artifacts without claude-code-made: shell and claude start with no '
+                'plugin entry and hooks unavailable; a client that never sends ClaudeState '
+                'receives no Claude Code frame; the client-side helper_version gate is '
+                'model-level; an older supervisor binary was not available here; '
+                + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+        close_quietly(quiet)
+        fx.stage_claude_package()
+
+
+def claude_privacy_and_home(h, fx, workspace):
+    """Prompt, message, tool and transcript markers reach no relay frame and
+    no app-owned spool, and the remote user's `~/.claude` stays byte-identical."""
+    fx.seed_claude_home()
+    before = tree_fingerprint(fx.claude_home)
+    tab = ClaudeTab(h, fx, workspace)
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude()
+        spool = pathlib.Path(fx.claude_env(pid)['spool'])
+        (work,) = claude_workdirs(fx, 'privacy')
+        for event in ('SessionStart', 'UserPromptSubmit', 'PermissionRequest', 'Notification',
+                      'Stop'):
+            fx.hook(pid, event, 'p-1', work, notification='permission_prompt')
+        fx.set_agents([{'pid': pid, 'cwd': work, 'kind': 'interactive',
+                        'prompt': CLAUDE_MARKER}])
+        tab.trigger()
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'p-1') == work)
+        tab.quiet(3.0)
+        spool_bytes = spool.read_bytes() if spool.exists() else b''
+        if not spool_bytes:
+            raise AssertionError('the spool recorded nothing to search')
+        relay = [frame for frame in tab.raw if '"Claude' in frame]
+        if not relay:
+            raise AssertionError('no Claude Code relay frame to search')
+        for name, text in (('spool', spool_bytes.decode('utf-8', 'replace')),
+                           ('relay', '\n'.join(relay))):
+            if CLAUDE_MARKER in text:
+                raise AssertionError(f'the privacy marker reached the {name}')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        if tree_fingerprint(fx.claude_home) != before:
+            raise AssertionError('the remote user\'s ~/.claude changed')
+        return (f'markers in prompt, message, tool and transcript fields reached neither the '
+                f'{len(spool_bytes)}-byte spool nor {len(relay)} relay frames; ~/.claude stayed '
+                f'byte-identical (that it was not read is the file-access audit of '
+                f'crates/made-remote/tests/claude.rs); client logs/diagnostics are model-level; '
+                + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+
+
+def claude_undetected(h, fx, workspace):
+    """claude off the remote PATH the detection sees: no Claude Code launch,
+    a claude started by absolute path in the shell still loads the staged
+    plugin and follows hooks, and a trigger runs no listing."""
+    tab = ClaudeTab(h, fx, workspace, claude=False)
+    direct = None
+    try:
+        tab.collect_terminal()
+        tab.claude_state()
+        pid = tab.type_claude(shlex.quote(str(fx.claude_scripts['claude'])))
+        if fx.claude_env(pid)['dirs'] != staged_claude_dir(fx):
+            raise AssertionError('the shell-typed claude did not get the staged entry')
+        (work,) = claude_workdirs(fx, 'undetected')
+        fx.hook(pid, 'SessionStart', 'u-1', work)
+        tab.wait_claude(lambda s: claude_session_cwd(s, 'u-1') == work)
+        tab.trigger()
+        tab.quiet(3.0)
+        if any(argv.startswith('agents') for argv in fx.claude_argv()):
+            raise AssertionError('a listing ran although claude was not detected')
+        fx.control(pid, 'exit')
+        if not tab.close():
+            raise AssertionError('remote cleanup unconfirmed')
+        direct = ClaudeTab(h, fx, workspace, target='Claude', claude=False,
+                           attach_timeout=8)
+        if direct.error is None:
+            raise AssertionError('Open/Claude started without a detected claude')
+        return ('claude undetected: Open/Claude refused, a shell-typed claude still loads the '
+                'staged plugin and follows hooks, no listing runs; ' + CLAUDE_BOUNDARY)
+    finally:
+        close_quietly(tab)
+        close_quietly(direct)
+
+
+CLAUDE_SCENARIOS = (
+    ('direct-launch', claude_direct_launch, True),
+    ('protocol-only-bare', claude_protocol_only_bare, True),
+    ('shell-typed-plugin-dirs', claude_shell_typed_plugin_dirs, True),
+    ('hook-follow', claude_hook_follow, True),
+    ('cd-via-listing', claude_cd_via_listing, True),
+    ('agent-view-listing', claude_agent_view_listing, True),
+    ('two-tab-isolation', claude_two_tab_isolation, True),
+    ('foreign-and-reparented-not-claimed', claude_foreign_and_reparented, True),
+    ('older-supervisor-and-stage', claude_older_supervisor_and_stage, True),
+    ('privacy-and-claude-home', claude_privacy_and_home, True),
+    ('claude-undetected', claude_undetected, True),
+    ('loss-and-reattach', claude_loss_and_reattach, True),
+)
+
+
+def run_claude_scenarios(harness, fixture, workspace, only):
+    results = []
+    fixture.reset_stage()
+    fixture.stage_claude_package()
+    for name, scenario, needs_session in CLAUDE_SCENARIOS:
+        if only and name not in only:
+            continue
+        fixture.reset_claude_logs()
+        shutil.rmtree(fixture.claude_home, ignore_errors=True)
+        if needs_session:
+            reason = supervisor_unavailable(harness, fixture, workspace)
+            if reason is not None:
+                print(f'BLOCKED claude/{name}: scenario unrun — {reason.splitlines()[0]}')
+                results.append((name, 'blocked', reason))
+                continue
+        try:
+            evidence = scenario(harness, fixture, workspace)
+            print(f'PASS claude/{name} — {evidence}')
+            results.append((name, 'pass', evidence))
+        except SupervisorPreflightError as exc:
+            print(f'BLOCKED claude/{name}: {exc}')
+            results.append((name, 'blocked', str(exc)))
+        except (AssertionError, TimeoutError, EOFError, ValueError,
+                subprocess.SubprocessError, OSError) as exc:
+            print(f'FAIL claude/{name}: {type(exc).__name__}: {exc}', file=sys.stderr)
+            results.append((name, 'fail', str(exc)))
+    counts = {}
+    for _, status, _ in results:
+        counts[status] = counts.get(status, 0) + 1
+    tally = ', '.join(f'{key}={value}' for key, value in sorted(counts.items())) or 'none ran'
+    print(f'SUMMARY claude/claude-parity: {tally}')
+    return 0 if counts.get('pass') and not counts.get('fail') else 2
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=(
         'inspect', 'ssh-smoke', 'capabilities', 'survival', 'container-survival',
-        'grok-parity', 'grok-first-fail'))
+        'grok-parity', 'grok-first-fail', 'claude-parity'))
     parser.add_argument('--frontend', help='explicit companion remote frontend/bootstrap command')
     parser.add_argument('--companion', help='Linux aarch64 companion binary to upload')
     parser.add_argument('--fingerprint', help='out-of-band verified SHA256 host-key fingerprint')
     parser.add_argument('--host-companion',
                         help='locally built companion binary for the loopback Grok scenarios')
-    parser.add_argument('--scenario', help='comma-separated subset of the grok scenarios')
+    parser.add_argument('--scenario',
+                        help='comma-separated subset of the grok or claude scenarios')
     args = parser.parse_args()
     if args.mode == 'inspect':
         print(json.dumps({'platform': platform.platform(), 'machine': platform.machine(),
@@ -2238,6 +3158,15 @@ def main():
             fixture = GrokFixture(harness.root, companion)
             print(f'command: loopback grok parity with companion {companion}')
             return run_grok_scenarios(harness, fixture, workspace, args.mode, only)
+    if args.mode == 'claude-parity':
+        companion = resolve_host_companion(args.host_companion)
+        only = ({name.strip() for name in args.scenario.split(',')}
+                if args.scenario else None)
+        with Harness() as harness:
+            workspace = fixtures(harness.root)
+            fixture = ClaudeFixture(harness.root, companion)
+            print(f'command: loopback claude parity with companion {companion}')
+            return run_claude_scenarios(harness, fixture, workspace, only)
     if args.mode in ('capabilities', 'survival') and not args.frontend:
         raise PrerequisiteError('--frontend required: companion CLI/bootstrap is not frozen')
     with Harness() as harness:

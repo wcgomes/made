@@ -6985,6 +6985,7 @@ mod tests {
             integration_error: None,
             focus: None,
             grok: None,
+            claude: None,
             mode: ExplorerMode::Files,
             cleanup_unconfirmed: false,
         }
@@ -7414,6 +7415,7 @@ mod tests {
             integration_error: None,
             focus: None,
             grok: None,
+            claude: None,
             mode: ExplorerMode::Files,
             cleanup_unconfirmed: false,
         };

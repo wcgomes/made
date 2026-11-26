@@ -260,6 +260,12 @@ struct RemoteTab {
     companion_opencode: Option<bool>,
     /// Pending `Capabilities` request sent after the current attach.
     capabilities_request: Option<u64>,
+    /// Whether the current attach's supervisor decodes the Claude Code
+    /// operations, from its `Capabilities.helper_version`; `None` until the
+    /// reply. An older supervisor is never sent them.
+    claude_supported: Option<bool>,
+    /// Pending `ClaudeState` request of the current attach.
+    claude_state_request: Option<u64>,
     // END remote-path
     probe: Option<crate::ssh_servers::ProbeAttempt>,
     stage: Option<crate::ssh_servers::StageAttempt>,
@@ -304,6 +310,52 @@ struct RemoteTab {
     next_upload: u64,
 }
 
+// BEGIN remote-path (AIA-02)
+/// Whether a supervisor whose `Capabilities.helper_version` is `helper`
+/// decodes the Claude Code operations. An older supervisor treats an unknown
+/// operation as a fatal decode error, so only a supervisor of this release or
+/// a newer one is sent them; an unparsable version is older. Pre-release and
+/// build suffixes are ignored, so `0.2.0-beta.1` counts as `0.2.0`.
+fn claude_ops_supported(helper: &str) -> bool {
+    fn parse(version: &str) -> Option<(u64, u64, u64)> {
+        let core = version.split(['-', '+']).next()?;
+        let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+        let version = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(version)
+    }
+    matches!((parse(helper), parse(APP_VERSION)), (Some(helper), Some(own)) if helper >= own)
+}
+
+/// Ask the current attach's supervisor for its Claude Code state, but only
+/// when its `helper_version` says it decodes the operation.
+fn arm_claude_state(
+    remote: &mut RemoteTab,
+    client: &made_remote::client::RemoteClient,
+    helper: &str,
+) {
+    let supported = claude_ops_supported(helper);
+    remote.claude_supported = Some(supported);
+    remote.claude_state_request = supported
+        .then(|| {
+            client
+                .request(made_remote::protocol::Operation::ClaudeState, None)
+                .ok()
+        })
+        .flatten();
+}
+
+/// A client reset drops the pending `ClaudeState`, whose reply the server
+/// defers until its resnapshot completes; ask again so the attachment still
+/// receives its fresh snapshot.
+fn rearm_claude_state(remote: &mut RemoteTab, client: &made_remote::client::RemoteClient) {
+    if remote.claude_state_request.is_some() {
+        remote.claude_state_request = client
+            .request(made_remote::protocol::Operation::ClaudeState, None)
+            .ok();
+    }
+}
+// END remote-path
+
 impl RemoteTab {
     fn connecting(
         snapshot: crate::ssh_servers::ServerSnapshot,
@@ -340,6 +392,8 @@ impl RemoteTab {
             opencode_detected: false,
             companion_opencode: None,
             capabilities_request: None,
+            claude_supported: None,
+            claude_state_request: None,
             // END remote-path
             probe: None,
             stage: None,
@@ -739,6 +793,8 @@ impl Workbench {
             opencode_detected: false,
             companion_opencode: None,
             capabilities_request: None,
+            claude_supported: None,
+            claude_state_request: None,
             // END remote-path
             probe: None,
             stage: None,
@@ -2831,6 +2887,9 @@ impl Workbench {
         }
         self.pump_remote_client();
         self.sync_remote_sessions();
+        // BEGIN remote-path (AIA-02)
+        self.sync_remote_claude();
+        // END remote-path
         let terminal_changed = self.pump_remote_terminal();
         self.poll_integrations(Instant::now());
         self.pump_remote_upload();
@@ -3375,7 +3434,15 @@ impl Workbench {
                             } = &reply.operation
                             {
                                 remote.companion_opencode = Some(capabilities.opencode);
+                                arm_claude_state(remote, &client, &capabilities.helper_version);
                             }
+                            continue;
+                        }
+                        // The deferred Claude Code state reply never uses the
+                        // workspace id map; it is not root-generation scoped.
+                        if remote.claude_state_request == Some(reply.request_id) {
+                            remote.claude_state_request = None;
+                            let _ = remote.workspace.accept_claude(reply);
                             continue;
                         }
                         // END remote-path
@@ -3454,8 +3521,12 @@ impl Workbench {
                         if let Ok(Some(crate::remote_workspace::RemoteResult::Root(path))) =
                             remote.workspace.accept_root(resolution)
                         {
-                            if generation > client.identity().generation {
-                                let _ = client.set_root(path, generation);
+                            if generation > client.identity().generation
+                                && client.set_root(path, generation).is_ok()
+                            {
+                                // BEGIN remote-path (AIA-02)
+                                rearm_claude_state(remote, &client);
+                                // END remote-path
                             }
                         }
                     }
@@ -3477,6 +3548,15 @@ impl Workbench {
                                 | made_remote::protocol::Operation::GrokEvent { .. }
                         ) {
                             let _ = remote.workspace.accept_grok_push(reply);
+                            continue;
+                        }
+                        // Claude Code events and listings are pushes too.
+                        if matches!(
+                            reply.operation,
+                            made_remote::protocol::Operation::ClaudeEvent { .. }
+                                | made_remote::protocol::Operation::ClaudeListing { .. }
+                        ) {
+                            let _ = remote.workspace.accept_claude(reply);
                             continue;
                         }
                         // END remote-path
@@ -3548,6 +3628,9 @@ impl Workbench {
                         remote.workspace.disconnect();
                         break;
                     }
+                    // BEGIN remote-path (AIA-02)
+                    rearm_claude_state(remote, &client);
+                    // END remote-path
                 }
                 match client.request(operation, grant.as_ref()) {
                     Ok(client_id) => {
@@ -3563,7 +3646,61 @@ impl Workbench {
             let _ = remote.workspace.reconcile();
         };
         self.sync_remote_sessions();
+        // BEGIN remote-path (AIA-02)
+        self.sync_remote_claude();
+        // END remote-path
     }
+
+    // BEGIN remote-path (AIA-02)
+    /// Hand the remote workspace's owned Claude Code state to the tab, send
+    /// a listing trigger the tab detected, and feed the tab's selected
+    /// directory into the remote root precedence. Nothing here reads host
+    /// processes or host paths.
+    fn sync_remote_claude(&mut self) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let Some(state) = crate::integrations::claude_code::tab_state_mut(
+            self.integrations,
+            &mut self.tab_states,
+        ) else {
+            return;
+        };
+        let hooks = match remote.claude_supported {
+            Some(false) => Some(false),
+            _ => remote.workspace.claude_hooks_available(),
+        };
+        let listing = remote.workspace.take_claude_listing();
+        let sessions = remote
+            .workspace
+            .projection()
+            .claude
+            .as_ref()
+            .map(|snapshot| snapshot.sessions.clone())
+            .unwrap_or_default();
+        state.apply_remote(
+            &sessions,
+            listing.as_ref(),
+            self.terminal.as_ref().and_then(TerminalPane::title),
+            hooks,
+        );
+        // A trigger carries no input or title bytes and goes only to a
+        // supervisor that decodes it; the server ignores it while the tab
+        // owns no live session.
+        if state.take_remote_trigger()
+            && remote.claude_supported == Some(true)
+            && remote.attach_request.is_none()
+        {
+            if let Some(client) = remote.client.as_ref() {
+                let _ = client.request(made_remote::protocol::Operation::ClaudeTrigger, None);
+            }
+        }
+        let directory = state.remote_directory().and_then(|directory| {
+            made_remote::protocol::RemotePath::new(directory.into_bytes()).ok()
+        });
+        let _ = remote.workspace.set_claude_root(directory);
+    }
+    // END remote-path
 
     /// Mirror the remote projection's session snapshot into the shared session
     /// map and drop stale rows once the remote integration no longer carries
@@ -3602,6 +3739,10 @@ impl Workbench {
             remote.client = None;
             remote.attach_request = None;
             remote.capabilities_request = None;
+            // BEGIN remote-path (AIA-02)
+            remote.claude_supported = None;
+            remote.claude_state_request = None;
+            // END remote-path
             remote.deferred_shell_cwd = None;
             remote.holding_input = false;
             remote.upload = None;
@@ -3741,6 +3882,8 @@ impl Workbench {
         // The companion's own OpenCode capability for this attach feeds the
         // diagnostics row. Attach never depends on the reply.
         remote.companion_opencode = None;
+        remote.claude_supported = None;
+        remote.claude_state_request = None;
         remote.capabilities_request = remote.client.as_ref().and_then(|client| {
             client
                 .request(made_remote::protocol::Operation::Capabilities, None)
@@ -5119,6 +5262,13 @@ impl Workbench {
         if let Some(report) = self.remote_opencode_diagnostics() {
             snapshot.set_remote_opencode(report);
         }
+        if let Some(remote) = self.remote.as_ref() {
+            if remote.claude_supported == Some(false) {
+                snapshot.set_remote_claude_detail("older supervisor");
+            } else if remote.workspace.claude_hooks_available() == Some(false) {
+                snapshot.set_remote_claude_detail("staged package unavailable");
+            }
+        }
         // END remote-path
         for (key, report) in self.row_reports() {
             snapshot.set_row(key, report);
@@ -5629,6 +5779,20 @@ mod tests {
     use crate::integrations::claude_code::launch::{CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV};
     use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
     use crate::integrations::{claude_code, grok, GROK, OPENCODE};
+
+    #[test]
+    fn the_claude_ops_gate_ignores_pre_release_and_build_suffixes() {
+        assert!(claude_ops_supported(APP_VERSION));
+        assert!(claude_ops_supported(&format!("{APP_VERSION}-beta.1")));
+        assert!(claude_ops_supported(&format!("{APP_VERSION}+build.7")));
+        assert!(claude_ops_supported(&format!("{APP_VERSION}-rc.2+sha.1")));
+        assert!(claude_ops_supported("999.0.0-alpha"));
+        assert!(!claude_ops_supported("0.0.1"));
+        assert!(!claude_ops_supported("0.0.1-beta.9"));
+        assert!(!claude_ops_supported("probe"));
+        assert!(!claude_ops_supported("1.2"));
+        assert!(!claude_ops_supported(""));
+    }
 
     impl Workbench {
         /// The Claude Code state of this tab.
@@ -8561,9 +8725,9 @@ mod tests {
         }
 
         #[test]
-        fn a_remote_tab_presents_grok_build_before_claude_code() {
-            // SSH-10 before SSH-11: a remote tab that presents Grok Build
-            // keeps it even though Claude Code ranks ahead of Grok Build.
+        fn a_remote_tab_presents_claude_code_before_grok_build() {
+            // The remote order equals the local order: present Claude Code
+            // presents before open Grok Build sessions.
             let (mut bench, attach) = remote_claude_bench();
             let brand = |bench: &RemoteBench| {
                 crate::ui::tab_brand(&bench.workbench).map(|(entry, _)| entry.descriptor().key)
@@ -8601,16 +8765,17 @@ mod tests {
             assert!(bench.workbench.claude_tab().unwrap().present());
             assert_eq!(
                 brand(&bench),
-                Some("grok"),
-                "an open Grok Build session presents before Claude Code"
+                Some("claude-code"),
+                "present Claude Code presents before an open Grok Build session"
             );
 
-            push(&mut bench, grok_snapshot(2, false, vec![]));
-            assert_eq!(
-                brand(&bench),
-                Some("claude-code"),
-                "Claude Code presents again once Grok Build has nothing open"
+            // Grok Build presents again once Claude Code is gone.
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=clear:app=claude-code\x07",
             );
+            assert_eq!(brand(&bench), Some("grok"));
         }
 
         #[test]
@@ -8677,18 +8842,27 @@ mod tests {
             );
             assert_eq!(
                 row(&bench),
+                (Inactive, "Claude Code is starting.".to_owned()),
+                "an emission without a live owned session is still starting"
+            );
+            // Past the grace period with no live owned session, the local
+            // hooks sentence applies; the over-SSH sentence is retired.
+            bench.workbench.claude_state_mut().set_present_since(Some(
+                Instant::now() - crate::integrations::claude_code::diagnostics::CLAUDE_GRACE * 2,
+            ));
+            assert_eq!(
+                row(&bench),
                 (
                     Degraded,
-                    "Claude Code session-status hooks are unavailable over SSH.".to_owned()
-                ),
-                "an emission proves the protocol, never remote hooks"
+                    "Claude Code session-status hooks are unavailable.".to_owned()
+                )
             );
             let report = bench.workbench.sanitized_diagnostics_text();
             assert!(
-                report
-                    .contains("claude: Claude Code session-status hooks are unavailable over SSH."),
+                report.contains("claude: Claude Code session-status hooks are unavailable."),
                 "{report}"
             );
+            assert!(!report.contains("over SSH"), "{report}");
             assert!(
                 !report.contains("Claude Code session follow is ready."),
                 "{report}"
@@ -8780,7 +8954,8 @@ mod tests {
                 row(&bench),
                 (Inactive, "Claude Code is starting.".to_owned())
             );
-            // A probe alone, past the grace period: protocol unavailable.
+            // Past the grace period with no live owned session: the local
+            // hooks sentence.
             bench.workbench.claude_state_mut().set_present_since(Some(
                 Instant::now() - crate::integrations::claude_code::diagnostics::CLAUDE_GRACE * 2,
             ));
@@ -8788,7 +8963,7 @@ mod tests {
                 row(&bench),
                 (
                     Degraded,
-                    "Claude Code status protocol is unavailable.".to_owned()
+                    "Claude Code session-status hooks are unavailable.".to_owned()
                 )
             );
             remote_terminal_bytes(
@@ -8798,7 +8973,8 @@ mod tests {
             );
             assert_eq!(
                 row(&bench).1,
-                "Claude Code session-status hooks are unavailable over SSH."
+                "Claude Code session-status hooks are unavailable.",
+                "an emission without a live owned session past the grace period"
             );
             // The remote claude exits: not present, so the tab returns to the
             // server-name label and terminal glyph.
@@ -8817,6 +8993,609 @@ mod tests {
             bench.workbench.poll_integrations(Instant::now());
             assert!(!bench.workbench.claude_tab().unwrap().present());
             assert_eq!(row(&bench).1, "Claude Code is not running.");
+        }
+
+        fn claude_session(
+            id: &str,
+            pid: u32,
+            cwd: Option<&str>,
+            recency: u64,
+            activity: made_remote::protocol::ClaudeActivity,
+        ) -> made_remote::protocol::ClaudeSessionInfo {
+            made_remote::protocol::ClaudeSessionInfo {
+                session_id: id.to_owned(),
+                pid,
+                cwd: cwd.map(remote_path),
+                activity,
+                title: String::new(),
+                recency,
+                nested: false,
+            }
+        }
+
+        fn claude_state(
+            revision: u64,
+            sessions: Vec<made_remote::protocol::ClaudeSessionInfo>,
+        ) -> made_remote::protocol::ClaudeSessionSnapshot {
+            made_remote::protocol::ClaudeSessionSnapshot {
+                revision,
+                hooks_available: true,
+                sessions,
+            }
+        }
+
+        fn capabilities(helper: &str) -> Operation {
+            Operation::CapabilitiesResult {
+                capabilities: made_remote::protocol::Capabilities {
+                    target: made_remote::protocol::RemoteTarget::LinuxX64,
+                    tmux: false,
+                    opencode: false,
+                    shell_cwd: false,
+                    helper_version: helper.to_owned(),
+                    grok: false,
+                    python3: false,
+                },
+            }
+        }
+
+        /// Answer what a remote tab sends while it attaches and follows: root
+        /// checks and selections, listings, watches, Git and OpenCode reads,
+        /// Capabilities from `helper`, and trigger acknowledgements. Returns
+        /// whether the frame was answered.
+        fn serve(bench: &RemoteBench, frame: &WireEnvelope, helper: &str) -> bool {
+            let answer = match &frame.operation {
+                Operation::RootValidate { path } => root_result(frame, path),
+                Operation::RootSelect { path } => {
+                    let mut result = root_result(frame, path);
+                    if let Operation::RootResult { generation, .. } = &mut result {
+                        *generation += 1;
+                    }
+                    result
+                }
+                Operation::List { path } => listed(path),
+                Operation::Watch { path } => Operation::Changed { path: path.clone() },
+                Operation::GitRead { .. } | Operation::SessionState | Operation::GrokState => {
+                    Operation::Error {
+                        code: ErrorCode::Unavailable,
+                    }
+                }
+                Operation::Capabilities => capabilities(helper),
+                Operation::ClaudeTrigger => Operation::Ack,
+                _ => return false,
+            };
+            bench.reply(frame, answer);
+            true
+        }
+
+        /// A remote shell tab attached to a supervisor of `helper`, served
+        /// until its Claude Code state request (when it sends one).
+        fn claude_parity_bench(helper: &str) -> (RemoteBench, u64, Option<WireEnvelope>) {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            let mut state = None;
+            let mut answered = None;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                for frame in bench.take_written() {
+                    if matches!(frame.operation, Operation::Capabilities) {
+                        answered = Some(Instant::now());
+                    }
+                    if matches!(frame.operation, Operation::ClaudeState) {
+                        state = Some(frame);
+                    } else {
+                        serve(&bench, &frame, helper);
+                    }
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                let settled = remote.attached_once && !remote.holding_input;
+                // A supervisor that is not asked gets a quiet window to prove it.
+                if settled
+                    && (state.is_some()
+                        || answered.is_some_and(|at| at.elapsed() > Duration::from_millis(200)))
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the remote tab did not attach");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                answered.is_some(),
+                "the per-attach Capabilities request was sent"
+            );
+            (bench, attach, state)
+        }
+
+        /// Pump, poll and serve until `done`, collecting the triggers sent.
+        fn settle_claude(
+            bench: &mut RemoteBench,
+            mut done: impl FnMut(&RemoteBench) -> bool,
+        ) -> usize {
+            let mut triggers = 0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                bench.pump();
+                for frame in bench.take_written() {
+                    triggers += usize::from(matches!(frame.operation, Operation::ClaudeTrigger));
+                    serve(bench, &frame, APP_VERSION);
+                }
+                if done(bench) {
+                    return triggers;
+                }
+                assert!(Instant::now() < deadline, "the remote tab did not settle");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Pump a fixed number of rounds and count the triggers sent.
+        fn quiet_triggers(bench: &mut RemoteBench) -> usize {
+            let mut rounds = 0;
+            settle_claude(bench, |_| {
+                rounds += 1;
+                rounds > 20
+            })
+        }
+
+        fn claude_push(bench: &RemoteBench, attach: u64, operation: Operation) {
+            bench.send(WireEnvelope::new(
+                current_identity(bench),
+                attach,
+                operation,
+            ));
+        }
+
+        fn remote_root(bench: &RemoteBench) -> (RemotePath, RootSource) {
+            let workspace = &bench.workbench.remote.as_ref().unwrap().workspace;
+            (workspace.root().clone(), workspace.projection().source)
+        }
+
+        fn root_current(bench: &RemoteBench) -> bool {
+            bench
+                .workbench
+                .remote_workspace()
+                .unwrap()
+                .projection()
+                .root_state
+                == crate::remote_workspace::Freshness::Current
+        }
+
+        fn brand_key(bench: &RemoteBench) -> Option<&'static str> {
+            crate::ui::tab_brand(&bench.workbench).map(|(entry, _)| entry.descriptor().key)
+        }
+
+        #[test]
+        fn remote_claude_root_and_presentation_follow_the_local_order() {
+            use made_remote::protocol::ClaudeActivity as Remote;
+
+            let (mut bench, attach, state) = claude_parity_bench(APP_VERSION);
+            let state = state.expect("a current supervisor is asked for Claude Code state");
+            // The deferred reply carries one owned busy session.
+            bench.reply(
+                &state,
+                Operation::ClaudeSnapshot {
+                    snapshot: claude_state(
+                        1,
+                        vec![claude_session("a", 40, Some("/claude-a"), 1, Remote::Busy)],
+                    ),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/claude-a"), RootSource::Claude)
+            });
+            assert_eq!(brand_key(&bench), Some("claude-code"));
+            assert_eq!(
+                bench.workbench.claude_tab().unwrap().dots(),
+                vec![crate::integrations::claude_code::follow::ClaudeActivity::Busy]
+            );
+
+            // An open Grok session is retained under Claude Code.
+            let identity = current_identity(&bench);
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .accept_grok_push(grok_snapshot_envelope(
+                    &identity,
+                    attach,
+                    grok_snapshot(
+                        1,
+                        true,
+                        vec![grok_session("g", Some("/grok-a"), 1, GrokActivity::Idle)],
+                    ),
+                ))
+                .unwrap();
+            settle_claude(&mut bench, root_current);
+            assert_eq!(
+                remote_root(&bench),
+                (remote_path("/claude-a"), RootSource::Claude)
+            );
+            assert_eq!(brand_key(&bench), Some("claude-code"));
+
+            // The session ends: Grok gets the root and the tab back.
+            claude_push(
+                &bench,
+                attach,
+                Operation::ClaudeEvent {
+                    snapshot: claude_state(2, vec![]),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/grok-a"), RootSource::Grok)
+            });
+            assert_eq!(brand_key(&bench), Some("grok"));
+
+            // Protocol-only presence brands the tab but holds no root.
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            settle_claude(&mut bench, |bench| brand_key(bench) == Some("claude-code"));
+            assert_eq!(remote_root(&bench).1, RootSource::Grok);
+
+            // OpenCode outranks Claude Code, whose directory is retained.
+            claude_push(
+                &bench,
+                attach,
+                Operation::SessionSnapshot {
+                    snapshot: active_snapshot(1, "/opencode"),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/opencode"), RootSource::Session)
+            });
+            assert_eq!(brand_key(&bench), Some("opencode"));
+            claude_push(
+                &bench,
+                attach,
+                Operation::ClaudeEvent {
+                    snapshot: claude_state(
+                        3,
+                        vec![claude_session("b", 41, Some("/claude-b"), 2, Remote::Idle)],
+                    ),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                bench.workbench.claude_tab().unwrap().session_count() == 1
+            });
+            assert_eq!(remote_root(&bench).0, remote_path("/opencode"));
+            assert_eq!(brand_key(&bench), Some("opencode"));
+            claude_push(
+                &bench,
+                attach,
+                Operation::SessionSnapshot {
+                    snapshot: empty_snapshot(2),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/claude-b"), RootSource::Claude)
+            });
+            // A connected OpenCode keeps the tab's presentation.
+            assert_eq!(brand_key(&bench), Some("opencode"));
+        }
+
+        #[test]
+        fn remote_claude_directories_are_validated_on_the_remote_authority_only() {
+            use made_remote::protocol::ClaudeActivity as Remote;
+
+            let (mut bench, _attach, state) = claude_parity_bench(APP_VERSION);
+            let state = state.expect("Claude Code state is requested");
+            settle_claude(&mut bench, root_current);
+            let before = remote_root(&bench);
+            // A path that exists only on the host must be checked by the
+            // server; the server rejects it and the explorer stays.
+            let host_only = std::env::temp_dir();
+            let host_only = host_only.to_str().unwrap().trim_end_matches('/');
+            bench.reply(
+                &state,
+                Operation::ClaudeSnapshot {
+                    snapshot: claude_state(
+                        1,
+                        vec![claude_session("a", 40, Some(host_only), 1, Remote::Idle)],
+                    ),
+                },
+            );
+            let mut selected = false;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !selected {
+                assert!(Instant::now() < deadline, "the server was not asked");
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                bench.pump();
+                for frame in bench.take_written() {
+                    match &frame.operation {
+                        Operation::RootSelect { path }
+                            if path.as_bytes() == host_only.as_bytes() =>
+                        {
+                            selected = true;
+                            bench.reply(
+                                &frame,
+                                Operation::Error {
+                                    code: ErrorCode::Unavailable,
+                                },
+                            );
+                        }
+                        _ => {
+                            serve(&bench, &frame, APP_VERSION);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            settle_claude(&mut bench, root_current);
+            assert_eq!(remote_root(&bench), before);
+        }
+
+        #[test]
+        fn remote_claude_disconnect_clears_status_dots_title_and_root() {
+            use made_remote::protocol::ClaudeActivity as Remote;
+
+            let (mut bench, attach, state) = claude_parity_bench(APP_VERSION);
+            let mut session = claude_session("b", 40, Some("/claude-b"), 1, Remote::Busy);
+            session.title = "Session B".to_owned();
+            bench.reply(
+                &state.unwrap(),
+                Operation::ClaudeSnapshot {
+                    snapshot: claude_state(1, vec![session]),
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/claude-b"), RootSource::Claude)
+            });
+            assert_eq!(
+                bench.workbench.claude_tab().unwrap().tooltip_title(None),
+                "Session B"
+            );
+            // Another epoch's item never applies to this attachment.
+            let mut old = current_identity(&bench);
+            old.epoch += 1;
+            assert!(bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .accept_claude(WireEnvelope::new(
+                    old,
+                    attach,
+                    Operation::ClaudeEvent {
+                        snapshot: claude_state(5, vec![]),
+                    },
+                ))
+                .is_err());
+            quiet_triggers(&mut bench);
+            assert_eq!(bench.workbench.claude_tab().unwrap().session_count(), 1);
+
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            bench.pump();
+            bench.workbench.poll_integrations(Instant::now());
+            bench.pump();
+            assert!(!bench
+                .workbench
+                .claude_tab()
+                .is_some_and(|tab| tab.present() || !tab.dots().is_empty()));
+            let workspace = bench.workbench.remote_workspace().unwrap();
+            assert!(workspace.projection().claude.is_none());
+            assert!(
+                bench
+                    .workbench
+                    .claude_tab()
+                    .and_then(|tab| tab.directory())
+                    .is_none(),
+                "no session-driven root survives the transport"
+            );
+            assert_eq!(brand_key(&bench), None);
+        }
+
+        #[test]
+        fn an_older_supervisor_is_never_sent_claude_code_operations() {
+            use crate::diagnostics::DiagnosticsPill::Degraded;
+
+            let (mut bench, attach, state) = claude_parity_bench("0.0.1");
+            assert!(
+                state.is_none(),
+                "an older supervisor cannot decode ClaudeState"
+            );
+            bench.workbench.set_remote_claude_detection(Some(true));
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            {
+                let workbench = &mut bench.workbench;
+                workbench.terminal.as_mut().unwrap().send_key(
+                    made_terminal::Key::Enter,
+                    made_terminal::Modifiers::default(),
+                    workbench.diag.log_mut(),
+                );
+            }
+            let mut sent = Vec::new();
+            for _ in 0..20 {
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                bench.pump();
+                sent.extend(bench.take_written());
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!sent.iter().any(|frame| matches!(
+                frame.operation,
+                Operation::ClaudeState | Operation::ClaudeTrigger
+            )));
+            let snapshot = bench.workbench.diagnostics_snapshot();
+            let row = snapshot.row("claude status").unwrap();
+            assert_eq!(
+                (row.pill, row.sentence.as_str()),
+                (
+                    Degraded,
+                    "Claude Code session-status hooks are unavailable."
+                )
+            );
+            let text = snapshot.to_text();
+            assert!(text.contains("ssh claude code: older supervisor"), "{text}");
+        }
+
+        /// One poll can drain the deferred state reply (generic queue) before
+        /// the pushes that preceded it (session queue): event 1, listing 2 and
+        /// the reply 3 arrive together. No listing may be lost to that order.
+        #[test]
+        fn a_listing_drained_after_a_newer_state_reply_still_applies() {
+            use made_remote::protocol::ClaudeActivity as Remote;
+
+            let (mut bench, attach, state) = claude_parity_bench(APP_VERSION);
+            let state = state.expect("Claude Code state is requested");
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07\x1b]0;\xe2\x9c\xb3 Spec task\x07",
+            );
+            let session = || claude_session("a", 40, Some("/claude-a"), 1, Remote::Idle);
+            claude_push(
+                &bench,
+                attach,
+                Operation::ClaudeEvent {
+                    snapshot: claude_state(1, vec![session()]),
+                },
+            );
+            claude_push(
+                &bench,
+                attach,
+                Operation::ClaudeListing {
+                    listing: made_remote::protocol::ClaudeListingResult {
+                        revision: 2,
+                        background: vec![made_remote::protocol::ClaudeBackgroundEntry {
+                            name: "Spec task".to_owned(),
+                            cwd: remote_path("/bg-spec"),
+                        }],
+                    },
+                },
+            );
+            bench.reply(
+                &state,
+                Operation::ClaudeSnapshot {
+                    snapshot: claude_state(3, vec![session()]),
+                },
+            );
+            // Let the transport queue all three before the tab drains them.
+            thread::sleep(Duration::from_millis(100));
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/bg-spec"), RootSource::Claude)
+            });
+        }
+
+        #[test]
+        fn remote_claude_triggers_carry_nothing_and_follow_the_local_trigger_set() {
+            use made_remote::protocol::ClaudeActivity as Remote;
+
+            let (mut bench, attach, state) = claude_parity_bench(APP_VERSION);
+            // No owned session: neither input nor a title sends a trigger.
+            {
+                let workbench = &mut bench.workbench;
+                workbench.terminal.as_mut().unwrap().send_key(
+                    made_terminal::Key::Enter,
+                    made_terminal::Modifiers::default(),
+                    workbench.diag.log_mut(),
+                );
+            }
+            assert_eq!(quiet_triggers(&mut bench), 0);
+
+            // The tab starts owning a session: one trigger.
+            bench.reply(
+                &state.unwrap(),
+                Operation::ClaudeSnapshot {
+                    snapshot: claude_state(
+                        1,
+                        vec![claude_session("a", 40, Some("/claude-a"), 1, Remote::Idle)],
+                    ),
+                },
+            );
+            let mut triggers = settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/claude-a"), RootSource::Claude)
+            });
+            triggers += quiet_triggers(&mut bench);
+            assert_eq!(triggers, 1, "a session starting to be owned triggers once");
+
+            // An idle session sends none.
+            assert_eq!(quiet_triggers(&mut bench), 0);
+
+            // A submitted line sends one; typed text without a newline none.
+            {
+                let workbench = &mut bench.workbench;
+                let log = workbench.diag.log_mut();
+                let terminal = workbench.terminal.as_mut().unwrap();
+                terminal.send_key(
+                    made_terminal::Key::Char('x'),
+                    made_terminal::Modifiers::default(),
+                    log,
+                );
+            }
+            assert_eq!(quiet_triggers(&mut bench), 0);
+            {
+                let workbench = &mut bench.workbench;
+                workbench.terminal.as_mut().unwrap().send_key(
+                    made_terminal::Key::Enter,
+                    made_terminal::Modifiers::default(),
+                    workbench.diag.log_mut(),
+                );
+            }
+            assert_eq!(quiet_triggers(&mut bench), 1);
+
+            // A title change counts only while a protocol status is live.
+            remote_terminal_bytes(&mut bench, attach, b"\x1b]0;Other title\x07");
+            assert_eq!(quiet_triggers(&mut bench), 0);
+            remote_terminal_bytes(
+                &mut bench,
+                attach,
+                b"\x1b]7501;state=working:app=claude-code\x07",
+            );
+            let first = quiet_triggers(&mut bench);
+            remote_terminal_bytes(&mut bench, attach, b"\x1b]0;\xe2\x9c\xb3 Spec task\x07");
+            assert_eq!(first + quiet_triggers(&mut bench), 2);
+
+            // The agent-view listing selects the background entry the title
+            // names, and the explorer returns once the title changes.
+            claude_push(
+                &bench,
+                attach,
+                Operation::ClaudeListing {
+                    listing: made_remote::protocol::ClaudeListingResult {
+                        revision: 2,
+                        background: vec![made_remote::protocol::ClaudeBackgroundEntry {
+                            name: "Spec task".to_owned(),
+                            cwd: remote_path("/bg-spec"),
+                        }],
+                    },
+                },
+            );
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/bg-spec"), RootSource::Claude)
+            });
+            remote_terminal_bytes(&mut bench, attach, b"\x1b]0;\xe2\x9c\xb3 Claude Code\x07");
+            settle_claude(&mut bench, |bench| {
+                remote_root(bench) == (remote_path("/claude-a"), RootSource::Claude)
+            });
         }
 
         #[test]

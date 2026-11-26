@@ -29,7 +29,6 @@
 //! discarded, and nothing is logged.
 
 use std::ffi::OsStr;
-use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -39,11 +38,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+pub(crate) use made_remote::claude::{background_cwd_for_name, cwd_for_pid, normalize_title};
+pub use made_remote::claude::{parse_agents, AgentCwd};
 
-use super::follow::MAX_TITLE_CHARS;
 use crate::integrations::CLAUDE_CODE;
-use crate::sanitize::sanitize_display;
 
 /// When the runs of one burst are due, measured from its [`trigger`].
 const BURST: [Duration; 3] = [
@@ -71,30 +69,6 @@ const STEP: Duration = Duration::from_millis(10);
 /// Most output bytes read from one run.
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 
-/// One running Claude Code session as `claude agents --json` reports it.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AgentCwd {
-    pub pid: u32,
-    /// Untrusted and unvalidated, exactly like a hook record's `cwd`.
-    pub cwd: String,
-    /// A background (agent-view) session: matched only by name, never by pid.
-    pub background: bool,
-    /// The session name normalized by [`normalize_title`]; kept only for
-    /// background sessions. Untrusted display text, never logged.
-    pub name: String,
-}
-
-/// Leaves out the untrusted `cwd` and `name`.
-impl fmt::Debug for AgentCwd {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentCwd")
-            .field("pid", &self.pid)
-            .field("background", &self.background)
-            .finish_non_exhaustive()
-    }
-}
-
 /// The output of one successful run.
 pub(crate) struct AgentSnapshot {
     /// When the run started: the reported directories are at least this new.
@@ -102,86 +76,6 @@ pub(crate) struct AgentSnapshot {
     /// The trigger burst the run served.
     pub burst: u64,
     pub entries: Vec<AgentCwd>,
-}
-
-#[derive(Deserialize)]
-struct RawAgent {
-    #[serde(default)]
-    pid: Option<u32>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-/// Parse `claude agents --json` output, or `None` when it is not a JSON array.
-/// Entries that are malformed or lack a pid or a directory are dropped.
-pub fn parse_agents(json: &[u8]) -> Option<Vec<AgentCwd>> {
-    let raw: Vec<serde_json::Value> = serde_json::from_slice(json).ok()?;
-    Some(
-        raw.into_iter()
-            .filter_map(|value| serde_json::from_value::<RawAgent>(value).ok())
-            .filter_map(|agent| {
-                let pid = agent.pid.filter(|pid| *pid != 0)?;
-                let cwd = agent.cwd.filter(|cwd| !cwd.is_empty())?;
-                let background = agent.kind.as_deref() == Some("background");
-                let name = match agent.name.as_deref() {
-                    Some(name) if background => normalize_title(name),
-                    _ => String::new(),
-                };
-                Some(AgentCwd {
-                    pid,
-                    cwd,
-                    background,
-                    name,
-                })
-            })
-            .collect(),
-    )
-}
-
-/// The directory `entries` report for the Claude Code process `pid`. A
-/// background session never matches by pid.
-pub(crate) fn cwd_for_pid(entries: &[AgentCwd], pid: u32) -> Option<&str> {
-    entries
-        .iter()
-        .find(|entry| !entry.background && entry.pid == pid)
-        .map(|entry| entry.cwd.as_str())
-}
-
-/// Whether `c` is a status glyph Claude Code may put before its window title:
-/// a Braille spinner frame (U+2800 to U+28FF), a Dingbats star or asterisk
-/// (U+2700 to U+27BF, such as `✳` and `✻`), a middle dot or a bullet.
-fn is_title_glyph(c: char) -> bool {
-    matches!(c, '\u{2800}'..='\u{28FF}' | '\u{2700}'..='\u{27BF}' | '·' | '•' | '●')
-}
-
-/// A window title or session name reduced to the text that is compared:
-/// sanitized and capped exactly as the tooltip title is, then every leading
-/// status glyph and whitespace character removed, then trailing whitespace
-/// removed.
-pub(crate) fn normalize_title(text: &str) -> String {
-    sanitize_display(text, MAX_TITLE_CHARS)
-        .trim_start_matches(|c: char| c.is_whitespace() || is_title_glyph(c))
-        .trim_end()
-        .to_owned()
-}
-
-/// The directory of the one background session whose name equals `name`, a
-/// window title already normalized by [`normalize_title`]. An empty name, no
-/// match or more than one background session with that name gives `None`;
-/// interactive sessions never match.
-pub(crate) fn background_cwd_for_name<'a>(entries: &'a [AgentCwd], name: &str) -> Option<&'a str> {
-    if name.is_empty() {
-        return None;
-    }
-    let mut matches = entries
-        .iter()
-        .filter(|entry| entry.background && entry.name == name);
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first.cwd.as_str())
 }
 
 struct Poller {

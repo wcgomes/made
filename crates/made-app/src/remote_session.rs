@@ -261,6 +261,10 @@ pub const STAGE_FILES: &[&str] = &[
     "plugins/grok-made/README.md",
     "plugins/grok-made/hooks/hooks.json",
     "plugins/grok-made/hooks/bin/made-grok-status",
+    "plugins/claude-code-made/.claude-plugin/plugin.json",
+    "plugins/claude-code-made/README.md",
+    "plugins/claude-code-made/hooks/hooks.json",
+    "plugins/claude-code-made/bin/made-claude-status",
 ];
 
 /// Build the Stage stdin body. Consent false is a hard refusal from the
@@ -430,13 +434,25 @@ mod tests {
     #[test]
     fn stage_body_requires_consent_and_embeds_hashes() {
         // One entry per STAGE_FILES element: the fixed staging header, the
-        // companion binary, and both complete plugin packages.
+        // companion binary, and the three complete plugin packages.
         let files: Vec<Vec<u8>> = STAGE_FILES
             .iter()
             .enumerate()
             .map(|(index, _)| vec![b'a' + index as u8])
             .collect();
-        assert_eq!(files.len(), 10);
+        assert_eq!(files.len(), 14);
+        for name in [
+            "plugins/claude-code-made/.claude-plugin/plugin.json",
+            "plugins/claude-code-made/README.md",
+            "plugins/claude-code-made/hooks/hooks.json",
+            "plugins/claude-code-made/bin/made-claude-status",
+        ] {
+            assert!(STAGE_FILES.contains(&name), "{name} is staged");
+        }
+        assert!(
+            stage_body(true, "0.1.0", "x86_64-unknown-linux-gnu", &files[..13]).is_err(),
+            "a 13-file payload is not the shipped set"
+        );
         assert!(stage_body(false, "0.1.0", "x86_64-unknown-linux-gnu", &files).is_err());
         let body = stage_body(true, "0.1.0", "x86_64-unknown-linux-gnu", &files).unwrap();
         let text = String::from_utf8_lossy(&body);

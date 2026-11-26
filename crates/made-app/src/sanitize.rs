@@ -7,6 +7,7 @@
 //! single place that strips them before any text reaches a label or a log.
 
 use made_bridge::security::{redact_secret, Token};
+use made_remote::sanitize::is_format_control;
 
 /// Sanitize arbitrary display text without truncating it.
 ///
@@ -34,21 +35,9 @@ pub fn sanitize_log_text(text: &str) -> String {
 }
 
 /// Sanitize text and bound it to `max_chars`, appending an ellipsis when cut.
+/// The one implementation lives in `made-remote`, shared with the companion.
 pub fn sanitize_display(text: &str, max_chars: usize) -> String {
-    let sanitized = sanitize_text(text);
-    if max_chars == 0 {
-        return String::new();
-    }
-    let count = sanitized.chars().count();
-    if count <= max_chars {
-        return sanitized;
-    }
-    if max_chars == 1 {
-        return "…".to_owned();
-    }
-    let mut truncated: String = sanitized.chars().take(max_chars - 1).collect();
-    truncated.push('…');
-    truncated
+    made_remote::sanitize::sanitize_display(text, max_chars)
 }
 
 /// Prepare text for the clipboard: sanitize display controls, optionally
@@ -63,29 +52,35 @@ pub fn sanitize_copy_text(text: &str, token: Option<&Token>, max_chars: usize) -
     }
 }
 
-fn is_format_control(character: char) -> bool {
-    matches!(
-        character,
-        '\u{00AD}' // soft hyphen
-            | '\u{061C}' // Arabic letter mark
-            | '\u{180E}' // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM, RLM
-            | '\u{202A}'..='\u{202E}' // bidi embedding/override
-            | '\u{2060}'..='\u{2064}' // word joiner and invisible operators
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{206A}'..='\u{206F}' // deprecated format controls
-            | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation controls
-            | '\u{1D173}'..='\u{1D17A}' // musical format controls
-            | '\u{E0001}' // language tag
-            | '\u{E0020}'..='\u{E007F}' // tag characters
-            | '\u{FEFF}' // zero-width no-break space
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use made_bridge::security::Token;
+
+    #[test]
+    fn display_sanitization_has_one_source_shared_with_the_companion() {
+        let samples = [
+            "plain",
+            "tab\tnew\nline\u{2028}sep",
+            "bidi\u{202e}rev\u{2066}iso\u{200b}zw\u{feff}bom\u{e0041}tag",
+            "\u{1b}]0;title\u{7}",
+            "long title that is cut",
+        ];
+        for text in samples {
+            for max in [0, 1, 5, 120] {
+                assert_eq!(
+                    sanitize_display(text, max),
+                    made_remote::sanitize::sanitize_display(text, max)
+                );
+            }
+            for character in text.chars() {
+                assert_eq!(
+                    is_format_control(character),
+                    made_remote::sanitize::is_format_control(character)
+                );
+            }
+        }
+    }
 
     #[test]
     fn controls_escape_sequences_bidi_and_zero_width_are_stripped() {

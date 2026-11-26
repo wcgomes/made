@@ -4,6 +4,7 @@
 use made_bridge::{config, config_guard::ConfigSnapshot, remote_rpc::RpcConnection};
 use made_platform::{Environment, PathsInputs, Platform, PlatformFamily, PtyRequest};
 use made_remote::{
+    claude,
     filesystem::native,
     grok::{self, GrokFiles},
     integration::{resolve_config, Integration},
@@ -256,7 +257,8 @@ fn daemon() -> io::Result<()> {
             (program, vec![OsString::from("dashboard")])
         }
         // Direct Claude Code launch: the detected absolute claude with no
-        // arguments, no shell first, no plugin, environment or bridge.
+        // arguments, no shell first and no bridge. Its environment gets only
+        // the staged Claude Code plugin entry and spool binding below.
         LaunchTarget::Claude => {
             let program = grok::detect_on_path(&environment, "claude").ok_or_else(fail)?;
             (program, Vec::new())
@@ -288,6 +290,21 @@ fn daemon() -> io::Result<()> {
     let mut env = platform.environment(&[], &[]).with_terminal_defaults();
     if let Some(i) = &integration {
         let (key, value) = i.environment();
+        env.set(key, value);
+    }
+    // Claude Code: the server-staged plugin entry, composed with the remote
+    // user's own list, and this tab's spool, for shell and Claude Code
+    // launches only. No host value is involved; an inherited spool binding
+    // never reaches another tab's processes.
+    env.remove(claude::CLAUDE_SPOOL_ENV);
+    let staged = claude::staged_plugin_dir(&std::env::current_exe()?);
+    let composed = claude::launch_environment(
+        *target,
+        staged.as_deref(),
+        &environment,
+        &claude::spool_path(&runtime),
+    );
+    for (key, value) in composed.env {
         env.set(key, value);
     }
     let launch = ChildLaunch {
@@ -376,13 +393,23 @@ const ARTIFACTS: &[&str] = &[
     "plugins/opencode-made/src/protocol.ts",
     "plugins/opencode-made/src/integration.ts",
 ];
+/// The complete shipped claude-code-made package, with the native
+/// session-event hook built for this target, staged beside grok-made.
+const CLAUDE_ARTIFACTS: &[&str] = &[
+    "plugins/claude-code-made/.claude-plugin/plugin.json",
+    "plugins/claude-code-made/README.md",
+    "plugins/claude-code-made/hooks/hooks.json",
+    "plugins/claude-code-made/bin/made-claude-status",
+];
 /// Every staged artifact: the fixed list above plus the complete shipped
-/// grok-made package, coordinated with the fixed platform staging list.
+/// grok-made and claude-code-made packages, coordinated with the fixed
+/// platform staging list.
 fn all_artifacts() -> Vec<&'static str> {
     ARTIFACTS
         .iter()
         .copied()
         .chain(grok::GROK_ARTIFACTS.iter().copied())
+        .chain(CLAUDE_ARTIFACTS.iter().copied())
         .collect()
 }
 /// Fixed marker shared with the platform stage script and its classifier.
@@ -402,7 +429,12 @@ fn recovery_required() -> io::Error {
 }
 
 fn executable_artifact(name: &str) -> bool {
-    name == "made-remote" || name == "plugins/grok-made/hooks/bin/made-grok-status"
+    matches!(
+        name,
+        "made-remote"
+            | "plugins/grok-made/hooks/bin/made-grok-status"
+            | "plugins/claude-code-made/bin/made-claude-status"
+    )
 }
 
 /// One already-written staging artifact must match size, hash and mode.
@@ -812,6 +844,10 @@ mod tests {
                 "plugins/grok-made/README.md",
                 "plugins/grok-made/hooks/hooks.json",
                 "plugins/grok-made/hooks/bin/made-grok-status",
+                "plugins/claude-code-made/.claude-plugin/plugin.json",
+                "plugins/claude-code-made/README.md",
+                "plugins/claude-code-made/hooks/hooks.json",
+                "plugins/claude-code-made/bin/made-claude-status",
             ],
             "the legacy --stage manifest must accept exactly the fixed \
              platform/app staging list"

@@ -26,10 +26,14 @@ cd "$root"
 cargo test -p made-remote --locked --target "$target"
 cargo test -p made-platform --test headless --locked --no-default-features --target "$target"
 cargo test -p made-grok-hook --locked --target "$target"
+cargo test -p made-claude-hook --locked --target "$target"
 cargo build -p made-remote --locked --release --target "$target"
 # The native session-status hook ships beside the companion in the staged
 # grok-made package and is built for the same deployment target.
 cargo build -p made-grok-hook --locked --release --target "$target"
+# The native session-event hook ships in the staged claude-code-made package
+# and is built for the same deployment target.
+cargo build -p made-claude-hook --locked --release --target "$target"
 
 tree="$(cargo tree -p made-remote --locked --target "$target" -e features)"
 if printf '%s\n' "$tree" | grep -F 'feature "desktop"'; then
@@ -44,12 +48,14 @@ fi
 
 bin="target/${target}/release/made-remote"
 hook_bin="target/${target}/release/made-grok-status"
+claude_hook_bin="target/${target}/release/made-claude-status"
 test -s "$bin"
 test -s "$hook_bin"
-chmod 755 "$bin" "$hook_bin"
+test -s "$claude_hook_bin"
+chmod 755 "$bin" "$hook_bin" "$claude_hook_bin"
 
-# Both executables must record deployment target 12.0 and link no GUI framework.
-for artifact in "$bin" "$hook_bin"; do
+# Every executable must record deployment target 12.0 and link no GUI framework.
+for artifact in "$bin" "$hook_bin" "$claude_hook_bin"; do
   minos="$(otool -l "$artifact" | awk '/minos / { print $2 }')"
   if [ -z "$minos" ]; then
     echo "LC_BUILD_VERSION minos missing in $artifact; deployment target was not recorded" >&2
@@ -97,6 +103,6 @@ LINKAGE_KIND=macos \
 LINKAGE_DEPLOYMENT_TARGET=12.0 \
 LINKAGE_MINOS=12.0 \
   bash "$root/.github/scripts/stage-companion.sh" \
-    "$target" "$bin" "$hook_bin" "$root/dist/ssh-companion-${target}"
+    "$target" "$bin" "$hook_bin" "$claude_hook_bin" "$root/dist/ssh-companion-${target}"
 
 echo "staged macOS 12.0 companion for $target"

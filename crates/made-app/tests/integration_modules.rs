@@ -223,7 +223,7 @@ mod neutrality {
         ("diagnostics.rs", 2),
         ("tui.rs", 7),
         ("ui.rs", 10),
-        ("workbench.rs", 16),
+        ("workbench.rs", 23),
     ];
 
     /// Lines inside remote-path regions per core file (the lines between the
@@ -231,10 +231,10 @@ mod neutrality {
     /// count and shows in the diff of this list.
     const EXEMPT_LINE_COUNTS: &[(&str, usize)] = &[
         ("app.rs", 1075),
-        ("diagnostics.rs", 234),
+        ("diagnostics.rs", 241),
         ("tui.rs", 40),
-        ("ui.rs", 288),
-        ("workbench.rs", 282),
+        ("ui.rs", 286),
+        ("workbench.rs", 415),
     ];
 
     /// Core-named items that stay outside remote-path regions, in two named

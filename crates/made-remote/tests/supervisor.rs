@@ -350,6 +350,7 @@ mod live {
 
     pub struct Session {
         pub workspace: PathBuf,
+        pub runtime: PathBuf,
         _temp: tempfile::TempDir,
         identity: Identity,
         endpoint: Endpoint,
@@ -364,11 +365,23 @@ mod live {
         /// Starts the supervisor with `args` for `/bin/bash` and an environment
         /// that, like a non-interactive SSH exec session, has no locale.
         pub fn start(args: &[&str]) -> (Self, TcpStream) {
+            Self::start_with(args, false, |_| {})
+        }
+
+        /// Like [`Self::start`]; `claude_spool` binds the tab's Claude Code
+        /// spool the way the companion's launch composition does, and `plant`
+        /// prepares the runtime root before the supervisor starts.
+        pub fn start_with(
+            args: &[&str],
+            claude_spool: bool,
+            plant: impl FnOnce(&Path),
+        ) -> (Self, TcpStream) {
             let temp = tempfile::tempdir().unwrap();
             let workspace = std::fs::canonicalize(temp.path()).unwrap().join("work");
             std::fs::create_dir_all(&workspace).unwrap();
             let runtime = temp.path().join("remote/runtime/sha256-0123456789abcdef");
             made_platform::ensure_private_directory(&runtime).unwrap();
+            plant(runtime.parent().unwrap());
             let identity = Identity {
                 authority: AuthorityId::random().unwrap(),
                 tab: TabCapability::random().unwrap(),
@@ -391,7 +404,15 @@ mod live {
                 ("PATH".into(), "/usr/bin:/bin".into()),
                 ("TERM".into(), "xterm-256color".into()),
                 ("PS1".into(), "$ ".into()),
-            ];
+            ]
+            .into_iter()
+            .chain(claude_spool.then(|| {
+                (
+                    made_remote::claude::CLAUDE_SPOOL_ENV.into(),
+                    made_remote::claude::spool_path(&runtime).into(),
+                )
+            }))
+            .collect();
             let supervisor = Supervisor::create(
                 &first,
                 runtime.clone(),
@@ -417,6 +438,7 @@ mod live {
             };
             let session = Self {
                 workspace,
+                runtime,
                 _temp: temp,
                 identity,
                 endpoint,
@@ -451,6 +473,14 @@ mod live {
                 1,
                 Operation::Attach { rows, cols },
             ))
+        }
+
+        pub fn request(&self, stream: &mut TcpStream, request: u64, operation: Operation) {
+            write_envelope(
+                stream,
+                &WireEnvelope::new(self.identity.clone(), request, operation),
+            )
+            .expect("send request");
         }
 
         pub fn type_text(&self, stream: &mut TcpStream, request: u64, text: &str) {
@@ -731,5 +761,200 @@ fn reattach_restores_the_shell_cwd_the_client_forgot() {
         Operation::ShellCwd { path } if path.as_bytes() == expected => Some(()),
         _ => None,
     });
+    session.close(stream);
+}
+
+#[test]
+#[cfg(unix)]
+fn the_claude_spool_is_private_runtime_state_created_without_following_symlinks() {
+    use made_remote::claude::{spool_path, ClaudeSpool};
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let runtime = root.join("remote/runtime/tab");
+    made_platform::ensure_private_directory(&runtime).unwrap();
+    let spool = ClaudeSpool::create(&runtime).unwrap();
+    assert_eq!(spool.path(), spool_path(&runtime));
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&runtime.join("claude")), 0o700);
+    assert_eq!(mode(spool.path()), 0o600);
+    // The shipped hook writes only to `<...>/claude/<pid>-<id>/<name>.jsonl`
+    // with Made's `owner.lock` beside it, in a private directory.
+    let parent = spool.path().parent().unwrap();
+    let owner = parent.file_name().unwrap().to_str().unwrap();
+    let (pid, id) = owner.split_once('-').expect("`<pid>-<id>` spool directory");
+    assert!(!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty());
+    assert_eq!(parent.parent().unwrap(), runtime.join("claude"));
+    assert!(spool.path().extension().is_some_and(|ext| ext == "jsonl"));
+    assert!(std::fs::symlink_metadata(parent.join("owner.lock"))
+        .unwrap()
+        .is_file());
+    assert_eq!(mode(parent), 0o700);
+    assert!(ClaudeSpool::create(&runtime).is_err(), "never reused");
+    drop(spool);
+    assert!(
+        !runtime.join("claude").exists(),
+        "teardown removes the spool"
+    );
+
+    // A planted symlink is never followed.
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let other = root.join("remote/runtime/other");
+    made_platform::ensure_private_directory(&other).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, other.join("claude")).unwrap();
+    assert!(ClaudeSpool::create(&other).is_err());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert!(std::fs::symlink_metadata(other.join("claude"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+#[cfg(unix)]
+fn the_helper_start_sweep_removes_only_spools_whose_supervisor_is_gone() {
+    use made_remote::claude::{sweep_stale_spools, ClaudeSpool};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("remote/runtime");
+    let live = root.join("live");
+    made_platform::ensure_private_directory(&live).unwrap();
+    let spool = ClaudeSpool::create(&live).unwrap();
+    // A supervisor that died: its lock file exists and nobody holds it.
+    let dead = root.join("dead/claude/0-supervisor");
+    made_platform::ensure_private_directory(&root.join("dead/claude")).unwrap();
+    made_platform::ensure_private_directory(&dead).unwrap();
+    std::fs::write(dead.join("owner.lock"), "").unwrap();
+    std::fs::write(dead.join("spool.jsonl"), "{}\n").unwrap();
+    // A supervisor still creating its spool has no lock file yet.
+    let starting = root.join("starting/claude");
+    made_platform::ensure_private_directory(&starting).unwrap();
+    // A symlinked spool directory is not followed.
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("owner.lock"), "").unwrap();
+    made_platform::ensure_private_directory(&root.join("linked")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, root.join("linked/claude")).unwrap();
+
+    assert_eq!(sweep_stale_spools(&root), 1);
+    assert!(!root.join("dead/claude").exists());
+    assert!(spool.path().exists(), "a live supervisor's spool stays");
+    assert!(starting.exists());
+    assert!(elsewhere.join("owner.lock").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_bound_spool_lives_with_the_managed_session_and_goes_with_its_teardown() {
+    let (session, mut stream) =
+        live::Session::start_with(&["--noprofile", "--norc"], true, |runtime_root| {
+            let stale = runtime_root.join("stale/claude/0-supervisor");
+            made_platform::ensure_private_directory(&runtime_root.join("stale/claude")).unwrap();
+            made_platform::ensure_private_directory(&stale).unwrap();
+            std::fs::write(stale.join("owner.lock"), "").unwrap();
+            std::fs::write(stale.join("spool.jsonl"), "").unwrap();
+        });
+    let runtime_root = session.runtime.parent().unwrap().to_path_buf();
+    assert!(
+        !runtime_root.join("stale/claude").exists(),
+        "the helper-start sweep removed the dead supervisor's spool"
+    );
+    let spool = made_remote::claude::spool_path(&session.runtime);
+    assert!(spool.is_file());
+    let mut wire = Vec::new();
+    live::prompt_until(&mut stream, &mut wire);
+    // The binding reaches the shell, and a Claude Code session ending does
+    // not remove the spool.
+    session.type_text(
+        &mut stream,
+        2,
+        "printf '%s\\n' \"spool=$MADE_CLAUDE_SPOOL\"; printf '{\"sessionId\":\"s\",\"status\":\"ended\",\"pids\":[]}\\n' >> \"$MADE_CLAUDE_SPOOL\"\n",
+    );
+    live::output_until(
+        &mut stream,
+        &mut wire,
+        &format!("spool={}", spool.display()),
+    );
+    thread::sleep(Duration::from_millis(300));
+    assert!(spool.is_file(), "kept when only a Claude Code session ends");
+    let claude_dir = spool.parent().unwrap().parent().unwrap().to_path_buf();
+    session.close(stream);
+    assert!(
+        !claude_dir.exists(),
+        "owned-session teardown removes the spool"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_state_follows_the_completing_resnapshot_and_reattach_gets_a_fresh_snapshot() {
+    let (mut session, mut stream) =
+        live::Session::start_with(&["--noprofile", "--norc"], true, |_| {});
+    let mut wire = Vec::new();
+    live::prompt_until(&mut stream, &mut wire);
+    // Pushes start only once the client asks for Claude Code state.
+    session.request(&mut stream, 4, Operation::ClaudeState);
+    let initial = live::frames_until(&mut stream, |operation| match operation {
+        Operation::ClaudeSnapshot { snapshot } => Some(snapshot.clone()),
+        _ => None,
+    });
+    assert!(initial.hooks_available && initial.sessions.is_empty());
+    // A Claude Code stand-in under the tab's shell fires one hook record with
+    // content fields Made must never relay.
+    session.type_text(&mut stream, 2, "set +H\n");
+    session.type_text(
+        &mut stream,
+        3,
+        "sleep 30 & printf '{\"sessionId\":\"s1\",\"cwd\":\"%s\",\"event\":\"SessionStart\",\"status\":\"idle\",\"pids\":[%s],\"prompt\":\"MARKER-PROMPT-s1\"}\\n' \"$PWD\" \"$!\" >> \"$MADE_CLAUDE_SPOOL\"\n",
+    );
+    let first = live::frames_until(&mut stream, |operation| match operation {
+        Operation::ClaudeEvent { snapshot } if !snapshot.sessions.is_empty() => {
+            Some(snapshot.clone())
+        }
+        _ => None,
+    });
+    assert!(first.hooks_available);
+    assert_eq!(first.sessions[0].session_id, "s1");
+    let expected_cwd = session.workspace.as_os_str().as_encoded_bytes().to_vec();
+    assert_eq!(
+        first.sessions[0].cwd.as_ref().unwrap().as_bytes(),
+        expected_cwd
+    );
+
+    // Reattach: a state request sent at once is answered only after the
+    // completing resnapshot frame, with a fresh snapshot of the live state.
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+    let mut stream = session.reattach(2, 24, 80);
+    session.request(&mut stream, 5, Operation::ClaudeState);
+    let mut done_seen = false;
+    let fresh = live::frames_until(&mut stream, |operation| match operation {
+        Operation::TerminalOutput { done: true, .. } => {
+            done_seen = true;
+            None
+        }
+        Operation::ClaudeEvent { snapshot } | Operation::ClaudeSnapshot { snapshot } => {
+            assert!(
+                done_seen,
+                "Claude Code state before the completing resnapshot frame"
+            );
+            Some(snapshot.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        fresh.revision, 1,
+        "a new epoch starts a fresh revision sequence"
+    );
+    assert_eq!(fresh.sessions, first.sessions);
+    let encoded = serde_json::to_string(&fresh).unwrap();
+    assert!(!encoded.contains("MARKER"));
+    // A trigger is acknowledged; no claude is on this PATH, so nothing runs.
+    session.request(&mut stream, 6, Operation::ClaudeTrigger);
+    live::frames_until(&mut stream, |operation| {
+        matches!(operation, Operation::Ack).then_some(())
+    });
+    session.type_text(&mut stream, 7, "kill %1\n");
     session.close(stream);
 }

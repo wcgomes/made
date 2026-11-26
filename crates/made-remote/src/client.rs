@@ -186,6 +186,12 @@ impl State {
             Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. } if !grok_state_reply => {
                 self.sessions.push_back(frame.clone())
             }
+            // Claude Code events and listings are always unsolicited pushes;
+            // a ClaudeSnapshot is the reply to a pending ClaudeState and keeps
+            // the generic reply queue.
+            Operation::ClaudeEvent { .. } | Operation::ClaudeListing { .. } => {
+                self.sessions.push_back(frame.clone())
+            }
             Operation::Error { code } => {
                 if let Some(p) = self.pending.get(&frame.request_id) {
                     match p.request.operation {
@@ -220,6 +226,10 @@ impl State {
             frame.operation,
             Operation::GrokSnapshot { .. } | Operation::GrokEvent { .. }
         ) && !grok_state_reply)
+            && !matches!(
+                frame.operation,
+                Operation::ClaudeEvent { .. } | Operation::ClaudeListing { .. }
+            )
             && !self.pending.get(&frame.request_id).is_some_and(|p| {
                 matches!(
                     p.request.operation,
@@ -282,7 +292,7 @@ impl State {
         // A reset or accepted root transition deliberately abandons old-root
         // work. Late replies for those request ids are drained, not treated as
         // forged replies that would disconnect the new root. Unsolicited
-        // SessionSnapshot and Grok push events reuse the current Open/Attach
+        // SessionSnapshot, Grok and Claude Code push events reuse the current Open/Attach
         // request id, so only that event source survives the discard window;
         // downstream revision/identity validation still rejects stale or
         // foreign state.
@@ -291,6 +301,8 @@ impl State {
             Operation::SessionSnapshot { .. }
                 | Operation::GrokSnapshot { .. }
                 | Operation::GrokEvent { .. }
+                | Operation::ClaudeEvent { .. }
+                | Operation::ClaudeListing { .. }
         ) && self.attach_request == Some(frame.request_id);
         if !unsolicited_plugin
             && !self.pending.contains_key(&frame.request_id)
@@ -320,6 +332,11 @@ impl State {
                     matches!(pending.request.operation, Operation::GrokState)
                 }) =>
             {
+                return self.deliver(frame);
+            }
+            // Claude Code events and listings are never replies; they ride the
+            // attach id, which must not be consumed while it is pending.
+            Operation::ClaudeEvent { .. } | Operation::ClaudeListing { .. } => {
                 return self.deliver(frame);
             }
             _ => {}

@@ -1,9 +1,10 @@
 //! Pure controller/fake-transport evidence; not real SSH/TUI acceptance.
 use made_app::remote_workspace::*;
 use made_remote::protocol::{
-    AuthorityId, Chunk, DirectoryEntry, EntryKind, ErrorCode, GitRead, GrokActivity, GrokEventKind,
-    GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, PreviewKind,
-    RemotePath, TabCapability, WireEnvelope, MAX_IN_FLIGHT,
+    AuthorityId, Chunk, ClaudeActivity, ClaudeBackgroundEntry, ClaudeListingResult,
+    ClaudeSessionInfo, ClaudeSessionSnapshot, DirectoryEntry, EntryKind, ErrorCode, GitRead,
+    GrokActivity, GrokEventKind, GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity,
+    Operation, PreviewKind, RemotePath, TabCapability, WireEnvelope, MAX_IN_FLIGHT,
 };
 
 fn path(value: &str) -> RemotePath {
@@ -1526,75 +1527,527 @@ fn grok_cwd_is_used_byte_exact_and_granted_like_any_remote_report() {
     assert_eq!(workspace.projection().source, RootSource::Grok);
 }
 
+fn claude_session(id: &str, pid: u32, cwd: Option<&str>, recency: u64) -> ClaudeSessionInfo {
+    ClaudeSessionInfo {
+        session_id: id.to_owned(),
+        pid,
+        cwd: cwd.map(path),
+        activity: ClaudeActivity::Idle,
+        title: String::new(),
+        recency,
+        nested: false,
+    }
+}
+fn claude_frame(identity: &Identity, request_id: u64, operation: Operation) -> WireEnvelope {
+    WireEnvelope::new(identity.clone(), request_id, operation)
+}
+fn claude_event(revision: u64, sessions: Vec<ClaudeSessionInfo>) -> Operation {
+    Operation::ClaudeEvent {
+        snapshot: ClaudeSessionSnapshot {
+            revision,
+            hooks_available: true,
+            sessions,
+        },
+    }
+}
+fn claude_listing(revision: u64, background: &[(&str, &str)]) -> Operation {
+    Operation::ClaudeListing {
+        listing: ClaudeListingResult {
+            revision,
+            background: background
+                .iter()
+                .map(|(name, cwd)| ClaudeBackgroundEntry {
+                    name: (*name).to_owned(),
+                    cwd: path(cwd),
+                })
+                .collect(),
+        },
+    }
+}
+
+#[test]
+fn claude_relay_is_accepted_only_for_the_owning_tab_current_epoch_and_newer_revision() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    assert!(workspace.projection().claude.is_none());
+    assert_eq!(workspace.claude_hooks_available(), None);
+
+    // Another tab and a previous epoch are rejected without effect.
+    let other = model(1).identity().clone();
+    assert!(workspace
+        .accept_claude(claude_frame(&other, 1, claude_event(1, vec![])))
+        .is_err());
+    let mut stale_epoch = identity.clone();
+    stale_epoch.epoch = 0;
+    assert!(workspace
+        .accept_claude(claude_frame(&stale_epoch, 1, claude_event(1, vec![])))
+        .is_err());
+    assert!(workspace.projection().claude.is_none());
+
+    // The deferred state reply and pushes apply by revision; Claude Code
+    // state is not filesystem-generation scoped.
+    let mut moved = identity.clone();
+    moved.generation += 3;
+    workspace
+        .accept_claude(claude_frame(
+            &moved,
+            7,
+            Operation::ClaudeSnapshot {
+                snapshot: ClaudeSessionSnapshot {
+                    revision: 2,
+                    hooks_available: true,
+                    sessions: vec![claude_session("a", 40, Some("/claude-a"), 1)],
+                },
+            },
+        ))
+        .unwrap();
+    assert_eq!(workspace.claude_hooks_available(), Some(true));
+    assert_eq!(workspace.projection().claude.as_ref().unwrap().revision, 2);
+
+    // A late or duplicated item does not apply again.
+    assert!(workspace
+        .accept_claude(claude_frame(&identity, 1, claude_event(1, vec![])))
+        .is_err());
+    workspace
+        .accept_claude(claude_frame(&identity, 1, claude_event(2, vec![])))
+        .unwrap();
+    assert_eq!(
+        workspace
+            .projection()
+            .claude
+            .as_ref()
+            .unwrap()
+            .sessions
+            .len(),
+        1,
+        "an equal revision is a duplicate and changes nothing"
+    );
+    workspace
+        .accept_claude(claude_frame(&identity, 1, claude_event(3, vec![])))
+        .unwrap();
+    assert!(workspace
+        .projection()
+        .claude
+        .as_ref()
+        .unwrap()
+        .sessions
+        .is_empty());
+
+    // A listing is handed out once.
+    workspace
+        .accept_claude(claude_frame(
+            &identity,
+            1,
+            claude_listing(4, &[("Spec task", "/bg")]),
+        ))
+        .unwrap();
+    let listing = workspace.take_claude_listing().unwrap();
+    assert_eq!(listing.background[0].cwd, path("/bg"));
+    assert!(workspace.take_claude_listing().is_none());
+    workspace
+        .accept_claude(claude_frame(
+            &identity,
+            1,
+            claude_listing(4, &[("Spec task", "/bg")]),
+        ))
+        .unwrap();
+    assert!(
+        workspace.take_claude_listing().is_none(),
+        "a duplicated listing is not applied twice"
+    );
+    assert!(workspace
+        .accept_claude(claude_frame(&identity, 1, claude_listing(3, &[])))
+        .is_err());
+
+    // Corrupt or oversized items fail bounded and change nothing.
+    let mut long_title = claude_session("b", 41, None, 2);
+    long_title.title = "x".repeat(made_remote::protocol::MAX_CLAUDE_TITLE_CHARS + 1);
+    assert!(workspace
+        .accept_claude(claude_frame(
+            &identity,
+            1,
+            claude_event(9, vec![long_title])
+        ))
+        .is_err());
+    let crowded: Vec<(String, String)> = (0..=made_remote::protocol::MAX_CLAUDE_BACKGROUND)
+        .map(|index| (format!("n{index}"), format!("/bg{index}")))
+        .collect();
+    let crowded: Vec<(&str, &str)> = crowded
+        .iter()
+        .map(|(name, cwd)| (name.as_str(), cwd.as_str()))
+        .collect();
+    assert!(workspace
+        .accept_claude(claude_frame(&identity, 1, claude_listing(10, &crowded)))
+        .is_err());
+    assert!(workspace
+        .accept_claude(claude_frame(
+            &identity,
+            1,
+            Operation::GrokSnapshot {
+                snapshot: grok_snapshot(11, true, vec![]),
+            },
+        ))
+        .is_err());
+    assert_eq!(workspace.projection().claude.as_ref().unwrap().revision, 3);
+    assert!(workspace.take_claude_listing().is_none());
+}
+
+#[test]
+fn claude_push_never_consumes_pending_work_even_by_numeric_id() {
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    let list_id = workspace.load_directory(path("/project")).unwrap();
+    let pending = workspace.pending_count();
+    let identity = workspace.identity().clone();
+    workspace
+        .accept_claude(claude_frame(&identity, list_id, claude_event(1, vec![])))
+        .unwrap();
+    assert_eq!(workspace.pending_count(), pending);
+    assert_eq!(workspace.next_command().unwrap().request_id, list_id);
+}
+
+#[test]
+fn claude_root_sits_below_opencode_and_above_grok_and_each_is_retained() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace
+        .report_shell_cwd(&identity, path("/shell-a"))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    let inventory = grok_snapshot(
+        1,
+        true,
+        vec![grok_session("g", Some("/grok-a"), 1, GrokActivity::Idle)],
+    );
+    workspace.refresh_grok().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+
+    // Claude Code holds the root over Grok; Grok is retained under it.
+    workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/claude-a"));
+    assert_eq!(workspace.projection().source, RootSource::Claude);
+    workspace.set_claude_root(None).unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(1)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/grok-a"));
+    assert_eq!(workspace.projection().source, RootSource::Grok);
+
+    // OpenCode outranks Claude Code, whose directory is retained under it.
+    workspace.refresh_sessions().unwrap();
+    settle_with_grok(
+        &mut workspace,
+        Some(&active_snapshot(2, "/opencode")),
+        Some(&inventory),
+    );
+    assert_eq!(workspace.root(), &path("/opencode"));
+    workspace.set_claude_root(Some(path("/claude-b"))).unwrap();
+    settle_with_grok(
+        &mut workspace,
+        Some(&active_snapshot(2, "/opencode")),
+        Some(&inventory),
+    );
+    assert_eq!(workspace.root(), &path("/opencode"));
+    assert_eq!(workspace.projection().source, RootSource::Session);
+    workspace.refresh_sessions().unwrap();
+    settle_with_grok(&mut workspace, Some(&empty_snapshot(3)), Some(&inventory));
+    assert_eq!(workspace.root(), &path("/claude-b"));
+    assert_eq!(workspace.projection().source, RootSource::Claude);
+}
+
+#[test]
+fn a_claude_directory_rejected_by_the_server_does_not_move_the_explorer() {
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace
+        .report_shell_cwd(&identity, path("/shell-a"))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+
+    workspace.set_claude_root(Some(path("/missing"))).unwrap();
+    let select = workspace.next_command().unwrap();
+    assert!(matches!(
+        &select.operation,
+        Operation::RootSelect { path: selected } if selected == &path("/missing")
+    ));
+    workspace
+        .accept(reply(
+            &select,
+            Operation::Error {
+                code: ErrorCode::Unavailable,
+            },
+        ))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+    assert_eq!(workspace.projection().source, RootSource::Shell);
+    assert_eq!(workspace.projection().root_state, Freshness::Current);
+    // The same rejected directory is not retried; a different one is.
+    workspace.set_claude_root(Some(path("/missing"))).unwrap();
+    assert!(workspace.next_command().is_none());
+    workspace.set_claude_root(Some(path("/claude-b"))).unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/claude-b"));
+}
+
+#[test]
+fn a_transient_failure_retries_the_claude_directory_after_a_backoff() {
+    use std::time::{Duration, Instant};
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace
+        .report_shell_cwd(&identity, path("/shell-a"))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    let fail = |workspace: &mut RemoteWorkspace, code| {
+        let select = workspace.next_command().unwrap();
+        assert!(matches!(
+            &select.operation,
+            Operation::RootSelect { path: selected } if selected == &path("/claude-a")
+        ));
+        workspace
+            .accept(reply(&select, Operation::Error { code }))
+            .unwrap();
+        settle(workspace, &empty_snapshot(1));
+    };
+    for code in [ErrorCode::Timeout, ErrorCode::Stale, ErrorCode::Io] {
+        workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+        fail(&mut workspace, code);
+        assert_eq!(workspace.root(), &path("/shell-a"), "{code:?}");
+        // Not before the backoff.
+        let started = Instant::now();
+        workspace.expire(started).unwrap();
+        workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+        assert!(workspace.next_command().is_none(), "{code:?}");
+        // After about a second the same directory is tried again.
+        workspace
+            .expire(started + Duration::from_millis(1100))
+            .unwrap();
+        settle(&mut workspace, &empty_snapshot(1));
+        assert_eq!(workspace.root(), &path("/claude-a"), "{code:?}");
+        assert_eq!(workspace.projection().source, RootSource::Claude);
+        workspace.set_claude_root(None).unwrap();
+        settle(&mut workspace, &empty_snapshot(1));
+        assert_eq!(workspace.root(), &path("/shell-a"));
+    }
+    // A missing, denied or invalid directory is a rejection: no retry.
+    for code in [
+        ErrorCode::Unavailable,
+        ErrorCode::Unauthorized,
+        ErrorCode::InvalidRequest,
+    ] {
+        workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+        fail(&mut workspace, code);
+        workspace
+            .expire(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+        assert!(workspace.next_command().is_none(), "{code:?}");
+        assert_eq!(workspace.root(), &path("/shell-a"));
+        workspace.set_claude_root(None).unwrap();
+    }
+}
+
+#[test]
+fn an_ended_session_cancels_a_pending_claude_directory_retry() {
+    use std::time::{Duration, Instant};
+    let mut workspace = model(1);
+    let identity = workspace.identity().clone();
+    workspace
+        .report_shell_cwd(&identity, path("/shell-a"))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    workspace.set_claude_root(Some(path("/claude-a"))).unwrap();
+    let select = workspace.next_command().unwrap();
+    workspace
+        .accept(reply(
+            &select,
+            Operation::Error {
+                code: ErrorCode::Timeout,
+            },
+        ))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    // The session ends while its directory waits for the retry: the root
+    // never comes back to it.
+    workspace.set_claude_root(None).unwrap();
+    workspace
+        .expire(Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/shell-a"));
+    assert_ne!(workspace.projection().source, RootSource::Claude);
+}
+
+#[test]
+fn disconnect_and_reattach_clear_claude_state_until_a_fresh_snapshot() {
+    let mut workspace = model(1);
+    workspace.begin_resnapshot().unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    let old = workspace.identity().clone();
+    workspace
+        .accept_claude(claude_frame(
+            &old,
+            1,
+            claude_event(5, vec![claude_session("b", 40, Some("/claude-b"), 1)]),
+        ))
+        .unwrap();
+    workspace
+        .accept_claude(claude_frame(&old, 1, claude_listing(6, &[])))
+        .unwrap();
+    workspace.set_claude_root(Some(path("/claude-b"))).unwrap();
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_eq!(workspace.root(), &path("/claude-b"));
+
+    workspace.disconnect();
+    assert!(workspace.projection().claude.is_none());
+    assert_eq!(workspace.claude_hooks_available(), None);
+    assert!(workspace.take_claude_listing().is_none());
+    workspace.reattach(2).unwrap();
+    // Previous-epoch state cannot apply to the fresh attachment.
+    assert!(workspace
+        .accept_claude(claude_frame(&old, 1, claude_event(7, vec![])))
+        .is_err());
+    settle(&mut workspace, &empty_snapshot(1));
+    assert_ne!(workspace.projection().source, RootSource::Claude);
+    // The fresh epoch restarts its revisions at 1.
+    let fresh = workspace.identity().clone();
+    workspace
+        .accept_claude(claude_frame(
+            &fresh,
+            1,
+            claude_event(1, vec![claude_session("b", 40, Some("/claude-c"), 1)]),
+        ))
+        .unwrap();
+    assert_eq!(workspace.projection().claude.as_ref().unwrap().revision, 1);
+}
+
 mod remote_claude_row {
     use made_app::diagnostics::DiagnosticsPill;
-    use made_app::diagnostics::DiagnosticsPill::{Degraded, Inactive};
+    use made_app::diagnostics::DiagnosticsPill::{Degraded, Inactive, Ready};
     use made_app::integrations::claude_code::diagnostics::{
-        remote_claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase,
-        CLAUDE_GRACE,
+        claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase, CLAUDE_GRACE,
     };
     use std::time::Duration;
 
+    /// A remote tab's inputs: its server's detection, whether the staged
+    /// package is unavailable for the tab (as on an older supervisor), its
+    /// presence, live owned sessions and observed protocol.
     fn inputs(
         phase: ClaudeDiagnosticsPhase,
+        staged_unavailable: bool,
         present: bool,
         present_for: Duration,
+        live_session: bool,
         protocol_observed: bool,
     ) -> ClaudeDiagnosticsInputs {
         ClaudeDiagnosticsInputs {
             phase,
-            // A remote tab has no plugin and no hook sessions; these never
-            // change the remote row.
-            plugin_missing: true,
+            plugin_missing: staged_unavailable,
             present,
             present_for,
-            live_session: false,
+            live_session,
             protocol_observed,
         }
     }
 
     fn row(inputs: ClaudeDiagnosticsInputs) -> (DiagnosticsPill, String) {
-        let report = remote_claude_diagnostics_row(&inputs);
+        let report = claude_diagnostics_row(&inputs);
         (report.pill, report.sentence)
     }
 
     #[test]
-    fn remote_states_use_the_tabs_own_detection_and_presence() {
+    fn remote_states_use_the_tabs_own_detection_and_the_local_sentences() {
         use ClaudeDiagnosticsPhase::{Available, Checking, NotOnPath};
         let young = Duration::from_secs(1);
         let old = CLAUDE_GRACE + Duration::from_secs(1);
         assert_eq!(
-            row(inputs(Checking, false, Duration::ZERO, false)),
+            row(inputs(Checking, false, false, Duration::ZERO, false, false)),
             (Inactive, "Checking for Claude Code.".to_owned())
         );
         assert_eq!(
-            row(inputs(NotOnPath, false, Duration::ZERO, false)),
+            row(inputs(
+                NotOnPath,
+                false,
+                false,
+                Duration::ZERO,
+                false,
+                false
+            )),
             (Inactive, "Claude Code is not on PATH.".to_owned())
         );
         assert_eq!(
-            row(inputs(Available, false, Duration::ZERO, false)),
+            row(inputs(
+                Available,
+                false,
+                false,
+                Duration::ZERO,
+                false,
+                false
+            )),
             (Inactive, "Claude Code is not running.".to_owned())
         );
-        // A directly launched remote claude with no session-level emission.
         assert_eq!(
-            row(inputs(Available, true, young, false)),
+            row(inputs(Available, false, true, young, false, false)),
             (Inactive, "Claude Code is starting.".to_owned())
         );
+        // `--bare` past the grace period: protocol only, no live session.
         assert_eq!(
-            row(inputs(Available, true, old, false)),
+            row(inputs(Available, false, true, old, false, true)),
+            (
+                Degraded,
+                "Claude Code session-status hooks are unavailable.".to_owned()
+            )
+        );
+        // A live owned session without a session-level emission.
+        assert_eq!(
+            row(inputs(Available, false, true, old, true, false)),
             (
                 Degraded,
                 "Claude Code status protocol is unavailable.".to_owned()
             )
         );
-        // Emissions prove the protocol; remote hooks are permanently absent,
-        // so the remote row never reaches a ready state.
-        for present_for in [young, old] {
+        for (_, sentence) in [
+            row(inputs(Available, false, true, old, false, true)),
+            row(inputs(Available, false, true, old, true, false)),
+        ] {
+            assert!(!sentence.contains("over SSH"), "{sentence}");
+        }
+    }
+
+    #[test]
+    fn a_remote_row_reaches_ready_with_a_live_owned_session_and_the_protocol() {
+        let report = row(inputs(
+            ClaudeDiagnosticsPhase::Available,
+            false,
+            true,
+            Duration::from_secs(1),
+            true,
+            true,
+        ));
+        assert_eq!(
+            report,
+            (Ready, "Claude Code session follow is ready.".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_older_supervisor_reports_session_status_hooks_unavailable() {
+        for present in [false, true] {
             assert_eq!(
-                row(inputs(Available, true, present_for, true)),
+                row(inputs(
+                    ClaudeDiagnosticsPhase::Available,
+                    true,
+                    present,
+                    CLAUDE_GRACE * 2,
+                    false,
+                    true,
+                )),
                 (
                     Degraded,
-                    "Claude Code session-status hooks are unavailable over SSH.".to_owned()
+                    "Claude Code session-status hooks are unavailable.".to_owned()
                 )
             );
         }

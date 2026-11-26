@@ -1130,10 +1130,9 @@ pub(crate) fn tab_brand(workbench: &Workbench) -> Option<(IntegrationRef, Presen
 }
 
 // BEGIN remote-path (AIA-02)
-/// The branding of a remote tab. OpenCode and Grok Build present from the
-/// tab's own server state; an integration that presents from its tab state
-/// yields to OpenCode and to a remote tab that already presents Grok Build
-/// under SSH-10.
+/// The branding of a remote tab, in the local order. OpenCode and Grok Build
+/// present from the tab's own server state; an integration that presents from
+/// its tab state (Claude Code) yields to OpenCode and ranks above Grok Build.
 fn remote_tab_brand(
     workbench: &Workbench,
     list: IntegrationList,
@@ -1149,9 +1148,8 @@ fn remote_tab_brand(
             workbench.remote_grok_running(),
             grok_dots.len(),
         );
-    let generic = generic.filter(|_| {
-        crate::integrations::claude_code::workspace_claude_branded(opencode, remote_grok, true)
-    });
+    let generic = generic
+        .filter(|_| crate::integrations::claude_code::workspace_claude_branded(opencode, true));
     if opencode {
         let dots = workbench
             .session_map()
@@ -5832,14 +5830,62 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_brand_yields_to_opencode_and_to_remote_grok_presentation() {
-        // Present Claude Code brands the tab on its own.
-        assert!(workspace_claude_branded(false, false, true));
-        assert!(!workspace_claude_branded(false, false, false));
+    fn claude_code_brand_yields_to_opencode_but_not_to_remote_grok_presentation() {
+        // Present Claude Code brands the tab on its own, locally and remotely,
+        // including over open remote Grok Build sessions.
+        assert!(workspace_claude_branded(false, true));
+        assert!(!workspace_claude_branded(false, false));
         // OpenCode keeps its label, icon and dots.
-        assert!(!workspace_claude_branded(true, false, true));
-        // A remote tab already presenting Grok Build under SSH-10 keeps it.
-        assert!(!workspace_claude_branded(false, true, true));
+        assert!(!workspace_claude_branded(true, true));
+    }
+
+    #[test]
+    fn a_remote_claude_tab_shows_owned_session_dots_and_the_local_tooltip_title() {
+        use crate::integrations::claude_code::follow::{ClaudeActivity, ClaudeTab};
+        use made_remote::protocol::{ClaudeActivity as Remote, ClaudeSessionInfo, RemotePath};
+        use made_terminal::{ProtocolEvent, ProtocolState};
+
+        let session = |id: &str, recency, activity, title: &str| ClaudeSessionInfo {
+            session_id: id.to_owned(),
+            pid: 40 + recency as u32,
+            cwd: Some(RemotePath::new(format!("/srv/{id}").into_bytes()).unwrap()),
+            activity,
+            title: title.to_owned(),
+            recency,
+            nested: false,
+        };
+        let mut tab = ClaudeTab::new(0, false);
+        tab.apply_remote_sessions(&[
+            session("old", 1, Remote::Busy, "Older"),
+            session("new", 2, Remote::Attention, "Newest\u{202e}"),
+        ]);
+        // One dot per live owned session, in attachment order, with the
+        // hook-derived status.
+        assert_eq!(
+            tab.dots(),
+            vec![ClaudeActivity::Busy, ClaudeActivity::Attention]
+        );
+        // Without a protocol status the latest session's sanitized hook title
+        // is the tooltip title; the remote terminal title is not read.
+        assert_eq!(tab.tooltip_title(Some("Remote title")), "Newest");
+        assert_eq!(tab.directory().as_deref(), Some("/srv/new"));
+        // A live protocol status applies to the latest session, and the tab's
+        // own remote terminal title leads the tooltip.
+        tab.note_protocol(ProtocolEvent::Status {
+            state: ProtocolState::Working,
+        });
+        assert_eq!(tab.dots(), vec![ClaudeActivity::Busy, ClaudeActivity::Busy]);
+        assert_eq!(tab.tooltip_title(Some("Remote title")), "Remote title");
+        // A nested session never takes the tab over.
+        let mut nested = session("nested", 3, Remote::Idle, "Nested");
+        nested.nested = true;
+        tab.apply_remote_sessions(&[session("new", 2, Remote::Idle, "Newest"), nested]);
+        assert_eq!(tab.directory().as_deref(), Some("/srv/new"));
+        // No session and no protocol: the default title.
+        tab.apply_remote_sessions(&[]);
+        tab.note_shell_prompt();
+        assert!(!tab.present());
+        assert_eq!(tab.tooltip_title(Some("Remote title")), "Claude Code");
     }
 
     #[test]

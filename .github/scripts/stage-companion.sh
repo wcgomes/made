@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Stage one companion and the allowlisted plugin files the Stage stream sends.
-# Usage: stage-companion.sh <target> <companion-binary> <hook-binary> <out>.
-# Names match made_app::remote_session::STAGE_FILES (10 artifacts). The
+# Usage: stage-companion.sh <target> <companion-binary> <hook-binary>
+# <claude-hook-binary> <out>.
+# Names match made_app::remote_session::STAGE_FILES (14 artifacts). The
 # grok-made package, including the native session-status hook built for the
-# same target, comes from stage-grok-plugin.sh. Empty files and files over the
-# 128 MiB stage cap fail here, not at connection time.
+# same target, comes from stage-grok-plugin.sh; the claude-code-made package,
+# including the native session-event hook built for the same target, comes
+# from stage-claude-plugin.sh. Empty files and files over the 128 MiB stage
+# cap fail here, not at connection time.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -14,7 +17,8 @@ source "$root/.github/scripts/hash.sh"
 target="${1:?target required}"
 binary="${2:?binary required}"
 hook="${3:?hook binary required}"
-out="${4:?output directory required}"
+claude_hook="${4:?claude hook binary required}"
+out="${5:?output directory required}"
 
 case "$target" in
   x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;;
@@ -35,6 +39,10 @@ files=(
   plugins/grok-made/README.md
   plugins/grok-made/hooks/hooks.json
   plugins/grok-made/hooks/bin/made-grok-status
+  plugins/claude-code-made/.claude-plugin/plugin.json
+  plugins/claude-code-made/README.md
+  plugins/claude-code-made/hooks/hooks.json
+  plugins/claude-code-made/bin/made-claude-status
 )
 
 max_bytes=$((128 * 1024 * 1024))
@@ -52,6 +60,7 @@ cp "$root/plugins/opencode-made/src/integration.ts" "$out/plugins/opencode-made/
 # exactly like the companion binary's, and the hook must be a native binary
 # for this target, never a script.
 bash "$root/.github/scripts/stage-grok-plugin.sh" "$target" "$hook" "$out/plugins/grok-made"
+bash "$root/.github/scripts/stage-claude-plugin.sh" "$target" "$claude_hook" "$out/plugins/claude-code-made"
 
 linkage_kind="${LINKAGE_KIND:?LINKAGE_KIND required}"
 case "$linkage_kind" in

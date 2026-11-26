@@ -4235,8 +4235,8 @@ mod tab_presentation_characterization {
     // BEGIN characterization adapter
     use made_app::explorer_icons;
     use made_remote::protocol::{
-        GrokActivity, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, RemotePath,
-        TabCapability, WireEnvelope,
+        ClaudeActivity, ClaudeSessionInfo, ClaudeSessionSnapshot, GrokActivity, GrokSessionInfo,
+        GrokSessionSnapshot, Identity, Operation, RemotePath, TabCapability, WireEnvelope,
     };
 
     /// The marks a tab can show, with the SVG they are painted from.
@@ -4404,6 +4404,51 @@ mod tab_presentation_characterization {
                 },
             ))
             .expect("the current-attach Grok snapshot applies");
+    }
+
+    /// Relay one owned busy remote Claude Code session (or none, releasing
+    /// it) at `revision`, in `directory`, and let the tab apply it.
+    fn remote_claude_sessions(
+        lite: &mut Lite,
+        id: WorkspaceId,
+        revision: u64,
+        directory: Option<&str>,
+    ) {
+        let workbench = lite.model.workspace_mut(id).unwrap();
+        let remote = workbench.remote_workspace_mut().unwrap();
+        let identity = remote.identity().clone();
+        let sessions: Vec<ClaudeSessionInfo> = directory
+            .map(|directory| ClaudeSessionInfo {
+                session_id: "remote-claude".to_owned(),
+                pid: 4242,
+                cwd: Some(RemotePath::new(directory.as_bytes().to_vec()).unwrap()),
+                activity: ClaudeActivity::Busy,
+                title: "Remote session".to_owned(),
+                recency: 1,
+                nested: false,
+            })
+            .into_iter()
+            .collect();
+        let owned = sessions.len();
+        remote
+            .accept_claude(WireEnvelope::new(
+                identity,
+                1,
+                Operation::ClaudeEvent {
+                    snapshot: ClaudeSessionSnapshot {
+                        revision,
+                        hooks_available: true,
+                        sessions,
+                    },
+                },
+            ))
+            .expect("the current-attach Claude Code event applies");
+        lite.pump_until("remote claude sessions", |model| {
+            model
+                .workspace(id)
+                .and_then(made_app::integrations::claude_code::tab)
+                .is_some_and(|tab| tab.session_count() == owned)
+        });
     }
 
     /// Connect OpenCode on the remote tab with one busy session.
@@ -4808,7 +4853,7 @@ mod tab_presentation_characterization {
         record
     }
 
-    fn remote_record(opencode: bool, grok: bool) -> String {
+    fn remote_record(opencode: bool, claude: bool, grok: bool) -> String {
         let mut model =
             AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
         let name = "remote-server";
@@ -4818,11 +4863,16 @@ mod tab_presentation_characterization {
         if grok {
             remote_grok_open(&mut lite, id);
         }
+        if claude {
+            remote_claude_sessions(&mut lite, id, 1, Some("/project"));
+        }
         if opencode {
             remote_opencode_active(&mut lite, id);
         }
         let expected_label = if opencode {
             "OpenCode"
+        } else if claude {
+            "Claude Code"
         } else if grok {
             "Grok Build"
         } else {
@@ -4933,6 +4983,9 @@ mod tab_presentation_characterization {
         if isolated("tab_presentation_characterization::remote_tabs_present_opencode_then_grok_else_the_server_name") {
             return;
         }
+        // SSH-11/AIA-05: a deliberate contract change, not a reorganization
+        // step. The remote order equals the local order: OpenCode, then
+        // Claude Code, then Grok Build, else the server name.
         let server = expect(
             "remote-server",
             "none",
@@ -4954,18 +5007,124 @@ mod tab_presentation_characterization {
             "Tab: OpenCode — Sessions: 1 running",
             &["×", "Sessions: 1 running"],
         );
-        let table: [((bool, bool), &String); 4] = [
-            ((false, false), &server),
-            ((false, true), &grok),
-            ((true, false), &opencode),
-            ((true, true), &opencode),
+        let claude = expect(
+            "Claude Code",
+            "claude-code",
+            &["busy"],
+            "Tab: Claude Code — Sessions: 1 running",
+            &["×", "Remote session — Sessions: 1 running"],
+        );
+        // (OpenCode active, Claude Code present, Grok open).
+        let table: [((bool, bool, bool), &String); 8] = [
+            ((false, false, false), &server),
+            ((false, false, true), &grok),
+            ((false, true, false), &claude),
+            ((false, true, true), &claude),
+            ((true, false, false), &opencode),
+            ((true, false, true), &opencode),
+            ((true, true, false), &opencode),
+            ((true, true, true), &opencode),
         ];
-        for ((opencode_active, grok_open), expected) in table {
+        for ((opencode_active, claude_present, grok_open), expected) in table {
             assert_eq!(
-                &remote_record(opencode_active, grok_open),
+                &remote_record(opencode_active, claude_present, grok_open),
                 expected,
-                "remote opencode={opencode_active} grok={grok_open}"
+                "remote opencode={opencode_active} claude={claude_present} grok={grok_open}"
             );
+        }
+    }
+
+    /// AIA-05 `Remote order equals local order`: with remote OpenCode, Claude
+    /// Code and Grok each holding a usable remote directory, releasing them
+    /// one at a time always leaves the root and the presentation with the
+    /// highest-ranked remaining holder, then the shell fallback and the
+    /// server name.
+    #[test]
+    fn remote_release_order_matches_the_local_order() {
+        use made_app::remote_workspace::{IntegrationState, RootSource};
+
+        if isolated(
+            "tab_presentation_characterization::remote_release_order_matches_the_local_order",
+        ) {
+            return;
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Holder {
+            OpenCode,
+            Claude,
+            Grok,
+        }
+        let label = |holder: Option<Holder>| match holder {
+            Some(Holder::OpenCode) => "OpenCode",
+            Some(Holder::Claude) => "Claude Code",
+            Some(Holder::Grok) => "Grok Build",
+            None => "remote-server",
+        };
+        let source = |holder: Option<Holder>| match holder {
+            Some(Holder::OpenCode) => RootSource::Session,
+            Some(Holder::Claude) => RootSource::Claude,
+            Some(Holder::Grok) => RootSource::Grok,
+            None => RootSource::Launch,
+        };
+        for order in [
+            [Holder::OpenCode, Holder::Claude, Holder::Grok],
+            [Holder::OpenCode, Holder::Grok, Holder::Claude],
+        ] {
+            let mut model =
+                AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+            let id = remote_tab(&mut model, "remote-server");
+            let mut lite = Lite::new(model);
+            lite.render();
+            remote_grok_open(&mut lite, id);
+            remote_claude_sessions(&mut lite, id, 1, Some("/project/claude"));
+            remote_opencode_active(&mut lite, id);
+            let mut held = vec![Holder::OpenCode, Holder::Claude, Holder::Grok];
+            let check = |lite: &mut Lite, held: &[Holder]| {
+                let top = held.first().copied();
+                lite.render_until_label(id, label(top));
+                let workbench = lite.model.workspace(id).unwrap();
+                let projection = workbench.remote_workspace().unwrap().projection();
+                assert_eq!(
+                    projection.source,
+                    source(top),
+                    "order {order:?}, held {held:?}"
+                );
+            };
+            check(&mut lite, &held);
+            for release in order {
+                let workbench = lite.model.workspace_mut(id).unwrap();
+                let remote = workbench.remote_workspace_mut().unwrap();
+                let identity = remote.identity().clone();
+                match release {
+                    Holder::OpenCode => remote
+                        .integration_changed(&identity, IntegrationState::Unavailable)
+                        .unwrap(),
+                    Holder::Claude => remote_claude_sessions(&mut lite, id, 2, None),
+                    Holder::Grok => remote
+                        .accept_grok_push(WireEnvelope::new(
+                            identity,
+                            1,
+                            Operation::GrokSnapshot {
+                                snapshot: GrokSessionSnapshot {
+                                    revision: 2,
+                                    running: false,
+                                    hooks_ready: false,
+                                    sessions: Vec::new(),
+                                },
+                            },
+                        ))
+                        .unwrap(),
+                }
+                held.retain(|holder| {
+                    !matches!(
+                        (holder, release),
+                        (Holder::OpenCode, Holder::OpenCode)
+                            | (Holder::Claude, Holder::Claude)
+                            | (Holder::Grok, Holder::Grok)
+                    )
+                });
+                check(&mut lite, &held);
+            }
         }
     }
 }

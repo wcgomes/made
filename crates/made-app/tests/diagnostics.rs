@@ -1575,8 +1575,7 @@ mod copied_report_characterization {
     use made_app::app::{AppModel, AppOptions};
     use made_app::diagnostics::{remote_grok_row, RemoteGrokInstallOutcome};
     use made_app::integrations::claude_code::diagnostics::{
-        claude_diagnostics_row, remote_claude_diagnostics_row, ClaudeDiagnosticsInputs,
-        ClaudeDiagnosticsPhase,
+        claude_diagnostics_row, ClaudeDiagnosticsInputs, ClaudeDiagnosticsPhase,
     };
     use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
     use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE};
@@ -1586,9 +1585,10 @@ mod copied_report_characterization {
         view.set_row("claude status", claude_diagnostics_row(inputs));
     }
 
-    /// Apply the remote Claude Code row for `inputs`.
+    /// Apply the remote Claude Code row for `inputs`: the local state
+    /// machine, driven by the tab's remote state.
     fn apply_remote_claude(view: &mut DiagnosticsSnapshot, inputs: &ClaudeDiagnosticsInputs) {
-        view.set_row("claude status", remote_claude_diagnostics_row(inputs));
+        view.set_row("claude status", claude_diagnostics_row(inputs));
     }
 
     /// Apply a remote Grok Build row.
@@ -1851,7 +1851,7 @@ recent log:\n";
 
     #[test]
     fn remote_claude_rows_in_the_copied_report() {
-        let cases: [(&str, ClaudeDiagnosticsInputs, (&str, &str)); 6] = [
+        let cases: [(&str, ClaudeDiagnosticsInputs, (&str, &str)); 7] = [
             (
                 "checking",
                 inputs(Phase::Checking),
@@ -1884,12 +1884,20 @@ recent log:\n";
                 ("degraded", "Claude Code status protocol is unavailable."),
             ),
             (
-                "hooks unavailable over ssh",
-                inputs(Phase::Available),
+                "hooks unavailable",
+                ClaudeDiagnosticsInputs {
+                    live_session: false,
+                    ..inputs(Phase::Available)
+                },
                 (
                     "degraded",
-                    "Claude Code session-status hooks are unavailable over SSH.",
+                    "Claude Code session-status hooks are unavailable.",
                 ),
+            ),
+            (
+                "ready",
+                inputs(Phase::Available),
+                ("ready", "Claude Code session follow is ready."),
             ),
         ];
         for (name, claude_inputs, claude) in cases {

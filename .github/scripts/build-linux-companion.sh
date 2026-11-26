@@ -57,10 +57,14 @@ fi
 cargo test -p made-remote --locked --target "$target"
 cargo test -p made-platform --test headless --locked --no-default-features --target "$target"
 cargo test -p made-grok-hook --locked --target "$target"
+cargo test -p made-claude-hook --locked --target "$target"
 cargo build -p made-remote --locked --release --target "$target"
 # The native session-status hook ships beside the companion in the staged
 # grok-made package and is built under the same glibc 2.31 constraint.
 cargo build -p made-grok-hook --locked --release --target "$target"
+# The native session-event hook ships in the staged claude-code-made package
+# under the same glibc 2.31 constraint.
+cargo build -p made-claude-hook --locked --release --target "$target"
 
 tree="$(cargo tree -p made-remote --locked --target "$target" -e features)"
 if printf '%s\n' "$tree" | grep -F 'feature "desktop"'; then
@@ -76,17 +80,19 @@ fi
 target_dir="${CARGO_TARGET_DIR:-target}"
 bin="${target_dir}/${target}/release/made-remote"
 hook_bin="${target_dir}/${target}/release/made-grok-status"
+claude_hook_bin="${target_dir}/${target}/release/made-claude-status"
 test -s "$bin"
 test -s "$hook_bin"
-chmod 755 "$bin" "$hook_bin"
+test -s "$claude_hook_bin"
+chmod 755 "$bin" "$hook_bin" "$claude_hook_bin"
 
 if ! command -v readelf >/dev/null 2>&1; then
   echo "readelf is required to reject a musl interpreter" >&2
   exit 1
 fi
-# Both executables get the same checks: no musl interpreter, no missing or GUI
+# Every executable gets the same checks: no musl interpreter, no missing or GUI
 # library, and no glibc symbol newer than 2.31.
-for artifact in "$bin" "$hook_bin"; do
+for artifact in "$bin" "$hook_bin" "$claude_hook_bin"; do
   interpreter="$(readelf -l "$artifact" | awk '/Requesting program interpreter/ { print $NF }' | tr -d '[]')"
   echo "interpreter of $artifact: $interpreter"
   case "$interpreter" in
@@ -137,6 +143,6 @@ LINKAGE_KIND=glibc \
 LINKAGE_SYSTEM=2.31 \
 LINKAGE_MAX_SYMBOL=2.31 \
   bash "$root/.github/scripts/stage-companion.sh" \
-    "$target" "$bin" "$hook_bin" "$root/dist/ssh-companion-${target}"
+    "$target" "$bin" "$hook_bin" "$claude_hook_bin" "$root/dist/ssh-companion-${target}"
 
 echo "staged glibc 2.31 companion for $target"

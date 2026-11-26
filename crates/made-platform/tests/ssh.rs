@@ -454,7 +454,7 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
     std::fs::write(&grok_config, b"existing = true\n").unwrap();
     let hash = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
     let mut input = staging_header(true, "1.0", target).unwrap();
-    for _ in 0..10 {
+    for _ in 0..14 {
         input.extend_from_slice(format!("1\n{hash}\nx").as_bytes());
     }
     let mut child = Command::new("/bin/sh")
@@ -524,6 +524,41 @@ fn staging_fixed_script_checks_hashes_and_only_writes_owned_private_files() {
         0o700,
         "the shipped hook must keep an executable bit"
     );
+    // The claude-code-made package is staged beside grok-made: private files,
+    // the package directories, and the executable session-event hook.
+    let claude_plugin = destination.join("plugins/claude-code-made");
+    for directory in ["", ".claude-plugin", "hooks", "bin"] {
+        let path = claude_plugin.join(directory);
+        assert!(path.is_dir(), "{directory} is a directory");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    for name in [
+        ".claude-plugin/plugin.json",
+        "README.md",
+        "hooks/hooks.json",
+    ] {
+        assert_eq!(std::fs::read(claude_plugin.join(name)).unwrap(), b"x");
+        assert_eq!(
+            std::fs::metadata(claude_plugin.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(claude_plugin.join("bin/made-claude-status"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the Claude Code hook must keep an executable bit"
+    );
     // Staging never writes the remote user's Grok home; that is the separate
     // consented install's only permitted mutation.
     assert_eq!(std::fs::read(&grok_config).unwrap(), b"existing = true\n");
@@ -552,7 +587,7 @@ mod fixed_staging {
         process::{Child, Command, Output, Stdio},
     };
 
-    pub const ARTIFACTS: [&str; 10] = [
+    pub const ARTIFACTS: [&str; 14] = [
         "made-remote",
         "plugins/opencode-made/package.json",
         "plugins/opencode-made/tui.ts",
@@ -563,6 +598,10 @@ mod fixed_staging {
         "plugins/grok-made/README.md",
         "plugins/grok-made/hooks/hooks.json",
         "plugins/grok-made/hooks/bin/made-grok-status",
+        "plugins/claude-code-made/.claude-plugin/plugin.json",
+        "plugins/claude-code-made/README.md",
+        "plugins/claude-code-made/hooks/hooks.json",
+        "plugins/claude-code-made/bin/made-claude-status",
     ];
     pub const UPDATE_REQUIRED: &str = "MADE-STAGE-UPDATE-REQUIRED";
     pub const RECOVERY_REQUIRED: &str = "MADE-STAGE-RECOVERY-REQUIRED";
@@ -988,6 +1027,34 @@ fn staging_same_version_mismatch_missing_or_corruption_reports_update_required_w
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn staging_same_version_ten_artifact_target_requires_an_approved_update() {
+    let Some(target) = fixed_staging::target() else {
+        return;
+    };
+    let (_temp, home) = fixed_staging::home();
+    let initial = fixed_staging::run(&home, &fixed_staging::body(false, "1.0", b"x"));
+    assert!(initial.status.success(), "initial staging failed");
+    let destination = fixed_staging::destination(&home, "1.0");
+    // A target staged before the Claude Code package: the ten older artifacts.
+    std::fs::remove_dir_all(destination.join("plugins/claude-code-made")).unwrap();
+    let before = fixed_staging::fingerprint(&destination);
+    let result = fixed_staging::run(&home, &fixed_staging::body(false, "1.0", b"x"));
+    assert_eq!(result.status.code(), Some(74));
+    assert!(String::from_utf8_lossy(&result.stderr).contains(fixed_staging::UPDATE_REQUIRED));
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("MADE-STAGED-1"));
+    assert_eq!(
+        fixed_staging::fingerprint(&destination),
+        before,
+        "the ten-artifact target is not repaired before approval"
+    );
+    assert_eq!(
+        fixed_staging::entries(&fixed_staging::version_root(&home, "1.0")),
+        vec![target.to_owned()]
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn staging_approved_update_swaps_cleans_keeps_the_old_process_and_reuses_exactly() {
     use std::{os::unix::fs::PermissionsExt, process::Stdio};
     let Some(target) = fixed_staging::target() else {
@@ -1052,6 +1119,15 @@ fn staging_approved_update_swaps_cleans_keeps_the_old_process_and_reuses_exactly
             .mode()
             & 0o777,
         0o600
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("plugins/claude-code-made/bin/made-claude-status"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "the updated Claude Code hook keeps its executable bit"
     );
     assert!(
         old_process.try_wait().unwrap().is_none(),

@@ -226,6 +226,12 @@ fn made_claude_code_sources_open_no_listener_connection_or_claude_path() {
         "made-hook-common/src/lib.rs".to_owned(),
         include_str!("../../made-hook-common/src/lib.rs").to_owned(),
     ));
+    // The shared module both sides use, including the companion's server-side
+    // spool ingestion, tracker and listing worker.
+    sources.push((
+        "made-remote/src/claude.rs".to_owned(),
+        include_str!("../../made-remote/src/claude.rs").to_owned(),
+    ));
     for (name, source) in &sources {
         let lower = source.to_ascii_lowercase();
         for forbidden in [

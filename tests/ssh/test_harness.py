@@ -235,9 +235,78 @@ class GrokNoInterpreterTests(unittest.TestCase):
 
     def test_staged_set_names_the_native_hook_not_a_script(self):
         names = parity.current_stage_artifact_names()
-        self.assertEqual(len(names), 10)
+        self.assertEqual(len(names), 14)
         self.assertIn(parity.NATIVE_HOOK_ARTIFACT, names)
+        self.assertIn(parity.CLAUDE_HOOK_ARTIFACT, names)
         self.assertFalse([name for name in names if name.endswith('.py')])
+
+
+class ClaudeParityContractTests(unittest.TestCase):
+    """The claude-parity mode: its scenario table, the fixture claude and the
+    staged claude-code-made package it drives. Contract checks only; the real
+    loopback run is `parity.py claude-parity`."""
+
+    def fixture(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = pathlib.Path(directory.name)
+        companion = root / 'made-remote'
+        companion.write_text('fixture')
+        hook = root / 'hook'
+        hook.write_text('#!/bin/sh\ncat > /dev/null\n')
+        hook.chmod(0o755)
+        return parity.ClaudeFixture(root, companion, hook=hook)
+
+    def test_scenario_table_covers_the_required_flows(self):
+        names = [name for name, _, _ in parity.CLAUDE_SCENARIOS]
+        self.assertEqual(len(names), len(set(names)))
+        for required in ('direct-launch', 'protocol-only-bare', 'shell-typed-plugin-dirs',
+                         'hook-follow', 'cd-via-listing', 'agent-view-listing',
+                         'two-tab-isolation', 'foreign-and-reparented-not-claimed',
+                         'loss-and-reattach', 'older-supervisor-and-stage',
+                         'privacy-and-claude-home', 'claude-undetected'):
+            self.assertIn(required, names)
+
+    def test_mode_is_a_parity_choice(self):
+        source = pathlib.Path(parity.__file__).read_text()
+        self.assertIn("'claude-parity'", source)
+
+    def test_staged_package_is_the_four_artifacts_with_an_executable_hook(self):
+        fixture = self.fixture()
+        staged = fixture.stage_claude_package()
+        names = sorted(str(path.relative_to(fixture.companion_dir))
+                       for path in staged.rglob('*') if path.is_file())
+        self.assertEqual(names, sorted(parity.CLAUDE_ARTIFACTS))
+        self.assertTrue(os.access(staged / 'bin' / 'made-claude-status', os.X_OK))
+        fixture.reset_stage()
+        self.assertFalse((fixture.companion_dir / 'plugins' / 'claude-code-made').exists())
+
+    def test_fixture_claude_answers_agents_json_without_firing_hooks(self):
+        fixture = self.fixture()
+        fixture.set_agents([{'pid': 7, 'cwd': '/w', 'kind': 'interactive'}])
+        out = parity.subprocess.run([str(fixture.claude_scripts['claude']), 'agents', '--json'],
+                                    stdin=parity.subprocess.DEVNULL, capture_output=True,
+                                    timeout=10, check=True)
+        self.assertEqual(json_loads(out.stdout), [{'pid': 7, 'cwd': '/w', 'kind': 'interactive'}])
+        self.assertEqual(fixture.claude_argv(), ['agents --json'])
+
+    def test_fixture_payloads_carry_markers_only_in_content_fields(self):
+        payload = parity.claude_hook_payload('UserPromptSubmit', 's1', '/w', title='T')
+        event = json_loads(payload.encode())
+        self.assertEqual(event['hook_event_name'], 'UserPromptSubmit')
+        for field in ('prompt', 'message', 'tool_input'):
+            self.assertIn(parity.CLAUDE_MARKER, json_dumps(event[field]))
+        self.assertNotIn(parity.CLAUDE_MARKER, event['session_id'] + event['cwd'])
+
+
+def json_loads(data):
+    import json
+    return json.loads(data)
+
+
+def json_dumps(value):
+    import json
+    return json.dumps(value)
 
 
 if __name__ == '__main__':
