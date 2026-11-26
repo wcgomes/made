@@ -87,6 +87,9 @@ jobs:
         with:
           name: ssh-companion-${{ matrix.target }}
           path: dist/ssh-companion-${{ matrix.target }}/
+          # The staged claude-code-made plugin keeps its manifest in
+          # `.claude-plugin/`, which upload-artifact omits by default.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
@@ -161,6 +164,9 @@ jobs:
         with:
           name: ssh-companion-${{ matrix.target }}
           path: dist/ssh-companion-${{ matrix.target }}/
+          # The staged claude-code-made plugin keeps its manifest in
+          # `.claude-plugin/`, which upload-artifact omits by default.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
