@@ -46,6 +46,8 @@ const DEFAULT_SIGNALS: [libc::c_int; 7] = [
 /// `cwd` falls back to `HOME` (then the password database, then `/`) when it
 /// is not a directory, a relative `program` is searched in the child's `PATH`,
 /// `argv[0]` is `program` as given, and `SHELL` defaults to the user's shell.
+/// Like `execvp`, a program the kernel rejects with `ENOEXEC` is run by
+/// `/bin/sh`.
 pub(crate) fn spawn_pty_child(
     program: &OsStr,
     args: &[OsString],
@@ -74,7 +76,14 @@ pub(crate) fn spawn_pty_child(
             cstring(entry)
         })
         .collect::<io::Result<Vec<_>>>()?;
+    // execvp's ENOEXEC fallback: a file without a recognized header runs as a
+    // `/bin/sh` script, with argv `sh <path> <args...>` like Apple's execvp.
+    let script_argv = [cstring(b"sh".to_vec())?, path.clone()]
+        .into_iter()
+        .chain(argv.iter().skip(1).cloned())
+        .collect::<Vec<_>>();
     let argv_ptrs = null_terminated(&argv);
+    let script_argv_ptrs = null_terminated(&script_argv);
     let envp_ptrs = null_terminated(&envp);
 
     let mut attrs = SpawnAttrs::new()?;
@@ -104,6 +113,9 @@ pub(crate) fn spawn_pty_child(
         libc::sigemptyset(&mut mask);
         check(libc::posix_spawnattr_setsigmask(attrs.as_mut_ptr(), &mask))?;
 
+        // The `_np` form is intentional: the release deployment target is macOS
+        // 12.0, and the unsuffixed posix_spawn_file_actions_addchdir only
+        // exists from macOS 26.
         check(libc::posix_spawn_file_actions_addchdir_np(
             actions.as_mut_ptr(),
             cwd.as_ptr(),
@@ -130,14 +142,21 @@ pub(crate) fn spawn_pty_child(
         ))?;
 
         let mut pid: libc::pid_t = 0;
-        check(libc::posix_spawn(
-            &mut pid,
-            path.as_ptr(),
-            actions.as_mut_ptr(),
-            attrs.as_mut_ptr(),
-            argv_ptrs.as_ptr(),
-            envp_ptrs.as_ptr(),
-        ))?;
+        let mut spawn = |program: &CStr, argv: &[*mut libc::c_char]| {
+            libc::posix_spawn(
+                &mut pid,
+                program.as_ptr(),
+                actions.as_mut_ptr(),
+                attrs.as_mut_ptr(),
+                argv.as_ptr(),
+                envp_ptrs.as_ptr(),
+            )
+        };
+        let mut code = spawn(&path, &argv_ptrs);
+        if code == libc::ENOEXEC {
+            code = spawn(c"/bin/sh", &script_argv_ptrs);
+        }
+        check(code)?;
         Ok(Box::new(SpawnedChild { pid, status: None }))
     }
 }
@@ -187,15 +206,32 @@ fn child_cwd(cwd: &Path, env: &[(OsString, OsString)]) -> PathBuf {
 }
 
 fn passwd_field(field: impl Fn(&libc::passwd) -> *mut libc::c_char) -> Option<OsString> {
-    // SAFETY: getpwuid returns null or a pointer to static storage that stays
-    // valid until the next getpw* call; the field is copied out immediately.
-    unsafe {
-        let entry = libc::getpwuid(libc::getuid());
-        if entry.is_null() {
-            return None;
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    loop {
+        // SAFETY: `entry` and `buffer` outlive the call, and the string fields
+        // getpwuid_r stores point into `buffer`; the field is copied out before
+        // `buffer` is dropped or resized.
+        unsafe {
+            let mut entry: libc::passwd = std::mem::zeroed();
+            let mut found: *mut libc::passwd = std::ptr::null_mut();
+            let code = libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            );
+            if code == libc::ERANGE && buffer.len() < 1 << 20 {
+                buffer.resize(buffer.len() * 2, 0);
+                continue;
+            }
+            if code != 0 || found.is_null() {
+                return None;
+            }
+            let value = field(&entry);
+            return (!value.is_null())
+                .then(|| OsStr::from_bytes(CStr::from_ptr(value).to_bytes()).into());
         }
-        let value = field(&*entry);
-        (!value.is_null()).then(|| OsStr::from_bytes(CStr::from_ptr(value).to_bytes()).into())
     }
 }
 

@@ -4,8 +4,11 @@
 //! A forked child of a multithreaded process runs libSystem's atfork handlers,
 //! which can trap (`os_once_t is corrupt`, `Illegal instruction: 4` on Intel)
 //! when another thread was inside a one-time libSystem initialization at the
-//! fork. `posix_spawn` runs no atfork handlers. This file holds its own process
-//! so no other test forks while the handler counts.
+//! fork. `posix_spawn` runs no atfork handlers.
+//!
+//! Keep this the only test in this binary: it changes process-wide state (an
+//! atfork handler, an ignored SIGINT, descriptor 77) and counts every fork in
+//! the process, so another test here could fork or inherit that state.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -42,8 +45,8 @@ fn pty_child_is_spawned_without_fork_and_keeps_session_tty_fd_and_signal_setup()
     };
     assert_eq!(leaked, 77);
 
-    let cwd = tempfile::tempdir().unwrap();
-    let cwd = cwd.path().canonicalize().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().canonicalize().unwrap();
     let script = "printf 'pid=%s\\n' $$; \
                   printf 'tpgid=%s\\n' $(ps -o tpgid= -p $$); \
                   printf 'tty=%s\\n' \"$(tty)\"; \
