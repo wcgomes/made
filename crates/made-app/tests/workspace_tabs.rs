@@ -4872,10 +4872,11 @@ mod tab_presentation_characterization {
             }
         }
         let socket = opencode.then(|| make_opencode_active(&mut lite, id, &root));
+        // Program tabs are labeled with their session title.
         let expected_label = if opencode {
-            "OpenCode".to_owned()
+            "Owned session".to_owned()
         } else if claude {
-            "Claude Code".to_owned()
+            "Window title".to_owned()
         } else if grok {
             "Grok Build".to_owned()
         } else {
@@ -4902,14 +4903,16 @@ mod tab_presentation_characterization {
         if opencode {
             remote_opencode_active(&mut lite, id);
         }
+        // Program tabs are labeled with their session title; a shell tab
+        // with its remote cwd.
         let expected_label = if opencode {
-            "OpenCode"
+            "Remote"
         } else if claude {
-            "Claude Code"
+            "Remote session"
         } else if grok {
             "Grok Build"
         } else {
-            name
+            "project"
         };
         presentation(&mut lite, id, expected_label, "<no host root>")
     }
@@ -4949,21 +4952,21 @@ mod tab_presentation_characterization {
 
     fn claude_local() -> String {
         expect(
-            "Claude Code",
+            "Window title",
             "claude-code",
             &["busy"],
-            "Tab: Claude Code — Sessions: 1 running",
+            "Tab: Claude Code — Window title — Sessions: 1 running",
             &["×", "Window title — Sessions: 1 running"],
         )
     }
 
     fn opencode_local() -> String {
         expect(
-            "OpenCode",
+            "Owned session",
             "opencode",
             &["idle"],
-            "Tab: OpenCode — Sessions: 1 idle",
-            &["×", "Sessions: 1 idle"],
+            "Tab: OpenCode — Owned session — Sessions: 1 idle",
+            &["×", "Owned session — Sessions: 1 idle"],
         )
     }
 
@@ -5020,11 +5023,11 @@ mod tab_presentation_characterization {
         // step. The remote order equals the local order: OpenCode, then
         // Claude Code, then Grok Build, else the server name.
         let server = expect(
-            "remote-server",
+            "project",
             "none",
             &[],
-            "Tab: remote-server",
-            &["×", "/project"],
+            "Tab: project",
+            &["×", "remote-server: /project"],
         );
         let grok = expect(
             "Grok Build",
@@ -5034,17 +5037,17 @@ mod tab_presentation_characterization {
             &["×", "Sessions: 1 running"],
         );
         let opencode = expect(
-            "OpenCode",
+            "Remote",
             "opencode",
             &["busy"],
-            "Tab: OpenCode — Sessions: 1 running",
-            &["×", "Sessions: 1 running"],
+            "Tab: OpenCode — Remote — Sessions: 1 running",
+            &["×", "Remote — Sessions: 1 running"],
         );
         let claude = expect(
-            "Claude Code",
+            "Remote session",
             "claude-code",
             &["busy"],
-            "Tab: Claude Code — Sessions: 1 running",
+            "Tab: Claude Code — Remote session — Sessions: 1 running",
             &["×", "Remote session — Sessions: 1 running"],
         );
         // (OpenCode active, Claude Code present, Grok open).
@@ -5088,10 +5091,10 @@ mod tab_presentation_characterization {
             Grok,
         }
         let label = |holder: Option<Holder>| match holder {
-            Some(Holder::OpenCode) => "OpenCode",
-            Some(Holder::Claude) => "Claude Code",
+            Some(Holder::OpenCode) => "Remote",
+            Some(Holder::Claude) => "Remote session",
             Some(Holder::Grok) => "Grok Build",
-            None => "remote-server",
+            None => "project",
         };
         let source = |holder: Option<Holder>| match holder {
             Some(Holder::OpenCode) => RootSource::Session,
@@ -5456,4 +5459,63 @@ fn a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_loca
     );
     assert_eq!(model.workspace_count(), 2);
     model.shutdown();
+}
+
+/// A shell tab is named after its shell's current directory and follows `cd`;
+/// `/` is named `/`. The tooltip keeps the full path.
+#[test]
+fn a_shell_tab_label_follows_cd() {
+    if made_platform::PlatformFamily::current() == made_platform::PlatformFamily::Windows {
+        return;
+    }
+    if isolated("a_shell_tab_label_follows_cd") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("first-folder");
+    let target = root.join("projeto café");
+    std::fs::create_dir_all(&target).unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    open(&mut model, &root);
+    let id = model.workspace_ids().next().unwrap();
+    let ctx = egui::Context::default();
+    let label = |model: &AppModel| {
+        made_app::ui::workspace_tab_summaries(model)
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| (tab.label, tab.tooltip))
+            .unwrap()
+    };
+    assert_eq!(label(&model).0, "first-folder");
+    let wait = |model: &mut AppModel, expected: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && label(model).0 != expected {
+            model.logic(&ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline
+        && !model
+            .workspace(id)
+            .and_then(|workspace| workspace.terminal())
+            .is_some_and(|terminal| terminal.output_bytes() > 0)
+    {
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    type_command(
+        model.workspace_mut(id).unwrap(),
+        &format!("cd '{}'", target.display()),
+    );
+    wait(&mut model, "projeto café");
+    let (name, tooltip) = label(&model);
+    assert_eq!(name, "projeto café");
+    assert_eq!(
+        tooltip.as_deref(),
+        Some(target.display().to_string().as_str())
+    );
+    type_command(model.workspace_mut(id).unwrap(), "cd /");
+    wait(&mut model, "/");
+    assert_eq!(label(&model).0, "/");
 }

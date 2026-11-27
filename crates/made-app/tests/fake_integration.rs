@@ -1382,7 +1382,8 @@ fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude()
     // The fake reports a directory and holds the root: rank 250 outranks
     // Grok Build at 300.
     set_fake_directory(Some(&fake_dir));
-    drive_to_label(&mut model, "Fake Agent");
+    // The label is the session title the fake presents.
+    drive_to_label(&mut model, "Fake session");
     let summary = tab(&model);
     assert_eq!(summary.mark, Some(FAKE_DESCRIPTOR.mark));
     assert_eq!(summary.dots, [SessionActivity::Busy]);
@@ -1390,7 +1391,13 @@ fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude()
         summary.tooltip.as_deref(),
         Some("Fake session — Sessions: 1 running")
     );
-    assert!(summary.accessible_name.contains("Fake Agent"));
+    assert!(
+        summary
+            .accessible_name
+            .starts_with("Fake Agent — Fake session — Sessions: 1 running"),
+        "{}",
+        summary.accessible_name
+    );
 
     // OpenCode connected (its label held here) outranks the fake.
     let id = model.active_workspace_id().unwrap();
@@ -1414,7 +1421,8 @@ fn a_fake_at_rank_250_brands_a_tab_over_grok_and_yields_to_opencode_and_claude()
     // again.
     exit_claude();
     drive_to_root(&mut model, "fake", &fake_dir);
-    drive_to_label(&mut model, "Fake Agent");
+    // The label is the session title the fake presents.
+    drive_to_label(&mut model, "Fake session");
     assert_eq!(tab(&model).mark, Some(FAKE_DESCRIPTOR.mark));
     set_fake_directory(None);
 }
@@ -1428,7 +1436,8 @@ fn a_fake_at_rank_150_brands_a_tab_over_claude_code() {
     let fake_dir = directory(temp.path(), "fake-dir");
     set_fake_directory(Some(&fake_dir));
     let mut model = model_with_tab(WITH_ABOVE, Some(CLAUDE_CODE));
-    drive_to_label(&mut model, "Fake Agent");
+    // The label is the session title the fake presents.
+    drive_to_label(&mut model, "Fake session");
     assert_eq!(tab(&model).mark, Some(ABOVE_DESCRIPTOR.mark));
     let id = model.active_workspace_id().unwrap();
     made_app::integrations::opencode::hold_label(&mut model, id);

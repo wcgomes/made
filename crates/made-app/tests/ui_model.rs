@@ -18,9 +18,9 @@ use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
 use made_app::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE};
 use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
-    diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
-    picker_control_id, picker_current_target, picker_list_id, picker_path_id, ssh_field_id,
-    top_action_id, top_workspace_action_id, workspace_tab_close_id, workspace_tab_id,
+    diagnostics_previous_log_path_id, explorer_splitter_id, picker_control_id,
+    picker_current_target, picker_list_id, picker_path_id, ssh_field_id, top_action_id,
+    top_workspace_action_id, workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
@@ -2152,6 +2152,20 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         tab_session_dots(&busy_output, beta_tab).is_empty(),
         "a plain shell workspace must stay free of OpenCode session dots"
     );
+    // The label, tooltip and accessible name carry the active session title.
+    let summary = made_app::ui::workspace_tab_summaries(&headless.model)
+        .into_iter()
+        .find(|tab| tab.id == alpha_id)
+        .unwrap();
+    assert_eq!(summary.label, "Session 0");
+    assert_eq!(
+        summary.tooltip.as_deref(),
+        Some("Session 0 — Sessions: 1 running, 1 idle")
+    );
+    assert_eq!(
+        summary.accessible_name,
+        "OpenCode — Session 0 — Sessions: 1 running, 1 idle"
+    );
 
     let opencode_icon = icon_named("opencode.svg");
     let icon_image = painted_images(&busy_output)
@@ -2172,10 +2186,10 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         egui::Color32::WHITE,
         "the tab icon keeps the shipped SVG colors"
     );
-    let alpha_label = text_rects(&busy_output, "OpenCode", 55.0)
+    let alpha_label = text_rects(&busy_output, "Session 0", 55.0)
         .into_iter()
         .find(|rect| alpha_tab.contains_rect(*rect))
-        .expect("the OpenCode label must be painted");
+        .expect("the active OpenCode session title must be the label");
     assert!(
         icon_image.rect.right() < alpha_label.left(),
         "the OpenCode icon must precede the label: {:?} vs {:?}",
@@ -2265,17 +2279,17 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the close target must stay centered at right - 13: target {close_target:?}, tab {alpha_tab:?}"
     );
     assert!(
-        (alpha_tab.width() - 135.6).abs() < 0.75,
-        "two dots on the OpenCode label must keep the base width: {alpha_tab:?}"
+        (alpha_tab.width() - 141.8).abs() < 0.75,
+        "two dots on the session-title label must keep the base width: {alpha_tab:?}"
     );
     assert!(
-        (initial_alpha_tab.width() - 238.0).abs() < 0.75,
+        (initial_alpha_tab.width() - 280.0).abs() < 0.75,
         "the disconnected folder tab must keep its long-label clamp: {initial_alpha_tab:?}"
     );
     // Usable label area ends 26px (close slot) + 14px (right-edge allowance) from the right.
     let label_area = alpha_tab.right() - 40.0 - alpha_label.left();
     assert!(
-        (label_area - 63.6).abs() < 0.75,
+        (label_area - 69.8).abs() < 0.75,
         "the OpenCode label must keep its base text area: {label_area} (tab {alpha_tab:?}, label {alpha_label:?})"
     );
     assert!(
@@ -2582,10 +2596,10 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the ninth attention session must stay out of the eight-dot row"
     );
     assert!(
-        (alpha_tab.width() - 166.6).abs() < 0.75,
-        "eight dots must grow the OpenCode tab to exactly 166.6px: {alpha_tab:?}"
+        (alpha_tab.width() - 172.8).abs() < 0.75,
+        "eight dots must grow the OpenCode tab to exactly 172.8px: {alpha_tab:?}"
     );
-    let many_label = text_rects(&many_output, "OpenCode", 55.0)
+    let many_label = text_rects(&many_output, "Session 0", 55.0)
         .into_iter()
         .find(|rect| alpha_tab.contains_rect(*rect))
         .expect("the capped-dot tab must keep its label");
@@ -2673,7 +2687,7 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the disconnected tab must revert to its folder label"
     );
     assert!(
-        (alpha_tab.width() - 238.0).abs() < 0.75,
+        (alpha_tab.width() - 280.0).abs() < 0.75,
         "the reverted folder label must restore the long-label width: {alpha_tab:?}"
     );
     headless.hover_until_text(workspace_tab_id(alpha_id), &alpha_path);
@@ -4551,10 +4565,20 @@ fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
     let initial_output = headless.render();
     let initial_tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&initial_output, name, 55.0)
+        text_rects(&initial_output, "project", 55.0)
             .iter()
             .any(|rect| initial_tab.contains_rect(*rect)),
-        "a remote shell tab without OpenCode keeps the server-name label"
+        "a remote shell tab without OpenCode is named after its remote cwd"
+    );
+    let summary = made_app::ui::workspace_tab_summaries(&headless.model)
+        .into_iter()
+        .find(|tab| tab.id == remote_id)
+        .unwrap();
+    assert_eq!(summary.label, "project");
+    assert_eq!(
+        summary.tooltip.as_deref(),
+        Some("remote-opencode-parity: /project"),
+        "an SSH shell tab's tooltip names the server and the full remote path"
     );
     assert!(
         tab_session_dots(&initial_output, initial_tab).is_empty(),
@@ -4619,13 +4643,13 @@ fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
     let output = headless.render_events_at(Vec::new(), headless.last_time + 0.5);
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Busy", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "a connected remote OpenCode tab must be labeled OpenCode"
+        "a connected remote OpenCode tab is labeled with its active session title"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the tab label while the integration is connected"
@@ -4770,7 +4794,7 @@ fn remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "the tab returns to the server-name presentation after the remote OpenCode exits"
@@ -4822,7 +4846,7 @@ fn remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "the tab returns to the server-name presentation after the transport disconnects"
@@ -4916,7 +4940,7 @@ fn remote_grok_tab_shows_grok_build_branding_and_dots() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "a remote shell tab stays on the server name until a Grok session opens"
@@ -4947,7 +4971,7 @@ fn remote_grok_tab_shows_grok_build_branding_and_dots() {
         "an owned remote Grok session must brand the shell tab Grok Build"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the label while a Grok session is open"
@@ -5114,7 +5138,7 @@ fn remote_grok_direct_launch_brands_before_a_session_and_exits() {
         "a directly launched remote grok must be labeled Grok Build before any session"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the label while the remote grok process runs"
@@ -5166,7 +5190,7 @@ fn remote_grok_direct_launch_brands_before_a_session_and_exits() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "an exited remote grok with no sessions restores the server-name label"
@@ -5383,7 +5407,7 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "an exited remote grok with no open sessions restores the server-name label"
@@ -5438,10 +5462,10 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
         "stale-epoch Grok state must not repaint dots"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "discarded stale state keeps the server-name presentation"
+        "discarded stale state keeps the remote cwd presentation"
     );
 
     // A transport disconnect clears Grok activity without touching the
@@ -5472,10 +5496,10 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "the disconnect restores the server-name presentation"
+        "the disconnect restores the remote cwd presentation"
     );
     assert!(
         tab_session_dots(&output, tab).is_empty(),
@@ -6100,7 +6124,6 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         "preview keystrokes must never reach the hidden shell"
     );
 
-    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
     headless.click(top_workspace_action_id(id, "explorer"));
     assert!(!headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
@@ -6121,17 +6144,18 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     assert!(headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
     assert!(output_text(&headless.render()).contains("EXPLORER"));
-    let terminal_id = headless
+    let close_id = headless
         .model
         .workspace(id)
         .unwrap()
         .explorer()
         .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
+        .preview_action_id(PreviewAction::Close);
+    headless.click(close_id);
     assert_eq!(
         headless.model.workspace(id).unwrap().left_surface(),
-        LeftSurface::Terminal
+        LeftSurface::Terminal,
+        "Close must return to the live terminal"
     );
     for _ in 0..4 {
         headless.render();
@@ -6160,7 +6184,7 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         .explorer()
         .unwrap()
         .preview_path()
-        .is_some());
+        .is_none());
     assert_eq!(
         headless
             .model
@@ -6172,40 +6196,6 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         pid
     );
 
-    headless.click(left_surface_action_id(&pane_id, "file"));
-    assert_eq!(
-        headless.model.workspace(id).unwrap().left_surface(),
-        LeftSurface::Preview
-    );
-    assert!(headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_document()
-        .is_some());
-    let preview_focus = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_focus_id();
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(preview_focus),
-        "File affordance must give the preview explicit focus"
-    );
-    let terminal_id = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
     let selected_file = headless
         .model
         .workspace(id)
@@ -6217,8 +6207,36 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     assert_eq!(
         headless.model.workspace(id).unwrap().left_surface(),
         LeftSurface::Preview,
-        "clicking the selected file must reopen the loaded preview"
+        "clicking the file again must reopen the preview"
     );
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::explorer)
+            .and_then(made_app::ExplorerPane::preview_document)
+            .is_some()
+    });
+    let preview_focus = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .preview_focus_id();
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(preview_focus),
+        "reopening a file must give the preview explicit focus"
+    );
+    let text = output_text(&headless.render());
+    assert!(text.contains("Close"), "{text}");
+    for retired in ["updated", " ago"] {
+        assert!(
+            !text.contains(retired),
+            "preview header must not paint {retired:?}: {text}"
+        );
+    }
     let close_id = headless
         .model
         .workspace(id)
@@ -6982,9 +7000,14 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
                 && (left_card.top() - expected_card_top).abs() < 1.0,
             "{width}x{height} cards {left_card:?} {explorer_card:?} must sit 4px from the window edges"
         );
+        let text = output_text(&output);
         assert!(
-            output_text(&output).contains("Terminal"),
-            "preview header must provide the return-to-terminal action"
+            text.contains("Close"),
+            "preview header must provide the close action: {text}"
+        );
+        assert!(
+            !text.contains("updated"),
+            "preview header must not paint a refresh age: {text}"
         );
     }
 }
@@ -7040,22 +7063,10 @@ fn root_change_clears_a_loaded_preview_and_returns_terminal() {
     assert!(headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
     assert!(output_text(&headless.render()).contains("EXPLORER"));
-    let terminal_id = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
-    assert!(headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_path()
-        .is_some());
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
+    );
     type_terminal_command(
         headless.model.workspace_mut(id).unwrap(),
         &format!("cd '{}'", target.display()),
@@ -7701,8 +7712,8 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
 }
 
 #[test]
-fn file_control_sits_below_session_strip_and_path() {
-    if isolated("file_control_sits_below_session_strip_and_path") {
+fn closing_the_preview_clears_it_and_reselecting_reopens_it() {
+    if isolated("closing_the_preview_clears_it_and_reselecting_reopens_it") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -7712,13 +7723,6 @@ fn file_control_sits_below_session_strip_and_path() {
     let mut headless = Headless::new(model, 1280.0, 800.0);
     wait_explorer_ready(&mut headless, id);
     headless.render();
-    assert!(
-        headless
-            .ctx
-            .read_response(top_workspace_action_id(id, "sessions"))
-            .is_none(),
-        "Sessions control must be absent without session data"
-    );
     let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
     let mut socket = connect(&options);
     send_state(&mut socket, 1, &root);
@@ -7737,30 +7741,61 @@ fn file_control_sits_below_session_strip_and_path() {
         .explorer()
         .unwrap()
         .row_widget_id(0);
-    headless.click(row);
-    headless.pump_until(|model| {
+    let loaded = |model: &AppModel| {
         model
             .workspace(id)
             .and_then(Workbench::explorer)
             .and_then(made_app::ExplorerPane::preview_document)
             .is_some()
-    });
-    let terminal_id = headless
+    };
+    headless.click(row);
+    headless.pump_until(loaded);
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
+    );
+    // Close: the terminal returns and the preview is cleared.
+    let close = headless
         .model
         .workspace(id)
         .unwrap()
         .explorer()
         .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
+        .preview_action_id(PreviewAction::Close);
+    headless.click(close);
+    headless.render();
+    let workbench = headless.model.workspace(id).unwrap();
+    assert_eq!(workbench.left_surface(), LeftSurface::Terminal);
+    assert!(
+        workbench.explorer().unwrap().preview_path().is_none(),
+        "closing clears the preview"
+    );
+    // A programmatic return to the terminal clears it too.
+    headless.click(row);
+    headless.pump_until(loaded);
+    headless.model.workspace_mut(id).unwrap().close_preview();
+    assert!(headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .preview_path()
+        .is_none());
+    // No File re-show control; the session strip and path line keep the
+    // single terminal glass layer.
     let output = headless.render();
     let text = output_text(&output);
     assert!(text.contains("Owned session"));
+    assert!(
+        !text.lines().any(|line| line == "File"),
+        "no File control: {text}"
+    );
     let glass = rects_with_fill(&output, made_app::theme::BG_TERMINAL_GLASS);
     assert_eq!(
         glass.len(),
         1,
-        "session/path/file-slot primary state must keep exactly one terminal glass layer: {glass:?}"
+        "session/path primary state must keep exactly one terminal glass layer: {glass:?}"
     );
     assert!(
         glass[0].width() > 500.0 && glass[0].height() > 300.0,
@@ -7768,22 +7803,14 @@ fn file_control_sits_below_session_strip_and_path() {
     );
     assert!(
         rects_with_fill(&output, made_app::theme::BG_TERMINAL).is_empty(),
-        "primary terminal body/path/file-slot chrome must not paint opaque BG_TERMINAL"
+        "primary terminal body and path chrome must not paint opaque BG_TERMINAL"
     );
-    assert!(
-        !rects_with_fill(&output, made_app::theme::BG_HEADER).is_empty(),
-        "the optional session strip/header must remain opaque BG_HEADER"
-    );
-    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
-    let file_rect = headless
-        .response(left_surface_action_id(&pane_id, "file"))
-        .rect;
-    let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
-    let card_top = layout.content_top();
-    let path_line = 22.0;
-    assert!(
-        file_rect.top() >= card_top + layout.tab_strip_height + path_line - 1.0,
-        "File control overlapped the session strip/path: {file_rect:?}"
+    // Reselecting the file in the Explorer reopens the preview.
+    headless.click(row);
+    headless.pump_until(loaded);
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
     );
 }
 
@@ -8643,7 +8670,8 @@ fn optional_session_map_appears_only_after_session_data() {
         "another workspace must not inherit session data or the map control"
     );
     let beta_text = output_text(&headless.render());
-    assert!(!beta_text.contains("Owned session"));
+    // Only the first tab's label names the session; no map shows it.
+    assert_eq!(beta_text.matches("Owned session").count(), 1, "{beta_text}");
     headless.click(workspace_tab_id(id));
     assert!(headless.model.workspace(id).unwrap().sessions_visible());
     let alpha_text = output_text(&headless.render());
@@ -9441,10 +9469,10 @@ fn an_opencode_tab_keeps_its_dots_and_root_when_grok_events_arrive() {
         "the OpenCode idle dot",
     );
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Session 0", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "the connected tab must stay labeled OpenCode"
+        "the connected tab stays labeled with its OpenCode session title"
     );
     assert!(
         text_rects(&output, "Grok Build", 55.0)
@@ -11174,9 +11202,10 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
     );
     headless.render();
     let withdrawn = output_text(&headless.render());
+    // A success adds no notice text; the card itself shows the offer again.
     assert!(
-        withdrawn.contains("Consent withdrawn"),
-        "withdrawal is disclosed: {withdrawn}"
+        withdrawn.contains("Approve") && !withdrawn.contains("Consent withdrawn"),
+        "withdrawal returns the card to its offer: {withdrawn}"
     );
 }
 
@@ -13209,7 +13238,8 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
     // Protocol only: no hook record, so no live owned session.
     fixture.emit(b"\x1b]0;Refactor parser\x07");
     fixture.emit(CLAUDE_ESC_WORKING);
-    let output = fixture.labeled("Claude Code");
+    // The tab is labeled with the session title.
+    let output = fixture.labeled("Refactor parser");
     let tab = fixture.tab();
     let dots = tab_session_dots(&output, tab);
     assert_eq!(
@@ -13218,7 +13248,7 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
         "one protocol-only dot without a live session"
     );
     assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the busy dot");
-    let label = text_rects(&output, "Claude Code", 55.0)
+    let label = text_rects(&output, "Refactor parser", 55.0)
         .into_iter()
         .find(|rect| tab.contains_rect(*rect))
         .unwrap();
@@ -13241,7 +13271,10 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
     let output = fixture.headless.render();
     let (role, name, _) = accesskit_row_state(&output, workspace_tab_id(fixture.id));
     assert_eq!(role, egui::Role::Tab);
-    assert_eq!(name.as_deref(), Some("Claude Code — Sessions: 1 running"));
+    assert_eq!(
+        name.as_deref(),
+        Some("Claude Code — Refactor parser — Sessions: 1 running")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -13256,14 +13289,28 @@ fn the_window_title_never_reaches_the_copied_report_or_the_log() {
     let id = fixture.id;
     fixture.emit(format!("\u{1b}]0;{MARKER}\u{7}").as_bytes());
     fixture.emit(CLAUDE_ESC_WORKING);
-    fixture.labeled("Claude Code");
+    fixture.labeled(MARKER);
     // The title is read, for the tooltip only.
     let hovered = fixture.hover_tab(MARKER);
     assert!(hovered.contains(MARKER), "{hovered}");
 
     // Open the diagnostics with the title live so every report path runs.
     open_about_diagnostics(&mut fixture.headless, id);
-    let shown = output_text(&fixture.headless.render());
+    // The tab label may show the title; the About card never does.
+    let output = fixture.headless.render();
+    let pane = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .pane_id()
+        .to_owned();
+    let about = fixture
+        .headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str()))))
+        .expect("about window");
+    let shown = text_in_rect(&output, about);
     assert!(!shown.contains(MARKER), "the About panel: {shown}");
     let workbench = fixture.headless.model.workspace(id).unwrap();
     let report = workbench.sanitized_diagnostics_text();
@@ -13634,13 +13681,14 @@ fn claude_code_row_walks_not_running_starting_and_ready() {
 /// `opencode.svg`, one busy and one idle dot, no Claude Code branding.
 #[cfg(target_os = "linux")]
 fn assert_connected_opencode_tab(fixture: &mut ClaudeFixture, phase: &str) {
-    let output = fixture.labeled("OpenCode");
+    // The OpenCode tab is labeled with its active session's title.
+    let output = fixture.labeled("Session 0");
     let tab = fixture.tab();
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Session 0", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "{phase}: the tab stays labeled OpenCode"
+        "{phase}: the tab stays labeled with the OpenCode session title"
     );
     assert!(
         text_rects(&output, "Claude Code", 55.0)
@@ -13987,16 +14035,31 @@ fn claude_content_markers_never_reach_the_tooltip_diagnostics_report_or_log() {
     // still no content marker appears.
     fixture.emit(CLAUDE_ESC_WORKING);
     fixture.emit(format!("\x1b]0;{TITLE_MARKER} title\x07").as_bytes());
-    fixture.labeled("Claude Code");
+    fixture.labeled(TITLE_MARKER);
     let hovered = fixture.hover_tab(TITLE_MARKER);
     assert!(hovered.contains(TITLE_MARKER), "{hovered}");
     assert_clean(&hovered, "the protocol tooltip");
 
     // About diagnostics, the copied report and the log.
     open_about_diagnostics(&mut fixture.headless, id);
-    let about = output_text(&fixture.headless.render());
+    let output = fixture.headless.render();
+    let about = output_text(&output);
     assert_clean(&about, "the About diagnostics");
-    assert!(!about.contains(TITLE_MARKER), "{about}");
+    // The tab label may show the title; the About card never does.
+    let pane = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .pane_id()
+        .to_owned();
+    let window = fixture
+        .headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str()))))
+        .expect("about window");
+    let card = text_in_rect(&output, window);
+    assert!(!card.contains(TITLE_MARKER), "{card}");
     let report = fixture
         .headless
         .model
@@ -14247,4 +14310,56 @@ fn an_empty_open_session_map_names_opencode() {
     let text = output_text(&headless.render());
     assert!(text.contains("No OpenCode sessions"), "{text}");
     assert!(!text.contains("No open sessions"), "{text}");
+}
+
+#[test]
+fn long_tab_labels_clamp_to_the_new_maxima_and_overflow() {
+    if isolated("long_tab_labels_clamp_to_the_new_maxima_and_overflow") {
+        return;
+    }
+    for (width, height, max) in [(1280.0, 800.0, 280.0), (720.0, 480.0, 230.0)] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let root = fixture_workspace(
+                temp.path(),
+                &format!("{index}-a-very-long-folder-name-that-exceeds-every-tab-maximum"),
+                "main.rs",
+            );
+            ids.push(open_workspace(&mut model, &root));
+        }
+        let mut headless = Headless::new(model, width, height);
+        for id in &ids {
+            wait_explorer_ready(&mut headless, *id);
+        }
+        headless.render();
+        let output = headless.render();
+        let shown: Vec<egui::Rect> = ids
+            .iter()
+            .filter_map(|id| headless.ctx.read_response(workspace_tab_id(*id)))
+            .map(|response| response.rect)
+            .collect();
+        assert!(!shown.is_empty());
+        assert!(shown.len() < ids.len(), "{width}px: some tabs overflow");
+        for rect in &shown {
+            assert!(
+                (rect.width() - max).abs() < 0.75,
+                "{width}px: a long label clamps at {max}: {rect:?}"
+            );
+        }
+        let text = output_text(&output);
+        assert!(
+            text.contains('…'),
+            "{width}px: the label ellipsizes: {text}"
+        );
+        assert!(
+            headless
+                .ctx
+                .read_response(top_action_id("workspace-overflow"))
+                .is_some(),
+            "{width}px: the overflow stays reachable"
+        );
+    }
 }

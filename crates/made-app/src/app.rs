@@ -364,6 +364,8 @@ pub struct AppModel {
     ssh: Result<ServerRegistry<PrivateMetadataStorage>, String>,
     ssh_selected: Option<made_remote::protocol::AuthorityId>,
     ssh_notice: Option<String>,
+    /// The last success or neutral SSH notice, never shown on the screen.
+    ssh_info: Option<String>,
     ssh_host_key_changed: bool,
     probe: Option<ProbeAttempt>,
     /// Password handling of the running connection test.
@@ -487,6 +489,7 @@ impl AppModel {
             ssh: load_ssh_registry(),
             ssh_selected: None,
             ssh_notice: None,
+            ssh_info: None,
             ssh_host_key_changed: false,
             probe: None,
             probe_secret: crate::credential_cache::AttemptSecret::default(),
@@ -807,9 +810,8 @@ impl AppModel {
             secret,
         ));
         self.push_integration_diagnostics();
-        self.ssh_notice = Some(
-            "Approved for this server and version. Installing the official Grok Build plugin."
-                .to_owned(),
+        self.ssh_info(
+            "Approved for this server and version. Installing the official Grok Build plugin.",
         );
         Ok(())
     }
@@ -820,9 +822,8 @@ impl AppModel {
         if !self.remote_grok_install_refusals.contains(&id) {
             self.remote_grok_install_refusals.push(id);
         }
-        self.ssh_notice = Some(
-            "Refused. Nothing was installed or written; session follow uses the remote inventory."
-                .to_owned(),
+        self.ssh_info(
+            "Refused. Nothing was installed or written; session follow uses the remote inventory.",
         );
     }
 
@@ -836,9 +837,7 @@ impl AppModel {
         registry
             .set_grok_consent(id, None)
             .map_err(|error| error.to_string())?;
-        self.ssh_notice = Some(
-            "Consent withdrawn. Nothing was uninstalled; no further install can start.".to_owned(),
-        );
+        self.ssh_info("Consent withdrawn. Nothing was uninstalled; no further install can start.");
         Ok(())
     }
 
@@ -916,8 +915,13 @@ impl AppModel {
                     ),
                     RemoteGrokInstallState::Running => String::new(),
                 };
+                    let info = !matches!(state, RemoteGrokInstallState::Failed { .. });
                     self.upsert_remote_grok_install(authority, state);
-                    self.ssh_notice = Some(notice);
+                    if info {
+                        self.ssh_info(notice)
+                    } else {
+                        self.ssh_notice = Some(notice)
+                    }
                 }
                 Err(error) => {
                     self.upsert_remote_grok_install(
@@ -1007,6 +1011,14 @@ impl AppModel {
         self.ssh_notice = Some(notice.into());
     }
 
+    /// Record a success or neutral SSH notice. The Open workspace screen
+    /// shows only failures, so this text never reaches its notice line.
+    fn ssh_info(&mut self, notice: impl Into<String>) {
+        let notice = notice.into();
+        self.ssh_info = Some(notice.clone());
+        self.ssh_notice = Some(notice);
+    }
+
     pub(crate) fn ssh_registry(&self) -> Result<&ServerRegistry<PrivateMetadataStorage>, &str> {
         self.ssh.as_ref().map_err(String::as_str)
     }
@@ -1032,9 +1044,8 @@ impl AppModel {
         if let Some(workbench) = self.workbench_mut() {
             workbench.grant_remote_consent();
         }
-        self.ssh_notice = Some(
-            "Provisioning approved for this server and version. No password was written to disk."
-                .to_owned(),
+        self.ssh_info(
+            "Provisioning approved for this server and version. No password was written to disk.",
         );
         Ok(())
     }
@@ -1052,9 +1063,8 @@ impl AppModel {
             .workbench_mut()
             .is_some_and(Workbench::approve_remote_update);
         if approved {
-            self.ssh_notice = Some(
-                "Companion update approved for this attempt only. Running sessions are not signalled."
-                    .to_owned(),
+            self.ssh_info(
+                "Companion update approved for this attempt only. Running sessions are not signalled.",
             );
             Ok(())
         } else {
@@ -1304,9 +1314,8 @@ impl AppModel {
             .clone();
         crate::ssh_servers::forget_saved_host_key(&metadata).map_err(|error| error.detail)?;
         self.ssh_host_key_changed = false;
-        self.ssh_notice = Some(
-            "Old host key forgotten. Test again to check and approve the new fingerprint."
-                .to_owned(),
+        self.ssh_info(
+            "Old host key forgotten. Test again to check and approve the new fingerprint.",
         );
         Ok(())
     }
@@ -1321,7 +1330,7 @@ impl AppModel {
         }
         self.probe = None;
         self.drop_card(PromptCard::is_probe);
-        self.ssh_notice = Some("Connection test cancelled.".to_owned());
+        self.ssh_info("Connection test cancelled.");
     }
 
     pub(crate) fn submit_ssh_prompt(&mut self, accept: bool) {
@@ -2558,6 +2567,24 @@ struct RemoteSession {
     secret: crate::credential_cache::AttemptSecret,
 }
 
+/// A contextual notice kind of the Open workspace screen's notice line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenNotice {
+    /// The address bar's navigation error.
+    Address,
+    /// Consent refusal, missing home or an ended browse connection.
+    Notice,
+    /// A listing failure.
+    Tree,
+    /// A launch that failed validation.
+    Launch,
+}
+
+impl ScreenNotice {
+    /// Every kind, in notice-line order.
+    pub const ALL: [Self; 4] = [Self::Address, Self::Notice, Self::Tree, Self::Launch];
+}
+
 /// Open workspace screen state, alive while the screen is shown.
 struct Screen {
     model: OpenWorkspace,
@@ -2582,6 +2609,9 @@ struct Screen {
     /// The selected host's connection failure was dismissed; it shows again
     /// after the host leaves the failed state.
     failure_dismissed: bool,
+    /// The dismissed text of each contextual notice kind; a notice shows
+    /// again once its text changes or clears.
+    dismissed: [Option<String>; 4],
     rows: (RowsKey, Arc<Vec<ScreenRow>>),
     picker_key: Option<(u64, u64, Option<usize>, PathBuf)>,
 }
@@ -2708,6 +2738,7 @@ impl AppModel {
                 tested: None,
                 passed: None,
                 failure_dismissed: false,
+                dismissed: Default::default(),
                 rows: (None, Arc::new(Vec::new())),
                 picker_key: None,
             });
@@ -2794,6 +2825,17 @@ impl AppModel {
         ) {
             screen.failure_dismissed = false;
         }
+        let current = ScreenNotice::ALL.map(|kind| self.screen_notice_text(kind));
+        if let Some(screen) = self.screen.as_mut() {
+            for (dismissed, current) in screen.dismissed.iter_mut().zip(current) {
+                if current.is_none() {
+                    *dismissed = None;
+                }
+            }
+        }
+        let Some(screen) = self.screen.as_mut() else {
+            return;
+        };
         screen
             .model
             .set_detected(HostId::Local, self.compatible_tuis.clone());
@@ -4084,8 +4126,10 @@ impl AppModel {
         (screen.tested == Some(host) || screen.model.selected_host() == HostId::Ssh(host))
             .then_some(())?;
         let report = self.ssh_notice.as_deref()?;
-        // The selected host's failure is written once, as its error line.
-        (self.selected_failure() != Some(report)).then_some((host, report))
+        // Successes add no text; the selected host's failure is written once,
+        // as its error line.
+        (self.ssh_info.as_deref() != Some(report) && self.selected_failure() != Some(report))
+            .then_some((host, report))
     }
 
     fn selected_failure(&self) -> Option<&str> {
@@ -4123,6 +4167,39 @@ impl AppModel {
                 }
             }
             RemoteLink::Consent { .. } | RemoteLink::Stopped(_) => None,
+        }
+    }
+
+    /// The raw text of one contextual notice kind, dismissed or not.
+    pub fn screen_notice_text(&self, kind: ScreenNotice) -> Option<String> {
+        match kind {
+            ScreenNotice::Address => self.screen_address_message().map(str::to_owned),
+            ScreenNotice::Notice => self.screen_notice().map(str::to_owned),
+            ScreenNotice::Tree => self.screen_tree_error(),
+            ScreenNotice::Launch => self.screen_launch_error().map(str::to_owned),
+        }
+    }
+
+    /// The contextual notices to show, in order, without dismissed ones.
+    pub fn screen_visible_notices(&self) -> Vec<(ScreenNotice, String)> {
+        let Some(screen) = self.screen.as_ref() else {
+            return Vec::new();
+        };
+        ScreenNotice::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                let text = self.screen_notice_text(kind)?;
+                (screen.dismissed[kind as usize].as_deref() != Some(text.as_str()))
+                    .then_some((kind, text))
+            })
+            .collect()
+    }
+
+    /// Dismiss one contextual notice until its text changes or clears.
+    pub fn screen_dismiss_notice(&mut self, kind: ScreenNotice) {
+        let text = self.screen_notice_text(kind);
+        if let Some(screen) = self.screen.as_mut() {
+            screen.dismissed[kind as usize] = text;
         }
     }
 
@@ -5284,6 +5361,123 @@ mod tests {
     }
 
     #[test]
+    fn success_and_neutral_ssh_notices_add_no_text_on_the_screen() {
+        let mut fixture = Fixture::new(None, false);
+        fixture.model.screen_test_host(fixture.id);
+        fixture.model.cancel_ssh_probe();
+        assert_eq!(fixture.model.screen_test_report(), None);
+        fixture.model.refuse_remote_grok_install(fixture.id);
+        assert_eq!(fixture.model.screen_test_report(), None);
+        let text = frame_text(&mut fixture, Vec::new());
+        for wording in ["cancelled", "Refused", "approved", "forgotten"] {
+            assert!(!text.contains(wording), "{wording}: {text}");
+        }
+        // A failure afterwards is still shown.
+        fixture.model.screen_test_host(fixture.id);
+        finish_test(&mut fixture, Err(failure(SshFailureClass::AuthFailed)));
+        assert!(fixture.model.screen_test_report().is_some());
+    }
+
+    #[test]
+    fn every_notice_kind_is_dismissible_and_returns_when_it_changes() {
+        use crate::app::ScreenNotice;
+        let mut fixture = Fixture::consent(None);
+        // Consent refusal: a screen notice, dismissed with Escape on its control.
+        fixture.model.screen_answer_consent(false);
+        fixture.sync();
+        let kinds = |fixture: &Fixture| -> Vec<ScreenNotice> {
+            fixture
+                .model
+                .screen_visible_notices()
+                .into_iter()
+                .map(|(kind, _)| kind)
+                .collect()
+        };
+        assert_eq!(kinds(&fixture), [ScreenNotice::Notice]);
+        let dismiss = crate::ui::picker_control_id("dismiss-notice");
+        for _ in 0..2 {
+            frame(&mut fixture, Vec::new());
+        }
+        let (texts, _) = frame_paint(&mut fixture, Vec::new());
+        let notice = fixture.model.screen_notice().unwrap().to_owned();
+        assert!(texts
+            .iter()
+            .any(|(text, color, _)| text.contains(&notice) && *color == crate::theme::ERROR));
+        assert!(fixture.ctx.read_response(dismiss).is_some());
+        fixture
+            .ctx
+            .memory_mut(|memory| memory.request_focus(dismiss));
+        frame(&mut fixture, Vec::new());
+        frame(&mut fixture, Vec::new());
+        press(&mut fixture, egui::Key::Escape);
+        assert!(kinds(&fixture).is_empty());
+        assert!(fixture.model.is_picker(), "Escape closes only the notice");
+        // Tree and launch errors: dismissed by pointer; a new text returns.
+        for (kind, id) in [
+            (ScreenNotice::Tree, "dismiss-tree"),
+            (ScreenNotice::Launch, "dismiss-launch"),
+        ] {
+            let set = |fixture: &mut Fixture, text: &str| {
+                let screen = fixture.model.screen.as_mut().unwrap();
+                match kind {
+                    ScreenNotice::Tree => screen.remote_tree.error = Some(text.to_owned()),
+                    _ => screen.launch_error = Some(text.to_owned()),
+                }
+            };
+            set(&mut fixture, "first failure");
+            fixture.sync();
+            for _ in 0..2 {
+                frame(&mut fixture, Vec::new());
+            }
+            assert!(kinds(&fixture).contains(&kind));
+            click(&mut fixture, crate::ui::picker_control_id(id));
+            assert!(!kinds(&fixture).contains(&kind), "{kind:?} dismissed");
+            set(&mut fixture, "another failure");
+            assert!(kinds(&fixture).contains(&kind), "{kind:?} changed");
+            fixture.model.screen_dismiss_notice(kind);
+            assert!(!kinds(&fixture).contains(&kind));
+        }
+        // A cleared error resets the dismissal: the same text shows again.
+        fixture.model.screen.as_mut().unwrap().launch_error = None;
+        fixture.sync();
+        fixture.model.screen.as_mut().unwrap().launch_error = Some("another failure".to_owned());
+        assert!(kinds(&fixture).contains(&ScreenNotice::Launch));
+    }
+
+    #[test]
+    fn an_address_error_is_dismissible() {
+        use crate::app::ScreenNotice;
+        let mut fixture = Fixture::new(None, false);
+        let missing = fixture._temp.path().join("missing-folder");
+        assert!(fixture
+            .model
+            .screen_navigate(&missing.display().to_string())
+            .is_err());
+        fixture.sync();
+        assert!(fixture
+            .model
+            .screen_visible_notices()
+            .iter()
+            .any(|(kind, _)| *kind == ScreenNotice::Address));
+        for _ in 0..2 {
+            frame(&mut fixture, Vec::new());
+        }
+        click(
+            &mut fixture,
+            crate::ui::picker_control_id("dismiss-address"),
+        );
+        assert!(!fixture
+            .model
+            .screen_visible_notices()
+            .iter()
+            .any(|(kind, _)| *kind == ScreenNotice::Address));
+        assert!(
+            fixture.model.screen_address_error().is_some(),
+            "the error stays"
+        );
+    }
+
+    #[test]
     fn a_failed_test_report_clears_on_a_later_success_or_a_host_change() {
         let mut fixture = Fixture::new(None, false);
         let detail = SshFailureClass::AuthFailed.detail().to_owned();
@@ -5322,9 +5516,17 @@ mod tests {
         };
         let mut fixture = Fixture::new(None, false);
         fail(&mut fixture);
-        let text = frame_text(&mut fixture, Vec::new());
         let detail = SshFailureClass::AuthFailed.detail();
-        assert!(text.contains(detail), "the failure is shown: {text}");
+        // On the notice line, in ERROR with the error glyph.
+        let (texts, _) = frame_paint(&mut fixture, Vec::new());
+        let line = texts
+            .iter()
+            .find(|(text, ..)| text.contains(detail))
+            .unwrap_or_else(|| panic!("the failure is shown: {texts:?}"));
+        assert_eq!(line.1, crate::theme::ERROR);
+        assert!(texts.iter().any(|(text, color, rect)| text == "!"
+            && *color == crate::theme::ERROR
+            && rect.right() <= line.2.left()));
         let rect = fixture.ctx.read_response(dismiss).expect("dismiss").rect;
         assert!(rect.width() >= 24.0 && rect.height() >= 24.0, "{rect:?}");
         // Pointer.

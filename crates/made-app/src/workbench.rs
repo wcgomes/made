@@ -499,7 +499,6 @@ struct RemotePreviewView {
     key: Option<RemotePreviewKey>,
     document: Option<PreviewDocument>,
     document_key: Option<RemotePreviewKey>,
-    refreshed_at: Option<Instant>,
     worker: Option<RemotePreviewWorker>,
     pending: Option<RemotePreviewKey>,
 }
@@ -546,7 +545,6 @@ impl RemotePreviewView {
         self.key = None;
         self.document = None;
         self.document_key = None;
-        self.refreshed_at = None;
         self.pending = None;
     }
 
@@ -585,7 +583,6 @@ impl RemotePreviewView {
             if self.key.as_ref() == Some(&result.key) {
                 self.document = Some(result.document);
                 self.document_key = Some(result.key);
-                self.refreshed_at = Some(Instant::now());
                 self.pending = None;
             }
         }
@@ -1774,9 +1771,19 @@ impl Workbench {
             terminal.set_visible(self.visible && surface == LeftSurface::Terminal);
         }
     }
-    /// Return from preview to the same live terminal with fresh focus.
+    /// Return from preview to the same live terminal with fresh focus. Closing
+    /// clears the loaded preview: it reopens only by selecting the file in the
+    /// Explorer again.
     pub fn close_preview(&mut self) {
         self.set_left_surface(LeftSurface::Terminal);
+        if let Some(explorer) = self.explorer.as_mut() {
+            explorer.clear_preview();
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            if remote.workspace.projection().preview.is_some() {
+                let _ = remote.workspace.close_preview();
+            }
+        }
     }
 
     /// Drop any in-flight preview timing when the preview is invalidated by a
@@ -2153,6 +2160,17 @@ impl Workbench {
         self.remote
             .as_ref()
             .map(|remote| remote.snapshot.server().metadata().display_name.clone())
+    }
+
+    /// The remote shell's current directory, or the remote root before the
+    /// shell reports one.
+    pub fn remote_cwd_label(&self) -> Option<String> {
+        let remote = self.remote.as_ref()?;
+        let cwd = remote
+            .workspace
+            .shell_cwd()
+            .unwrap_or_else(|| remote.workspace.root());
+        cwd.to_utf8().ok().map(str::to_owned)
     }
 
     pub fn remote_path_label(&self) -> Option<String> {
@@ -2773,7 +2791,6 @@ impl Workbench {
             if !same_path {
                 self.remote_preview.document = None;
                 self.remote_preview.document_key = None;
-                self.remote_preview.refreshed_at = None;
             }
             self.remote_preview.key = Some(key.clone());
         }
@@ -2824,13 +2841,11 @@ impl Workbench {
                 document: self.remote_preview.document.as_ref(),
                 loading,
                 error: error.as_deref(),
-                refreshed_at: self.remote_preview.refreshed_at,
                 focus_pending: self.remote_preview_focus_pending,
             },
             crate::explorer_view::PreviewCardIds {
                 focus: scope.with("preview-focus"),
                 close: scope.with(("preview-action", "Close")),
-                terminal: scope.with(("preview-action", "Terminal")),
                 refresh: scope.with(("preview-action", "Refresh")),
                 copy: scope.with(("preview-action", "Copy path")),
             },
@@ -2848,10 +2863,7 @@ impl Workbench {
                 let _ = remote.workspace.refresh_preview();
             }
         }
-        if matches!(
-            result.surface,
-            PreviewUiAction::Close | PreviewUiAction::ShowTerminal
-        ) {
+        if result.surface == PreviewUiAction::Close {
             ui.ctx()
                 .memory_mut(|memory| memory.surrender_focus(scope.with("preview-focus")));
         }
@@ -8637,6 +8649,16 @@ mod tests {
                         .directories
                         .contains_key(&target)
             });
+            // A shell tab is named after the remote cwd; the tooltip path is
+            // the full cwd.
+            assert_eq!(
+                crate::ui::workspace_tab_label(&bench.workbench),
+                "ação 日本"
+            );
+            assert_eq!(
+                bench.workbench.remote_cwd_label().as_deref(),
+                Some("/home/vscode/dir com espaço/ação 日本")
+            );
         }
 
         #[test]

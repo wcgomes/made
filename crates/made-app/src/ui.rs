@@ -226,6 +226,7 @@ enum ScreenCommand {
     ForgetHostKey,
     DismissReport,
     DismissFailure,
+    DismissNotice(crate::app::ScreenNotice),
     Close,
 }
 
@@ -988,42 +989,6 @@ fn screen_panels(
     if model.screen_form().is_some() {
         host_form_ui(model, ui, layout, command);
     }
-    let editing = model.screen_form().and_then(|form| form.editing);
-    if let Some((tested, report)) = model
-        .screen_test_report()
-        .map(|(id, text)| (id, text.to_owned()))
-        .filter(|(id, _)| Some(*id) != editing)
-    {
-        let name = model
-            .screen_hosts()
-            .into_iter()
-            .find(|host| host.id == crate::open_workspace::HostId::Ssh(tested))
-            .map(|host| host.name)
-            .unwrap_or_default();
-        panel_frame(ui, pad_x, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let extent = theme::icon_action_extent(24.0);
-                let text_width = (ui.available_width() - extent - 8.0).max(40.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(text_width, extent),
-                    egui::Layout::top_down(Align::Min),
-                    |ui| {
-                        ui.set_width(text_width);
-                        ui.add_space(4.0);
-                        ui.label(theme::micro(format!(
-                            "{}: {}",
-                            sanitize_display(&name, 128),
-                            sanitize_display(&report, 400)
-                        )));
-                    },
-                );
-                if dismiss_action(ui, picker_control_id("dismiss-report"), theme::BG_HEADER) {
-                    *command = Some(ScreenCommand::DismissReport);
-                }
-            });
-        });
-    }
     if let Some(message) = model.screen_removal().map(str::to_owned) {
         panel_frame(ui, pad_x, |ui| {
             ui.horizontal(|ui| {
@@ -1214,12 +1179,6 @@ fn host_form_ui(
     let Some(state) = model.screen_form().cloned() else {
         return;
     };
-    let report = state.editing.and_then(|id| {
-        model
-            .screen_test_report()
-            .filter(|(host, _)| *host == id)
-            .map(|(_, text)| text.to_owned())
-    });
     let pad_x = if layout.compact { 10.0 } else { 16.0 };
     let mut test = false;
     panel_frame(ui, pad_x, |ui| {
@@ -1310,10 +1269,6 @@ fn host_form_ui(
                     );
                 }
             });
-        }
-        if let Some(report) = &report {
-            ui.add_space(4.0);
-            ui.label(theme::micro(sanitize_display(report, 400)));
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -1525,37 +1480,47 @@ fn folder_area_ui(
     );
     area_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     let pad_x = if layout.compact { 10.0 } else { 12.0 };
-    // Fill, tone, text, tooltip and the dismiss control's id, if any.
-    let mut notices: Vec<(Color32, Color32, String, String, Option<egui::Id>)> = Vec::new();
-    if let Some(failure) = model.screen_connection_failure() {
-        let text = sanitize_display(failure, 600);
+    // Fill, tone, text, tooltip and the dismiss control with its command.
+    let mut notices: Vec<(Color32, Color32, String, String, Option<NoticeDismiss>)> = Vec::new();
+    let mut error = |text: String, dismiss: NoticeDismiss| {
         notices.push((
             theme::ERROR_TINT,
             theme::ERROR,
             text.clone(),
             text,
-            Some(picker_control_id("dismiss-failure")),
+            Some(dismiss),
         ));
+    };
+    if let Some(failure) = model.screen_connection_failure() {
+        error(sanitize_display(failure, 600), NoticeDismiss::Failure);
     }
-    if let Some(message) = model.screen_address_message() {
-        let target = picker_current_target(model).unwrap_or_default();
-        let text = format!(
-            "{} · Press Esc to restore {}.",
-            message,
-            sanitize_display(&target, 300)
+    if let Some((tested, report)) = model.screen_test_report() {
+        let name = model
+            .screen_hosts()
+            .into_iter()
+            .find(|host| host.id == crate::open_workspace::HostId::Ssh(tested))
+            .map(|host| sanitize_display(&host.name, 128))
+            .unwrap_or_default();
+        let report = sanitize_display(report, 600);
+        error(
+            if name.is_empty() {
+                report
+            } else {
+                format!("{name}: {report}")
+            },
+            NoticeDismiss::Report,
         );
-        notices.push((theme::ERROR_TINT, theme::ERROR, text.clone(), text, None));
     }
-    for text in [
-        model.screen_notice().map(str::to_owned),
-        model.screen_tree_error(),
-        model.screen_launch_error().map(str::to_owned),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let text = sanitize_display(&text, 600);
-        notices.push((theme::ERROR_TINT, theme::ERROR, text.clone(), text, None));
+    for (kind, text) in model.screen_visible_notices() {
+        let text = match kind {
+            crate::app::ScreenNotice::Address => format!(
+                "{} · Press Esc to restore {}.",
+                text,
+                sanitize_display(&picker_current_target(model).unwrap_or_default(), 300)
+            ),
+            _ => sanitize_display(&text, 600),
+        };
+        error(text, NoticeDismiss::Notice(kind));
     }
     let truncated = model.screen_truncated();
     if truncated > 0 {
@@ -1594,8 +1559,11 @@ fn folder_area_ui(
                 ))
                 .layout(egui::Layout::top_down(Align::Min)),
         );
-        if notice_strip(&mut strip, layout, *fill, *tone, text, tooltip, *dismiss) {
-            *command = Some(ScreenCommand::DismissFailure);
+        let id = dismiss.map(NoticeDismiss::id);
+        if notice_strip(&mut strip, layout, *fill, *tone, text, tooltip, id) {
+            if let Some(dismiss) = dismiss {
+                *command = Some(dismiss.command());
+            }
         }
         area_ui.add_space(strip.min_rect().height());
     }
@@ -2304,11 +2272,11 @@ fn screen_keyboard(model: &AppModel, ui: &mut Ui, command: &mut Option<ScreenCom
             if address_escape || text_focused || egui::Popup::is_any_open(&ctx) {
                 continue;
             }
-            if focused == Some(picker_control_id("dismiss-report")) {
+            if let Some(dismiss) = focused
+                .and_then(|focused| NoticeDismiss::ALL.into_iter().find(|d| d.id() == focused))
+            {
                 // Escape on a dismiss control closes only its notice.
-                *command = Some(ScreenCommand::DismissReport);
-            } else if focused == Some(picker_control_id("dismiss-failure")) {
-                *command = Some(ScreenCommand::DismissFailure);
+                *command = Some(dismiss.command());
             } else if model.screen_form().is_some() {
                 *command = Some(ScreenCommand::CancelForm);
             } else {
@@ -2375,6 +2343,7 @@ fn apply_screen_command(model: &mut AppModel, ui: &Ui, command: Option<ScreenCom
         }
         ScreenCommand::DismissReport => model.screen_dismiss_test_report(),
         ScreenCommand::DismissFailure => model.screen_dismiss_connection_failure(),
+        ScreenCommand::DismissNotice(kind) => model.screen_dismiss_notice(kind),
         ScreenCommand::Close => {
             model.close_picker();
         }
@@ -2429,11 +2398,6 @@ pub fn top_action_id(action: &str) -> egui::Id {
 /// Stable id for a top-bar control whose state belongs to one workspace.
 pub fn top_workspace_action_id(id: WorkspaceId, action: &str) -> egui::Id {
     egui::Id::unique(("made-top-workspace-action", action, id.get()))
-}
-
-/// Stable id for a workspace-scoped left-surface toggle.
-pub fn left_surface_action_id(pane_id: &str, surface: &str) -> egui::Id {
-    egui::Id::unique(("made-left-surface", pane_id, surface))
 }
 
 /// Stable id for the workspace explorer splitter.
@@ -2531,7 +2495,7 @@ fn workspace_tab_base_width(label: &str, layout: &Layout) -> f32 {
         + WORKSPACE_TAB_TEXT_GROWTH)
         .clamp(
             if layout.compact { 84.0 } else { 96.0 },
-            if layout.compact { 198.0 } else { 238.0 },
+            if layout.compact { 230.0 } else { 280.0 },
         )
 }
 
@@ -2619,11 +2583,24 @@ fn mark_leading(mark: Mark) -> theme::MenuLeading {
 
 /// Accessible tab name, including the non-color session summary when present.
 fn workspace_tab_accessible_label(label: &str, summary: Option<&str>) -> String {
-    let label = sanitize_display(label, 80);
+    let label = sanitize_display(label, 300);
     match summary {
         Some(summary) => format!("{label} — {summary}"),
         None => label,
     }
+}
+
+/// The accessible name of a tab: a branded tab names its program, then the
+/// session title its label shows; a shell tab names its label.
+fn workspace_tab_name(tab: &WorkspaceTabInfo, summary: Option<&str>) -> String {
+    let label = match &tab.brand {
+        Some(brand) => match &brand.shown {
+            Some(title) => format!("{} — {title}", brand.entry.descriptor().label),
+            None => brand.entry.descriptor().label.to_owned(),
+        },
+        None => tab.label.clone(),
+    };
+    workspace_tab_accessible_label(&label, summary)
 }
 
 /// Choose bounded visible tab indices while keeping the active tab visible.
@@ -2685,6 +2662,8 @@ struct WorkspaceTabInfo {
     label: String,
     path: std::path::PathBuf,
     remote_path: Option<String>,
+    /// The SSH server's display name, for a remote tab.
+    remote_server: Option<String>,
     /// The integration that brands the tab: its label, mark and dots.
     brand: Option<TabBrand>,
     sessions: Vec<SessionActivity>,
@@ -2696,6 +2675,9 @@ struct TabBrand {
     /// Sanitized tooltip title, for an integration whose tooltip names its
     /// session.
     title: Option<String>,
+    /// The session title the label shows, when it does not fall back to the
+    /// catalog label.
+    shown: Option<String>,
 }
 
 /// Whether the session map yields to another running program: the tab is
@@ -2779,36 +2761,83 @@ fn remote_tab_brand(
 // END remote-path
 
 /// The tab of one workspace.
+/// Longest tab label before sanitizing truncates it; the tab ellipsizes the
+/// rest to its width.
+const WORKSPACE_TAB_LABEL_MAX_CHARS: usize = 120;
+
+/// The last component of a slash-separated path; `/` names the root.
+fn folder_name(path: &str) -> String {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| path.to_owned(), str::to_owned)
+}
+
+/// A sanitized, bounded label, or `None` when nothing printable remains.
+fn bounded_label(text: &str) -> Option<String> {
+    let label = sanitize_display(text.trim(), WORKSPACE_TAB_LABEL_MAX_CHARS);
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// The session title a branded tab shows: the active session of the session
+/// channel's owner, or the title its presentation names. `None` when the tab
+/// falls back to the program's catalog label.
+fn branded_session_title(
+    workbench: &Workbench,
+    entry: IntegrationRef,
+    presentation: &Presentation,
+) -> Option<String> {
+    let title = if entry.follow() == crate::integrations::FollowKind::SessionChannel {
+        let map = workbench.session_map();
+        map.rows()
+            .iter()
+            .find(|row| Some(row.session_id.as_str()) == map.active_session_id())
+            .map(|row| row.title.clone())
+            .filter(|title| title != crate::session_map::UNTITLED)
+    } else {
+        presentation.title.clone()
+    };
+    title
+        .and_then(|title| bounded_label(&title))
+        .filter(|title| title != entry.descriptor().label)
+}
+
+/// The label of a workspace tab: a branded tab names its active session,
+/// falling back to the program's catalog label; a shell tab names its
+/// shell's current directory (the remote cwd for an SSH tab).
+pub(crate) fn workspace_tab_label(workbench: &Workbench) -> String {
+    let label = match tab_brand(workbench) {
+        Some((entry, presentation)) => branded_session_title(workbench, entry, &presentation)
+            .unwrap_or_else(|| entry.descriptor().label.to_owned()),
+        None => match workbench.remote_cwd_label() {
+            Some(cwd) => folder_name(&cwd),
+            None => folder_name(&workbench.shell_cwd().display().to_string()),
+        },
+    };
+    bounded_label(&label).unwrap_or_else(|| "Workspace".to_owned())
+}
+
 fn workspace_tab_info(id: WorkspaceId, workbench: &Workbench) -> WorkspaceTabInfo {
     let path = workbench.shell_cwd().to_path_buf();
-    let remote_path = workbench.remote_path_label();
+    let remote_path = workbench.remote_cwd_label();
+    let label = workspace_tab_label(workbench);
     let branded = tab_brand(workbench);
-    // A branded tab shows its integration's label; only an unbranded remote
-    // tab falls back to its server name so SSH identity stays inspectable.
-    let label = if let Some((entry, _)) = &branded {
-        entry.descriptor().label.to_owned()
-    } else if let Some(name) = workbench.remote_label() {
-        name
-    } else {
-        workbench
-            .launch_plan()
-            .map(|plan| plan.workspace.display_name().to_owned())
-            .unwrap_or_else(|| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Workspace".to_owned())
-            })
-    };
     // Session dots follow the brand, so stale rows cannot paint status after a
     // disconnect or fatal protocol failure.
     let (brand, sessions) = match branded {
-        Some((entry, presentation)) => (
-            Some(TabBrand {
-                entry,
-                title: presentation.title,
-            }),
-            presentation.dots,
-        ),
+        Some((entry, presentation)) => {
+            let shown = branded_session_title(workbench, entry, &presentation);
+            (
+                Some(TabBrand {
+                    entry,
+                    title: shown.clone().or(presentation.title),
+                    shown,
+                }),
+                presentation.dots,
+            )
+        }
         None => (None, Vec::new()),
     };
     WorkspaceTabInfo {
@@ -2816,6 +2845,7 @@ fn workspace_tab_info(id: WorkspaceId, workbench: &Workbench) -> WorkspaceTabInf
         label,
         path,
         remote_path,
+        remote_server: workbench.remote_label(),
         brand,
         sessions,
     }
@@ -2834,9 +2864,14 @@ fn workspace_tab_tooltip(tab: &WorkspaceTabInfo, summary: Option<&str>) -> Optio
         }),
         Some(_) => summary.map(str::to_owned),
         None if !tab.sessions.is_empty() => summary.map(str::to_owned),
-        None => Some(match &tab.remote_path {
-            Some(path) => sanitize_display(path, 900),
-            None => sanitize_display(&tab.path.display().to_string(), 900),
+        None => Some(match (&tab.remote_server, &tab.remote_path) {
+            (Some(server), Some(path)) => format!(
+                "{}: {}",
+                sanitize_display(server, 128),
+                sanitize_display(path, 900)
+            ),
+            (_, Some(path)) => sanitize_display(path, 900),
+            (_, None) => sanitize_display(&tab.path.display().to_string(), 900),
         }),
     }
 }
@@ -2874,7 +2909,7 @@ pub fn workspace_tab_summaries(model: &AppModel) -> Vec<TabSummary> {
                     .as_ref()
                     .map(|brand| brand.entry.descriptor().mark),
                 tooltip: workspace_tab_tooltip(&tab, summary.as_deref()),
-                accessible_name: workspace_tab_accessible_label(&tab.label, summary.as_deref()),
+                accessible_name: workspace_tab_name(&tab, summary.as_deref()),
                 dots: tab.sessions,
                 label: tab.label,
             })
@@ -3523,7 +3558,7 @@ fn workspace_tab_ui(
             egui::Role::Tab,
             true,
             active,
-            workspace_tab_accessible_label(&tab.label, session_summary.as_deref()),
+            workspace_tab_name(tab, session_summary.as_deref()),
         )
     });
     let label_left = rect.left() + WORKSPACE_TAB_INSET + WORKSPACE_TAB_ICON_SLOT;
@@ -3986,10 +4021,6 @@ impl Workbench {
             }
         }
 
-        let mut preview_loaded = explorer
-            .as_ref()
-            .is_some_and(|pane| pane.preview_path().is_some())
-            || self.remote_has_preview();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| {
@@ -4001,14 +4032,6 @@ impl Workbench {
                                 self.close_preview();
                                 self.sync_terminal_visibility(ui.ctx());
                                 self.request_terminal_focus(ui.ctx());
-                                preview_loaded = false;
-                                show_preview = false;
-                            }
-                            PreviewUiAction::ShowTerminal => {
-                                self.set_left_surface(LeftSurface::Terminal);
-                                self.sync_terminal_visibility(ui.ctx());
-                                pane.release_preview_focus(ui.ctx());
-                                self.request_terminal_focus(ui.ctx());
                                 show_preview = false;
                             }
                             PreviewUiAction::None => {}
@@ -4019,13 +4042,6 @@ impl Workbench {
                                 self.close_preview();
                                 self.sync_terminal_visibility(ui.ctx());
                                 self.request_terminal_focus(ui.ctx());
-                                preview_loaded = false;
-                                show_preview = false;
-                            }
-                            PreviewUiAction::ShowTerminal => {
-                                self.set_left_surface(LeftSurface::Terminal);
-                                self.sync_terminal_visibility(ui.ctx());
-                                self.request_terminal_focus(ui.ctx());
                                 show_preview = false;
                             }
                             PreviewUiAction::None => {}
@@ -4033,21 +4049,11 @@ impl Workbench {
                     } else {
                         self.close_preview();
                         self.sync_terminal_visibility(ui.ctx());
-                        preview_loaded = false;
                         show_preview = false;
                     }
                 }
                 if !show_preview {
-                    let file_clicked = self.terminal_card(ui, layout, preview_loaded);
-                    if file_clicked {
-                        self.set_left_surface(LeftSurface::Preview);
-                        self.sync_terminal_visibility(ui.ctx());
-                        if let Some(pane) = explorer.as_mut() {
-                            pane.focus_preview();
-                        } else if self.is_remote() {
-                            self.remote_preview_focus_pending = true;
-                        }
-                    }
+                    self.terminal_card(ui, layout);
                 }
             });
         self.explorer = explorer;
@@ -4058,7 +4064,7 @@ impl Workbench {
         }
     }
 
-    fn terminal_card(&mut self, ui: &mut Ui, layout: &Layout, preview_loaded: bool) -> bool {
+    fn terminal_card(&mut self, ui: &mut Ui, layout: &Layout) {
         let card_rect = ui.available_rect_before_wrap();
         ui.ctx()
             .data_mut(|data| data.insert_temp(terminal_hit_rect_id(), card_rect));
@@ -4129,43 +4135,6 @@ impl Workbench {
                 self.terminal_path_line(ui, path_rect, row, layout, chrome_fill);
                 top += path_rect.height();
             }
-        }
-
-        let mut file_clicked = false;
-        if preview_loaded {
-            let slot_height = layout.button_height + 4.0;
-            let slot_rect = egui::Rect::from_min_size(
-                egui::pos2(card_rect.left(), top),
-                egui::vec2(card_rect.width(), slot_height),
-            );
-            if let Some(fill) = chrome_fill {
-                ui.painter().rect_filled(slot_rect, 0.0, fill);
-            }
-            ui.painter().line_segment(
-                [
-                    egui::pos2(slot_rect.left(), slot_rect.bottom() - 0.5),
-                    egui::pos2(slot_rect.right(), slot_rect.bottom() - 0.5),
-                ],
-                Stroke::new(1.0, theme::BORDER_HEADER),
-            );
-            let mut slot_ui = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(slot_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
-                    .layout(egui::Layout::right_to_left(Align::Center)),
-            );
-            let action = theme::ghost_action(
-                &mut slot_ui,
-                left_surface_action_id(self.pane_id(), "file"),
-                "File",
-                false,
-                layout.button_height,
-                chrome_fill.unwrap_or(Color32::TRANSPARENT),
-            );
-            action
-                .response
-                .on_hover_text("Show the loaded file preview (preview stays open)");
-            file_clicked = action.activated;
-            top += slot_height;
         }
 
         let body_rect = egui::Rect::from_min_max(egui::pos2(card_rect.left(), top), card_rect.max);
@@ -4321,8 +4290,6 @@ impl Workbench {
                 }
             }
         }
-
-        file_clicked
     }
 
     fn activate_session_tab(&mut self, session_id: &str) {
@@ -6354,6 +6321,44 @@ fn terminal_unavailable_card(
         });
 }
 
+/// The dismiss control of one notice-line failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeDismiss {
+    Failure,
+    Report,
+    Notice(crate::app::ScreenNotice),
+}
+
+impl NoticeDismiss {
+    const ALL: [Self; 6] = [
+        Self::Failure,
+        Self::Report,
+        Self::Notice(crate::app::ScreenNotice::Address),
+        Self::Notice(crate::app::ScreenNotice::Notice),
+        Self::Notice(crate::app::ScreenNotice::Tree),
+        Self::Notice(crate::app::ScreenNotice::Launch),
+    ];
+
+    fn id(self) -> egui::Id {
+        picker_control_id(match self {
+            Self::Failure => "dismiss-failure",
+            Self::Report => "dismiss-report",
+            Self::Notice(crate::app::ScreenNotice::Address) => "dismiss-address",
+            Self::Notice(crate::app::ScreenNotice::Notice) => "dismiss-notice",
+            Self::Notice(crate::app::ScreenNotice::Tree) => "dismiss-tree",
+            Self::Notice(crate::app::ScreenNotice::Launch) => "dismiss-launch",
+        })
+    }
+
+    fn command(self) -> ScreenCommand {
+        match self {
+            Self::Failure => ScreenCommand::DismissFailure,
+            Self::Report => ScreenCommand::DismissReport,
+            Self::Notice(kind) => ScreenCommand::DismissNotice(kind),
+        }
+    }
+}
+
 /// One contextual notice line; with `dismiss`, an icon-only Dismiss control
 /// sits at its end. Returns whether that control was activated.
 fn notice_strip(
@@ -7145,8 +7150,8 @@ mod tests {
         );
 
         for (width, height, base_max, expected_max, old_label) in [
-            (720.0, 480.0, 198.0, 229.0, 114.0),
-            (1280.0, 800.0, 238.0, 269.0, 154.0),
+            (720.0, 480.0, 230.0, 261.0, 114.0),
+            (1280.0, 800.0, 280.0, 311.0, 154.0),
         ] {
             let layout = Layout::for_window(width, height);
             let long_label = "workspace-with-a-long-label-that-clamps";
@@ -7181,6 +7186,26 @@ mod tests {
                 "{width}px: a typical label must gain at least 12px of text: {typical_label_width} vs {old_typical_label}"
             );
         }
+    }
+
+    #[test]
+    fn tab_labels_are_sanitized_bounded_and_named_after_folders() {
+        let hostile = format!("a\nb\u{202e}c{}", "x".repeat(300));
+        let label = bounded_label(&hostile).unwrap();
+        assert!(
+            !label.contains('\n') && !label.contains('\u{202e}'),
+            "{label:?}"
+        );
+        assert!(
+            label.chars().count() <= WORKSPACE_TAB_LABEL_MAX_CHARS,
+            "{label}"
+        );
+        assert!(label.starts_with('a'), "{label}");
+        assert_eq!(bounded_label(" \u{202e} "), None);
+        assert_eq!(folder_name("/work/made/crates/made-app"), "made-app");
+        assert_eq!(folder_name("/var/log/"), "log");
+        assert_eq!(folder_name("/"), "/");
+        assert_eq!(folder_name("/home/me/dir com espaço"), "dir com espaço");
     }
 
     #[test]
