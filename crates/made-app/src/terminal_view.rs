@@ -523,7 +523,6 @@ impl TerminalPane {
     pub fn focus_id(&self) -> Option<egui::Id> {
         self.focus_id
     }
-    /// Whether the visible terminal currently owns keyboard/IME input.
     /// Set, each frame before [`TerminalPane::ui`], the area overlaid on the
     /// terminal whose pointer presses, releases, moves and scrolls the
     /// terminal must ignore.
@@ -531,6 +530,7 @@ impl TerminalPane {
         self.pointer_exclusion = rect;
     }
 
+    /// Whether the visible terminal currently owns keyboard/IME input.
     pub fn is_focused(&self) -> bool {
         self.focused
     }
