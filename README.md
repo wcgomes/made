@@ -6,30 +6,47 @@
 
 <p align="center"><strong>Minimal Agentic Development Environment</strong></p>
 
-A native, terminal-first desktop workspace for developers: one window, independent live workspace tabs, and a real shell plus file explorer in every tab. Use it without an agent installed; when you run OpenCode v2, Claude Code or Grok Build in a tab — yourself or from the `+` menu, locally or over SSH — Made follows the active session.
+Made is a native desktop workspace for working with coding agents in the terminal. Each tab opens a real shell and a file explorer straight away, on your machine or on an SSH server. Start OpenCode v2, Claude Code or Grok Build in a tab and Made follows the session: the explorer moves to the agent's working directory or worktree, and the tab shows the session's title and live status. If no agent is installed, Made works as a fast terminal with an explorer.
 
 ## Why Made
 
-- **Terminal-first, not agent-gated.** A shell and explorer open immediately. Made never installs, version-probes, or waits for an agent, and never starts one automatically.
-- **Your workspace follows you.** `cd` in a supported shell and the explorer follows. If OpenCode v2, Claude Code or Grok Build is running with an active session, that session's directory (a worktree directory included) takes precedence, and OpenCode also reports its worktree; disconnect returns to the shell cwd.
-- **Independent tabs for real work.** Each workspace tab owns its own shell, process, explorer, preview, and focus. Close one without disturbing the others.
-- **Native and fast.** Rust, `egui`, and a real PTY-backed terminal renderer. No webview.
-- **Quiet by design.** Full-height explorer, full-left read-only preview, icon-only controls, and a mint-accented, card-edge-aligned floating header over a frosted explorer that keeps the terminal readable.
+- **Terminal first, agents optional.** Each tab is a shell and an explorer. Made never installs, probes or waits for an agent, and never starts one on its own.
+- **Follows the agent you already use.** OpenCode v2, Claude Code and Grok Build are integrated, with no lock-in. The explorer follows the active session's directory, including a worktree. The tab label shows the session title, and dots show whether each session is busy, idle or waiting for you.
+- **One screen to open any workspace.** Pick Local or an SSH host, paste a path or browse to it, see the repository's worktrees and their pending changes, then launch a Terminal or any detected agent directly in that folder or worktree.
+- **SSH works like local.** Remote browsing, git and worktree views, terminals and agent TUIs work the same as on your machine. Remote sessions survive a dropped connection and reattach.
+- **Read-only and careful with your repositories.** Made never writes to git. Its git reads are hardened so that opening a repository never runs commands defined by that repository.
+- **Native and quiet.** Built with Rust and `egui` on a PTY-backed terminal, with no webview. The calm dark design keeps the terminal in focus.
 
-## What you get
+## Features
 
-- **Independent live workspace tabs** — switch folders, keep every shell running, and close only what you mean to close.
-- **Shell cwd follow** — launch-local bash, zsh, fish, and PowerShell hooks with spaces and Unicode support. Real bash is verified; other shell runs are pending.
-- **Optional agent session follow** — run `opencode`, `claude` or `grok` yourself, or start a detected one from the `+` menu; Made follows the active session directory, a worktree directory included, when available.
-- **SSH remote workspaces** — register servers from the header, then open a remote terminal or a remote OpenCode, Grok Build or Claude Code tab with the explorer, preview and session follow on the server.
-- **Self-updating releases** — installers and a Linux AppImage that check GitHub Releases and update in place (see [Updates](#updates)).
-- **Tabs that read at a glance** — a terminal or agent icon leads every workspace tab, and session dots mark busy (pulsing), idle (neutral), and attention (yellow) states without opening a tab.
-- **Full-height explorer** — hide, restore, and pointer-resize it without stopping the shell.
-- **Full-left read-only preview** — inspect a file over the still-running terminal, then return without relaunching anything.
-- **Clipboard image paste** — Cmd/Ctrl+V forwards the paste so agent TUIs read the image natively; Cmd/Ctrl+Shift+V saves it as a private PNG (7-day/64-file retention) and pastes the path as a fallback.
-- **Home startup and inline folder picker** — no argument opens your home workspace; `--picker` browses an inline expandable folder tree; an explicit path wins over both.
-- **About and diagnostics** — open About from the MADE wordmark for the app identity and version, then reveal workspace, cwd capability, effective root, integration state, logs, and metrics on demand without routine status chrome.
-- **Mint accent and glass surfaces** — the wordmark, tabs, and icon actions sit directly on the window clear/native backdrop across the content edges. Workspace tabs use fill-only idle/hover/selected states, with a dark green-gray selected fill; the full-height explorer keeps the in-app glass. The calm mint accent marks the wordmark, primary actions, focus, and splitter drag; optional macOS vibrancy or Windows 11 Acrylic (22H2, build 22621, or newer; older builds use the in-app glass) may layer behind the window. Linux and unsupported compositors use the in-app glass fallback.
+**Workspaces and tabs**
+- Each tab runs its own shell, processes, explorer, preview and focus. Closing one tab leaves the others running.
+- Shell tabs are named after the current folder and update when you `cd`. Agent tabs show the session title and fall back to the program name.
+- A terminal or agent icon leads every tab. Session dots show busy (pulsing), idle and attention (yellow) states.
+- Shell cwd follow uses launch-local hooks for bash, zsh, fish and PowerShell, with support for paths that contain spaces or Unicode.
+
+**Open workspace screen** (the `+` button, `--picker`, or closing the last tab)
+- A host bar lists Local first, then your saved SSH hosts with their connection state and the agents detected on each. You add, edit, test and remove hosts from the same bar.
+- Folder navigation uses an expandable folder tree and an editable address bar. Paste an absolute path and press Enter to jump to it.
+- A git indicator and a Worktrees list (main worktree first) show change counts split into conflicted, staged, modified and untracked.
+- Launch buttons appear in a fixed order: Terminal first, then each detected agent (OpenCode, Grok Build, Claude Code). Cmd/Ctrl+Enter launches a Terminal.
+
+**SSH remote workspaces**
+- Made uses your installed OpenSSH, including your aliases, config, ProxyJump, keys or agent, and password or MFA prompts. Made never stores or logs credentials.
+- When you connect to an unknown host, Made shows its OpenSSH fingerprint and waits for your approval. A changed host key is refused.
+- The explorer, preview, git view and session follow run against the server. Remote shells and sessions reattach after the connection drops, until a 24-hour detached lease expires.
+
+**Explorer, preview and git**
+- The full-height explorer can be hidden, restored and resized while the shell keeps running.
+- A read-only preview covers the terminal so you can inspect a file, then return to the same shell without relaunching anything.
+- The source-control view is read-only, with grouped changes and change dots on files and folders.
+- Every git read disables fsmonitor, protocol transports and lazy fetch. Filter drivers set by the repository are turned off for these reads.
+
+**Everyday details**
+- **Clipboard image paste:** Cmd/Ctrl+V forwards the paste so agent TUIs read the image natively. Cmd/Ctrl+Shift+V saves the image as a private PNG (kept 7 days, at most 64 files) and pastes its path as a fallback.
+- **About and diagnostics:** open About from the MADE wordmark. It shows the version and update controls, and reveals workspace, integration, log and metric details when you ask.
+- **Calm Editor design:** dark surfaces with one mint accent. macOS vibrancy or Windows 11 Acrylic (22H2, build 22621, or newer) is optional, and other systems fall back to in-app glass.
+- **Self-updating releases:** installers and a Linux AppImage update in place from GitHub Releases. See [Updates](#updates).
 
 ## Install
 
@@ -61,8 +78,8 @@ Maintainers: the bump-and-release procedure is in [`wiki/operations/release-ci.m
 
 - **Rust stable** via `rustup`.
 - **Linux x64 on X11 or Wayland**, **macOS arm64/x64**, or **Windows x64**.
-- **OpenCode v2** is optional. Install the native distribution for your OS if you want OpenCode session follow. Made never launches it automatically; when `opencode` is on `PATH`, the `+` menu can start it in a home-directory tab.
-- **Grok Build**, **Claude Code**, **OpenSSH** and **git** are optional. The `+` menu lists the agents it finds on `PATH`; OpenSSH is needed only for SSH workspaces.
+- **OpenCode v2** is optional. Install the native distribution for your OS if you want OpenCode session follow. Made never launches it automatically; when `opencode` is on `PATH`, the Open workspace screen offers it as a launch button.
+- **Grok Build**, **Claude Code**, **OpenSSH** and **git** are optional. The Open workspace screen shows a launch button for each agent it finds on the selected host; OpenSSH is needed only for SSH workspaces.
 - **Node.js 24** is only needed for the OpenCode plugin tests; the Grok and Claude Code hooks are native and need no interpreter.
 
 ### Platform setup
@@ -106,7 +123,7 @@ No extra system libraries are needed: Metal, CoreText, and the clipboard come fr
 
 #### Windows (x64)
 
-Build the Windows target natively, or run the Linux build under WSL2 (see [Linux](#linux-x64-x11-or-wayland)) — WSL2 is a Linux host and does not exercise the Windows-specific paths: ConPTY, Acrylic, native clipboard, and IME.
+Build the Windows target natively, or run the Linux build under WSL2 (see [Linux](#linux-x64-x11-or-wayland)). WSL2 is a Linux host and does not exercise the Windows-specific paths: ConPTY, Acrylic, native clipboard, and IME.
 
 Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload; the MSVC linker is required because `x86_64-pc-windows-msvc` is the only supported Windows target.
 
@@ -127,7 +144,7 @@ cargo build -p made-app
 # Open your home workspace
 cargo run -p made-app
 
-# Choose a folder
+# Start on the Open workspace screen
 cargo run -p made-app -- --picker
 
 # Open a specific workspace
@@ -139,7 +156,7 @@ MADE_NATIVE_BACKDROP=off cargo run -p made-app
 
 On PowerShell, set `$env:MADE_NATIVE_BACKDROP="off"` before launching.
 
-Start `opencode`, `claude` or `grok` inside a tab — or choose it from the `+` menu when it is on `PATH` — when you want agent session follow.
+For agent session follow, start `opencode`, `claude` or `grok` inside a tab, or launch it from the Open workspace screen when it is on `PATH`.
 
 ### Test
 
@@ -156,16 +173,16 @@ npm run typecheck
 
 Made is an early **0.1.x** release: installable and self-updating, but not production-ready.
 
-Automated tests and smoke checks pass in CI across the supported targets, and release builds pass an installed-layout smoke on hosted runners. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, live SSH workspaces, and fresh-machine installs of the packaged artifacts. Native macOS vibrancy was checked manually on arm64 only; macOS x64 and Windows 11 Acrylic (22H2+, build 22621) have not been validated interactively.
+Automated tests and smoke checks pass in CI across the supported targets, and release builds pass an installed-layout smoke on hosted runners. Interactive native desktop validation is still pending. That covers IME, clipboard and pointer behavior, hardware-GPU pacing, live OpenCode workflows, live SSH workspaces (including remote browsing and worktree views on the Open workspace screen), and fresh-machine installs of the packaged artifacts. Shell cwd follow is verified with real bash; zsh, fish and PowerShell have unit coverage only. Native macOS vibrancy was checked manually on arm64 only; macOS x64 and Windows 11 Acrylic (22H2+, build 22621) have not been validated interactively.
 
-The file preview is read-only: no editing, saving, LSP, or diff view. Releases are installable and update themselves, but they are not signed or notarized.
+The file preview is read-only: no editing, saving, LSP, or diff view. Made does not create or manage worktrees. Releases are installable and update themselves, but they are not signed or notarized.
 
 ## Supported targets
 
-- `aarch64-apple-darwin` — macOS arm64
-- `x86_64-apple-darwin` — macOS x64
-- `x86_64-unknown-linux-gnu` — Linux x64 on X11 and Wayland
-- `x86_64-pc-windows-msvc` — Windows x64 with native OpenCode (ConPTY; WSL-hosted OpenCode is out of scope)
+- `aarch64-apple-darwin`: macOS arm64
+- `x86_64-apple-darwin`: macOS x64
+- `x86_64-unknown-linux-gnu`: Linux x64 on X11 and Wayland
+- `x86_64-pc-windows-msvc`: Windows x64 with native OpenCode (ConPTY; WSL-hosted OpenCode is out of scope)
 
 ## Documentation
 
@@ -174,6 +191,7 @@ The file preview is read-only: no editing, saving, LSP, or diff view. Releases a
 - [UI/UX spec](specs/made-ui-ux.md)
 - [Agent integration architecture](specs/agent-integration-architecture.md)
 - [SSH remote workspaces spec](specs/ssh-remote-workspaces.md)
+- [Open workspace redesign (active change)](specs/changes/20261127-open-workspace-redesign/spec.md)
 - [Release and auto-update spec](specs/release-distribution.md)
 - [UX validation checklist (v1)](tests/e2e/ux_validation.md)
 - [Release acceptance record](tests/e2e/release_validation.md)
