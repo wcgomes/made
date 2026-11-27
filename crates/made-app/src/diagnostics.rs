@@ -976,10 +976,6 @@ fn remote_error_code_label(code: made_remote::protocol::ErrorCode) -> &'static s
     }
 }
 
-/// Remote OpenCode diagnostics sentence when the tab's own launch probe did
-/// not detect OpenCode on the server.
-pub const REMOTE_OPENCODE_NOT_DETECTED: &str = "OpenCode is not detected on this server.";
-
 /// What the owning remote tab knows about OpenCode besides its session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoteOpenCodeSignals {
@@ -996,9 +992,9 @@ pub struct RemoteOpenCodeSignals {
 /// Derive the owning remote tab's OpenCode report for the diagnostics pill.
 ///
 /// `attached` reports whether the SSH session is attached, and `failed_detail`
-/// carries the tab's own failure sentence when the tab failed. Transport loss
-/// is reported as transport, integration loss as integration, and the
-/// host-local integration state is never claimed for a remote tab.
+/// carries the tab's own failure sentence when the tab failed. Session and
+/// transport states use neutral SSH wording; OpenCode is named only for a tab
+/// that carries its integration. The host-local state is never claimed.
 pub fn remote_opencode_report(
     attached: bool,
     failed_detail: Option<&str>,
@@ -1007,75 +1003,60 @@ pub fn remote_opencode_report(
     integration_error: Option<made_remote::protocol::ErrorCode>,
     signals: RemoteOpenCodeSignals,
 ) -> RemoteOpenCodeReport {
+    use IntegrationStatus::{Connected, Degraded, Inactive};
+    let report = |status, code, reason: &str| RemoteOpenCodeReport {
+        status,
+        code,
+        reason: reason.to_owned(),
+    };
+    // SSH session and transport states are neutral for every launch target.
     if let Some(detail) = failed_detail {
-        return RemoteOpenCodeReport {
-            status: IntegrationStatus::Degraded,
-            code: ReasonCode::BridgeClosed.code(),
-            reason: detail.to_owned(),
-        };
+        return report(Degraded, "ssh_session_failed", detail);
     }
     if !attached {
-        return RemoteOpenCodeReport {
-            status: IntegrationStatus::Inactive,
-            code: ReasonCode::Inactive.code(),
-            reason: "The remote OpenCode integration has not been observed; the SSH session is not attached."
-                .to_owned(),
-        };
+        return report(
+            Inactive,
+            "ssh_not_attached",
+            "The SSH session is not attached.",
+        );
     }
+    // Only a tab that carries the OpenCode integration reports OpenCode.
+    let carries =
+        signals.integration_target && (signals.detected || signals.companion == Some(true));
+    let inactive = ReasonCode::Inactive.code();
     match (transport, integration) {
-        (RemoteConnectionState::Disconnected, _) => RemoteOpenCodeReport {
-            status: IntegrationStatus::Degraded,
-            code: ReasonCode::BridgeClosed.code(),
-            reason: "The SSH transport disconnected; the remote OpenCode integration state is unknown until reattach."
-                .to_owned(),
-        },
-        (RemoteConnectionState::Connected, RemoteIntegrationState::Connected) => {
-            RemoteOpenCodeReport {
-                status: IntegrationStatus::Connected,
-                code: ReasonCode::Connected.code(),
-                reason: ReasonCode::Connected.message().to_owned(),
-            }
-        }
-        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable)
-            if !signals.integration_target
-                || (signals.companion == Some(true)
-                    && integration_error == Some(made_remote::protocol::ErrorCode::Unavailable)) =>
+        (RemoteConnectionState::Disconnected, _) => report(
+            Degraded,
+            "ssh_disconnected",
+            "The SSH connection was lost; the remote session state is unknown until it reconnects.",
+        ),
+        (_, RemoteIntegrationState::Connected) => report(
+            Connected,
+            ReasonCode::Connected.code(),
+            ReasonCode::Connected.message(),
+        ),
+        // OpenCode is named only once observed; the companion's presence is
+        // never contradicted by a "not detected" sentence.
+        (_, RemoteIntegrationState::Unavailable)
+            if carries
+                && signals.companion == Some(true)
+                && integration_error == Some(made_remote::protocol::ErrorCode::Unavailable) =>
         {
-            RemoteOpenCodeReport {
-                status: IntegrationStatus::Inactive,
-                code: ReasonCode::Inactive.code(),
-                reason: ReasonCode::Inactive.message().to_owned(),
-            }
+            report(Inactive, inactive, ReasonCode::Inactive.message())
         }
-        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable)
-            if !signals.detected =>
-        {
-            RemoteOpenCodeReport {
-                status: IntegrationStatus::Inactive,
-                code: ReasonCode::Inactive.code(),
-                reason: REMOTE_OPENCODE_NOT_DETECTED.to_owned(),
-            }
-        }
-        (RemoteConnectionState::Connected, RemoteIntegrationState::Unavailable) => {
+        (_, RemoteIntegrationState::Unavailable) if carries => {
             let error = integration_error
                 .map(|code| format!("{code:?}"))
                 .unwrap_or_else(|| "unavailable".to_owned());
             RemoteOpenCodeReport {
-                status: IntegrationStatus::Degraded,
+                status: Degraded,
                 code: integration_error.map_or("unavailable", remote_error_code_label),
                 reason: format!(
                     "The remote OpenCode integration is unavailable (error: {error}); the remote terminal and files remain usable."
                 ),
             }
         }
-        (RemoteConnectionState::Connected, RemoteIntegrationState::Unknown) => {
-            RemoteOpenCodeReport {
-                status: IntegrationStatus::Inactive,
-                code: ReasonCode::Inactive.code(),
-                reason: "The remote OpenCode integration has not been observed on this connection."
-                    .to_owned(),
-            }
-        }
+        _ => report(Inactive, inactive, "The SSH session is connected."),
     }
 }
 // END remote-path
@@ -1308,14 +1289,18 @@ impl DiagnosticsSnapshot {
         if let Some(reason) = &self.worktree_reason {
             push_line(&mut text, "worktree reason", reason);
         }
+        // The plugin and protocol belong to the session-channel owner.
+        let owner = crate::integrations::session_channel_label(crate::integrations::PRODUCT)
+            .map(|label| format!("{} ", label.to_ascii_lowercase()))
+            .unwrap_or_default();
         push_line(
             &mut text,
-            "plugin version",
+            &format!("{owner}plugin version"),
             self.plugin_version.as_deref().unwrap_or("none"),
         );
         push_line(
             &mut text,
-            "protocol version",
+            &format!("{owner}protocol version"),
             &self
                 .protocol_version
                 .map(|version| version.to_string())

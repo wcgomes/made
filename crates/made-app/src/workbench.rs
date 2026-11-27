@@ -234,6 +234,8 @@ struct RemoteTab {
     detail: String,
     prompt: Option<made_platform::ssh_askpass::PromptRequest>,
     prompt_draft: String,
+    /// Password handling of the running probe, stage or companion attempt.
+    secret: crate::credential_cache::AttemptSecret,
     // BEGIN remote-path (AIA-02)
     opencode: bool,
     /// Whether the remote launch target is Grok: the first frame opens
@@ -372,6 +374,11 @@ impl RemoteTab {
             .map_err(|_| "remote workspace identity was rejected".to_owned())?;
         let mut workspace = workspace;
         workspace.disconnect();
+        let secret =
+            crate::credential_cache::AttemptSecret::new(crate::credential_cache::CacheKey::new(
+                snapshot.server().id(),
+                snapshot.server().metadata(),
+            ));
         Ok(Self {
             snapshot,
             workspace,
@@ -379,6 +386,7 @@ impl RemoteTab {
             detail: "Connecting. No local shell was started.".to_owned(),
             prompt: None,
             prompt_draft: String::new(),
+            secret,
             // BEGIN remote-path (AIA-02)
             opencode: false,
             grok: false,
@@ -647,6 +655,9 @@ pub struct Workbench {
     last_tick_active: bool,
     benchmark_frames: bool,
     pending_notice: Option<(String, Instant)>,
+    /// The focus request refused because the session channel was not
+    /// connected; it is the diagnostics reason until the channel connects.
+    pub(crate) focus_unavailable: Option<String>,
     remote: Option<RemoteTab>,
     remote_preview: RemotePreviewView,
     remote_explorer_cache: crate::explorer_view::RemoteExplorerCache,
@@ -775,6 +786,11 @@ impl Workbench {
         target: TerminalTarget,
         detail: impl Into<String>,
     ) -> Self {
+        let secret =
+            crate::credential_cache::AttemptSecret::new(crate::credential_cache::CacheKey::new(
+                snapshot.server().id(),
+                snapshot.server().metadata(),
+            ));
         let remote = RemoteTab {
             snapshot,
             workspace,
@@ -782,6 +798,7 @@ impl Workbench {
             detail: detail.into(),
             prompt: None,
             prompt_draft: String::new(),
+            secret,
             // BEGIN remote-path (AIA-02)
             opencode: matches!(target, TerminalTarget::RemoteOpenCode { .. }),
             grok: matches!(target, TerminalTarget::RemoteGrok { .. }),
@@ -963,6 +980,7 @@ impl Workbench {
             last_tick_active: false,
             benchmark_frames: false,
             pending_notice: None,
+            focus_unavailable: None,
             remote,
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
@@ -2053,9 +2071,14 @@ impl Workbench {
             return;
         }
         let Some(bridge) = session_bridge(self.integrations, &self.tab_states) else {
-            self.set_notice("Focus is unavailable: the integration is not connected.");
+            let owner = crate::integrations::session_channel_label(self.integrations)
+                .unwrap_or("the integration");
+            let reason = format!("Focus is unavailable: {owner} is not connected.");
+            self.set_notice(reason.clone());
+            self.focus_unavailable = Some(reason);
             return;
         };
+        self.focus_unavailable = None;
         let update = self.focus.request(bridge, session_id.to_owned());
         self.handle_focus_update(update);
     }
@@ -2274,7 +2297,7 @@ impl Workbench {
             remote.update_approved = true;
             remote.update_failed = false;
             remote.prompt = None;
-            remote.prompt_draft.clear();
+            crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         }
         self.start_remote_stage_with(true);
         true
@@ -2383,6 +2406,11 @@ impl Workbench {
         };
         let class = crate::remote_session::classify_prompt(&prompt.text);
         let draft = std::mem::take(&mut remote.prompt_draft);
+        // An expired prompt is never answered: OpenSSH stopped waiting.
+        if crate::credential_cache::expired(&prompt) {
+            crate::credential_cache::wipe(draft);
+            return;
+        }
         match class {
             crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
                 self.cancel_remote_attempt("the remote host key changed and was refused");
@@ -2391,7 +2419,7 @@ impl Workbench {
                 if accept {
                     let answer =
                         made_platform::ssh_askpass::PromptAnswer::new(b"yes".to_vec()).ok();
-                    self.deliver_remote_answer(prompt.id, answer);
+                    let _ = self.deliver_remote_answer(prompt.id, answer);
                 } else {
                     self.cancel_remote_attempt(
                         crate::remote_session::SshFailureClass::Cancelled.detail(),
@@ -2400,13 +2428,16 @@ impl Workbench {
             }
             crate::remote_session::SshPromptClass::Secret { .. } => {
                 if accept {
-                    if crate::credential_cache::is_password_prompt(&prompt.text) {
-                        if let Some(authority) = self.remote_authority() {
-                            crate::credential_cache::remember(authority, &draft);
+                    match made_platform::ssh_askpass::PromptAnswer::new(draft.as_bytes().to_vec()) {
+                        Ok(answer) => {
+                            // Held only once the attempt took it, and cached
+                            // only once that attempt authenticates.
+                            if self.deliver_remote_answer(prompt.id, Some(answer)) {
+                                if let Some(remote) = self.remote.as_mut() {
+                                    remote.secret.typed(&prompt, &draft);
+                                }
+                            }
                         }
-                    }
-                    match made_platform::ssh_askpass::PromptAnswer::new(draft.into_bytes()) {
-                        Ok(answer) => self.deliver_remote_answer(prompt.id, Some(answer)),
                         Err(_) => {
                             if let Some(remote) = self.remote.as_mut() {
                                 remote.prompt = Some(prompt);
@@ -2417,13 +2448,18 @@ impl Workbench {
                         }
                     }
                 } else {
-                    self.deliver_remote_answer(prompt.id, None);
+                    let _ = self.deliver_remote_answer(prompt.id, None);
+                    if let Some(remote) = self.remote.as_mut() {
+                        let cancelled = crate::remote_session::SshFailureClass::Cancelled;
+                        remote.secret.failed(Some(cancelled));
+                    }
                     self.cancel_remote_attempt(
                         crate::remote_session::SshFailureClass::Cancelled.detail(),
                     );
                 }
             }
         }
+        crate::credential_cache::wipe(draft);
     }
 
     pub fn reconnect_remote(&mut self) -> bool {
@@ -2442,7 +2478,7 @@ impl Workbench {
         remote.detail =
             "Reconnecting. The previous session is not replaced until attach succeeds.".to_owned();
         remote.prompt = None;
-        remote.prompt_draft.clear();
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         remote.attach_request = None;
         remote.deferred_shell_cwd = None;
         remote.workspace.disconnect();
@@ -2489,25 +2525,25 @@ impl Workbench {
         None
     }
 
+    /// Hand an answer to the attempt that is running; whether it took it.
     fn deliver_remote_answer(
         &mut self,
         id: u64,
         answer: Option<made_platform::ssh_askpass::PromptAnswer>,
-    ) {
+    ) -> bool {
         let Some(remote) = self.remote.as_mut() else {
-            return;
+            return false;
         };
         if let Some(probe) = remote.probe.as_ref() {
-            let _ = probe.answer(id, answer);
-            return;
+            return probe.answer(id, answer);
         }
         if let Some(stage) = remote.stage.as_ref() {
-            let _ = stage.answer(id, answer);
-            return;
+            return stage.answer(id, answer);
         }
-        if let Some(client) = remote.client.as_ref() {
-            let _ = client.answer_prompt(id, answer);
-        }
+        remote
+            .client
+            .as_ref()
+            .is_some_and(|client| client.answer_prompt(id, answer).is_ok())
     }
 
     fn cancel_remote_attempt(&mut self, detail: &str) {
@@ -2528,7 +2564,8 @@ impl Workbench {
         remote.stage = None;
         remote.client_rx = None;
         remote.prompt = None;
-        remote.prompt_draft.clear();
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
+        remote.secret.failed(None);
         remote.phase = RemotePhase::Failed;
         remote.detail = detail.to_owned();
         remote.update_approved = false;
@@ -2852,6 +2889,7 @@ impl Workbench {
     pub fn answer_remote_prompt(&mut self, text: Option<String>) {
         if let Some(text) = text {
             if let Some(remote) = self.remote.as_mut() {
+                crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
                 remote.prompt_draft = text;
             }
             self.submit_remote_auth(true);
@@ -3049,10 +3087,10 @@ impl Workbench {
             }
             return;
         }
-        if matches!(class, crate::remote_session::SshPromptClass::Secret { .. })
-            && crate::credential_cache::is_password_prompt(&prompt.text)
+        // A cached password is sent at most once per attempt; a repeated
+        // password prompt means it was rejected and the user is asked.
         {
-            if let Some(answer) = crate::credential_cache::answer(remote.snapshot.server().id()) {
+            if let Some(answer) = remote.secret.on_prompt(&prompt) {
                 if let Some(probe) = remote.probe.as_ref() {
                     let _ = probe.answer(prompt.id, Some(answer));
                     return;
@@ -3067,6 +3105,8 @@ impl Workbench {
                 }
             }
         }
+        // A new card starts from an empty draft.
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         remote.prompt = Some(prompt);
     }
 
@@ -3096,36 +3136,32 @@ impl Workbench {
         };
         remote.probe = None;
         remote.prompt = None;
-        remote.prompt_draft.clear();
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         let report = match result {
             Ok(report) => report,
             Err(error) => return self.apply_attempt_error(error, OpenRetry::Probe),
         };
+        remote.secret.authenticated();
         let capabilities = report.capabilities;
         // Presence is recorded; the field itself is not a gate.
         let _ = capabilities.tmux;
         // BEGIN remote-path (AIA-02)
-        if remote.opencode && !capabilities.opencode {
+        let missing = [
+            (
+                remote.opencode && !capabilities.opencode,
+                crate::integrations::OPENCODE,
+            ),
+            (remote.grok && !capabilities.grok, crate::integrations::GROK),
+            (
+                remote.claude && !report.claude,
+                crate::integrations::CLAUDE_CODE,
+            ),
+        ];
+        if let Some((_, tui)) = missing.into_iter().find(|(missing, _)| *missing) {
             remote.phase = RemotePhase::Failed;
+            let label = tui.descriptor().label;
             remote.detail =
-                "OpenCode was not detected on this server. Nothing ran locally.".to_owned();
-            remote
-                .workspace
-                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
-            return;
-        }
-        if remote.grok && !capabilities.grok {
-            remote.phase = RemotePhase::Failed;
-            remote.detail = "Grok was not detected on this server. Nothing ran locally.".to_owned();
-            remote
-                .workspace
-                .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
-            return;
-        }
-        if remote.claude && !report.claude {
-            remote.phase = RemotePhase::Failed;
-            remote.detail =
-                "Claude Code was not detected on this server. Nothing ran locally.".to_owned();
+                format!("{label} was not detected on this server. Nothing ran locally.");
             remote
                 .workspace
                 .project_unavailable(made_remote::protocol::ErrorCode::Unavailable);
@@ -3197,6 +3233,9 @@ impl Workbench {
             return;
         };
         let metadata = remote.snapshot.server().metadata().clone();
+        // A new attempt never inherits a card of the previous one.
+        remote.prompt = None;
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         remote.stage = Some(if update {
             crate::ssh_servers::spawn_approved_update_stage(
                 metadata,
@@ -3222,9 +3261,10 @@ impl Workbench {
         };
         remote.stage = None;
         remote.prompt = None;
-        remote.prompt_draft.clear();
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         let update = remote.update_approved;
         let Err(error) = result else {
+            remote.secret.authenticated();
             remote.update_approved = false;
             remote.update_failed = false;
             remote.update_target = None;
@@ -3267,16 +3307,12 @@ impl Workbench {
             LogLevel::Error,
             format!("remote attempt failed: {}", error.detail),
         );
-        if error.class == crate::remote_session::SshFailureClass::AuthFailed {
-            if let Some(authority) = self.remote_authority() {
-                crate::credential_cache::forget(authority);
-            }
-        }
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
+        remote.secret.failed(Some(error.class));
         remote.prompt = None;
-        remote.prompt_draft.clear();
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         // A pre-attach failure cannot supply a tree. Project a bounded
         // unavailable Explorer state instead of leaving it loading forever.
         if !remote.attached_once {
@@ -3333,6 +3369,7 @@ impl Workbench {
         remote.phase = RemotePhase::Connecting;
         remote.detail = "Retrying after host approval. No local shell was started.".to_owned();
         remote.prompt = None;
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         remote.probe = Some(crate::ssh_servers::spawn_probe(
             crate::ssh_servers::ProbeRequest {
                 ticket: crate::ssh_servers::ProbeTicket {
@@ -3362,6 +3399,9 @@ impl Workbench {
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
+        // A new attempt never inherits a card of the previous one.
+        remote.prompt = None;
+        crate::credential_cache::wipe_in_place(&mut remote.prompt_draft);
         let Some(target) = remote.remote_target.clone() else {
             remote.phase = RemotePhase::Failed;
             remote.detail =
@@ -3947,6 +3987,8 @@ impl Workbench {
         }
         let open = remote.session_open;
         let epoch = remote.client.as_ref().map(|client| client.identity().epoch);
+        // The companion attempt authenticated.
+        remote.secret.authenticated();
         let attached = match open {
             crate::remote_session::SessionOpen::New => remote
                 .workspace
@@ -4551,6 +4593,7 @@ impl Workbench {
                 self.focus.clear_error();
                 self.session_map.clear();
                 if self.integration.status().is_connected() {
+                    self.focus_unavailable = None;
                     self.diag.log_mut().push(
                         LogEntry::new(
                             LogLevel::Info,
@@ -5355,6 +5398,10 @@ impl Workbench {
             self.worktree(),
         );
         snapshot.attach_workspace(self.workspace_diagnostics_context());
+        // A refused focus request is the reason until the channel connects.
+        if let (Some(reason), false) = (&self.focus_unavailable, self.is_connected()) {
+            snapshot.reason = reason.clone();
+        }
         // BEGIN remote-path (AIA-02)
         if let Some(report) = self.remote_opencode_diagnostics() {
             snapshot.set_remote_opencode(report);
@@ -6647,6 +6694,32 @@ mod tests {
         assert!(workbench.url_card().is_some());
     }
 
+    #[test]
+    fn focus_without_a_session_channel_names_opencode() {
+        let mut workbench = idle_workbench(TerminalTarget::Shell, None);
+        let before = workbench.diagnostics_snapshot();
+        assert_ne!(
+            before.reason,
+            "Focus is unavailable: OpenCode is not connected."
+        );
+        workbench.focus_session("session-a");
+        assert_eq!(
+            workbench.notice(),
+            Some("Focus is unavailable: OpenCode is not connected.")
+        );
+        // The diagnostics reason (OpenCode's row and the copied report) says
+        // the same; the status is unchanged.
+        let snapshot = workbench.diagnostics_snapshot();
+        assert_eq!(
+            snapshot.reason,
+            "Focus is unavailable: OpenCode is not connected."
+        );
+        assert_eq!(snapshot.status, before.status);
+        assert!(snapshot
+            .to_text()
+            .contains("reason: Focus is unavailable: OpenCode is not connected.\n"));
+    }
+
     fn idle_workbench(target: TerminalTarget, terminal: Option<TerminalPane>) -> Workbench {
         let cwd = std::env::temp_dir();
         let now = Instant::now();
@@ -6713,6 +6786,7 @@ mod tests {
             last_tick_active: false,
             benchmark_frames: false,
             pending_notice: None,
+            focus_unavailable: None,
             remote: None,
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
@@ -10890,5 +10964,249 @@ mod tests {
         assert_eq!(typed_accent_output(true), "X2\u{e9}Y");
         // Without the fix bash 3.2 readline drops the 8-bit bytes.
         assert_eq!(typed_accent_output(false), "X2Y");
+    }
+
+    mod tab_ssh_passwords {
+        use super::*;
+        use made_remote::protocol::{Capabilities, RemotePath, RemoteTarget};
+
+        const PASSWORD: &str = "me@lab.invalid's password: ";
+
+        struct Storage;
+
+        impl crate::ssh_servers::ServerStorage for Storage {
+            fn read(
+                &mut self,
+                _limit: usize,
+            ) -> Result<Option<Vec<u8>>, crate::ssh_servers::StorageError> {
+                Ok(None)
+            }
+            fn replace(&mut self, _: &[u8]) -> Result<(), crate::ssh_servers::StorageError> {
+                Ok(())
+            }
+        }
+
+        /// A remote tab whose launch probe is scripted; no SSH runs.
+        fn probing() -> (
+            Workbench,
+            crate::ssh_servers::ScriptedAttempt<crate::ssh_servers::ProbeReport>,
+            made_remote::protocol::AuthorityId,
+        ) {
+            let mut registry = crate::ssh_servers::ServerRegistry::load(Storage).unwrap();
+            let authority = registry
+                .add(crate::ssh_servers::ServerMetadata {
+                    display_name: "lab".to_owned(),
+                    host: "lab.invalid".to_owned(),
+                    user: None,
+                    port: None,
+                    key_file: None,
+                    initial_directory: None,
+                })
+                .unwrap();
+            let snapshot = registry.snapshot(authority).unwrap();
+            let root = RemotePath::new(b"/srv".to_vec()).unwrap();
+            let mut workbench = idle_workbench(TerminalTarget::RemoteShell { authority }, None);
+            workbench.remote = Some(RemoteTab::connecting(snapshot, root).unwrap());
+            let (probe, script) =
+                crate::ssh_servers::scripted_probe(crate::ssh_servers::ProbeTicket {
+                    authority,
+                    attempt: 1,
+                });
+            workbench.remote.as_mut().unwrap().probe = Some(probe);
+            (workbench, script, authority)
+        }
+
+        fn metadata(host: &str) -> crate::ssh_servers::ServerMetadata {
+            crate::ssh_servers::ServerMetadata {
+                display_name: "lab".to_owned(),
+                host: host.to_owned(),
+                user: None,
+                port: None,
+                key_file: None,
+                initial_directory: None,
+            }
+        }
+
+        /// The cache key of the tab's own record snapshot.
+        fn key(authority: made_remote::protocol::AuthorityId) -> crate::credential_cache::CacheKey {
+            crate::credential_cache::CacheKey::new(authority, &metadata("lab.invalid"))
+        }
+
+        fn prompt(id: u64) -> made_platform::ssh_askpass::PromptRequest {
+            made_platform::ssh_askpass::PromptRequest {
+                id,
+                text: PASSWORD.to_owned(),
+                expires_at: Instant::now() + Duration::from_secs(300),
+            }
+        }
+
+        fn shown(workbench: &Workbench) -> bool {
+            workbench.remote_prompt_id().is_some()
+        }
+
+        fn answer(workbench: &mut Workbench, text: &str) {
+            *workbench.remote_prompt_draft().unwrap() = text.to_owned();
+            workbench.submit_remote_auth(true);
+        }
+
+        fn report() -> crate::ssh_servers::ProbeReport {
+            crate::ssh_servers::ProbeReport {
+                capabilities: Capabilities {
+                    target: RemoteTarget::LinuxX64,
+                    tmux: false,
+                    opencode: false,
+                    shell_cwd: false,
+                    helper_version: "probe".to_owned(),
+                    grok: false,
+                    python3: false,
+                },
+                claude: false,
+            }
+        }
+
+        #[test]
+        fn a_vanished_program_names_its_catalog_label() {
+            for (program, label) in [(0, "OpenCode"), (1, "Grok Build"), (2, "Claude Code")] {
+                let (mut workbench, _script, _) = probing();
+                let remote = workbench.remote.as_mut().unwrap();
+                remote.opencode = program == 0;
+                remote.grok = program == 1;
+                remote.claude = program == 2;
+                workbench.finish_remote_probe(Ok(report()));
+                let remote = workbench.remote.as_ref().unwrap();
+                assert!(matches!(remote.phase, RemotePhase::Failed));
+                assert_eq!(
+                    remote.detail,
+                    format!("{label} was not detected on this server. Nothing ran locally.")
+                );
+            }
+        }
+
+        #[test]
+        fn a_typed_password_is_cached_only_after_authentication_and_never_resent() {
+            let (mut workbench, script, authority) = probing();
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            answer(&mut workbench, "wrong");
+            assert_eq!(script.answer(), Some((1, true)));
+            assert!(
+                !crate::credential_cache::cached(authority),
+                "not cached before authentication"
+            );
+            // Rejected: OpenSSH asks again and the user is asked again.
+            script.prompts.send(prompt(2)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            assert_eq!(script.answer(), None);
+            answer(&mut workbench, "right");
+            assert_eq!(script.answer(), Some((2, true)));
+            workbench.finish_remote_probe(Ok(report()));
+            assert!(crate::credential_cache::cached(authority));
+            crate::credential_cache::forget_server(authority);
+        }
+
+        #[test]
+        fn a_rejected_cached_password_is_sent_once_then_forgotten() {
+            let (mut workbench, script, authority) = probing();
+            crate::credential_cache::remember(&key(authority), "stale");
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(!shown(&workbench), "the cache answers once");
+            assert_eq!(script.answer(), Some((1, true)));
+            script.prompts.send(prompt(2)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench), "never twice in one attempt");
+            assert_eq!(script.answer(), None);
+            assert!(!crate::credential_cache::cached(authority));
+        }
+
+        #[test]
+        fn failed_or_cancelled_authentication_forgets_the_cached_password_it_sent() {
+            let (mut workbench, script, authority) = probing();
+            crate::credential_cache::remember(&key(authority), "stale");
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert_eq!(script.answer(), Some((1, true)));
+            workbench.finish_remote_probe(Err(crate::ssh_servers::AttemptError {
+                class: crate::remote_session::SshFailureClass::AuthFailed,
+                detail: "denied".to_owned(),
+                fingerprint: None,
+            }));
+            assert!(!crate::credential_cache::cached(authority));
+
+            let (mut workbench, script, authority) = probing();
+            crate::credential_cache::remember(&key(authority), "stale");
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            script.prompts.send(prompt(2)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            // Another tab validated a fresh value meanwhile: this tab's stale
+            // rejection and its cancel leave it alone.
+            crate::credential_cache::remember(&key(authority), "typed elsewhere");
+            workbench.submit_remote_auth(false);
+            assert!(crate::credential_cache::cached(authority));
+            crate::credential_cache::forget_server(authority);
+        }
+
+        #[test]
+        fn an_expired_tab_prompt_is_neither_answered_nor_held() {
+            let (mut workbench, script, authority) = probing();
+            let mut late = prompt(1);
+            late.expires_at = Instant::now() - Duration::from_secs(1);
+            script.prompts.send(late).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            answer(&mut workbench, "too late");
+            assert_eq!(script.answer(), None);
+            workbench.finish_remote_probe(Ok(report()));
+            assert!(!crate::credential_cache::cached(authority));
+        }
+
+        #[test]
+        fn a_tab_draft_never_moves_to_a_new_card() {
+            let (mut workbench, script, _authority) = probing();
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            *workbench.remote_prompt_draft().unwrap() = "for one".to_owned();
+            workbench.remote.as_mut().unwrap().prompt = None;
+            script.prompts.send(prompt(2)).unwrap();
+            workbench.poll_remote_prompt();
+            assert_eq!(workbench.remote_prompt_draft().unwrap().as_str(), "");
+        }
+
+        #[test]
+        fn a_stale_rejection_never_evicts_another_tabs_fresh_password() {
+            let (mut workbench, script, authority) = probing();
+            crate::credential_cache::remember(&key(authority), "stale");
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert_eq!(script.answer(), Some((1, true)));
+            // Another tab validates a new value before this one is rejected.
+            crate::credential_cache::remember(&key(authority), "fresh");
+            script.prompts.send(prompt(2)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            assert!(
+                crate::credential_cache::cached(authority),
+                "the fresh value survives the stale rejection"
+            );
+            crate::credential_cache::forget_server(authority);
+        }
+
+        #[test]
+        fn a_tab_on_an_older_snapshot_never_receives_the_edited_targets_password() {
+            let (mut workbench, script, authority) = probing();
+            // The record was edited to another host and authenticated there.
+            let edited =
+                crate::credential_cache::CacheKey::new(authority, &metadata("lab2.invalid"));
+            crate::credential_cache::remember(&edited, "for lab2");
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench), "the old tab asks instead");
+            assert_eq!(script.answer(), None);
+            crate::credential_cache::forget_server(authority);
+        }
     }
 }

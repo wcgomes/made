@@ -658,6 +658,137 @@ fn the_shell_target_has_no_program_arguments_and_typing_grok_adds_no_dashboard()
     assert_eq!(content, "0\n", "no argument, in particular no `dashboard`");
 }
 
+/// Program, arguments, environment, cwd and explorer root of the tab an app
+/// launch started (open-workspace-redesign, phase 0).
+fn app_launch_record(
+    model: &made_app::AppModel,
+    label: &str,
+    placeholders: &Placeholders,
+) -> String {
+    let workbench = model.workbench().expect("the launch started a tab");
+    let options = workbench.terminal().expect("local terminal").options();
+    let program = options
+        .shell
+        .as_ref()
+        .map_or("<platform shell>".to_owned(), |shell| {
+            placeholders.apply(&shell.to_string_lossy())
+        });
+    let args: Vec<String> = options
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let set: Vec<String> = options
+        .env
+        .iter()
+        .map(|(key, value)| {
+            let key = key.to_string_lossy();
+            let value = if key == made_bridge::config::CONFIG_CONTENT_ENV {
+                "<composed configuration>".to_owned()
+            } else if key == SPOOL {
+                "<spool>".to_owned()
+            } else {
+                placeholders.apply(&value.to_string_lossy())
+            };
+            format!("{key}={value}")
+        })
+        .collect();
+    let removed: Vec<String> = options
+        .env_remove
+        .iter()
+        .map(|key| key.to_string_lossy().into_owned())
+        .collect();
+    let explorer = workbench.launch_plan().map_or("<none>".to_owned(), |plan| {
+        placeholders.apply(&plan.explorer_root.to_string_lossy())
+    });
+    format!(
+        "== {label}\nprogram: {program}\nargs: {args:?}\nset: {set:?}\nremoved: {removed:?}\ncwd: {}\nexplorer: {explorer}\n",
+        placeholders.apply(&options.cwd.to_string_lossy())
+    )
+}
+
+/// Today's app-level launch matrix: Terminal from the folder picker opens the
+/// picker folder, and a `+` menu TUI opens a new home-directory tab. Later
+/// phases of open-workspace-redesign change only the cwd and explorer root.
+#[test]
+fn app_launches_start_the_picker_folder_or_the_home_directory() {
+    if isolated(
+        "app_launches_start_the_picker_folder_or_the_home_directory",
+        Layout::PluginAndSpool,
+    ) {
+        return;
+    }
+    let bin = PathBuf::from(std::env::var_os(BIN_ENV).unwrap());
+    let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+    let placeholders = Placeholders {
+        pairs: vec![
+            (bin.to_string_lossy().into_owned(), "<bin>"),
+            (root.to_string_lossy().into_owned(), "<install>"),
+            (home_dir().to_string_lossy().into_owned(), "<home>"),
+            (raw_home(), "<home>"),
+        ],
+    };
+    let mut out = String::new();
+    // Terminal: the picker's current folder (the process cwd, here the home).
+    let mut model = made_app::AppModel::from_launch(
+        made_app::WorkspaceLaunch::waiting_for_picker(),
+        made_app::AppOptions::new(),
+    );
+    model
+        .begin_terminal_workspace_in(&home_dir())
+        .expect("picker folder");
+    model.ensure_workbench();
+    out.push_str(&app_launch_record(&model, "terminal", &placeholders));
+    model.shutdown();
+    for (label, tui) in [
+        ("opencode", OPENCODE),
+        ("grok", GROK),
+        ("claude-code", CLAUDE_CODE),
+    ] {
+        let mut model = made_app::AppModel::from_launch(
+            made_app::WorkspaceLaunch::waiting_for_picker(),
+            made_app::AppOptions::new(),
+        );
+        model
+            .begin_tui_workspace_in(tui, &home_dir())
+            .expect("home folder");
+        model.ensure_workbench();
+        out.push_str(&app_launch_record(&model, label, &placeholders));
+        model.shutdown();
+    }
+    assert_eq!(out, GOLDEN_APP_LAUNCHES);
+}
+
+const GOLDEN_APP_LAUNCHES: &str = r#"== terminal
+program: <platform shell>
+args: []
+set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>", "OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
+cwd: <home>
+explorer: <home>
+== opencode
+program: <bin>/opencode
+args: []
+set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
+cwd: <home>
+explorer: <home>
+== grok
+program: <bin>/grok
+args: ["dashboard"]
+set: []
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
+cwd: <home>
+explorer: <home>
+== claude-code
+program: <bin>/claude
+args: []
+set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
+cwd: <home>
+explorer: <home>
+"#;
+
 const GOLDEN_PLUGIN_AND_SPOOL: &str = r#"== shell
 program: <platform shell>
 args: []

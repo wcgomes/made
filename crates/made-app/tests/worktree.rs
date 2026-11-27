@@ -570,12 +570,12 @@ fn local_runner_keeps_unbounded_output_and_deadline_behavior() {
     let large = script_in(
         temp.path(),
         "large-status.sh",
-        "#!/bin/sh\ndd if=/dev/zero bs=2097153 count=1 2>/dev/null | tr '\\0' 'a'\n",
+        "#!/bin/sh\ncase \"$*\" in *--get-regexp*) exit 1 ;; esac\ndd if=/dev/zero bs=2097153 count=1 2>/dev/null | tr '\\0' 'a'\n",
     );
     let slow = script_in(
         temp.path(),
         "slow-status.sh",
-        "#!/bin/sh\nsleep 0.3\nprintf '?? local.txt\\0'\n",
+        "#!/bin/sh\ncase \"$*\" in *--get-regexp*) exit 1 ;; esac\nsleep 0.3\nprintf '?? local.txt\\0'\n",
     );
 
     let local = GitRunner::with_program(&large);
@@ -606,4 +606,535 @@ fn local_runner_keeps_unbounded_output_and_deadline_behavior() {
         .iter()
         .flat_map(|group| &group.rows)
         .any(|row| row.relative.ends_with("local.txt")));
+}
+
+// open-workspace-redesign: the Open workspace screen's bounded, off-thread,
+// read-only worktree list and change counts.
+
+use made_app::open_workspace::{CountsState, GitState, WorktreeItem};
+use made_app::worktree::{ChangeCounts, WorktreeReadUpdate, WorktreeReads};
+
+/// A repository at `made` with linked worktrees `made-wt/feature-a` (branch
+/// `feature-a`) and `made-wt/fix` (detached). Returns canonical paths.
+fn repository_with_worktrees(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    let main = temp.path().join("made");
+    init_repo(&main);
+    fs::create_dir_all(main.join("crates")).unwrap();
+    let feature = temp.path().join("made-wt").join("feature-a");
+    let fix = temp.path().join("made-wt").join("fix");
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-a",
+            feature.to_str().unwrap(),
+        ],
+    );
+    run_git(
+        &main,
+        &["worktree", "add", "-q", "--detach", fix.to_str().unwrap()],
+    );
+    (
+        fs::canonicalize(main).unwrap(),
+        fs::canonicalize(feature).unwrap(),
+        fs::canonicalize(fix).unwrap(),
+    )
+}
+
+fn worktree_paths(state: &GitState) -> Vec<PathBuf> {
+    match state {
+        GitState::Repository { worktrees, .. } => {
+            worktrees.iter().map(|item| item.path.clone()).collect()
+        }
+        GitState::NoRepository => Vec::new(),
+    }
+}
+
+fn toplevel(state: &GitState) -> Option<&Path> {
+    match state {
+        GitState::Repository { toplevel, .. } => Some(toplevel),
+        GitState::NoRepository => None,
+    }
+}
+
+fn head_commit(directory: &Path) -> String {
+    run_git(directory, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn repository_root_lists_main_first_then_linked_worktrees() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, fix) = repository_with_worktrees(&temp);
+    let state = runner().read_open_workspace_target(&main);
+    assert_eq!(toplevel(&state), Some(main.as_path()));
+    let GitState::Repository {
+        worktrees, counts, ..
+    } = &state
+    else {
+        panic!("a repository");
+    };
+    let short: String = head_commit(&fix).chars().take(8).collect();
+    assert_eq!(
+        worktrees,
+        &vec![
+            WorktreeItem {
+                path: main.clone(),
+                label: Some("main".to_owned()),
+                missing: false,
+                counts: CountsState::Pending,
+            },
+            WorktreeItem {
+                path: feature,
+                label: Some("feature-a".to_owned()),
+                missing: false,
+                counts: CountsState::Pending,
+            },
+            WorktreeItem {
+                path: fix,
+                label: Some(short),
+                missing: false,
+                counts: CountsState::Pending,
+            },
+        ]
+    );
+    assert_eq!(*counts, CountsState::Pending);
+}
+
+#[test]
+fn a_linked_worktree_root_reads_the_same_list_as_the_main_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, _) = repository_with_worktrees(&temp);
+    let from_main = runner().read_open_workspace_target(&main);
+    let from_linked = runner().read_open_workspace_target(&feature);
+    assert_eq!(toplevel(&from_linked), Some(feature.as_path()));
+    assert_eq!(worktree_paths(&from_linked), worktree_paths(&from_main));
+    assert_eq!(worktree_paths(&from_linked)[0], main, "main first");
+    match (&from_main, &from_linked) {
+        (GitState::Repository { worktrees: a, .. }, GitState::Repository { worktrees: b, .. }) => {
+            assert_eq!(a, b)
+        }
+        _ => panic!("both are repositories"),
+    }
+}
+
+#[test]
+fn subdirectory_single_worktree_and_non_repository_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, _, _) = repository_with_worktrees(&temp);
+    // A subdirectory reports its working tree's top level, not itself.
+    let sub = runner().read_open_workspace_target(&main.join("crates"));
+    assert_eq!(toplevel(&sub), Some(main.as_path()));
+
+    let single = temp.path().join("single");
+    init_repo(&single);
+    let single = fs::canonicalize(single).unwrap();
+    let state = runner().read_open_workspace_target(&single);
+    assert_eq!(toplevel(&state), Some(single.as_path()));
+    assert_eq!(worktree_paths(&state), vec![single.clone()]);
+
+    let plain = temp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    assert_eq!(
+        runner().read_open_workspace_target(&plain),
+        GitState::NoRepository
+    );
+    assert_eq!(
+        GitRunner::with_program(temp.path().join("missing-git")).read_open_workspace_target(&main),
+        GitState::NoRepository,
+        "git missing degrades to no indicator"
+    );
+    assert_eq!(
+        GitRunner::with_program(temp.path().join("missing-git")).read_change_counts(&main),
+        CountsState::Failed
+    );
+}
+
+#[test]
+fn a_deleted_linked_worktree_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, _) = repository_with_worktrees(&temp);
+    fs::remove_dir_all(&feature).unwrap();
+    let GitState::Repository { worktrees, .. } = runner().read_open_workspace_target(&main) else {
+        panic!("a repository");
+    };
+    assert_eq!(worktrees.len(), 3);
+    assert!(!worktrees[0].missing);
+    assert!(worktrees[1].missing, "{worktrees:?}");
+    assert!(!worktrees[2].missing);
+}
+
+#[test]
+fn change_counts_cover_the_whole_working_tree_with_the_grouped_classification() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, _) = repository_with_worktrees(&temp);
+    fs::write(main.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(main.join("a.txt"), "a\n").unwrap();
+    fs::write(main.join("crates").join("b.txt"), "b\n").unwrap();
+    run_git(&main, &["add", ".gitignore", "a.txt", "crates/b.txt"]);
+    run_git(&main, &["commit", "-q", "-m", "tracked"]);
+    // Partially staged: once staged, once modified.
+    fs::write(main.join("a.txt"), "a2\n").unwrap();
+    run_git(&main, &["add", "a.txt"]);
+    fs::write(main.join("a.txt"), "a3\n").unwrap();
+    // A change outside the `crates` subfolder still counts.
+    fs::write(main.join("README.md"), "changed\n").unwrap();
+    fs::write(main.join("crates").join("b.txt"), "b2\n").unwrap();
+    fs::write(main.join("build.log"), "ignored\n").unwrap();
+    for index in 0..4 {
+        fs::write(feature.join(format!("new-{index}.txt")), "n\n").unwrap();
+    }
+
+    assert_eq!(
+        runner().read_change_counts(&main),
+        CountsState::Ready(ChangeCounts {
+            conflicted: 0,
+            staged: 1,
+            modified: 3,
+            untracked: 0,
+        })
+    );
+    assert_eq!(
+        runner().read_change_counts(&feature),
+        CountsState::Ready(ChangeCounts {
+            untracked: 4,
+            ..ChangeCounts::default()
+        })
+    );
+    let clean = temp.path().join("clean");
+    init_repo(&clean);
+    assert_eq!(
+        runner().read_change_counts(&clean),
+        CountsState::Ready(ChangeCounts::default())
+    );
+}
+
+/// Updates of `generation` until its target and `counts` count updates came.
+fn collect(reads: &mut WorktreeReads, counts: usize) -> Vec<WorktreeReadUpdate> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut updates = Vec::new();
+    loop {
+        updates.extend(reads.poll());
+        let targets = updates
+            .iter()
+            .filter(|update| matches!(update, WorktreeReadUpdate::Target { .. }))
+            .count();
+        let counted = updates
+            .iter()
+            .filter(|update| matches!(update, WorktreeReadUpdate::Counts { .. }))
+            .count();
+        if targets == 1 && counted == counts {
+            return updates;
+        }
+        assert!(std::time::Instant::now() < deadline, "{updates:?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn off_thread_reads_count_every_listed_worktree_or_only_the_toplevel() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, fix) = repository_with_worktrees(&temp);
+    let mut reads = WorktreeReads::new(runner());
+    reads.request(1, main.clone());
+    let updates = collect(&mut reads, 3);
+    let mut counted: Vec<_> = updates
+        .iter()
+        .filter_map(|update| match update {
+            WorktreeReadUpdate::Counts {
+                generation, path, ..
+            } => {
+                assert_eq!(*generation, 1);
+                Some(path.clone())
+            }
+            WorktreeReadUpdate::Target { .. } => None,
+        })
+        .collect();
+    counted.sort();
+    let mut expected = vec![main.clone(), feature, fix];
+    expected.sort();
+    assert_eq!(counted, expected);
+
+    // A subdirectory shows no list: only its working tree is counted.
+    reads.request(2, main.join("crates"));
+    let updates = collect(&mut reads, 1);
+    assert!(updates.iter().any(|update| matches!(
+        update,
+        WorktreeReadUpdate::Counts { generation: 2, path, .. } if *path == main
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_generations_are_discarded() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, _, _) = repository_with_worktrees(&temp);
+    let plain = temp.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    // Reads of the repository are slow; the plain folder answers at once.
+    let slow_git = script_in(
+        temp.path(),
+        "slow-git",
+        &format!(
+            "#!/bin/sh\nprev=\nfor arg in \"$@\"; do [ \"$prev\" = -C ] && dir=$arg; prev=$arg; done\ncase \"$dir\" in {main}|{main}/*) sleep 1 ;; esac\nexec git \"$@\"\n",
+            main = main.display()
+        ),
+    );
+    let mut reads = WorktreeReads::new(GitRunner::with_program(&slow_git));
+    reads.request(1, main.clone());
+    reads.request(2, plain.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut updates = Vec::new();
+    while std::time::Instant::now() < deadline {
+        updates.extend(reads.poll());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        updates,
+        vec![WorktreeReadUpdate::Target {
+            generation: 2,
+            state: GitState::NoRepository,
+        }],
+        "the late repository read is discarded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_screen_reads_issue_only_read_only_git_arguments() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, _) = repository_with_worktrees(&temp);
+    let log = temp.path().join("git-args.log");
+    let logging_git = script_in(
+        temp.path(),
+        "logging-git",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git \"$@\"\n",
+            log.display()
+        ),
+    );
+    let runner = GitRunner::with_program(&logging_git);
+    let mut reads = WorktreeReads::new(runner.clone());
+    reads.request(1, main.clone());
+    collect(&mut reads, 3);
+    reads.request(2, feature.clone());
+    collect(&mut reads, 3);
+    let _ = runner.read_open_workspace_target(&main.join("crates"));
+    let _ = runner.read_change_counts(&main);
+
+    let logged = fs::read_to_string(&log).unwrap();
+    assert!(!logged.is_empty());
+    for line in logged.lines() {
+        // The forced read-only configuration (and, for status, the disabled
+        // filter drivers), `-C <directory>`, then the fixed argument vector.
+        let (settings, rest) = line.split_once(" -C ").expect(line);
+        assert!(
+            settings.starts_with(
+                "-c core.fsmonitor=false -c log.showSignature=false -c protocol.allow=never "
+            ),
+            "{line}"
+        );
+        assert!(settings
+            .strip_prefix("-c ")
+            .expect(line)
+            .split(" -c ")
+            .all(|setting| !setting.is_empty() && !setting.contains(' ')));
+        let args = READ_ONLY_GIT_ARGUMENTS
+            .iter()
+            .find(|args| rest.ends_with(&format!(" {}", args.join(" "))));
+        assert!(args.is_some(), "not a read-only git invocation: {line}");
+    }
+    assert!(logged.contains("worktree list --porcelain"));
+    assert!(logged.contains("status --porcelain=v1"));
+    assert!(logged.contains("config --show-scope --name-only --get-regexp"));
+}
+
+/// Drive the screen model with the real reader until the target and its
+/// counts are applied.
+fn read_into(model: &mut made_app::open_workspace::OpenWorkspace, reads: &mut WorktreeReads) {
+    let request = model.sync().expect("target changed");
+    reads.request(request.generation, request.target);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        for update in reads.poll() {
+            match update {
+                WorktreeReadUpdate::Target { generation, state } => {
+                    model.apply_git(generation, state);
+                }
+                WorktreeReadUpdate::Counts {
+                    generation,
+                    path,
+                    counts,
+                } => {
+                    model.apply_counts(generation, &path, counts);
+                }
+            }
+        }
+        let pending = match model.git_state() {
+            None => true,
+            Some(GitState::NoRepository) => false,
+            Some(GitState::Repository {
+                counts, worktrees, ..
+            }) => {
+                if model.worktrees_shown() {
+                    worktrees
+                        .iter()
+                        .any(|item| !item.missing && item.counts == CountsState::Pending)
+                } else {
+                    *counts == CountsState::Pending
+                }
+            }
+        };
+        if !pending {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn the_screen_preselects_the_navigated_working_tree_from_real_reads() {
+    use made_app::open_workspace::OpenWorkspace;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (main, feature, _) = repository_with_worktrees(&temp);
+    fs::write(feature.join("new.txt"), "n\n").unwrap();
+    let mut reads = WorktreeReads::new(runner());
+
+    // Repository root: the root is preselected and is the effective path.
+    let mut model = OpenWorkspace::new(made_app::integrations::PRODUCT, Vec::new(), None, &main);
+    read_into(&mut model, &mut reads);
+    assert!(model.git_indicator() && model.worktrees_shown());
+    assert_eq!(model.worktree_selection(), Some(0));
+    assert_eq!(model.effective_launch_path(), Some(main.clone()));
+    assert_eq!(
+        model.worktrees()[1].counts,
+        CountsState::Ready(ChangeCounts {
+            untracked: 1,
+            ..ChangeCounts::default()
+        })
+    );
+    assert_eq!(
+        model.worktrees()[0].counts,
+        CountsState::Ready(ChangeCounts::default())
+    );
+
+    // Pasted linked worktree root: that worktree, not the main root.
+    model
+        .local_picker_mut()
+        .unwrap()
+        .navigate_to(&feature.to_string_lossy())
+        .unwrap();
+    read_into(&mut model, &mut reads);
+    assert!(model.worktrees_shown());
+    assert_eq!(model.worktrees()[0].path, main);
+    assert_eq!(model.worktree_selection(), Some(1));
+    assert_eq!(model.effective_launch_path(), Some(feature.clone()));
+
+    // Subdirectory: indicator and the working tree's counts, no list.
+    model
+        .local_picker_mut()
+        .unwrap()
+        .navigate_to(&main.join("crates").to_string_lossy())
+        .unwrap();
+    read_into(&mut model, &mut reads);
+    assert!(model.git_indicator() && !model.worktrees_shown());
+    assert_eq!(model.effective_launch_path(), Some(main.join("crates")));
+    assert!(matches!(
+        model.git_state(),
+        Some(GitState::Repository {
+            counts: CountsState::Ready(_),
+            ..
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn rapid_target_changes_run_one_git_process_at_a_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let log = temp.path().join("runs.log");
+    // Every read takes a while and logs when it starts and ends.
+    let slow_git = script_in(
+        temp.path(),
+        "slow-git",
+        &format!(
+            "#!/bin/sh\necho start >> '{log}'\nsleep 0.2\necho end >> '{log}'\nexit 1\n",
+            log = log.display()
+        ),
+    );
+    let mut reads = WorktreeReads::new(GitRunner::with_program(&slow_git));
+    // Holding Down: one target change per frame.
+    for generation in 1..=30 {
+        reads.request(generation, temp.path().join(format!("dir-{generation}")));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut updates = Vec::new();
+    while !updates
+        .iter()
+        .any(|update| matches!(update, WorktreeReadUpdate::Target { generation: 30, .. }))
+    {
+        assert!(std::time::Instant::now() < deadline, "{updates:?}");
+        updates.extend(reads.poll());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        updates,
+        vec![WorktreeReadUpdate::Target {
+            generation: 30,
+            state: GitState::NoRepository,
+        }]
+    );
+    // Give stray workers, if any, time to log.
+    std::thread::sleep(Duration::from_millis(500));
+    let logged = fs::read_to_string(&log).unwrap();
+    let (mut running, mut peak, mut runs) = (0i32, 0i32, 0);
+    for line in logged.lines() {
+        if line == "start" {
+            running += 1;
+            runs += 1;
+            peak = peak.max(running);
+        } else {
+            running -= 1;
+        }
+    }
+    assert_eq!(peak, 1, "git reads overlapped:\n{logged}");
+    assert!(runs <= 3, "superseded targets kept forking git: {runs}");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_screen_reads_never_run_a_repository_fsmonitor_hook() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("repo");
+    init_repo(&main);
+    let marker = temp.path().join("marker");
+    let hook = script_in(
+        temp.path(),
+        "hook.sh",
+        &format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
+    );
+    run_git(&main, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    fs::write(main.join("README.md"), "changed\n").unwrap();
+    let main = fs::canonicalize(main).unwrap();
+    let mut reads = WorktreeReads::new(runner());
+    reads.request(1, main.clone());
+    collect(&mut reads, 1);
+    assert_eq!(
+        runner().read_change_counts(&main),
+        CountsState::Ready(ChangeCounts {
+            modified: 1,
+            ..ChangeCounts::default()
+        })
+    );
+    let _ = runner().read_metadata(&main);
+    assert!(matches!(
+        runner().read_status(&main, Some(&main)),
+        GitStatusRead::Ready(_)
+    ));
+    assert!(!marker.exists(), "the repository's fsmonitor hook ran");
 }

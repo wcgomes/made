@@ -11,7 +11,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
@@ -24,7 +23,7 @@ use crate::diagnostics::{DiagnosticsPill, DiagnosticsSnapshot};
 use crate::explorer_view::{ExplorerPane, PreviewUiAction};
 use crate::integration_status::IntegrationStatus;
 use crate::integrations::{rank_order, IntegrationList, IntegrationRef, Mark, Presentation};
-use crate::sanitize::{sanitize_copy_text, sanitize_display, sanitize_text};
+use crate::sanitize::{sanitize_copy_text, sanitize_display};
 use crate::session_map::{truncate_end, truncate_path, SessionActivity, SessionRow};
 use crate::terminal_view::TerminalUiOutput;
 use crate::theme::{self, Layout};
@@ -103,449 +102,1099 @@ fn paint_status_pill(
         .on_hover_text(sanitize_display(reason, 400))
 }
 
-// ── Picker ──────────────────────────────────────────────────────────────────
+// ── Open workspace screen ───────────────────────────────────────────────────
 
-/// Folder picker shown when Made starts without a workspace.
+/// The Open workspace screen: shown for `+`, `--picker`, last-tab close and
+/// the smoke surface without a folder.
 pub fn picker_ui(model: &mut AppModel, ui: &mut Ui) {
     let layout = Layout::for_window(ui.available_width(), ui.available_height());
-    egui::Frame::NONE
-        .inner_margin(egui::Margin::same(layout.gutter as i8))
-        .show(ui, |ui| picker_surface(model, ui, &layout));
+    open_workspace_surface(model, ui, &layout);
 }
 
-/// Stable id for a picker action button.
+/// Stable id for an Open workspace screen control.
 pub fn picker_control_id(action: &str) -> egui::Id {
     egui::Id::unique(("made-picker-control", action))
 }
 
-/// The picker list's single focusable container.
+/// The folder tree's single focusable container.
 pub fn picker_list_id() -> egui::Id {
     egui::Id::unique("made-picker-list-focus")
 }
 
-/// Stable id for the picker's current-path chip.
+/// Stable id for the editable address bar.
 pub fn picker_path_id() -> egui::Id {
     egui::Id::unique("made-picker-path")
 }
 
-/// Current picker target used by the primary action and its tooltip.
+/// Stable id for one host button of the host bar.
+pub fn open_workspace_host_id(host: crate::open_workspace::HostId) -> egui::Id {
+    match host {
+        crate::open_workspace::HostId::Local => egui::Id::unique("made-host-local"),
+        crate::open_workspace::HostId::Ssh(id) => {
+            egui::Id::unique(("made-host-ssh", authority_key(id)))
+        }
+    }
+}
+
+/// Stable id for the `+ Add host` button.
+pub fn open_workspace_add_host_id() -> egui::Id {
+    egui::Id::unique("made-host-add")
+}
+
+/// Stable id for the `Host actions` (⋯) button of an SSH host.
+pub fn host_actions_id(id: made_remote::protocol::AuthorityId) -> egui::Id {
+    egui::Id::unique(("made-host-actions", authority_key(id)))
+}
+
+/// Stable id for one item of the `Host actions` menu.
+pub fn host_action_item_id(
+    id: made_remote::protocol::AuthorityId,
+    action: crate::ssh_servers::HostAction,
+) -> egui::Id {
+    egui::Id::unique(("made-host-action", authority_key(id), action.label()))
+}
+
+/// The Worktrees list's single focusable container.
+pub fn worktree_list_id() -> egui::Id {
+    egui::Id::unique("made-worktree-list")
+}
+
+/// Stable id for one launch button: `terminal` or the TUI's menu item id.
+pub fn launch_button_id(kind: crate::open_workspace::LaunchKind) -> egui::Id {
+    egui::Id::unique(("made-launch", launch_key(kind)))
+}
+
+fn launch_key(kind: crate::open_workspace::LaunchKind) -> &'static str {
+    match kind {
+        crate::open_workspace::LaunchKind::Terminal => "terminal",
+        crate::open_workspace::LaunchKind::Tui(tui) => tui.descriptor().menu_item_id,
+    }
+}
+
+/// Stable id for one field of the host form.
+pub fn host_form_field_id(field: crate::ssh_servers::HostField) -> egui::Id {
+    egui::Id::unique(("made-host-form", format!("{field:?}")))
+}
+
+/// The effective launch path shown on the launch bar.
 pub fn picker_current_target(model: &AppModel) -> Option<String> {
     model
-        .launch()
-        .picker()
-        .map(|picker| picker.path_target().display().to_string())
-}
-
-#[derive(Debug, Clone)]
-struct PickerBackContext {
-    label: String,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PickerCacheKey {
-    instance: u64,
-    revision: u64,
-    dir: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct PickerDisplayRow {
-    index: usize,
-    name: String,
-    path: PathBuf,
-    depth: usize,
-    expanded: bool,
-}
-
-struct PickerEntryCache {
-    key: PickerCacheKey,
-    rows: Arc<Vec<PickerDisplayRow>>,
-}
-
-fn picker_cache_id() -> egui::Id {
-    egui::Id::unique("made-picker-entry-cache")
-}
-
-fn invalidate_picker_cache(ctx: &egui::Context) {
-    ctx.data_mut(|data| data.remove::<Arc<PickerEntryCache>>(picker_cache_id()));
-}
-
-fn picker_display_rows(
-    ctx: &egui::Context,
-    picker: &crate::workspace_picker::WorkspacePicker,
-) -> Arc<Vec<PickerDisplayRow>> {
-    let key = PickerCacheKey {
-        instance: picker.instance_id(),
-        revision: picker.revision(),
-        dir: picker.current_dir().to_path_buf(),
-    };
-    if let Some(cache) = ctx.data(|data| data.get_temp::<Arc<PickerEntryCache>>(picker_cache_id()))
-    {
-        if cache.key == key {
-            return cache.rows.clone();
-        }
-    }
-    let rows = Arc::new(
-        picker
-            .rows()
-            .iter()
-            .enumerate()
-            .map(|(index, row)| PickerDisplayRow {
-                index,
-                name: sanitize_display(row.name(), 200),
-                path: row.path().to_path_buf(),
-                depth: row.depth(),
-                expanded: row.expanded(),
-            })
-            .collect::<Vec<_>>(),
-    );
-    ctx.data_mut(|data| {
-        data.insert_temp(
-            picker_cache_id(),
-            Arc::new(PickerEntryCache {
-                key,
-                rows: rows.clone(),
-            }),
-        );
-    });
-    rows
-}
-
-fn picker_back_context(model: &AppModel) -> Option<PickerBackContext> {
-    let id = model.active_workspace_id()?;
-    let workbench = model.workspace(id)?;
-    let path = workbench
-        .launch_plan()
-        .map(|plan| plan.workspace.path().to_path_buf())
-        .unwrap_or_else(|| workbench.shell_cwd().to_path_buf());
-    let label = workbench
-        .launch_plan()
-        .map(|plan| plan.workspace.display_name().to_owned())
-        .unwrap_or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "workspace".to_owned())
-        });
-    Some(PickerBackContext { label, path })
-}
-
-fn picker_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
-    let mut command = None;
-    let mut keyboard_move: Option<isize> = None;
-    let mut keyboard_confirm = false;
-    let mut keyboard_toggle = false;
-    let mut keyboard_expand = false;
-    let mut keyboard_collapse = false;
-    let mut keyboard_up = false;
-    let back = picker_back_context(model);
-
-    brand_row(ui, layout, back.as_ref(), &mut command);
-
-    let available = ui.available_size();
-    let top_padding = ((available.y - 600.0) / 3.0).max(24.0);
-    ui.add_space(top_padding);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new("Open a workspace")
-                .font(FontId::proportional(theme::HERO_SIZE))
-                .color(theme::TEXT_PRIMARY),
-        );
-        ui.label(theme::body(
-            "Made starts its terminal and explorer only after you choose a folder.",
-        ));
-    });
-    ui.add_space(14.0);
-
-    let Some(picker) = model.launch().picker() else {
-        return;
-    };
-    let target = picker.path_target().to_path_buf();
-    let rows = picker_display_rows(ui.ctx(), picker);
-    let selection = picker.selection();
-    let picker_instance = picker.instance_id();
-    let picker_revision = picker.revision();
-    let picker_error = picker
-        .error()
-        .map(|error| sanitize_display(&error.to_string(), 600));
-    let launch_error = model
-        .launch()
-        .error()
-        .map(|error| sanitize_display(&error.message(), 600));
-    let truncated = picker.truncated_entries();
-    let notice_height = if truncated > 0 { 20.0 } else { 0.0 };
-    let base_list_max = if layout.compact {
-        160.0
-    } else {
-        (layout.window_height - 2.0 * layout.gutter - 280.0).clamp(120.0, 320.0)
-    };
-    let list_max = (base_list_max - notice_height).max(64.0);
-    let card_width = (ui.available_width() - 48.0)
-        .min(if layout.compact { 672.0 } else { 760.0 })
-        .max(280.0);
-
-    ui.horizontal(|ui| {
-        let gutter = ((ui.available_width() - card_width) / 2.0).max(0.0);
-        ui.add_space(gutter);
-        ui.vertical(|ui| {
-            ui.set_width(card_width);
-            egui::Frame::new()
-                .fill(theme::BG_CARD)
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .corner_radius(CornerRadius::same(12))
-                .show(ui, |ui| {
-                    ui.set_width(card_width);
-                    picker_toolbar(ui, layout, &target, &mut command);
-                    if truncated > 0 {
-                        picker_truncated_notice(ui, layout, truncated);
-                    }
-                    picker_list(
-                        ui,
-                        layout,
-                        &rows,
-                        selection,
-                        list_max,
-                        (picker_instance, picker_revision),
-                        &mut command,
-                    );
-                    if let Some(error) = picker_error.as_deref().or(launch_error.as_deref()) {
-                        notice_strip(ui, layout, theme::ERROR_TINT, theme::ERROR, error, error);
-                    }
-                    picker_footer(ui, layout, selection, &target, &mut command);
-                });
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                ui.label(theme::micro(
-                    "Click a folder to expand or collapse it. Up/Down select, Right expands, Left collapses, Enter toggles, Ctrl/Cmd+Enter opens.",
-                ));
-            });
-        });
-    });
-
-    let focused = ui.ctx().memory(|memory| memory.focused());
-    let button_focused = focused.is_some_and(|id| id != picker_list_id());
-    let input = ui.ctx().input(|input| input.events.clone());
-    for event in input {
-        if let egui::Event::Key {
-            key,
-            pressed: true,
-            modifiers,
-            ..
-        } = event
-        {
-            if key == egui::Key::Escape {
-                command = Some(PickerCommand::Close);
-                continue;
-            }
-            if key == egui::Key::Backspace {
-                keyboard_up = true;
-                continue;
-            }
-            if button_focused {
-                // Focused buttons own Enter/Space and arrow keys. The global
-                // list navigation must not hijack their activation.
-                continue;
-            }
-            match key {
-                egui::Key::ArrowDown => keyboard_move = Some(1),
-                egui::Key::ArrowUp => keyboard_move = Some(-1),
-                egui::Key::ArrowRight => keyboard_expand = true,
-                egui::Key::ArrowLeft => keyboard_collapse = true,
-                egui::Key::Enter if modifiers.command => keyboard_confirm = true,
-                egui::Key::Enter => keyboard_toggle = true,
-                _ => {}
-            }
-        }
-    }
-
-    if let Some(delta) = keyboard_move {
-        model.picker_move(delta);
-    }
-    if keyboard_up {
-        let _ = model.picker_up();
-    }
-    if keyboard_toggle {
-        let _ = model.picker_toggle_selected();
-    }
-    if keyboard_expand {
-        let _ = model.picker_expand_selected();
-    }
-    if keyboard_collapse {
-        let _ = model.picker_collapse_selected();
-    }
-    if keyboard_confirm {
-        let _ = model.confirm_picker();
-    }
-    match command {
-        Some(PickerCommand::Up) => {
-            let _ = model.picker_up();
-        }
-        Some(PickerCommand::Refresh) => {
-            let _ = model.picker_refresh();
-            invalidate_picker_cache(ui.ctx());
-        }
-        Some(PickerCommand::Toggle(index)) => {
-            let _ = model.picker_toggle(index);
-        }
-        Some(PickerCommand::ConfirmCurrent) => {
-            let _ = model.confirm_picker();
-        }
-        Some(PickerCommand::ConfirmRow(index)) => {
-            let result = model
+        .open_workspace()
+        .and_then(crate::open_workspace::OpenWorkspace::effective_launch_path)
+        .or_else(|| {
+            model
                 .launch()
                 .picker()
-                .map(|picker| picker.confirm_row(index));
-            match result {
-                Some(Ok(plan)) => model.open_plan(plan),
-                Some(Err(error)) => {
-                    if let Some(picker) = model.launch_mut().picker_mut() {
-                        picker.set_error(error);
-                    }
-                }
-                None => {}
-            }
-        }
-        Some(PickerCommand::Back) => {
-            model.cancel_picker();
-        }
-        Some(PickerCommand::Close) => {
-            model.close_picker();
-        }
-        None => {}
+                .map(|picker| picker.path_target().to_path_buf())
+        })
+        .map(|path| path.display().to_string())
+}
+
+/// Folder rows and Worktrees rows are this tall (the Explorer row height).
+pub const OPEN_WORKSPACE_ROW_HEIGHT: f32 = 24.0;
+/// Horizontal and vertical window margins of the Open workspace card: 48/32
+/// at the wide layout, 16/12 compact.
+pub fn open_workspace_card_margins(compact: bool) -> (f32, f32) {
+    if compact {
+        (16.0, 12.0)
+    } else {
+        (48.0, 32.0)
     }
 }
 
-fn brand_row(
+enum ScreenCommand {
+    Up,
+    Refresh,
+    Toggle(usize),
+    SelectHost(crate::open_workspace::HostId),
+    AddHost,
+    EditHost(made_remote::protocol::AuthorityId),
+    TestHost(made_remote::protocol::AuthorityId),
+    RemoveHost(made_remote::protocol::AuthorityId),
+    SelectWorktree(usize),
+    Launch(crate::open_workspace::LaunchKind),
+    Navigate(String),
+    Move(isize),
+    Expand,
+    Collapse,
+    ToggleSelected,
+    SaveForm,
+    CancelForm,
+    Removal(bool),
+    Prompt(bool),
+    Consent(bool),
+    ForgetHostKey,
+    DismissReport,
+    DismissFailure,
+    Close,
+}
+
+fn address_draft_id() -> egui::Id {
+    egui::Id::unique("made-address-draft")
+}
+
+fn host_menu_id(id: made_remote::protocol::AuthorityId) -> egui::Id {
+    egui::Id::unique(("made-host-menu", authority_key(id)))
+}
+
+fn host_icon_glyph(host: crate::open_workspace::HostId) -> theme::IconGlyph {
+    match host {
+        crate::open_workspace::HostId::Local => theme::IconGlyph::Computer,
+        crate::open_workspace::HostId::Ssh(_) => theme::IconGlyph::Servers,
+    }
+}
+
+fn connection_text(state: &crate::open_workspace::ConnectionState) -> String {
+    use crate::open_workspace::ConnectionState as C;
+    match state {
+        C::NotConnected => "Not connected".to_owned(),
+        C::Connecting => "Connecting".to_owned(),
+        C::Connected => "Connected".to_owned(),
+        C::HostKeyApprovalNeeded => "Host key approval needed".to_owned(),
+        C::AuthenticationCancelled => "Authentication cancelled".to_owned(),
+        C::Failed(reason) => format!("Connection failed: {}", sanitize_display(reason, 200)),
+    }
+}
+
+fn connection_glyph(state: &crate::open_workspace::ConnectionState) -> theme::HostStatusGlyph {
+    use crate::open_workspace::ConnectionState as C;
+    match state {
+        C::NotConnected => theme::HostStatusGlyph::NotConnected,
+        C::Connecting => theme::HostStatusGlyph::Connecting,
+        C::Connected => theme::HostStatusGlyph::Connected,
+        C::HostKeyApprovalNeeded => theme::HostStatusGlyph::ApprovalNeeded,
+        C::AuthenticationCancelled => theme::HostStatusGlyph::Cancelled,
+        C::Failed(_) => theme::HostStatusGlyph::Failed,
+    }
+}
+
+/// Tooltip and accessible name of a host button: kind, full name, full
+/// address, connection state and detection.
+pub fn host_accessible_label(host: &crate::app::ScreenHost) -> String {
+    let kind = match host.id {
+        crate::open_workspace::HostId::Local => "Local computer",
+        crate::open_workspace::HostId::Ssh(_) => "SSH host",
+    };
+    let mut label = format!(
+        "{kind}: {}, {}",
+        sanitize_display(&host.name, 128),
+        sanitize_display(&host.address, 300)
+    );
+    if let Some(state) = &host.connection {
+        label.push_str(&format!(" — {}", connection_text(state)));
+    }
+    // Detection can still arrive only on Local or while connecting.
+    let pending = matches!(
+        host.connection,
+        None | Some(
+            crate::open_workspace::ConnectionState::Connecting
+                | crate::open_workspace::ConnectionState::HostKeyApprovalNeeded
+                | crate::open_workspace::ConnectionState::Connected
+        )
+    );
+    match &host.detected {
+        None if pending => label.push_str(" — detection pending"),
+        None => {}
+        Some(found) if !found.is_empty() => {
+            let names: Vec<&str> = found.iter().map(|tui| tui.descriptor().label).collect();
+            label.push_str(&format!(" — detected: {}", names.join(", ")));
+        }
+        Some(_) => {}
+    }
+    label
+}
+
+/// Colored dot of a change pill: the status color of its git group.
+pub fn pill_dot_color(kind: made_remote::git::PillKind) -> Color32 {
+    match kind {
+        made_remote::git::PillKind::Conflicted => theme::ERROR,
+        made_remote::git::PillKind::Staged => theme::INFO,
+        made_remote::git::PillKind::Modified => theme::WARNING,
+        made_remote::git::PillKind::Untracked => theme::SUCCESS,
+    }
+}
+
+const PILL_HEIGHT: f32 = 18.0;
+const PILL_GAP: f32 = 4.0;
+
+fn pill_width(ui: &Ui, text: &str) -> f32 {
+    let text = ui
+        .painter()
+        .layout_no_wrap(
+            text.to_owned(),
+            FontId::proportional(theme::SMALL_SIZE),
+            theme::TEXT_SECONDARY,
+        )
+        .size()
+        .x;
+    6.0 + 6.0 + 5.0 + text + 7.0
+}
+
+fn pills_width(ui: &Ui, pills: &[(made_remote::git::PillKind, usize)]) -> f32 {
+    pills
+        .iter()
+        .map(|(kind, count)| pill_width(ui, &format!("{count} {}", kind.label())))
+        .sum::<f32>()
+        + PILL_GAP * pills.len().saturating_sub(1) as f32
+}
+
+/// Paint change pills from `left` on the row centered at `center_y`.
+fn paint_pills(
+    ui: &Ui,
+    left: f32,
+    center_y: f32,
+    pills: &[(made_remote::git::PillKind, usize)],
+) -> f32 {
+    let mut x = left;
+    for (kind, count) in pills {
+        let text = format!("{count} {}", kind.label());
+        let width = pill_width(ui, &text);
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(x, center_y - PILL_HEIGHT / 2.0),
+            egui::vec2(width, PILL_HEIGHT),
+        );
+        ui.painter().rect(
+            rect,
+            CornerRadius::same((PILL_HEIGHT / 2.0) as u8),
+            theme::BG_ELEVATED,
+            Stroke::new(1.0, theme::BORDER),
+            StrokeKind::Inside,
+        );
+        ui.painter().circle_filled(
+            egui::pos2(rect.left() + 9.0, rect.center().y),
+            3.0,
+            pill_dot_color(*kind),
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + 17.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            text,
+            FontId::proportional(theme::SMALL_SIZE),
+            theme::TEXT_SECONDARY,
+        );
+        x = rect.right() + PILL_GAP;
+    }
+    x
+}
+
+fn counts_pills(
+    counts: &crate::open_workspace::CountsState,
+) -> Vec<(made_remote::git::PillKind, usize)> {
+    match counts {
+        crate::open_workspace::CountsState::Ready(counts) => counts.nonzero(),
+        _ => Vec::new(),
+    }
+}
+
+fn counts_summary(counts: &crate::open_workspace::CountsState) -> Option<String> {
+    match counts {
+        crate::open_workspace::CountsState::Ready(counts) => counts.summary(),
+        _ => None,
+    }
+}
+
+/// Middle-ellipsize `text` to fit `width` in `font`.
+fn middle_ellipsized(ui: &Ui, text: &str, font: &FontId, width: f32) -> String {
+    let full = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT_PRIMARY)
+        .size()
+        .x;
+    if full <= width {
+        return text.to_owned();
+    }
+    let chars = text.chars().count().max(1);
+    let per_char = full / chars as f32;
+    let budget = ((width / per_char).floor() as usize).max(3);
+    theme::truncate_middle(text, budget)
+}
+
+/// Rows of the launch area, top to bottom: target row height (`Launch in`),
+/// gap, button row height, and the top/bottom padding (wide 20/6/26, 8/10;
+/// compact 18/4/24, 6/8).
+pub fn launch_area_metrics(compact: bool) -> (f32, f32, f32, f32, f32) {
+    if compact {
+        (18.0, 4.0, 24.0, 6.0, 8.0)
+    } else {
+        (20.0, 6.0, 26.0, 8.0, 10.0)
+    }
+}
+
+fn open_workspace_surface(model: &mut AppModel, ui: &mut Ui, layout: &Layout) {
+    let mut command: Option<ScreenCommand> = None;
+    let screen = ui.max_rect();
+    // The card grows with the window inside margins that let the backdrop
+    // show around it.
+    let (margin_x, margin_y) = open_workspace_card_margins(layout.compact);
+    let card = egui::Rect::from_min_max(
+        screen.min + egui::vec2(margin_x, margin_y),
+        egui::pos2(
+            (screen.right() - margin_x).max(screen.left() + margin_x + 1.0),
+            (screen.bottom() - margin_y).max(screen.top() + margin_y + 1.0),
+        ),
+    );
+    let native_backdrop_applied = model.native_backdrop().is_applied();
+    theme::paint_glass_card(ui.painter(), card, layout, native_backdrop_applied);
+    let Some(open) = model.open_workspace() else {
+        return;
+    };
+    let selected_host = open.selected_host();
+    let compact = layout.compact;
+    let pad_x = if compact { 10.0 } else { 12.0 };
+    let separator = |ui: &Ui, y: f32| {
+        ui.painter().line_segment(
+            [
+                egui::pos2(card.left() + 1.0, y - 0.5),
+                egui::pos2(card.right() - 1.0, y - 0.5),
+            ],
+            Stroke::new(1.0, theme::BORDER_HEADER),
+        );
+    };
+
+    // Brand row; its controls register last for the Tab order.
+    let brand_height = if compact { 32.0 } else { 40.0 };
+    let brand = egui::Rect::from_min_size(card.min, egui::vec2(card.width(), brand_height));
+    theme::paint_glass_card_header(ui, brand, layout, native_backdrop_applied);
+    theme::paint_card_border(ui, card, layout);
+
+    // Host bar.
+    let host_pad_y = if compact { 6.0 } else { 8.0 };
+    let host_height = if compact { 40.0 } else { 44.0 };
+    let host_bar = egui::Rect::from_min_size(
+        egui::pos2(card.left(), brand.bottom()),
+        egui::vec2(card.width(), host_height + 2.0 * host_pad_y),
+    );
+    host_bar_ui(model, ui, host_bar, pad_x, host_height, &mut command);
+    separator(ui, host_bar.bottom());
+
+    // Everything below the host bar is laid out top-down in a child ui.
+    let body = egui::Rect::from_min_max(
+        egui::pos2(card.left() + 1.0, host_bar.bottom()),
+        egui::pos2(card.right() - 1.0, card.bottom() - 1.0),
+    );
+    let mut body_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(body)
+            .layout(egui::Layout::top_down(Align::Min)),
+    );
+    body_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+    let (target_row, launch_gap, button_row, launch_top, launch_bottom) =
+        launch_area_metrics(compact);
+    let launch_height = launch_top + target_row + launch_gap + button_row + launch_bottom + 1.0;
+    let worktrees_shown = model
+        .open_workspace()
+        .is_some_and(crate::open_workspace::OpenWorkspace::worktrees_shown);
+    let worktree_count = model
+        .open_workspace()
+        .map_or(0, |open| open.worktrees().len());
+    let wt_head = if compact { 22.0 } else { 26.0 };
+    let wt_pad = if compact { 4.0 } else { 10.0 };
+    let toolbar_height = if compact { 36.0 } else { 40.0 };
+    let tree_pad = if compact { 2.0 } else { 4.0 };
+    let min_tree = 4.0 * OPEN_WORKSPACE_ROW_HEIGHT + 2.0 * tree_pad;
+
+    // Transient panels above the folder area: form, removal, prompt, report.
+    let panels_budget = (body.height()
+        - launch_height
+        - toolbar_height
+        - min_tree
+        - if worktrees_shown {
+            1.0 + wt_head + wt_pad + 2.0 * (OPEN_WORKSPACE_ROW_HEIGHT + 1.0)
+        } else {
+            0.0
+        })
+    .max(48.0);
+    egui::ScrollArea::vertical()
+        .id_salt("made-open-workspace-panels")
+        .max_height(panels_budget)
+        .auto_shrink([false, true])
+        .show(&mut body_ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            screen_panels(model, ui, layout, selected_host, &mut command);
+        });
+
+    toolbar_ui(
+        model,
+        &mut body_ui,
+        layout,
+        toolbar_height,
+        pad_x,
+        &mut command,
+    );
+    let remaining = body_ui.available_height();
+    let wt_rows_space = if worktrees_shown {
+        let natural = worktree_count as f32 * (OPEN_WORKSPACE_ROW_HEIGHT + 1.0);
+        let max = (remaining - launch_height - min_tree - 1.0 - wt_head - wt_pad)
+            .max(2.0 * (OPEN_WORKSPACE_ROW_HEIGHT + 1.0));
+        natural
+            .min(max)
+            .min(6.0 * (OPEN_WORKSPACE_ROW_HEIGHT + 1.0))
+    } else {
+        0.0
+    };
+    let wt_height = if worktrees_shown {
+        1.0 + wt_head + wt_pad + wt_rows_space
+    } else {
+        0.0
+    };
+    let tree_height = (remaining - launch_height - wt_height).max(OPEN_WORKSPACE_ROW_HEIGHT);
+    folder_area_ui(
+        model,
+        &mut body_ui,
+        layout,
+        tree_height,
+        tree_pad,
+        &mut command,
+    );
+    if worktrees_shown {
+        worktrees_ui(
+            model,
+            &mut body_ui,
+            layout,
+            wt_head,
+            wt_rows_space,
+            &mut command,
+        );
+    }
+    launch_bar_ui(model, &mut body_ui, layout, pad_x, &mut command);
+
+    // Brand row controls last: Close ends the Tab order.
+    brand_row_ui(ui, layout, brand, pad_x, &mut command);
+
+    screen_keyboard(model, ui, &mut command);
+    apply_screen_command(model, ui, command);
+}
+
+fn brand_row_ui(
     ui: &mut Ui,
     layout: &Layout,
-    back: Option<&PickerBackContext>,
-    command: &mut Option<PickerCommand>,
+    rect: egui::Rect,
+    pad_x: f32,
+    command: &mut Option<ScreenCommand>,
 ) {
-    let height = if layout.compact { 32.0 } else { 36.0 };
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
     let mut row = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect)
+            .max_rect(egui::Rect::from_min_max(
+                rect.min + egui::vec2(pad_x, 0.0),
+                rect.max - egui::vec2(pad_x - 4.0, 0.0),
+            ))
             .layout(egui::Layout::left_to_right(Align::Center)),
     );
-    theme::wordmark(&mut row);
+    row.spacing_mut().item_spacing.x = 8.0;
+    theme::wordmark_brand(&mut row);
     row.label(theme::micro(APP_VERSION));
+    let (divider, _) = row.allocate_exact_size(egui::vec2(1.0, 14.0), Sense::hover());
+    row.painter().rect_filled(divider, 0.0, theme::BORDER);
+    row.label(
+        RichText::new("Open workspace")
+            .font(FontId::proportional(13.0))
+            .color(theme::TEXT_PRIMARY),
+    );
     row.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let close = theme::icon_action(
             ui,
             picker_control_id("close"),
             theme::IconGlyph::Close,
-            "Close picker",
+            "Close",
             false,
             layout.button_height,
-            theme::BG_CLEAR_SOLID,
+            theme::BG_CARD,
         );
         if close.activated {
-            *command = Some(PickerCommand::Close);
-        }
-        if let Some(back) = back {
-            let label = format!(
-                "Back to {}",
-                truncate_end(
-                    &sanitize_display(&back.label, 80),
-                    if layout.compact { 14 } else { 24 }
-                )
-            );
-            let action = theme::ghost_action(
-                ui,
-                picker_control_id("back"),
-                &label,
-                false,
-                layout.button_height,
-                theme::BG_CLEAR_SOLID,
-            );
-            action.response.on_hover_text(format!(
-                "Return to {} without stopping its shell",
-                sanitize_display(&back.path.display().to_string(), 900)
-            ));
-            if action.activated {
-                *command = Some(PickerCommand::Back);
-            }
-        } else {
-            ui.label(theme::micro("Choose a workspace"));
+            *command = Some(ScreenCommand::Close);
         }
     });
 }
 
-fn picker_toolbar(
+fn host_bar_ui(
+    model: &mut AppModel,
     ui: &mut Ui,
-    layout: &Layout,
-    current: &std::path::Path,
-    command: &mut Option<PickerCommand>,
+    rect: egui::Rect,
+    pad_x: f32,
+    height: f32,
+    command: &mut Option<ScreenCommand>,
 ) {
-    let height = if layout.compact { 36.0 } else { 40.0 };
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let mut toolbar = ui.new_child(
+    let hosts = model.screen_hosts();
+    let selected = model
+        .open_workspace()
+        .map(crate::open_workspace::OpenWorkspace::selected_host);
+    let adding = model
+        .screen_form()
+        .is_some_and(|form| form.editing.is_none());
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + pad_x, rect.top()),
+        egui::pos2(rect.right() - pad_x, rect.bottom()),
+    );
+    let mut bar = ui.new_child(
         UiBuilder::new()
-            .max_rect(
-                rect.shrink2(egui::vec2(layout.header_padding_x, 0.0))
-                    .shrink(1.0),
-            )
+            .max_rect(inner)
             .layout(egui::Layout::left_to_right(Align::Center)),
     );
-    let up = theme::ghost_action(
-        &mut toolbar,
-        picker_control_id("up"),
-        "Up",
-        false,
-        layout.button_height,
-        theme::BG_CARD,
-    );
-    up.response.on_hover_text("Go to the parent folder");
-    if up.activated {
-        *command = Some(PickerCommand::Up);
+    let mut order: Vec<egui::Id> = hosts
+        .iter()
+        .map(|host| open_workspace_host_id(host.id))
+        .collect();
+    order.push(open_workspace_add_host_id());
+    let focused = ui.ctx().memory(|memory| memory.focused());
+    let step = ui.input(|input| {
+        if input.key_pressed(egui::Key::ArrowRight) {
+            1
+        } else if input.key_pressed(egui::Key::ArrowLeft) {
+            -1
+        } else {
+            0
+        }
+    });
+    if let Some(index) = focused.and_then(|focused| order.iter().position(|id| *id == focused)) {
+        if step != 0 {
+            let next = (index as isize + step).clamp(0, order.len() as isize - 1) as usize;
+            ui.ctx()
+                .memory_mut(|memory| memory.request_focus(order[next]));
+        }
     }
-    let refresh = theme::ghost_action(
-        &mut toolbar,
-        picker_control_id("refresh"),
-        "Refresh",
-        false,
-        layout.button_height,
-        theme::BG_CARD,
-    );
-    refresh.response.on_hover_text("Re-read the current folder");
-    if refresh.activated {
-        *command = Some(PickerCommand::Refresh);
-    }
-    let (divider, _) = toolbar.allocate_exact_size(egui::vec2(1.0, 14.0), Sense::hover());
-    toolbar.painter().rect_filled(divider, 0.0, theme::BORDER);
-    let full = current.display().to_string();
-    let available = toolbar.available_width().max(0.0);
-    if available > 24.0 {
-        let max_text = (available - 12.0).max(1.0);
-        let char_budget = (max_text / 6.3).floor().max(4.0) as usize;
-        let display = truncate_path(&sanitize_display(&full, 900), char_budget);
-        let galley = toolbar.painter().layout_job(theme::ellipsized_job(
-            display,
-            FontId::monospace(10.5),
-            theme::TEXT_PRIMARY,
-            max_text,
-        ));
-        let chip_width = (galley.size().x + 12.0).min(available).max(1.0);
-        let (chip_rect, _) =
-            toolbar.allocate_exact_size(egui::vec2(chip_width, 20.0), Sense::hover());
-        let chip = toolbar.interact(chip_rect, picker_path_id(), Sense::hover());
-        toolbar
-            .painter()
-            .rect_filled(chip_rect, CornerRadius::same(4), theme::BG_SELECTED);
-        toolbar.painter().galley(
-            egui::pos2(
-                chip_rect.left() + 6.0,
-                chip_rect.center().y - galley.size().y / 2.0,
-            ),
-            galley,
-            theme::TEXT_PRIMARY,
+    egui::ScrollArea::horizontal()
+        .id_salt("made-host-bar")
+        .auto_shrink([false, false])
+        .max_height(inner.height())
+        .show(&mut bar, |ui| {
+            ui.set_min_height(inner.height());
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for host in &hosts {
+                    host_button_ui(ui, host, Some(host.id) == selected, height, command);
+                }
+                add_host_button_ui(ui, height, adding, command);
+            });
+        });
+}
+
+fn host_button_ui(
+    ui: &mut Ui,
+    host: &crate::app::ScreenHost,
+    selected: bool,
+    height: f32,
+    command: &mut Option<ScreenCommand>,
+) {
+    let id = open_workspace_host_id(host.id);
+    let ssh = match host.id {
+        crate::open_workspace::HostId::Ssh(id) => Some(id),
+        crate::open_workspace::HostId::Local => None,
+    };
+    let name = sanitize_display(&host.name, 128);
+    let address = sanitize_display(&host.address, 300);
+    let name_font = FontId::proportional(theme::BODY_SIZE);
+    let address_font = FontId::monospace(10.5);
+    let marks: Vec<IntegrationRef> = host.detected.clone().unwrap_or_default();
+    let name_width = ui
+        .painter()
+        .layout_no_wrap(name.clone(), name_font.clone(), theme::TEXT_SECONDARY)
+        .size()
+        .x
+        .min(220.0);
+    let marks_width = if marks.is_empty() {
+        0.0
+    } else {
+        2.0 + marks.len() as f32 * 16.0
+    };
+    let address_width = ui
+        .painter()
+        .layout_no_wrap(address.clone(), address_font.clone(), theme::TEXT_TERTIARY)
+        .size()
+        .x
+        .min(220.0);
+    let text_width = (name_width + marks_width).max(address_width);
+    let actions_width = if ssh.is_some() { 6.0 + 24.0 - 4.0 } else { 0.0 };
+    let width = 10.0 + 16.0 + 8.0 + text_width + actions_width + 10.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: false,
+                escape: false,
+            },
         );
-        chip.on_hover_text(sanitize_display(&full, 900));
+    });
+    let actions_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 10.0 + 4.0 - 24.0, rect.center().y - 12.0),
+        egui::vec2(24.0, 24.0),
+    );
+    let menu_open = ssh.is_some_and(|ssh| egui::Popup::is_id_open(ui.ctx(), host_menu_id(ssh)));
+    let hovered = response.hovered() || ui.rect_contains_pointer(rect);
+    let fill = if selected {
+        theme::BG_SELECTED
+    } else if hovered {
+        theme::BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let text_color = if selected || hovered {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_SECONDARY
+    };
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 10.0, rect.center().y - 8.0),
+        egui::Vec2::splat(16.0),
+    );
+    theme::paint_icon(
+        ui.painter(),
+        icon_rect,
+        host_icon_glyph(host.id),
+        if selected {
+            theme::TEXT_PRIMARY
+        } else {
+            theme::TEXT_TERTIARY
+        },
+    );
+    if let Some(state) = &host.connection {
+        ui.painter().extend(theme::host_status_shapes(
+            icon_rect.right_bottom() + egui::vec2(-2.0, -2.0),
+            connection_glyph(state),
+            if fill == Color32::TRANSPARENT {
+                theme::BG_CARD
+            } else {
+                fill
+            },
+        ));
     }
+    let text_left = icon_rect.right() + 8.0;
+    let name_center = rect.center().y - 7.5;
+    let address_center = rect.center().y + 7.5;
+    theme::paint_ellipsized_centered(
+        ui.painter(),
+        text_left,
+        name_center,
+        &name,
+        name_font,
+        text_color,
+        name_width.max(1.0),
+    );
+    let mut mark_x = text_left + name_width + 4.0;
+    for tui in &marks {
+        let leading = mark_leading(tui.descriptor().mark);
+        let mark_rect = egui::Rect::from_center_size(
+            egui::pos2(mark_x + 6.0, name_center),
+            egui::Vec2::splat(12.0),
+        );
+        if let theme::MenuLeading::Image { uri, bytes } = leading {
+            egui::Image::from_bytes(uri, bytes).paint_at(ui, mark_rect);
+        }
+        mark_x += 16.0;
+    }
+    theme::paint_ellipsized_centered(
+        ui.painter(),
+        text_left,
+        address_center,
+        &address,
+        address_font,
+        theme::TEXT_TERTIARY,
+        address_width.max(1.0),
+    );
+    let label = host_accessible_label(host);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, true, selected, label.clone())
+    });
+    if response.has_focus() {
+        theme::paint_focus_ring(ui, rect, CornerRadius::same(6), theme::BG_CARD);
+        response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+    }
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let keyboard = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    if (response.clicked() || keyboard) && !selected {
+        *command = Some(ScreenCommand::SelectHost(host.id));
+    }
+    let Some(ssh) = ssh else {
+        response.on_hover_text(label);
+        return;
+    };
+    let context_key = response.has_focus()
+        && ui.input(|input| {
+            (input.key_pressed(egui::Key::F10) && input.modifiers.shift)
+                || input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::F10,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.shift
+                    )
+                })
+        });
+    let response = response.on_hover_text(label);
+    response.context_menu(|ui| host_actions_menu(ui, ssh, command));
+    // The ⋯ button is revealed by hover or focus and stays a 24×24 target.
+    let actions_focused = ui
+        .ctx()
+        .memory(|memory| memory.has_focus(host_actions_id(ssh)));
+    let reveal = hovered || response.has_focus() || actions_focused || menu_open;
+    let actions = ui.interact(actions_rect, host_actions_id(ssh), Sense::click());
+    if reveal {
+        let open = menu_open;
+        let action_fill = if open || actions.hovered() {
+            theme::BG_HOVER
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter()
+            .rect_filled(actions_rect, CornerRadius::same(6), action_fill);
+        theme::paint_icon(
+            ui.painter(),
+            actions_rect,
+            theme::IconGlyph::More,
+            if open || actions.hovered() {
+                theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_TERTIARY
+            },
+        );
+    }
+    if actions.has_focus() {
+        theme::paint_focus_ring(ui, actions_rect, CornerRadius::same(6), fill);
+    }
+    let actions_keyboard = actions.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let toggle = actions.clicked() || actions_keyboard || context_key;
+    let actions = actions.on_hover_text("Host actions");
+    actions.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Host actions"));
+    egui::Popup::menu(&actions)
+        .id(host_menu_id(ssh))
+        .open_memory(toggle.then_some(egui::SetOpenCommand::Toggle))
+        .show(|ui| host_actions_menu(ui, ssh, command));
+}
+
+fn host_actions_menu(
+    ui: &mut Ui,
+    ssh: made_remote::protocol::AuthorityId,
+    command: &mut Option<ScreenCommand>,
+) {
+    ui.set_min_width(168.0);
+    for action in crate::ssh_servers::host_actions(crate::open_workspace::HostId::Ssh(ssh)) {
+        if *action == crate::ssh_servers::HostAction::Remove {
+            ui.separator();
+        }
+        let label = match action {
+            crate::ssh_servers::HostAction::TestConnection => action.label().to_owned(),
+            _ => format!("{}…", action.label()),
+        };
+        let item = theme::ghost_action(
+            ui,
+            host_action_item_id(ssh, *action),
+            &label,
+            false,
+            26.0,
+            theme::BG_CARD,
+        );
+        if item.activated {
+            *command = Some(match action {
+                crate::ssh_servers::HostAction::Edit => ScreenCommand::EditHost(ssh),
+                crate::ssh_servers::HostAction::TestConnection => ScreenCommand::TestHost(ssh),
+                crate::ssh_servers::HostAction::Remove => ScreenCommand::RemoveHost(ssh),
+            });
+            ui.close();
+        }
+    }
+}
+
+fn add_host_button_ui(ui: &mut Ui, height: f32, open: bool, command: &mut Option<ScreenCommand>) {
+    let id = open_workspace_add_host_id();
+    let font = FontId::proportional(theme::BUTTON_SIZE);
+    let text = ui
+        .painter()
+        .layout_no_wrap("Add host".to_owned(), font.clone(), theme::TEXT_TERTIARY)
+        .size()
+        .x;
+    let width = 8.0 + 16.0 + 6.0 + text + 12.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: true,
+                vertical_arrows: false,
+                escape: false,
+            },
+        );
+    });
+    let hovered = response.hovered();
+    let fill = if open {
+        theme::BG_SELECTED
+    } else if hovered {
+        theme::BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let color = if open || hovered {
+        theme::TEXT_PRIMARY
+    } else {
+        theme::TEXT_TERTIARY
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let icon = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 8.0, rect.center().y - 8.0),
+        egui::Vec2::splat(16.0),
+    );
+    theme::paint_icon(ui.painter(), icon, theme::IconGlyph::Plus, color);
+    ui.painter().text(
+        egui::pos2(icon.right() + 6.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        "Add host",
+        font,
+        color,
+    );
+    if response.has_focus() {
+        theme::paint_focus_ring(ui, rect, CornerRadius::same(6), theme::BG_CARD);
+        response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+    }
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let keyboard = response.has_focus()
+        && ui.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    let response = response.on_hover_text("Add an SSH host");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Add host"));
+    if response.clicked() || keyboard {
+        *command = Some(ScreenCommand::AddHost);
+    }
+}
+
+fn screen_panels(
+    model: &mut AppModel,
+    ui: &mut Ui,
+    layout: &Layout,
+    selected_host: crate::open_workspace::HostId,
+    command: &mut Option<ScreenCommand>,
+) {
+    let pad_x = if layout.compact { 10.0 } else { 12.0 };
+    if model.screen_form().is_some() {
+        host_form_ui(model, ui, layout, command);
+    }
+    let editing = model.screen_form().and_then(|form| form.editing);
+    if let Some((tested, report)) = model
+        .screen_test_report()
+        .map(|(id, text)| (id, text.to_owned()))
+        .filter(|(id, _)| Some(*id) != editing)
+    {
+        let name = model
+            .screen_hosts()
+            .into_iter()
+            .find(|host| host.id == crate::open_workspace::HostId::Ssh(tested))
+            .map(|host| host.name)
+            .unwrap_or_default();
+        panel_frame(ui, pad_x, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let extent = theme::icon_action_extent(24.0);
+                let text_width = (ui.available_width() - extent - 8.0).max(40.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_width, extent),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(text_width);
+                        ui.add_space(4.0);
+                        ui.label(theme::micro(format!(
+                            "{}: {}",
+                            sanitize_display(&name, 128),
+                            sanitize_display(&report, 400)
+                        )));
+                    },
+                );
+                if dismiss_action(ui, picker_control_id("dismiss-report"), theme::BG_HEADER) {
+                    *command = Some(ScreenCommand::DismissReport);
+                }
+            });
+        });
+    }
+    if let Some(message) = model.screen_removal().map(str::to_owned) {
+        panel_frame(ui, pad_x, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(theme::body(sanitize_display(&message, 300)));
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    let remove = theme::ghost_action(
+                        ui,
+                        picker_control_id("remove-confirm"),
+                        "Remove",
+                        false,
+                        layout.button_height,
+                        theme::BG_HEADER,
+                    );
+                    if remove.activated {
+                        *command = Some(ScreenCommand::Removal(true));
+                    }
+                    let cancel = theme::ghost_action(
+                        ui,
+                        picker_control_id("remove-cancel"),
+                        "Cancel",
+                        false,
+                        layout.button_height,
+                        theme::BG_HEADER,
+                    );
+                    if cancel.activated {
+                        *command = Some(ScreenCommand::Removal(false));
+                    }
+                });
+            });
+        });
+    }
+    if let Some(text) = model.screen_prompt().map(|prompt| prompt.text.clone()) {
+        let class = crate::remote_session::classify_prompt(&text);
+        let changed = matches!(
+            class,
+            crate::remote_session::SshPromptClass::ChangedHostKey { .. }
+        );
+        panel_frame(ui, pad_x, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            match &class {
+                crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
+                    ui.label(theme::body(
+                        "The host key of this server changed. Made refused it.",
+                    ));
+                }
+                crate::remote_session::SshPromptClass::UnknownHost { text } => {
+                    ui.label(theme::body(
+                        "This host is not trusted yet. Approve only if the fingerprint matches.",
+                    ));
+                    ui.label(theme::mono(
+                        sanitize_display(text, 700),
+                        10.5,
+                        theme::TEXT_SECONDARY,
+                    ));
+                }
+                crate::remote_session::SshPromptClass::Secret { text } => {
+                    ui.label(theme::body(sanitize_display(text, 400)));
+                    let edit = egui::TextEdit::singleline(model.prompt_draft())
+                        .id(ssh_field_id("screen-prompt"))
+                        .password(true)
+                        .desired_width(f32::INFINITY);
+                    ui.add(edit);
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if !changed {
+                    let approve = theme::primary_action(
+                        ui,
+                        picker_control_id("prompt-approve"),
+                        "Continue",
+                        layout.button_height,
+                        true,
+                        theme::BG_HEADER,
+                    );
+                    if approve.activated {
+                        *command = Some(ScreenCommand::Prompt(true));
+                    }
+                }
+                let cancel = theme::ghost_action(
+                    ui,
+                    picker_control_id("prompt-cancel"),
+                    if changed { "Refuse key" } else { "Cancel" },
+                    false,
+                    layout.button_height,
+                    theme::BG_HEADER,
+                );
+                if cancel.activated {
+                    *command = Some(ScreenCommand::Prompt(false));
+                }
+            });
+        });
+    }
+    if let crate::open_workspace::HostId::Ssh(ssh) = selected_host {
+        if model.ssh_selected() == Some(ssh) && model.ssh_host_key_changed() {
+            panel_frame(ui, pad_x, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(theme::body(
+                    "The stored key no longer matches this server. Forget it only if the server key change was expected.",
+                ));
+                let forget = theme::secondary_action(
+                    ui,
+                    picker_control_id("forget-host-key"),
+                    "Forget old host key",
+                    layout.button_height,
+                    true,
+                    theme::BG_HEADER,
+                );
+                if forget.activated {
+                    *command = Some(ScreenCommand::ForgetHostKey);
+                }
+            });
+        }
+        if model.screen_consent_pending() {
+            panel_frame(ui, pad_x, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.label(theme::body(
+                    "Browsing this server needs Made's helper there. Approve to stage it for this server and version; no password is written to disk.",
+                ));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let approve = theme::primary_action(
+                        ui,
+                        picker_control_id("consent-approve"),
+                        "Approve",
+                        layout.button_height,
+                        true,
+                        theme::BG_HEADER,
+                    );
+                    if approve.activated {
+                        *command = Some(ScreenCommand::Consent(true));
+                    }
+                    let refuse = theme::ghost_action(
+                        ui,
+                        picker_control_id("consent-refuse"),
+                        "Not now",
+                        false,
+                        layout.button_height,
+                        theme::BG_HEADER,
+                    );
+                    if refuse.activated {
+                        *command = Some(ScreenCommand::Consent(false));
+                    }
+                });
+            });
+        }
+        // BEGIN remote-path (AIA-02)
+        if model.ssh_selected() == Some(ssh) {
+            panel_frame(ui, pad_x, |ui| grok_install_consent_card(model, ui, layout));
+        }
+        // END remote-path
+    }
+}
+
+/// A panel row of the screen. A panel whose content added nothing is not
+/// painted, so the screen never shows an empty notice line.
+fn panel_frame(ui: &mut Ui, pad_x: f32, add: impl FnOnce(&mut Ui)) {
+    let mut prepared = egui::Frame::new()
+        .fill(theme::BG_HEADER)
+        .inner_margin(egui::Margin::symmetric(pad_x as i8, 8))
+        .begin(ui);
+    prepared
+        .content_ui
+        .set_width(prepared.content_ui.available_width());
+    add(&mut prepared.content_ui);
+    if prepared.content_ui.min_rect().height() < 1.0 {
+        return;
+    }
+    prepared.end(ui);
+    let rect = ui.min_rect();
     ui.painter().line_segment(
         [
             egui::pos2(rect.left(), rect.bottom() - 0.5),
@@ -555,36 +1204,444 @@ fn picker_toolbar(
     );
 }
 
-fn picker_list(
+fn host_form_ui(
+    model: &mut AppModel,
     ui: &mut Ui,
-    _layout: &Layout,
-    rows: &[PickerDisplayRow],
-    selection: Option<usize>,
-    list_max: f32,
-    (instance, revision): (u64, u64),
-    command: &mut Option<PickerCommand>,
+    layout: &Layout,
+    command: &mut Option<ScreenCommand>,
 ) {
-    const ROW_HEIGHT: f32 = 32.0;
-    let scroll_id = egui::Id::unique(("made-picker-last-selection", instance));
-    let previous = ui
-        .ctx()
-        .data(|data| data.get_temp::<(Option<usize>, u64)>(scroll_id));
-    let scroll_to_selection = previous != Some((selection, revision));
-    if scroll_to_selection {
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(scroll_id, (selection, revision)));
-    }
-    let content_height = rows.len() as f32 * ROW_HEIGHT;
-    let list_height = if rows.is_empty() {
-        64.0
-    } else {
-        content_height.min(list_max).max(ROW_HEIGHT)
+    use crate::ssh_servers::HostField;
+    let Some(state) = model.screen_form().cloned() else {
+        return;
     };
-    let (list_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), list_height),
+    let report = state.editing.and_then(|id| {
+        model
+            .screen_test_report()
+            .filter(|(host, _)| *host == id)
+            .map(|(_, text)| text.to_owned())
+    });
+    let pad_x = if layout.compact { 10.0 } else { 16.0 };
+    let mut test = false;
+    panel_frame(ui, pad_x, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(12.0, 6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if state.editing.is_some() {
+                    "EDIT SSH HOST"
+                } else {
+                    "ADD SSH HOST"
+                })
+                .font(FontId::proportional(theme::SECTION_SIZE))
+                .color(theme::TEXT_TERTIARY),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.label(theme::micro(
+                    "Saved hosts keep no passwords, keys or prompt answers.",
+                ));
+            });
+        });
+        let fields: [(HostField, &str, bool); 6] = [
+            (HostField::Name, "Display name", false),
+            (HostField::Host, "Host or SSH alias", false),
+            (HostField::User, "User", true),
+            (HostField::Port, "Port", true),
+            (HostField::KeyFile, "Key file", true),
+            (HostField::Directory, "Initial remote directory", true),
+        ];
+        let columns = 3;
+        let gap = 12.0;
+        let width =
+            ((ui.available_width() - gap * (columns as f32 - 1.0)) / columns as f32).max(80.0);
+        for chunk in fields.chunks(columns) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (field, label, optional) in chunk {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(width);
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(theme::micro(*label));
+                                if *optional {
+                                    ui.label(
+                                        RichText::new("optional")
+                                            .font(FontId::proportional(theme::SECTION_SIZE))
+                                            .color(theme::TEXT_DISABLED),
+                                    );
+                                }
+                            });
+                            if let Some(form) = model.screen_form_mut() {
+                                let text = match field {
+                                    HostField::Name => &mut form.name,
+                                    HostField::Host => &mut form.host,
+                                    HostField::User => &mut form.user,
+                                    HostField::Port => &mut form.port,
+                                    HostField::KeyFile => &mut form.key_file,
+                                    HostField::Directory => &mut form.directory,
+                                };
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(text)
+                                        .id(host_form_field_id(*field))
+                                        .desired_width(width)
+                                        .margin(egui::Margin::symmetric(8, 6)),
+                                );
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::Role::TextInput, true, *label)
+                                });
+                                if response.lost_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                {
+                                    *command = Some(ScreenCommand::SaveForm);
+                                }
+                            }
+                            if let Some((_, error)) =
+                                state.errors.iter().find(|(errored, _)| errored == field)
+                            {
+                                ui.label(
+                                    RichText::new(*error)
+                                        .font(FontId::proportional(theme::SECTION_SIZE))
+                                        .color(theme::ERROR),
+                                );
+                            }
+                        },
+                    );
+                }
+            });
+        }
+        if let Some(report) = &report {
+            ui.add_space(4.0);
+            ui.label(theme::micro(sanitize_display(report, 400)));
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if state.editing.is_some() {
+                let action = theme::secondary_action(
+                    ui,
+                    picker_control_id("form-test"),
+                    "Test connection",
+                    layout.button_height,
+                    true,
+                    theme::BG_HEADER,
+                );
+                test = action.activated;
+            }
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                let save = theme::primary_action(
+                    ui,
+                    picker_control_id("form-save"),
+                    "Save host",
+                    layout.button_height,
+                    true,
+                    theme::BG_HEADER,
+                );
+                if save.activated {
+                    *command = Some(ScreenCommand::SaveForm);
+                }
+                let cancel = theme::ghost_action(
+                    ui,
+                    picker_control_id("form-cancel"),
+                    "Cancel",
+                    false,
+                    layout.button_height,
+                    theme::BG_HEADER,
+                );
+                if cancel.activated {
+                    *command = Some(ScreenCommand::CancelForm);
+                }
+            });
+        });
+    });
+    if test {
+        if let Some(id) = state.editing {
+            *command = Some(ScreenCommand::TestHost(id));
+        }
+    }
+}
+
+fn toolbar_ui(
+    model: &mut AppModel,
+    ui: &mut Ui,
+    layout: &Layout,
+    height: f32,
+    pad_x: f32,
+    command: &mut Option<ScreenCommand>,
+) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    let mut bar = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(pad_x, 0.0)))
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    bar.spacing_mut().item_spacing.x = 4.0;
+    let up = theme::icon_action(
+        &mut bar,
+        picker_control_id("up"),
+        theme::IconGlyph::Up,
+        "Go to the parent folder",
+        false,
+        layout.button_height,
+        theme::BG_CARD,
+    );
+    if up.activated {
+        *command = Some(ScreenCommand::Up);
+    }
+    let refresh = theme::icon_action(
+        &mut bar,
+        picker_control_id("refresh"),
+        theme::IconGlyph::Refresh,
+        "Refresh folders",
+        false,
+        layout.button_height,
+        theme::BG_CARD,
+    );
+    if refresh.activated {
+        *command = Some(ScreenCommand::Refresh);
+    }
+    bar.add_space(6.0);
+    let (divider, _) = bar.allocate_exact_size(egui::vec2(1.0, 14.0), Sense::hover());
+    bar.painter().rect_filled(divider, 0.0, theme::BORDER);
+    bar.add_space(6.0);
+
+    let target = model
+        .open_workspace()
+        .and_then(crate::open_workspace::OpenWorkspace::launch_target)
+        .map(|path| sanitize_display(&path.display().to_string(), 900))
+        .unwrap_or_default();
+    let error = model.screen_address_error();
+    let id = picker_path_id();
+    let editing = bar.ctx().memory(|memory| memory.has_focus(id));
+    let mut draft = bar
+        .ctx()
+        .data(|data| data.get_temp::<String>(address_draft_id()))
+        .unwrap_or_default();
+    if !editing && error.is_none() {
+        draft = target.clone();
+    }
+    let field_height = if layout.compact { 24.0 } else { 26.0 };
+    let (field, _) = bar.allocate_exact_size(
+        egui::vec2(bar.available_width().max(40.0), field_height),
         Sense::hover(),
     );
+    bar.painter()
+        .rect_filled(field, CornerRadius::same(4), theme::BG_SELECTED);
+    let text_rect = field.shrink2(egui::vec2(8.0, 0.0));
+    let text_rect = if error.is_some() {
+        egui::Rect::from_min_max(text_rect.min, text_rect.max - egui::vec2(20.0, 0.0))
+    } else {
+        text_rect
+    };
+    let mut field_ui = bar.new_child(
+        UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    field_ui.spacing_mut().interact_size.y = field_height;
+    let output = egui::TextEdit::singleline(&mut draft)
+        .id(id)
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::ZERO)
+        .align(Align2::LEFT_CENTER)
+        .font(FontId::monospace(10.5))
+        .text_color(theme::TEXT_PRIMARY)
+        .desired_width(text_rect.width())
+        .clip_text(true)
+        .show(&mut field_ui);
+    let response = output.response.response.clone();
+    if response.gained_focus() {
+        let mut state = output.state;
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(draft.chars().count()),
+            )));
+        state.store(bar.ctx(), id);
+    }
+    let enter = response.lost_focus() && bar.input(|input| input.key_pressed(egui::Key::Enter));
+    let escape = response.lost_focus() && bar.input(|input| input.key_pressed(egui::Key::Escape));
+    if enter {
+        *command = Some(ScreenCommand::Navigate(draft.clone()));
+        response.request_focus();
+    }
+    if escape {
+        draft = target.clone();
+        model.screen_clear_address_error();
+        bar.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::unique("made-address-escape"), true));
+    }
+    bar.ctx()
+        .data_mut(|data| data.insert_temp(address_draft_id(), draft));
+    if response.has_focus() {
+        theme::paint_focus_ring(&bar, field, CornerRadius::same(4), theme::BG_CARD);
+    }
+    if let Some(error) = error {
+        let center = egui::pos2(field.right() - 12.0, field.center().y);
+        bar.painter().circle_filled(center, 7.0, theme::ERROR);
+        bar.painter().text(
+            center,
+            Align2::CENTER_CENTER,
+            "!",
+            FontId::monospace(11.0),
+            theme::ACCENT_TEXT,
+        );
+        let _ = error;
+    }
+    let response = response.on_hover_text(if target.is_empty() {
+        "Type an absolute folder path and press Enter".to_owned()
+    } else {
+        target.clone()
+    });
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::TextInput, true, format!("Folder path {target}"))
+    });
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.bottom() - 0.5),
+            egui::pos2(rect.right(), rect.bottom() - 0.5),
+        ],
+        Stroke::new(1.0, theme::BORDER_HEADER),
+    );
+}
+
+fn folder_area_ui(
+    model: &mut AppModel,
+    ui: &mut Ui,
+    layout: &Layout,
+    height: f32,
+    pad: f32,
+    command: &mut Option<ScreenCommand>,
+) {
+    let (area, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    let mut area_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(area)
+            .layout(egui::Layout::top_down(Align::Min)),
+    );
+    area_ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    let pad_x = if layout.compact { 10.0 } else { 12.0 };
+    // Fill, tone, text, tooltip and the dismiss control's id, if any.
+    let mut notices: Vec<(Color32, Color32, String, String, Option<egui::Id>)> = Vec::new();
+    if let Some(failure) = model.screen_connection_failure() {
+        let text = sanitize_display(failure, 600);
+        notices.push((
+            theme::ERROR_TINT,
+            theme::ERROR,
+            text.clone(),
+            text,
+            Some(picker_control_id("dismiss-failure")),
+        ));
+    }
+    if let Some(message) = model.screen_address_message() {
+        let target = picker_current_target(model).unwrap_or_default();
+        let text = format!(
+            "{} · Press Esc to restore {}.",
+            message,
+            sanitize_display(&target, 300)
+        );
+        notices.push((theme::ERROR_TINT, theme::ERROR, text.clone(), text, None));
+    }
+    for text in [
+        model.screen_notice().map(str::to_owned),
+        model.screen_tree_error(),
+        model.screen_launch_error().map(str::to_owned),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let text = sanitize_display(&text, 600);
+        notices.push((theme::ERROR_TINT, theme::ERROR, text.clone(), text, None));
+    }
+    let truncated = model.screen_truncated();
+    if truncated > 0 {
+        let text = if model
+            .open_workspace()
+            .is_some_and(|open| open.selected_host() == crate::open_workspace::HostId::Local)
+        {
+            format!(
+                "Showing the first {} folders; {} more are not listed.",
+                crate::workspace_picker::MAX_PICKER_ENTRIES,
+                truncated
+            )
+        } else {
+            format!(
+                "Showing the first {} entries; more are not listed.",
+                crate::workspace_picker::MAX_PICKER_ENTRIES
+            )
+        };
+        notices.push((
+            theme::WARNING_TINT,
+            theme::WARNING,
+            text.clone(),
+            text,
+            None,
+        ));
+    }
+    // A notice line never renders empty.
+    notices.retain(|(_, _, text, ..)| !text.trim().is_empty());
+    for (fill, tone, text, tooltip, dismiss) in &notices {
+        area_ui.add_space(6.0);
+        let mut strip = area_ui.new_child(
+            UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    egui::pos2(area.left() + pad_x, area_ui.cursor().top()),
+                    egui::pos2(area.right() - pad_x, area.bottom()),
+                ))
+                .layout(egui::Layout::top_down(Align::Min)),
+        );
+        if notice_strip(&mut strip, layout, *fill, *tone, text, tooltip, *dismiss) {
+            *command = Some(ScreenCommand::DismissFailure);
+        }
+        area_ui.add_space(strip.min_rect().height());
+    }
+    let list_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            area.left() + (if layout.compact { 6.0 } else { 8.0 }),
+            area_ui.cursor().top() + pad,
+        ),
+        egui::pos2(
+            area.right() - (if layout.compact { 6.0 } else { 8.0 }),
+            area.bottom() - pad,
+        ),
+    );
+    let rows = model.screen_rows();
+    let selection = model.screen_selection();
+    let empty = model.screen_empty_text();
+    tree_ui(ui, list_rect, rows.as_slice(), selection, empty, command);
+}
+
+fn tree_ui(
+    ui: &mut Ui,
+    list_rect: egui::Rect,
+    rows: &[crate::app::ScreenRow],
+    selection: Option<usize>,
+    empty_text: Option<&str>,
+    command: &mut Option<ScreenCommand>,
+) {
+    const ROW: f32 = OPEN_WORKSPACE_ROW_HEIGHT;
+    if list_rect.height() < 1.0 {
+        return;
+    }
     let list_focus = picker_list_id();
+    let root_key = rows.first().map(|row| row.path.clone());
+    let scroll_id = egui::Id::unique("made-picker-last-selection");
+    let previous = ui
+        .ctx()
+        .data(|data| data.get_temp::<(Option<usize>, usize, Option<String>)>(scroll_id));
+    let current = (selection, rows.len(), root_key.clone());
+    let changed = previous.as_ref() != Some(&current);
+    let rerooted = previous
+        .as_ref()
+        .is_some_and(|previous| previous.2 != root_key);
+    if changed {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(scroll_id, current));
+    }
     ui.memory_mut(|memory| {
         memory.set_focus_lock_filter(
             list_focus,
@@ -600,60 +1657,71 @@ fn picker_list(
     if list_response.clicked() {
         list_response.request_focus();
     }
+    list_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Tree, true, "Folders"));
+    let content_height = rows.len() as f32 * ROW;
     let mut list_ui = ui.new_child(UiBuilder::new().max_rect(list_rect));
-    let visibility = if content_height > list_height + 0.5 {
-        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
-    } else {
-        egui::scroll_area::ScrollBarVisibility::AlwaysHidden
-    };
     let mut scroll = egui::ScrollArea::vertical()
-        .id_salt(("made-picker-list", instance, revision))
+        .id_salt("made-picker-list")
         .auto_shrink([false, false])
-        .scroll_bar_visibility(visibility)
-        .max_height(list_height);
-    if scroll_to_selection {
+        .max_height(list_rect.height());
+    if rerooted {
+        scroll = scroll.animated(false).vertical_scroll_offset(0.0);
+    } else if changed {
         if let Some(selected) = selection {
-            // Reveal minimally with a bottom-edge window. This shows the
-            // selected row and as many immediately preceding ancestor rows as
-            // fit, instead of centering and pushing the root ancestor away.
-            let rows_per_view = ((list_height / ROW_HEIGHT).floor() as usize).max(1);
-            let first_visible = selected.saturating_sub(rows_per_view - 1);
-            let max_offset = (content_height - list_height).max(0.0);
-            let target = (first_visible as f32 * ROW_HEIGHT).min(max_offset);
-            scroll = scroll.animated(false).vertical_scroll_offset(target);
+            // Minimal reveal: keep the row and as many ancestors as fit.
+            let offset = ui
+                .ctx()
+                .data(|data| data.get_temp::<f32>(egui::Id::unique("made-picker-offset")))
+                .unwrap_or(0.0);
+            let top = selected as f32 * ROW;
+            let bottom = top + ROW;
+            let max_offset = (content_height - list_rect.height()).max(0.0);
+            let target = if top < offset {
+                top
+            } else if bottom > offset + list_rect.height() {
+                bottom - list_rect.height()
+            } else {
+                offset
+            };
+            scroll = scroll
+                .animated(false)
+                .vertical_scroll_offset(target.clamp(0.0, max_offset));
         }
     }
     list_ui.spacing_mut().item_spacing.y = 0.0;
-    scroll.show_rows(&mut list_ui, ROW_HEIGHT, rows.len(), |ui, range| {
+    let output = scroll.show_rows(&mut list_ui, ROW, rows.len(), |ui, range| {
         ui.spacing_mut().item_spacing.y = 0.0;
         for index in range {
             let Some(row) = rows.get(index) else {
                 continue;
             };
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), ROW_HEIGHT), Sense::hover());
-            let row_id = egui::Id::unique(("made-picker-row", row.index));
-            let response = ui.interact(rect, row_id, Sense::CLICK);
-            let row_rect = rect.shrink2(egui::vec2(4.0, 1.0));
-            let selected = selection == Some(row.index);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), Sense::hover());
+            let response = ui.interact(
+                rect,
+                egui::Id::unique(("made-picker-row", index)),
+                Sense::CLICK,
+            );
+            let fill_rect = rect.shrink2(egui::vec2(4.0, 1.0));
+            let selected = selection == Some(index);
+            let hovered = response.hovered();
             if selected {
                 ui.painter()
-                    .rect_filled(row_rect, CornerRadius::same(6), theme::BG_SELECTED);
-            } else if response.hovered() {
+                    .rect_filled(fill_rect, CornerRadius::same(6), theme::BG_SELECTED);
+            } else if hovered {
                 ui.painter()
-                    .rect_filled(row_rect, CornerRadius::same(6), theme::BG_HOVER);
+                    .rect_filled(fill_rect, CornerRadius::same(6), theme::BG_HOVER);
             }
             let indent = 4.0 + row.depth as f32 * 14.0;
-            let marker_color = if selected {
-                theme::TEXT_PRIMARY
-            } else {
-                theme::TEXT_TERTIARY
-            };
             theme::paint_disclosure(
                 ui.painter(),
                 egui::pos2(rect.left() + indent + 8.0, rect.center().y),
                 row.expanded,
-                marker_color,
+                if selected || hovered {
+                    theme::TEXT_SECONDARY
+                } else {
+                    theme::TEXT_TERTIARY
+                },
             );
             let text_left = rect.left() + 24.0 + row.depth as f32 * 14.0;
             theme::paint_ellipsized_centered(
@@ -661,7 +1729,7 @@ fn picker_list(
                 text_left,
                 rect.center().y,
                 &row.name,
-                FontId::proportional(12.5),
+                FontId::proportional(theme::BODY_SIZE),
                 if selected {
                     theme::TEXT_PRIMARY
                 } else {
@@ -669,125 +1737,648 @@ fn picker_list(
                 },
                 (rect.right() - text_left - 6.0).max(20.0),
             );
-            let response =
-                response.on_hover_text(sanitize_display(&row.path.display().to_string(), 900));
+            let response = response.on_hover_text(sanitize_display(&row.path, 900));
             if response.double_clicked() {
-                // The first click already selected/toggled the row.
-                // Ignore the second click so a double-click toggles once.
+                // The first click already toggled; a double-click toggles once.
             } else if response.clicked() {
                 ui.memory_mut(|memory| memory.request_focus(list_focus));
-                *command = Some(PickerCommand::Toggle(row.index));
+                *command = Some(ScreenCommand::Toggle(index));
             }
         }
     });
-    if rows.is_empty() {
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique("made-picker-offset"),
+            output.state.clamped_offset().y,
+        )
+    });
+    if let (true, Some(text)) = (rows.is_empty(), empty_text) {
         let mut empty = ui.new_child(
             UiBuilder::new()
                 .max_rect(list_rect)
-                .layout(egui::Layout::left_to_right(Align::Center)),
+                .layout(egui::Layout::left_to_right(Align::Min)),
         );
         empty.add_space(8.0);
-        empty.label(theme::body("No child folders here."));
+        empty.label(theme::body(text));
     }
 }
 
-fn picker_truncated_notice(ui: &mut Ui, layout: &Layout, truncated: usize) {
-    let height = 20.0;
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::WARNING_TINT);
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
-        CornerRadius::same(2),
-        theme::WARNING,
-    );
-    let text = format!(
-        "Showing the first {} folders; {} more are not listed.",
-        crate::workspace_picker::MAX_PICKER_ENTRIES,
-        truncated
-    );
-    let full = format!(
-        "This folder contains more than {} child folders. Use Up/Refresh or open it directly to narrow the list.",
-        crate::workspace_picker::MAX_PICKER_ENTRIES
-    );
-    theme::paint_ellipsized(
-        ui.painter(),
-        egui::pos2(rect.left() + layout.header_padding_x, rect.center().y - 7.0),
-        text,
-        FontId::proportional(10.5),
-        theme::WARNING,
-        (rect.width() - layout.header_padding_x * 2.0).max(20.0),
-    );
-    response.on_hover_text(full);
-}
-
-fn picker_footer(
+fn worktrees_ui(
+    model: &mut AppModel,
     ui: &mut Ui,
     layout: &Layout,
-    selection: Option<usize>,
-    target: &std::path::Path,
-    command: &mut Option<PickerCommand>,
+    head: f32,
+    rows_height: f32,
+    command: &mut Option<ScreenCommand>,
 ) {
-    let height = if layout.compact { 48.0 } else { 52.0 };
+    const ROW: f32 = OPEN_WORKSPACE_ROW_HEIGHT;
+    let Some(open) = model.open_workspace() else {
+        return;
+    };
+    let items = open.worktrees().to_vec();
+    let selection = open.worktree_selection();
+    let compact = layout.compact;
+    let (pad_top, pad_bottom, pad_x) = if compact {
+        (2.0, 2.0, 6.0)
+    } else {
+        (4.0, 6.0, 8.0)
+    };
+    let total = 1.0 + pad_top + head + rows_height + pad_bottom;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), total), Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.top() + 0.5),
+            egui::pos2(rect.right(), rect.top() + 0.5),
+        ],
+        Stroke::new(1.0, theme::BORDER_HEADER),
+    );
+    let head_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad_x + 4.0, rect.top() + 1.0 + pad_top),
+        egui::vec2(rect.width() - 2.0 * pad_x, head),
+    );
+    let galley = ui.painter().layout_job(theme::section_job("WORKTREES"));
+    let label_width = galley.size().x;
+    ui.painter().galley(
+        egui::pos2(
+            head_rect.left(),
+            head_rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT_TERTIARY,
+    );
+    let count = items.len().to_string();
+    let count_galley = ui.painter().layout_no_wrap(
+        count,
+        FontId::proportional(theme::SMALL_SIZE),
+        theme::TEXT_TERTIARY,
+    );
+    let count_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            head_rect.left() + label_width + 6.0,
+            head_rect.center().y - 7.0,
+        ),
+        egui::vec2(count_galley.size().x + 10.0, 14.0),
+    );
+    ui.painter()
+        .rect_filled(count_rect, CornerRadius::same(7), theme::BG_ELEVATED);
+    ui.painter().galley(
+        count_rect.center() - count_galley.size() / 2.0,
+        count_galley,
+        theme::TEXT_TERTIARY,
+    );
+    let list_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad_x, head_rect.bottom()),
+        egui::vec2(rect.width() - 2.0 * pad_x, rows_height),
+    );
+    let focus = worktree_list_id();
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            focus,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: false,
+                vertical_arrows: true,
+                escape: false,
+            },
+        );
+    });
+    let list_response = ui.interact(list_rect, focus, Sense::click());
+    list_response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::List, true, "Worktrees"));
+    let has_focus = list_response.has_focus();
+    if has_focus {
+        let (up, down, pick) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowUp),
+                input.key_pressed(egui::Key::ArrowDown),
+                input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space),
+            )
+        });
+        let current = selection.unwrap_or(0);
+        let step = |from: usize, delta: isize| -> Option<usize> {
+            let mut index = from as isize + delta;
+            while index >= 0 && (index as usize) < items.len() {
+                if !items[index as usize].missing {
+                    return Some(index as usize);
+                }
+                index += delta;
+            }
+            None
+        };
+        if up {
+            if let Some(next) = step(current, -1) {
+                *command = Some(ScreenCommand::SelectWorktree(next));
+            }
+        } else if down {
+            if let Some(next) = step(current, 1) {
+                *command = Some(ScreenCommand::SelectWorktree(next));
+            }
+        } else if pick {
+            if let Some(index) = selection {
+                *command = Some(ScreenCommand::SelectWorktree(index));
+            }
+        }
+    }
+    let mut list_ui = ui.new_child(UiBuilder::new().max_rect(list_rect));
+    egui::ScrollArea::vertical()
+        .id_salt("made-worktree-list")
+        .auto_shrink([false, false])
+        .max_height(rows_height)
+        .show(&mut list_ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            for (index, item) in items.iter().enumerate() {
+                let (row, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW), Sense::hover());
+                let response = ui.interact(
+                    row,
+                    egui::Id::unique(("made-worktree-row", index)),
+                    if item.missing {
+                        Sense::hover()
+                    } else {
+                        Sense::CLICK
+                    },
+                );
+                let fill_rect = row.shrink2(egui::vec2(4.0, 0.0));
+                let selected = selection == Some(index);
+                let hovered = response.hovered() && !item.missing;
+                if selected {
+                    ui.painter()
+                        .rect_filled(fill_rect, CornerRadius::same(6), theme::BG_SELECTED);
+                } else if hovered {
+                    ui.painter()
+                        .rect_filled(fill_rect, CornerRadius::same(6), theme::BG_HOVER);
+                }
+                if selected && has_focus {
+                    response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+                }
+                let color = if item.missing {
+                    theme::TEXT_DISABLED
+                } else if selected {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SECONDARY
+                };
+                let icon = egui::Rect::from_min_size(
+                    egui::pos2(fill_rect.left() + 8.0, row.center().y - 8.0),
+                    egui::Vec2::splat(16.0),
+                );
+                theme::paint_icon(
+                    ui.painter(),
+                    icon,
+                    if index == 0 {
+                        theme::IconGlyph::GitRepository
+                    } else {
+                        theme::IconGlyph::LinkedWorktree
+                    },
+                    if selected {
+                        theme::TEXT_PRIMARY
+                    } else {
+                        theme::TEXT_TERTIARY
+                    },
+                );
+                let pills = counts_pills(&item.counts);
+                let pills_w = if pills.is_empty() {
+                    0.0
+                } else {
+                    pills_width(ui, &pills)
+                };
+                let right =
+                    fill_rect.right() - 8.0 - pills_w - if pills.is_empty() { 0.0 } else { 8.0 };
+                let path = sanitize_display(&item.path.display().to_string(), 900);
+                let text_left = icon.right() + 8.0;
+                let label = if item.missing {
+                    Some("missing".to_owned())
+                } else {
+                    item.label.as_ref().map(|label| sanitize_display(label, 80))
+                };
+                let label_width = label.as_ref().map_or(0.0, |label| {
+                    ui.painter()
+                        .layout_no_wrap(
+                            label.clone(),
+                            FontId::monospace(10.5),
+                            theme::TEXT_TERTIARY,
+                        )
+                        .size()
+                        .x
+                        + 8.0
+                });
+                let path_galley = theme::paint_ellipsized_centered(
+                    ui.painter(),
+                    text_left,
+                    row.center().y,
+                    &path,
+                    FontId::proportional(theme::BODY_SIZE),
+                    color,
+                    (right - text_left - label_width).max(40.0),
+                );
+                if let Some(label) = &label {
+                    ui.painter().text(
+                        egui::pos2(text_left + path_galley.size().x + 8.0, row.center().y),
+                        Align2::LEFT_CENTER,
+                        label,
+                        FontId::monospace(10.5),
+                        theme::TEXT_TERTIARY,
+                    );
+                }
+                if !pills.is_empty() {
+                    paint_pills(
+                        ui,
+                        fill_rect.right() - 8.0 - pills_w,
+                        row.center().y,
+                        &pills,
+                    );
+                }
+                let mut tooltip = path.clone();
+                if let Some(label) = &label {
+                    tooltip.push_str(&format!(" ({label})"));
+                }
+                if let Some(summary) = counts_summary(&item.counts) {
+                    tooltip.push_str(&format!(" — {summary}"));
+                }
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::Role::ListItem,
+                        !item.missing,
+                        selected,
+                        tooltip.clone(),
+                    )
+                });
+                let response = response.on_hover_text(tooltip);
+                if response.clicked() && !item.missing {
+                    ui.memory_mut(|memory| memory.request_focus(focus));
+                    *command = Some(ScreenCommand::SelectWorktree(index));
+                }
+            }
+        });
+}
+
+fn launch_bar_ui(
+    model: &mut AppModel,
+    ui: &mut Ui,
+    layout: &Layout,
+    pad_x: f32,
+    command: &mut Option<ScreenCommand>,
+) {
+    let compact = layout.compact;
+    let (target_row, gap, button_row, top, bottom) = launch_area_metrics(compact);
+    let height = 1.0 + top + target_row + gap + button_row + bottom;
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let mut footer = ui.new_child(
-        UiBuilder::new()
-            .max_rect(
-                rect.shrink2(egui::vec2(layout.header_padding_x, 0.0))
-                    .shrink(1.0),
-            )
-            .layout(egui::Layout::right_to_left(Align::Center)),
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.top() + 0.5),
+            egui::pos2(rect.right(), rect.top() + 0.5),
+        ],
+        Stroke::new(1.0, theme::BORDER_HEADER),
     );
-    let primary = theme::primary_action(
-        &mut footer,
-        picker_control_id("current"),
-        "Use current folder",
-        layout.primary_height,
-        true,
-        theme::BG_CARD,
+    let Some(open) = model.open_workspace() else {
+        return;
+    };
+    let target_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad_x, rect.top() + 1.0 + top),
+        egui::vec2(rect.width() - 2.0 * pad_x, target_row),
     );
-    primary.response.on_hover_text(format!(
-        "Open this folder: {}",
-        sanitize_display(&target.display().to_string(), 900)
-    ));
-    if primary.activated {
-        *command = Some(PickerCommand::ConfirmCurrent);
-    }
-    let enabled = selection.is_some();
-    let secondary = theme::quiet_secondary_action(
-        &mut footer,
-        picker_control_id("selected"),
-        "Open selected folder",
-        layout.primary_height,
-        enabled,
-        theme::BG_CARD,
+    let path = open
+        .effective_launch_path()
+        .map(|path| sanitize_display(&path.display().to_string(), 900));
+    let indicator = open.git_indicator();
+    let pills_counts = match open.git_state() {
+        Some(crate::open_workspace::GitState::Repository { counts, .. })
+            if !open.worktrees_shown() =>
+        {
+            *counts
+        }
+        _ => crate::open_workspace::CountsState::Pending,
+    };
+    let buttons = open.launch_buttons();
+
+    // Target row, left-aligned at the content inset: `Launch in`, git
+    // indicator, path, pills.
+    let center_y = target_rect.center().y;
+    let label_galley = ui.painter().layout_no_wrap(
+        "Launch in".to_owned(),
+        FontId::proportional(theme::META_SIZE),
+        theme::TEXT_TERTIARY,
     );
-    secondary.response.on_hover_text(if enabled {
-        "Open the selected tree row in a new workspace tab"
-    } else {
-        "Select a folder to open it in a new tab"
+    let mut x = target_rect.left();
+    ui.painter().galley(
+        egui::pos2(x, center_y - label_galley.size().y / 2.0),
+        label_galley.clone(),
+        theme::TEXT_TERTIARY,
+    );
+    x += label_galley.size().x + 8.0;
+    let mut pills = counts_pills(&pills_counts);
+    let summary = counts_summary(&pills_counts);
+    let path_font = FontId::monospace(11.0);
+    let indicator_width = if indicator { 16.0 + 8.0 } else { 0.0 };
+    let path_natural = path.as_ref().map_or(0.0, |path| {
+        ui.painter()
+            .layout_no_wrap(path.clone(), path_font.clone(), theme::TEXT_PRIMARY)
+            .size()
+            .x
     });
-    if secondary.activated {
-        if let Some(index) = selection {
-            *command = Some(PickerCommand::ConfirmRow(index));
+    let available = target_rect.right() - x - indicator_width;
+    // The path shortens first; pills that still do not fit hide from the end.
+    let min_path = path_natural.min(160.0);
+    let mut hidden: Vec<(made_remote::git::PillKind, usize)> = Vec::new();
+    while !pills.is_empty() && available - (pills_width(ui, &pills) + 8.0) < min_path {
+        if let Some(pill) = pills.pop() {
+            hidden.insert(0, pill);
+        }
+    }
+    let pills_space = if pills.is_empty() {
+        0.0
+    } else {
+        pills_width(ui, &pills) + 8.0
+    };
+    if indicator {
+        let icon =
+            egui::Rect::from_min_size(egui::pos2(x, center_y - 8.0), egui::Vec2::splat(16.0));
+        theme::paint_icon(
+            ui.painter(),
+            icon,
+            theme::IconGlyph::GitRepository,
+            theme::TEXT_SECONDARY,
+        );
+        let mut tooltip = "Git repository".to_owned();
+        if !hidden.is_empty() {
+            let parts: Vec<String> = hidden
+                .iter()
+                .map(|(kind, count)| format!("{count} {}", kind.label()))
+                .collect();
+            tooltip = format!("Git repository — {}", parts.join(" · "));
+        }
+        let response = ui.interact(icon, picker_control_id("git-indicator"), Sense::hover());
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, tooltip.clone()));
+        response.on_hover_text(tooltip);
+        x = icon.right() + 8.0;
+    }
+    let path_width = (target_rect.right() - x - pills_space).max(0.0);
+    if let Some(path) = &path {
+        let shown = middle_ellipsized(ui, path, &path_font, path_width);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(shown, path_font.clone(), theme::TEXT_PRIMARY);
+        let path_rect = egui::Rect::from_min_size(
+            egui::pos2(x, center_y - galley.size().y / 2.0),
+            egui::vec2(galley.size().x.min(path_width), galley.size().y),
+        );
+        ui.painter()
+            .with_clip_rect(path_rect.expand2(egui::vec2(0.0, 2.0)))
+            .galley(path_rect.min, galley, theme::TEXT_PRIMARY);
+        let response = ui.interact(path_rect, picker_control_id("launch-path"), Sense::hover());
+        let name = format!("Launch in {path}");
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, name.clone()));
+        response.on_hover_text(path.clone());
+        x = path_rect.right() + 8.0;
+    } else {
+        ui.painter().text(
+            egui::pos2(x, center_y),
+            Align2::LEFT_CENTER,
+            "No folder yet",
+            FontId::proportional(theme::META_SIZE),
+            theme::TEXT_TERTIARY,
+        );
+    }
+    if !pills.is_empty() {
+        let pills_rect = egui::Rect::from_min_size(
+            egui::pos2(x, center_y - PILL_HEIGHT / 2.0),
+            egui::vec2(pills_width(ui, &pills), PILL_HEIGHT),
+        );
+        paint_pills(ui, x, center_y, &pills);
+        let response = ui.interact(
+            pills_rect,
+            picker_control_id("launch-pills"),
+            Sense::hover(),
+        );
+        if let Some(summary) = summary {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Label, true, summary.clone())
+            });
+            response.on_hover_text(summary);
+        }
+    }
+
+    // Button row: centered in the footer, Terminal first; the path never
+    // moves it.
+    let labels: Vec<(crate::open_workspace::LaunchButton, f32)> = buttons
+        .iter()
+        .map(|button| {
+            (
+                *button,
+                theme::launch_button_width(ui, button.kind.label(), button_row),
+            )
+        })
+        .collect();
+    let total: f32 = labels.iter().map(|(_, width)| width).sum::<f32>()
+        + 6.0 * labels.len().saturating_sub(1) as f32;
+    let inner_left = rect.left() + pad_x;
+    let left = ((rect.center().x - total / 2.0).round()).max(inner_left);
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                egui::pos2(left, target_rect.bottom() + gap),
+                egui::vec2((rect.right() - pad_x - left).max(total), button_row),
+            ))
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    row.spacing_mut().item_spacing.x = 6.0;
+    let ids: Vec<egui::Id> = buttons
+        .iter()
+        .map(|button| launch_button_id(button.kind))
+        .collect();
+    let focused = ui.ctx().memory(|memory| memory.focused());
+    if let Some(index) = focused.and_then(|focused| ids.iter().position(|id| *id == focused)) {
+        let step = ui.input(|input| {
+            if input.key_pressed(egui::Key::ArrowRight) {
+                1
+            } else if input.key_pressed(egui::Key::ArrowLeft) {
+                -1
+            } else {
+                0
+            }
+        });
+        if step != 0 {
+            let next = (index as isize + step).clamp(0, ids.len() as isize - 1) as usize;
+            ui.ctx()
+                .memory_mut(|memory| memory.request_focus(ids[next]));
+        }
+    }
+    for (button, _) in labels {
+        let id = launch_button_id(button.kind);
+        row.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab: false,
+                    horizontal_arrows: true,
+                    vertical_arrows: false,
+                    escape: false,
+                },
+            );
+        });
+        let leading = match button.kind {
+            crate::open_workspace::LaunchKind::Terminal => {
+                theme::MenuLeading::Glyph(theme::IconGlyph::Terminal)
+            }
+            crate::open_workspace::LaunchKind::Tui(tui) => mark_leading(tui.descriptor().mark),
+        };
+        let tooltip = match (button.disabled_reason, &path) {
+            (Some(reason), _) => reason.to_owned(),
+            (None, Some(path)) => {
+                let base = format!("Open {} in {}", button.kind.label(), path);
+                if button.kind == crate::open_workspace::LaunchKind::Terminal {
+                    format!("{base} (Cmd/Ctrl+Enter)")
+                } else {
+                    base
+                }
+            }
+            (None, None) => button.kind.label().to_owned(),
+        };
+        let action = theme::launch_action(
+            &mut row,
+            id,
+            leading,
+            button.kind.label(),
+            button_row,
+            button.enabled,
+            &tooltip,
+        );
+        if action.activated {
+            *command = Some(ScreenCommand::Launch(button.kind));
         }
     }
 }
 
-/// Label on the picker's only accent-filled control. Used by the headless test.
-pub fn picker_primary_label() -> &'static str {
-    "Use current folder"
+fn screen_keyboard(model: &AppModel, ui: &mut Ui, command: &mut Option<ScreenCommand>) {
+    let ctx = ui.ctx().clone();
+    let focused = ctx.memory(|memory| memory.focused());
+    let address_escape = ctx.data_mut(|data| {
+        data.remove_temp::<bool>(egui::Id::unique("made-address-escape"))
+            .unwrap_or(false)
+    });
+    let text_focused = focused.is_some_and(|id| {
+        id == picker_path_id()
+            || id == ssh_field_id("screen-prompt")
+            || [
+                crate::ssh_servers::HostField::Name,
+                crate::ssh_servers::HostField::Host,
+                crate::ssh_servers::HostField::User,
+                crate::ssh_servers::HostField::Port,
+                crate::ssh_servers::HostField::KeyFile,
+                crate::ssh_servers::HostField::Directory,
+            ]
+            .into_iter()
+            .any(|field| host_form_field_id(field) == id)
+    });
+    let tree_keys = focused.is_none() || focused == Some(picker_list_id());
+    // Backspace belongs to folder navigation: the tree and its Up/Refresh
+    // toolbar, never the host bar, launch bar or other controls.
+    let folder_keys = tree_keys
+        || focused
+            .is_some_and(|id| id == picker_control_id("up") || id == picker_control_id("refresh"));
+    let events = ctx.input(|input| input.events.clone());
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if key == egui::Key::Enter && modifiers.command {
+            // Terminal is the Cmd/Ctrl+Enter target, even over a focused
+            // launch button; a text field or another action owning this Enter
+            // (Navigate, Save, a prompt or consent answer) is left alone.
+            let free = command.is_none() || matches!(command, Some(ScreenCommand::Launch(_)));
+            if !text_focused && free {
+                *command = Some(ScreenCommand::Launch(
+                    crate::open_workspace::LaunchKind::Terminal,
+                ));
+            }
+            continue;
+        }
+        if key == egui::Key::Escape {
+            if address_escape || text_focused || egui::Popup::is_any_open(&ctx) {
+                continue;
+            }
+            if focused == Some(picker_control_id("dismiss-report")) {
+                // Escape on a dismiss control closes only its notice.
+                *command = Some(ScreenCommand::DismissReport);
+            } else if focused == Some(picker_control_id("dismiss-failure")) {
+                *command = Some(ScreenCommand::DismissFailure);
+            } else if model.screen_form().is_some() {
+                *command = Some(ScreenCommand::CancelForm);
+            } else {
+                *command = Some(ScreenCommand::Close);
+            }
+            continue;
+        }
+        if key == egui::Key::Backspace && folder_keys && command.is_none() {
+            *command = Some(ScreenCommand::Up);
+            continue;
+        }
+        if !tree_keys || command.is_some() {
+            continue;
+        }
+        *command = match key {
+            egui::Key::ArrowDown => Some(ScreenCommand::Move(1)),
+            egui::Key::ArrowUp => Some(ScreenCommand::Move(-1)),
+            egui::Key::ArrowRight => Some(ScreenCommand::Expand),
+            egui::Key::ArrowLeft => Some(ScreenCommand::Collapse),
+            egui::Key::Enter => Some(ScreenCommand::ToggleSelected),
+            _ => None,
+        };
+    }
 }
 
-enum PickerCommand {
-    Up,
-    Refresh,
-    Toggle(usize),
-    ConfirmCurrent,
-    ConfirmRow(usize),
-    Back,
-    Close,
+fn apply_screen_command(model: &mut AppModel, ui: &Ui, command: Option<ScreenCommand>) {
+    let Some(command) = command else {
+        return;
+    };
+    match command {
+        ScreenCommand::Up => model.screen_up(),
+        ScreenCommand::Refresh => model.screen_refresh(),
+        ScreenCommand::Toggle(index) => model.screen_toggle(index),
+        ScreenCommand::SelectHost(host) => model.screen_select_host(host),
+        ScreenCommand::AddHost => model.screen_add_host(),
+        ScreenCommand::EditHost(id) => model.screen_edit_host(id),
+        ScreenCommand::TestHost(id) => model.screen_test_host(id),
+        ScreenCommand::RemoveHost(id) => model.screen_request_remove(id),
+        ScreenCommand::SelectWorktree(index) => {
+            model.screen_select_worktree(index);
+        }
+        ScreenCommand::Launch(kind) => model.screen_launch(kind),
+        ScreenCommand::Navigate(text) => {
+            if model.screen_navigate(&text).is_ok() {
+                ui.ctx()
+                    .memory_mut(|memory| memory.surrender_focus(picker_path_id()));
+            }
+        }
+        ScreenCommand::Move(delta) => model.screen_move(delta),
+        ScreenCommand::Expand => model.screen_expand(),
+        ScreenCommand::Collapse => model.screen_collapse(),
+        ScreenCommand::ToggleSelected => model.screen_toggle_selected(),
+        ScreenCommand::SaveForm => {
+            model.screen_save_form();
+        }
+        ScreenCommand::CancelForm => model.screen_cancel_form(),
+        ScreenCommand::Removal(confirm) => model.screen_answer_removal(confirm),
+        ScreenCommand::Prompt(accept) => model.screen_answer_prompt(accept),
+        ScreenCommand::Consent(approve) => model.screen_answer_consent(approve),
+        ScreenCommand::ForgetHostKey => {
+            if let Err(error) = model.forget_selected_ssh_host_key() {
+                model.set_ssh_notice(error);
+            }
+        }
+        ScreenCommand::DismissReport => model.screen_dismiss_test_report(),
+        ScreenCommand::DismissFailure => model.screen_dismiss_connection_failure(),
+        ScreenCommand::Close => {
+            model.close_picker();
+        }
+    }
 }
 
 // ── Starting surface ────────────────────────────────────────────────────────
@@ -833,11 +2424,6 @@ fn workspace_tab_close_reveal_id(id: WorkspaceId) -> egui::Id {
 /// Stable id for a global top-bar control.
 pub fn top_action_id(action: &str) -> egui::Id {
     egui::Id::unique(("made-top-action", action))
-}
-
-/// Stable id for one item in the `+` new-tab menu.
-pub fn new_tab_menu_item_id(action: &str) -> egui::Id {
-    egui::Id::unique(("made-new-tab-menu-item", action))
 }
 
 /// Stable id for a top-bar control whose state belongs to one workspace.
@@ -1112,6 +2698,21 @@ struct TabBrand {
     title: Option<String>,
 }
 
+/// Whether the session map yields to another running program: the tab is
+/// branded by an integration that does not own the session channel.
+pub(crate) fn sessions_outranked(workbench: &Workbench) -> bool {
+    tab_brand(workbench)
+        .is_some_and(|(entry, _)| entry.follow() != crate::integrations::FollowKind::SessionChannel)
+}
+
+/// `{lead} {owner} sessions`, or `{lead} sessions` without a session channel.
+fn sessions_label(lead: &str, owner: Option<&str>) -> String {
+    match owner {
+        Some(owner) => format!("{lead} {owner} sessions"),
+        None => format!("{lead} sessions"),
+    }
+}
+
 /// The first integration of the tab's list, in rank order, whose presentation
 /// brands the tab, with that presentation.
 pub(crate) fn tab_brand(workbench: &Workbench) -> Option<(IntegrationRef, Presentation)> {
@@ -1281,93 +2882,160 @@ pub fn workspace_tab_summaries(model: &AppModel) -> Vec<TabSummary> {
         .collect()
 }
 
-/// The entries of the new-tab menu below Terminal: the integrations of the
-/// model's list that PATH detection found, in list order.
-#[doc(hidden)]
-pub fn new_tab_menu_entries(model: &AppModel) -> Vec<IntegrationRef> {
-    model
-        .integrations()
-        .iter()
-        .copied()
-        .filter(|entry| model.compatible_tuis().contains(entry))
-        .collect()
+/// The pill of one About integration row: the primary integration keeps its
+/// status pill; declared rows keep their row pill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AboutPill {
+    Status(IntegrationStatus),
+    Row(DiagnosticsPill),
 }
 
-/// The integration rows of the About card: the pill and the sentence of each
-/// row of the snapshot, in list order.
-#[doc(hidden)]
-pub fn about_integration_rows(snapshot: &DiagnosticsSnapshot) -> Vec<(DiagnosticsPill, &str)> {
-    snapshot
-        .rows
+impl AboutPill {
+    /// 2 for unsupported, 1 for degraded or failed, 0 otherwise.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Status(IntegrationStatus::Unsupported) => 2,
+            Self::Status(IntegrationStatus::Degraded) | Self::Row(DiagnosticsPill::Degraded) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// One integration row of the About card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AboutRow<'a> {
+    /// The integration the row belongs to; `None` for the neutral headline.
+    pub entry: Option<IntegrationRef>,
+    pub pill: AboutPill,
+    pub sentence: &'a str,
+}
+
+/// The About card's integration rows and headline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AboutIntegrations<'a> {
+    /// The tab's overall state: the most severe actionable row (catalog order
+    /// breaks ties), else the active program's row, else a neutral inactive
+    /// sentence.
+    pub headline: AboutRow<'a>,
+    /// Every integration of `list` with diagnostics, as ordinary rows in list
+    /// order.
+    pub rows: Vec<AboutRow<'a>>,
+}
+
+/// Sentence of the headline when no program integration is active.
+pub const NO_PROGRAM_INTEGRATION: &str = "No program integration is active.";
+
+/// Build the About rows and headline of `snapshot` for a tab over `list`
+/// whose active program is `active`.
+pub fn about_integrations<'a>(
+    snapshot: &'a DiagnosticsSnapshot,
+    list: IntegrationList,
+    active: Option<IntegrationRef>,
+) -> AboutIntegrations<'a> {
+    use crate::integrations::DiagnosticsDecl;
+    let rows: Vec<AboutRow<'a>> = list
         .iter()
-        .map(|row| (row.pill, row.sentence.as_str()))
-        .collect()
+        .filter_map(|entry| match entry.diagnostics() {
+            DiagnosticsDecl::Primary => Some(AboutRow {
+                entry: Some(*entry),
+                pill: AboutPill::Status(snapshot.status),
+                sentence: snapshot.reason.as_str(),
+            }),
+            DiagnosticsDecl::Row(decl) => snapshot.row(decl.status_key).map(|row| AboutRow {
+                entry: Some(*entry),
+                pill: AboutPill::Row(row.pill),
+                sentence: row.sentence.as_str(),
+            }),
+            DiagnosticsDecl::None => None,
+        })
+        .collect();
+    // A program that is merely absent is actionable only as the active one.
+    let severity = |row: &AboutRow<'_>| match row.entry {
+        Some(entry)
+            if row.entry != active
+                && matches!(row.pill, AboutPill::Status(_))
+                && entry.reason_is_absence(snapshot.reason_code) =>
+        {
+            0
+        }
+        _ => row.pill.severity(),
+    };
+    let worst = rows.iter().map(severity).max().unwrap_or(0);
+    let headline = rows
+        .iter()
+        .find(|row| worst > 0 && severity(row) == worst)
+        .or_else(|| {
+            rows.iter()
+                .find(|row| active.is_some() && row.entry == active)
+        })
+        .copied()
+        .unwrap_or(AboutRow {
+            entry: None,
+            pill: AboutPill::Row(DiagnosticsPill::Inactive),
+            sentence: NO_PROGRAM_INTEGRATION,
+        });
+    AboutIntegrations { headline, rows }
+}
+
+/// A section that carries only the session-channel owner's bridge data.
+fn owner_section(owner: Option<&str>, section: &str) -> String {
+    match owner {
+        Some(owner) => format!("{} {section}", owner.to_uppercase()),
+        None => section.to_owned(),
+    }
+}
+
+/// The About rows and headline of `workbench`, whose active program is the
+/// integration branding the tab.
+fn workbench_about<'a>(
+    workbench: &Workbench,
+    snapshot: &'a DiagnosticsSnapshot,
+) -> AboutIntegrations<'a> {
+    about_integrations(
+        snapshot,
+        workbench.integrations(),
+        tab_brand(workbench).map(|(entry, _)| entry),
+    )
+}
+
+/// The About card headline sentence of `workbench`.
+pub fn about_headline(workbench: &Workbench) -> String {
+    let snapshot = workbench.diagnostics_snapshot();
+    workbench_about(workbench, &snapshot)
+        .headline
+        .sentence
+        .to_owned()
+}
+
+/// The integration rows under the headline; the headline row is shown once.
+fn about_rows_ui(ui: &mut Ui, about: &AboutIntegrations<'_>, layout: &Layout) {
+    for row in about.rows.iter().filter(|row| **row != about.headline) {
+        ui.horizontal(|ui| {
+            about_pill_ui(ui, row, layout);
+            ui.label(theme::micro(row.sentence))
+                .on_hover_text(row.sentence);
+        });
+    }
+}
+
+fn about_pill_ui(ui: &mut Ui, row: &AboutRow<'_>, layout: &Layout) -> egui::Response {
+    match row.pill {
+        AboutPill::Status(status) => status_pill_ui(ui, status, row.sentence, layout),
+        AboutPill::Row(pill) => integration_status_pill_ui(ui, pill, row.sentence, layout),
+    }
 }
 
 fn authority_key(id: made_remote::protocol::AuthorityId) -> String {
     id.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Stable id for the SSH servers window.
-pub fn ssh_servers_window_id() -> egui::Id {
-    egui::Id::unique("made-ssh-servers")
-}
-
-/// Stable id for one field in the SSH servers window.
+/// Stable id for one SSH prompt field.
 pub fn ssh_field_id(field: &str) -> egui::Id {
     egui::Id::unique(("made-ssh-field", field))
 }
 
 fn ssh_field_hold_id() -> egui::Id {
     egui::Id::unique("made-ssh-field-hold")
-}
-
-fn ssh_window_rect_id() -> egui::Id {
-    egui::Id::unique("made-ssh-window-rect")
-}
-
-fn ssh_window_was_open_id() -> egui::Id {
-    egui::Id::unique("made-ssh-window-was-open")
-}
-
-fn ssh_window_layer_id() -> egui::Id {
-    egui::Id::unique("made-ssh-window-layer")
-}
-
-fn ssh_pending_row_focus_id() -> egui::Id {
-    egui::Id::unique("made-ssh-row-focus-next")
-}
-
-fn ssh_body_height_id() -> egui::Id {
-    egui::Id::unique("made-ssh-window-body-height")
-}
-
-/// Stable id for one saved SSH server row.
-pub fn ssh_server_row_id(id: made_remote::protocol::AuthorityId) -> egui::Id {
-    egui::Id::unique(("made-ssh-server-row", authority_key(id)))
-}
-
-/// One bounded vertical scroll area in the shared floating-overlay style.
-/// `fill_width` keeps the SSH window width fixed; menus shrink to their rows.
-fn bounded_scroll_area(
-    id_salt: impl Hash + std::fmt::Debug,
-    max_height: f32,
-    fill_width: bool,
-    reset_scroll: bool,
-) -> egui::ScrollArea {
-    let scroll = egui::ScrollArea::vertical()
-        .id_salt(id_salt)
-        .max_height(max_height)
-        .auto_shrink([!fill_width, true])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded);
-    if reset_scroll {
-        // The salt is stable across open/close so deliberate scrolling survives
-        // within one open session. A fresh open starts at the top instead of
-        // inheriting the last session's offset.
-        scroll.vertical_scroll_offset(0.0)
-    } else {
-        scroll
-    }
 }
 
 fn ssh_field_painted_pass_id(field: egui::Id) -> egui::Id {
@@ -1395,28 +3063,15 @@ fn hold_ssh_field(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|data| data.insert_temp(ssh_field_hold_id(), id));
 }
 
-/// Drop only the field hold. Tab/click into another control inside the window
-/// and returning to the terminal both leave the window's rect, layer, and
-/// measured body height intact.
+/// Drop the field hold.
 fn release_ssh_field_hold(ctx: &egui::Context) {
     ctx.data_mut(|data| {
         data.remove::<egui::Id>(ssh_field_hold_id());
     });
 }
 
-/// Full reset, only when the window actually closes or disappears.
-fn reset_ssh_window_state(ctx: &egui::Context) {
-    ctx.data_mut(|data| {
-        data.remove::<egui::Id>(ssh_field_hold_id());
-        data.remove::<egui::Rect>(ssh_window_rect_id());
-        data.remove::<egui::LayerId>(ssh_window_layer_id());
-        data.remove::<egui::Id>(ssh_pending_row_focus_id());
-        data.remove::<f32>(ssh_body_height_id());
-    });
-}
-
-/// The terminal paints after this window and treats a click in its rect as its
-/// own, including clicks on the centered window. Restore the field after that.
+/// The terminal paints after a prompt card and treats a click in its rect as
+/// its own. Restore the held prompt field after that.
 struct SshFieldFocusRestore;
 
 impl egui::plugin::Plugin for SshFieldFocusRestore {
@@ -1425,25 +3080,8 @@ impl egui::plugin::Plugin for SshFieldFocusRestore {
     }
 
     fn on_end_pass(&mut self, ui: &mut Ui) {
-        apply_pending_ssh_row_focus(ui);
         restore_ssh_field_focus(ui);
     }
-}
-
-/// Tab from the action row enters the inventory after every widget in the
-/// frame has registered, so the next frame's workbench widgets cannot take the
-/// focus first.
-fn apply_pending_ssh_row_focus(ui: &mut Ui) {
-    let ctx = ui.ctx().clone();
-    let pending = ctx.data(|data| data.get_temp::<egui::Id>(ssh_pending_row_focus_id()));
-    let Some(pending) = pending else {
-        return;
-    };
-    ctx.data_mut(|data| data.remove::<egui::Id>(ssh_pending_row_focus_id()));
-    if ctx.memory(|memory| memory.focused()) == Some(pending) {
-        return;
-    }
-    ctx.memory_mut(|memory| memory.request_focus(pending));
 }
 
 fn restore_ssh_field_focus(ui: &mut Ui) {
@@ -1457,38 +3095,6 @@ fn restore_ssh_field_focus(ui: &mut Ui) {
     // pass before reclaiming focus.
     let painted = ctx.data(|data| data.get_temp::<u64>(ssh_field_painted_pass_id(field)));
     if painted != Some(ctx.cumulative_pass_nr()) {
-        release_ssh_field_hold(&ctx);
-        return;
-    }
-    // Tab/arrow focus that landed on another widget in this window is a
-    // deliberate move: release the field hold instead of pulling focus back.
-    let focused = ui.memory(|memory| memory.focused());
-    if let Some(focused) = focused.filter(|focused| *focused != field) {
-        let layer = ctx.data(|data| data.get_temp::<egui::LayerId>(ssh_window_layer_id()));
-        let in_window = layer.is_some_and(|layer| {
-            ctx.viewport(|viewport| {
-                viewport
-                    .this_pass
-                    .widgets
-                    .get(focused)
-                    .is_some_and(|widget| widget.layer_id == layer && widget.sense.is_focusable())
-            })
-        });
-        if in_window {
-            release_ssh_field_hold(&ctx);
-            return;
-        }
-    }
-    let window = ctx.data(|data| data.get_temp::<egui::Rect>(ssh_window_rect_id()));
-    let terminal = ctx.data(|data| data.get_temp::<egui::Rect>(terminal_hit_rect_id()));
-    let returned_to_terminal = ctx.input(|input| {
-        input.pointer.any_pressed()
-            && input.pointer.interact_pos().is_some_and(|pos| {
-                window.is_some_and(|window| !window.contains(pos))
-                    && terminal.is_some_and(|terminal| terminal.contains(pos))
-            })
-    });
-    if returned_to_terminal {
         release_ssh_field_hold(&ctx);
         return;
     }
@@ -1524,408 +3130,10 @@ fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) {
     }
 }
 
-/// Label sits 4px above its field. The window's `layout.gap` separates pairs.
-fn ssh_field(ui: &mut Ui, label: &str, field: &str, text: &mut String) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        ui.label(theme::micro(label));
-        ssh_text_edit(ui, field, text, false);
-    });
-}
-
-fn ssh_user_port_row(ui: &mut Ui, layout: &Layout, user: &mut String, port: &mut String) {
-    let gap = layout.gap;
-    let port_width = 96.0;
-    let width = ui.available_width();
-    ui.horizontal(|ui| {
-        ui.set_min_width(width);
-        ui.spacing_mut().item_spacing.x = gap;
-        let user_width = (width - gap - port_width).max(80.0);
-        ui.vertical(|ui| {
-            ui.set_width(user_width);
-            ssh_field(ui, "User", "user", user);
-        });
-        ui.vertical(|ui| {
-            ui.set_width(port_width);
-            ssh_field(ui, "Port", "port", port);
-        });
-    });
-}
-
-/// One saved server row with a stable id for focus and keyboard navigation.
-fn ssh_server_row(
-    ui: &mut Ui,
-    id: made_remote::protocol::AuthorityId,
-    selected: bool,
-    label: &str,
-    accessible_label: &str,
-    height: f32,
-) -> egui::Response {
-    let font = FontId::proportional(theme::BUTTON_SIZE);
-    let padding = ui.spacing().button_padding.x;
-    let full_width = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT_SECONDARY)
-        .size()
-        .x;
-    let available = ui.available_width().max(1.0);
-    let width = (full_width + 2.0 * padding).min(available);
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, height.max(24.0)), egui::Sense::hover());
-    let response = ui.interact(rect, ssh_server_row_id(id), egui::Sense::click());
-    if response.clicked() {
-        response.request_focus();
-    }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Button, true, selected, accessible_label)
-    });
-    let fill = if selected {
-        theme::BG_SELECTED
-    } else if response.hovered() {
-        theme::BG_HOVER
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
-    let color = if selected || response.hovered() {
-        theme::TEXT_PRIMARY
-    } else {
-        theme::TEXT_SECONDARY
-    };
-    theme::paint_ellipsized_centered(
-        ui.painter(),
-        rect.left() + 10.0,
-        rect.center().y,
-        label,
-        font,
-        color,
-        (rect.width() - 20.0).max(1.0),
-    );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if response.has_focus() {
-        theme::paint_focus_ring(ui, rect, egui::CornerRadius::same(6), theme::BG_CARD);
-        response.scroll_to_me(Some(Align::Center));
-    }
-    response
-}
-
-/// SSH server registration, test, and remote launch confirmation.
-pub fn ssh_servers_window(model: &mut AppModel, ctx: &egui::Context) {
+/// Keep a held SSH prompt field focused across the terminal's own focus
+/// requests. Installed every frame; it does nothing without a held field.
+pub fn install_ssh_field_focus(ctx: &egui::Context) {
     ctx.add_plugin(SshFieldFocusRestore);
-    let open_now = model.ssh_open();
-    let was_open = ctx
-        .data(|data| data.get_temp::<bool>(ssh_window_was_open_id()))
-        .unwrap_or(false);
-    if !open_now {
-        if was_open {
-            reset_ssh_window_state(ctx);
-            ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), false));
-            if let Some(workbench) = model.workbench_mut() {
-                workbench.request_terminal_focus(ctx);
-            }
-        }
-        return;
-    }
-    ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), true));
-    let just_opened = !was_open;
-    let focus_before = ctx.memory(|memory| memory.focused());
-    let tab_forward =
-        ctx.input(|input| input.key_pressed(egui::Key::Tab) && !input.modifiers.shift);
-    let body_max_height = (ctx.content_rect().height() - 100.0).max(96.0);
-    let body_height = ctx
-        .data(|data| data.get_temp::<f32>(ssh_body_height_id()))
-        .unwrap_or(0.0)
-        .clamp(0.0, body_max_height);
-    // BEGIN remote-path (AIA-02)
-    let rows_tab_after_actions = model.ssh_prompt().is_none()
-        && model.remote_launch().is_none()
-        && !model.ssh_selected().is_some_and(|selected| {
-            model
-                .ssh_registry()
-                .ok()
-                .is_some_and(|registry| registry.can_launch_grok(selected))
-        });
-    // END remote-path
-    let mut first_row = None;
-    let mut open = true;
-    let layout = Layout::for_window(ctx.content_rect().width(), ctx.content_rect().height());
-    let screen = ctx.content_rect();
-    let previous_size = ctx
-        .data(|data| data.get_temp::<egui::Rect>(ssh_window_rect_id()))
-        .map_or(egui::vec2(460.0, 120.0), |rect| rect.size());
-    let window_position = egui::pos2(
-        (screen.center().x - previous_size.x * 0.5).clamp(
-            screen.left(),
-            (screen.right() - previous_size.x).max(screen.left()),
-        ),
-        (screen.center().y - previous_size.y * 0.5).clamp(
-            screen.top(),
-            (screen.bottom() - previous_size.y).max(screen.top()),
-        ),
-    );
-    let shown = egui::Window::new("Servidores SSH")
-        .id(ssh_servers_window_id())
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .current_pos(window_position)
-        .constrain_to(screen)
-        .default_width(460.0)
-        .frame(theme::floating_frame())
-        .show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            ui.spacing_mut().item_spacing.y = layout.gap;
-            ui.spacing_mut().item_spacing.x = layout.gap;
-            let mut content_height = 0.0;
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), body_height),
-                egui::Layout::top_down(Align::Min),
-                |ui| {
-                    let body = bounded_scroll_area(
-                        ("made-ssh-window-body",),
-                        body_max_height,
-                        true,
-                        just_opened,
-                    );
-                    let output = body.show(ui, |ui| {
-                        if let Err(error) = model.ssh_registry() {
-                            ui.label(theme::body(sanitize_display(error, 300)));
-                        }
-                        if let Some(notice) = model.ssh_notice() {
-                            ui.label(theme::micro(sanitize_display(notice, 240)));
-                        }
-                        if model.ssh_host_key_changed() {
-                            ui.label(theme::micro(
-                                "The stored key no longer matches this server. Forget it only if the server key change was expected.",
-                            ));
-                            if ui.button("Forget old host key").clicked() {
-                                if let Err(error) = model.forget_selected_ssh_host_key() {
-                                    model.set_ssh_notice(error);
-                                }
-                            }
-                        }
-                        let listed = model.ssh_registry().ok().map(|registry| {
-                            registry
-                                .servers()
-                                .iter()
-                                .map(|server| {
-                                    let id = server.id();
-                                    let probe = match registry.probe_state(id) {
-                                        // BEGIN remote-path (AIA-02)
-                                        crate::ssh_servers::ProbeState::Complete(capabilities) => {
-                                            let opencode = if capabilities.opencode {
-                                                "OpenCode detected"
-                                            } else {
-                                                "OpenCode not detected"
-                                            };
-                                            if capabilities.grok {
-                                                format!("{opencode} · grok detected")
-                                            } else {
-                                                opencode.to_owned()
-                                            }
-                                        }
-                                        // END remote-path
-                                        crate::ssh_servers::ProbeState::Failed(_) => "test failed".to_owned(),
-                                        crate::ssh_servers::ProbeState::Running(_) => "testing".to_owned(),
-                                        crate::ssh_servers::ProbeState::Cancelled => "cancelled".to_owned(),
-                                        crate::ssh_servers::ProbeState::Idle => "not tested".to_owned(),
-                                    };
-                                    (id, server.metadata().display_name.clone(), probe)
-                                })
-                                .collect::<Vec<_>>()
-                        });
-                        if let Some(servers) = listed {
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                for (id, name, probe) in servers {
-                                    let selected = model.ssh_selected() == Some(id);
-                                    let label = format!("{} · {probe}", sanitize_display(&name, 48));
-                                    let accessible_label =
-                                        sanitize_text(&format!("{name} · {probe}"));
-                                    if first_row.is_none() {
-                                        first_row = Some(ssh_server_row_id(id));
-                                    }
-                                    let response = ssh_server_row(
-                                        ui,
-                                        id,
-                                        selected,
-                                        &label,
-                                        &accessible_label,
-                                        layout.button_height,
-                                    );
-                                    let activated = response.clicked()
-                                        || (response.has_focus()
-                                            && ui.input(|input| {
-                                                input.key_pressed(egui::Key::Enter)
-                                                    || input.key_pressed(egui::Key::Space)
-                                            }));
-                                    if activated {
-                                        model.select_ssh_server(id);
-                                    }
-                                }
-                            });
-                        }
-                        {
-                            let draft = model.ssh_draft();
-                            ssh_field(ui, "Display name", "name", &mut draft.name);
-                            ssh_field(ui, "Host or SSH alias", "host", &mut draft.host);
-                            ssh_user_port_row(ui, &layout, &mut draft.user, &mut draft.port);
-                            ssh_field(ui, "Key file reference", "key", &mut draft.key_file);
-                            ssh_field(
-                                ui,
-                                "Initial remote directory",
-                                "directory",
-                                &mut draft.directory,
-                            );
-                        }
-                        ui.label(theme::micro(
-                            "Passwords, tokens, and private key bytes are not stored.",
-                        ));
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = layout.gap;
-                            if theme::primary_action(
-                                ui,
-                                top_action_id("ssh-save"),
-                                "Save",
-                                layout.button_height,
-                                true,
-                                theme::BG_CARD,
-                            )
-                            .activated
-                            {
-                                if let Err(error) = model.save_ssh_server() {
-                                    model.set_ssh_notice(error);
-                                }
-                            }
-                            if theme::ghost_action(
-                                ui,
-                                top_action_id("ssh-test"),
-                                "Test",
-                                false,
-                                layout.button_height,
-                                theme::BG_CARD,
-                            )
-                            .activated
-                            {
-                                if let Err(error) = model.test_selected_ssh_server() {
-                                    model.set_ssh_notice(error);
-                                }
-                            }
-                            if theme::ghost_action(
-                                ui,
-                                top_action_id("ssh-remove"),
-                                "Remove",
-                                false,
-                                layout.button_height,
-                                theme::BG_CARD,
-                            )
-                            .activated
-                            {
-                                if let Err(error) = model.remove_selected_ssh_server() {
-                                    model.set_ssh_notice(error);
-                                }
-                            }
-                        });
-                        if model.ssh_prompt().is_some() {
-                            ui.separator();
-                            let class = model
-                                .ssh_prompt()
-                                .map(|prompt| crate::remote_session::classify_prompt(&prompt.text));
-                            let changed = matches!(
-                                class,
-                                Some(crate::remote_session::SshPromptClass::ChangedHostKey { .. })
-                            );
-                            if let Some(class) = class {
-                                ssh_prompt_card(ui, &class, model.prompt_draft());
-                            }
-                            ui.horizontal(|ui| {
-                                if !changed && ui.button("Approve").clicked() {
-                                    model.submit_ssh_prompt(true);
-                                }
-                                if ui
-                                    .button(if changed {
-                                        "Refuse key"
-                                    } else {
-                                        "Cancel prompt"
-                                    })
-                                    .clicked()
-                                {
-                                    model.submit_ssh_prompt(false);
-                                    if !changed {
-                                        model.cancel_ssh_probe();
-                                    }
-                                }
-                            });
-                        }
-                        // BEGIN remote-path (AIA-02)
-                        let launch_title = model.remote_launch().map(|launch| {
-                            if launch.opencode {
-                                format!("OpenCode SSH — {}", sanitize_display(&launch.label, 48))
-                            } else {
-                                format!("Terminal SSH — {}", sanitize_display(&launch.label, 48))
-                            }
-                        });
-                        grok_install_consent_card(model, ui, &layout);
-                        // END remote-path
-                        if let Some(title) = launch_title {
-                            ui.separator();
-                            ui.label(theme::body(title));
-                            if let Some(directory) = model.remote_launch_directory() {
-                                ssh_field(ui, "Remote directory", "launch-directory", directory);
-                            }
-                            ui.horizontal(|ui| {
-                                if theme::primary_action(
-                                    ui,
-                                    top_action_id("ssh-launch"),
-                                    "Open remote workspace",
-                                    layout.button_height,
-                                    true,
-                                    theme::BG_CARD,
-                                )
-                                .activated
-                                {
-                                    if let Err(error) = model.confirm_remote_launch() {
-                                        model.set_ssh_notice(error);
-                                    }
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    model.cancel_remote_launch();
-                                }
-                            });
-                        }
-                    });
-                    content_height = output.content_size.y;
-                },
-            );
-            ui.ctx().data_mut(|data| {
-                data.insert_temp(ssh_body_height_id(), content_height);
-            });
-        });
-    if let Some(shown) = shown {
-        ctx.data_mut(|data| {
-            data.insert_temp(ssh_window_rect_id(), shown.response.rect);
-            data.insert_temp(ssh_window_layer_id(), shown.response.layer_id);
-        });
-    }
-    if tab_forward && rows_tab_after_actions && focus_before == Some(top_action_id("ssh-remove")) {
-        if let Some(first_row) = first_row {
-            ctx.data_mut(|data| data.insert_temp(ssh_pending_row_focus_id(), first_row));
-        }
-    }
-    let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-    if escape && !egui::Popup::is_any_open(ctx) {
-        open = false;
-    }
-    if !open {
-        reset_ssh_window_state(ctx);
-        ctx.data_mut(|data| data.insert_temp(ssh_window_was_open_id(), false));
-        model.set_ssh_open(false);
-        if let Some(workbench) = model.workbench_mut() {
-            workbench.request_terminal_focus(ctx);
-        }
-    }
 }
 
 /// Global workspace tabs; OpenCode sessions remain a separate optional map.
@@ -1938,15 +3146,18 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         .filter_map(|id| Some(workspace_tab_info(id, model.workspace(id)?)))
         .collect();
     let has_workbench = model.workbench().is_some();
-    let compatible_tuis = new_tab_menu_entries(model);
     let explorer_visible = model.workbench().is_some_and(Workbench::explorer_visible);
     let sessions_visible = model.workbench().is_some_and(Workbench::sessions_visible);
     let sessions_available = model.workbench().is_some_and(|workbench| {
-        sessions_visible
-            || !workbench.session_map().is_empty()
-            || workbench.integration().status().is_connected()
-            || workbench.remote_sessions_available()
+        !sessions_outranked(workbench)
+            && (sessions_visible
+                || !workbench.session_map().is_empty()
+                || workbench.integration().status().is_connected()
+                || workbench.remote_sessions_available())
     });
+    let sessions_owner = model
+        .workbench()
+        .and_then(|workbench| crate::integrations::session_channel_label(workbench.integrations()));
     if let (Some(active), Some(workbench)) = (active, model.workbench()) {
         let target = top_workspace_action_id(active, "explorer");
         ui.ctx().data_mut(|data| {
@@ -1960,16 +3171,9 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
     let mut activate = None;
     let mut close = None;
     let mut create = false;
-    let mut launch_tui = None;
-    // BEGIN remote-path (AIA-02)
-    let mut launch_remote_grok = None;
-    let mut launch_remote_claude = None;
-    // END remote-path
     let mut toggle_explorer = false;
     let mut toggle_sessions = false;
-    let mut toggle_ssh = false;
     let mut about = false;
-    let mut launch_remote: Option<(made_remote::protocol::AuthorityId, bool)> = None;
 
     let panel_height = layout.content_top();
     egui::Panel::top("made-workspaces")
@@ -1989,26 +3193,18 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             let control_gap = if layout.compact { 4.0 } else { 6.0 };
             let wordmark_gap = theme::wordmark_gap(layout.compact);
 
-            let mut right_specs: Vec<(&'static str, theme::IconGlyph, &'static str, bool)> =
-                Vec::new();
+            let mut right_specs: Vec<(&'static str, theme::IconGlyph, String, bool)> = Vec::new();
             if sessions_available {
                 right_specs.push((
                     "sessions",
                     theme::IconGlyph::SessionList,
-                    if sessions_visible {
-                        "Hide sessions"
-                    } else {
-                        "Show sessions"
-                    },
+                    sessions_label(
+                        if sessions_visible { "Hide" } else { "Show" },
+                        sessions_owner,
+                    ),
                     sessions_visible,
                 ));
             }
-            right_specs.push((
-                "ssh-servers",
-                theme::IconGlyph::Servers,
-                "Servidores SSH",
-                model.ssh_open(),
-            ));
             if has_workbench {
                 right_specs.push((
                     "explorer",
@@ -2017,7 +3213,8 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                         "Hide explorer"
                     } else {
                         "Show explorer"
-                    },
+                    }
+                    .to_owned(),
                     explorer_visible,
                 ));
             }
@@ -2060,7 +3257,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 match *name {
                     "sessions" if action.activated => toggle_sessions = true,
                     "explorer" if action.activated => toggle_explorer = true,
-                    "ssh-servers" if action.activated => toggle_ssh = true,
                     _ => {}
                 }
             }
@@ -2141,138 +3337,13 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                 &mut tab_strip,
                 top_action_id("open-folder"),
                 theme::IconGlyph::Plus,
-                "Open folder",
+                "Open workspace",
                 false,
                 layout.tab_height,
                 theme::BG_CLEAR,
             );
-            let has_ssh_servers = model
-                .ssh_registry()
-                .ok()
-                .is_some_and(|registry| !registry.servers().is_empty());
-            // No local TUI and no saved server: open the picker. A menu with
-            // only Terminal is the same choice, and it hid the picker.
-            let show_new_tab_menu = !compatible_tuis.is_empty() || has_ssh_servers;
-            if open_folder.activated && !show_new_tab_menu {
+            if open_folder.activated {
                 create = true;
-            }
-            if show_new_tab_menu {
-                // Never reserve more rows than the viewport actually has left;
-                // the scroll area shrinks a short menu and caps a taller one
-                // without pushing controls past the screen edge.
-                let menu_max_height =
-                    (ui.ctx().content_rect().bottom() - open_folder.response.rect.bottom() - 8.0)
-                        .max(0.0);
-                let reset_menu_scroll = open_folder.activated;
-                egui::Popup::menu(&open_folder.response)
-                    .open_memory(
-                        open_folder
-                            .activated
-                            .then_some(egui::SetOpenCommand::Toggle),
-                    )
-                    .show(|ui| {
-                        let menu = bounded_scroll_area(
-                            ("made-new-tab-menu",),
-                            menu_max_height,
-                            false,
-                            reset_menu_scroll,
-                        );
-                        menu.show(ui, |ui| {
-                            if new_tab_menu_item(
-                                ui,
-                                new_tab_menu_item_id("terminal"),
-                                theme::MenuLeading::Glyph(theme::IconGlyph::Terminal),
-                                "Terminal",
-                                layout.button_height,
-                            ) {
-                                create = true;
-                                ui.close();
-                            }
-                            for tui in &compatible_tuis {
-                                let descriptor = tui.descriptor();
-                                if new_tab_menu_item(
-                                    ui,
-                                    new_tab_menu_item_id(descriptor.menu_item_id),
-                                    mark_leading(descriptor.mark),
-                                    descriptor.label,
-                                    layout.button_height,
-                                ) {
-                                    launch_tui = Some(*tui);
-                                    ui.close();
-                                }
-                            }
-                            if let Ok(registry) = model.ssh_registry() {
-                                for server in registry.servers() {
-                                    let name =
-                                        sanitize_display(&server.metadata().display_name, 48);
-                                    let terminal_label = format!("Terminal SSH — {name}");
-                                    if new_tab_menu_item(
-                                        ui,
-                                        new_tab_menu_item_id(&format!(
-                                            "ssh-terminal-{}",
-                                            authority_key(server.id())
-                                        )),
-                                        theme::MenuLeading::Glyph(theme::IconGlyph::Servers),
-                                        &terminal_label,
-                                        layout.button_height,
-                                    ) {
-                                        launch_remote = Some((server.id(), false));
-                                        ui.close();
-                                    }
-                                    // BEGIN remote-path (AIA-02)
-                                    if registry.can_launch_opencode(server.id()) {
-                                        let opencode_label = format!("OpenCode SSH — {name}");
-                                        if new_tab_menu_item(
-                                            ui,
-                                            new_tab_menu_item_id(&format!(
-                                                "ssh-opencode-{}",
-                                                authority_key(server.id())
-                                            )),
-                                            theme::MenuLeading::Glyph(theme::IconGlyph::Terminal),
-                                            &opencode_label,
-                                            layout.button_height,
-                                        ) {
-                                            launch_remote = Some((server.id(), true));
-                                            ui.close();
-                                        }
-                                    }
-                                    if registry.can_launch_grok(server.id()) {
-                                        let grok_label = format!("Grok SSH — {name}");
-                                        if new_tab_menu_item(
-                                            ui,
-                                            new_tab_menu_item_id(&format!(
-                                                "ssh-grok-{}",
-                                                authority_key(server.id())
-                                            )),
-                                            mark_leading(crate::integrations::grok::mark()),
-                                            &grok_label,
-                                            layout.button_height,
-                                        ) {
-                                            launch_remote_grok = Some(server.id());
-                                            ui.close();
-                                        }
-                                    }
-                                    if registry.can_launch_claude(server.id()) {
-                                        let claude_label = format!("Claude Code SSH — {name}");
-                                        if new_tab_menu_item(
-                                            ui,
-                                            new_tab_menu_item_id(&format!(
-                                                "ssh-claude-{}",
-                                                authority_key(server.id())
-                                            )),
-                                            mark_leading(crate::integrations::claude_code::mark()),
-                                            &claude_label,
-                                            layout.button_height,
-                                        ) {
-                                            launch_remote_claude = Some(server.id());
-                                            ui.close();
-                                        }
-                                    }
-                                    // END remote-path
-                                }
-                            }
-                        });
-                    });
             }
             if overflow {
                 let overflow_action = theme::ghost_action(
@@ -2316,32 +3387,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
             }
         });
 
-    if let Some(tui) = launch_tui {
-        model.begin_tui_workspace(tui);
-    }
-    // BEGIN remote-path (AIA-02)
-    if let Some((id, opencode)) = launch_remote {
-        if let Err(error) = model.begin_remote_choice(id, opencode) {
-            model.set_ssh_notice(error);
-            model.set_ssh_open(true);
-        }
-    }
-    if let Some(id) = launch_remote_grok {
-        if let Err(error) = model.begin_remote_grok_launch(id) {
-            model.set_ssh_notice(error);
-            model.set_ssh_open(true);
-        }
-    }
-    if let Some(id) = launch_remote_claude {
-        if let Err(error) = model.begin_remote_claude_launch(id) {
-            model.set_ssh_notice(error);
-            model.set_ssh_open(true);
-        }
-    }
-    // END remote-path
-    if toggle_ssh {
-        model.toggle_ssh();
-    }
     if create {
         model.begin_new_workspace();
     }
@@ -2365,23 +3410,6 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         }
     }
     about
-}
-
-fn new_tab_menu_item(
-    ui: &mut Ui,
-    id: egui::Id,
-    leading: theme::MenuLeading,
-    label: &str,
-    height: f32,
-) -> bool {
-    let action = theme::menu_labeled_action(ui, id, leading, label, height, theme::BG_CARD);
-    if action.response.has_focus() {
-        action.response.scroll_to_me(Some(Align::Center));
-    }
-    action
-        .response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-    action.activated
 }
 
 fn paint_workspace_tab_session_dots(
@@ -3056,7 +4084,8 @@ impl Workbench {
             .focus
             .last_error()
             .map(|error| sanitize_display(&error.message, 300));
-        let show_sessions = self.sessions_visible();
+        // The map is hidden, reserving no space, while another program runs.
+        let show_sessions = self.sessions_visible() && !sessions_outranked(self);
 
         if show_sessions {
             let strip_rect = egui::Rect::from_min_size(
@@ -3070,6 +4099,7 @@ impl Workbench {
                 active,
                 selected,
                 in_flight: self.focus.is_in_flight(),
+                owner: crate::integrations::session_channel_label(self.integrations()),
             };
             let output = tab_strip_ui(ui, strip_rect, layout, rows, &state);
             if let Some(session_id) = output.keyboard_selected {
@@ -3399,6 +4429,7 @@ impl Workbench {
         self.integration.status().label().hash(&mut hasher);
         self.integration.reason().code.code().hash(&mut hasher);
         self.integration.reason().detail.hash(&mut hasher);
+        self.focus_unavailable.hash(&mut hasher);
         self.integration
             .connection()
             .map(|connection| connection.connection_id)
@@ -3549,8 +4580,10 @@ impl Workbench {
         let log_write_issue = self.log_write_issue.clone();
         let log_path = cache.log_path.as_str();
         let pane_id = self.pane_id().to_owned();
-        let reason_full = snapshot.reason.clone();
+        let about = workbench_about(self, snapshot);
+        let reason_full = about.headline.sentence.to_owned();
         let reason = sanitize_display(&reason_full, 320);
+        let owner = crate::integrations::session_channel_label(self.integrations());
         let content = ctx.content_rect();
         let width = (content.width() - 64.0).clamp(440.0, 680.0);
         let mut open = *show_about;
@@ -3636,7 +4669,7 @@ impl Workbench {
                 ui.multiply_opacity(reveal);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    status_pill_ui(ui, snapshot.status, &reason_full, layout);
+                    about_pill_ui(ui, &about.headline, layout);
                     ui.label(theme::micro(&reason)).on_hover_text(&reason_full);
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         let copy_action = theme::secondary_action(
@@ -3655,11 +4688,10 @@ impl Workbench {
                         }
                     });
                 });
-                for (pill, sentence) in about_integration_rows(snapshot) {
-                    ui.horizontal(|ui| {
-                        integration_status_pill_ui(ui, pill, sentence, layout);
-                        ui.label(theme::micro(sentence)).on_hover_text(sentence);
-                    });
+                // Compact cards scroll the rows with the detail so the log
+                // footer stays inside the window.
+                if !layout.compact {
+                    about_rows_ui(ui, &about, layout);
                 }
                 if let Some(failure) = &config_failure {
                     notice_strip(
@@ -3669,6 +4701,7 @@ impl Workbench {
                         theme::WARNING,
                         &format!("configuration: {}", sanitize_display(failure, 400)),
                         &sanitize_display(failure, 700),
+                        None,
                     );
                 }
                 if let Some(issue) = &log_write_issue {
@@ -3684,6 +4717,7 @@ impl Workbench {
                         tone,
                         &format!("log: {}", sanitize_display(&message, 400)),
                         &message,
+                        None,
                     );
                 }
 
@@ -3692,6 +4726,9 @@ impl Workbench {
                     .auto_shrink([false, false])
                     .max_height(detail_height)
                     .show(ui, |ui| {
+                        if layout.compact {
+                            about_rows_ui(ui, &about, layout);
+                        }
                         diagnostics_section(ui, "WORKSPACE");
                         diagnostics_rows(
                             ui,
@@ -3772,7 +4809,7 @@ impl Workbench {
                             ],
                         );
 
-                        diagnostics_section(ui, "CONNECTION");
+                        diagnostics_section(ui, &owner_section(owner, "CONNECTION"));
                         diagnostics_rows(
                             ui,
                             "made-diag-connection",
@@ -3813,7 +4850,7 @@ impl Workbench {
                             ],
                         );
 
-                        diagnostics_section(ui, "SESSION");
+                        diagnostics_section(ui, &owner_section(owner, "SESSION"));
                         let mut session_rows = vec![
                             (
                                 "Active session",
@@ -3866,12 +4903,14 @@ impl Workbench {
                         diagnostics_rows(ui, "made-diag-worktree", &worktree_rows);
 
                         diagnostics_section(ui, "VERSIONS");
+                        let owner_plugin = owner
+                            .map_or_else(|| "Plugin".to_owned(), |owner| format!("{owner} plugin"));
                         diagnostics_rows(
                             ui,
                             "made-diag-versions",
                             &[
                                 (
-                                    "Plugin",
+                                    owner_plugin.as_str(),
                                     snapshot
                                         .plugin_version
                                         .clone()
@@ -4075,8 +5114,8 @@ pub fn about_update_not_now_id() -> egui::Id {
 /// Wording of the inline restart confirmation.
 pub fn restart_confirmation_text(version: &str) -> String {
     format!(
-        "Restart into Made {version}? Every open workspace, terminal and running session, \
-         including OpenCode, Grok and SSH sessions, will close and will not be restored."
+        "Restart into Made {version}? Every open workspace and terminal, including running \
+         programs and SSH sessions, will close and will not be restored."
     )
 }
 
@@ -4208,6 +5247,8 @@ struct TabStripState<'a> {
     active: Option<&'a str>,
     selected: Option<&'a str>,
     in_flight: bool,
+    /// The session-channel owner's label, which the map belongs to.
+    owner: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -4317,12 +5358,13 @@ fn tab_strip_ui(
                 )
                 .layout(egui::Layout::left_to_right(Align::Center)),
         );
+        let none = sessions_label("No", state.owner);
         if layout.compact {
             empty
-                .label(theme::micro("No open sessions"))
+                .label(theme::micro(&none))
                 .on_hover_text("Open OpenCode in the terminal.");
         } else {
-            empty.label(theme::micro("No open sessions"));
+            empty.label(theme::micro(&none));
             empty.label(theme::micro("Open OpenCode in the terminal."));
         }
     } else {
@@ -5312,6 +6354,8 @@ fn terminal_unavailable_card(
         });
 }
 
+/// One contextual notice line; with `dismiss`, an icon-only Dismiss control
+/// sits at its end. Returns whether that control was activated.
 fn notice_strip(
     ui: &mut Ui,
     layout: &Layout,
@@ -5319,7 +6363,8 @@ fn notice_strip(
     tone: Color32,
     text: &str,
     tooltip: &str,
-) {
+    dismiss: Option<egui::Id>,
+) -> bool {
     let height = if layout.compact { 26.0 } else { 30.0 };
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
@@ -5342,15 +6387,50 @@ fn notice_strip(
         FontId::proportional(10.5),
         tone,
     );
+    let control = if dismiss.is_some() {
+        theme::icon_action_extent(24.0) + 4.0
+    } else {
+        0.0
+    };
     theme::paint_ellipsized(
         ui.painter(),
         egui::pos2(rect.left() + 20.0, rect.center().y - 7.0),
         text,
         FontId::proportional(10.5),
         tone,
-        (rect.width() - 28.0).max(20.0),
+        (rect.width() - 28.0 - control).max(20.0),
     );
     response.on_hover_text(sanitize_display(tooltip, 700));
+    let Some(id) = dismiss else {
+        return false;
+    };
+    let extent = theme::icon_action_extent(24.0);
+    let mut slot = ui.new_child(
+        UiBuilder::new()
+            .max_rect(egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 3.0 - extent / 2.0, rect.center().y),
+                egui::Vec2::splat(extent),
+            ))
+            .layout(egui::Layout::left_to_right(Align::Center)),
+    );
+    dismiss_action(&mut slot, id, fill)
+}
+
+/// Icon-only Dismiss control of a screen notice. Escape while it is focused
+/// dismisses only that notice (see `screen_keyboard`).
+fn dismiss_action(ui: &mut Ui, id: egui::Id, gap: Color32) -> bool {
+    ui.memory_mut(|memory| {
+        memory.set_focus_lock_filter(
+            id,
+            egui::EventFilter {
+                tab: false,
+                horizontal_arrows: false,
+                vertical_arrows: false,
+                escape: true,
+            },
+        );
+    });
+    theme::icon_action(ui, id, theme::IconGlyph::Close, "Dismiss", false, 24.0, gap).activated
 }
 
 fn log_level_tone(level: crate::diagnostics::LogLevel) -> (Color32, Color32) {
@@ -5445,6 +6525,57 @@ mod tests {
     use std::sync::MutexGuard;
 
     static APP_PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn command_enter_never_overrides_another_action_that_took_enter() {
+        use crate::open_workspace::LaunchKind;
+        let temp = tempfile::tempdir().unwrap();
+        let picker = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
+        let model = AppModel::from_launch(
+            crate::workspace::WorkspaceLaunch::Picker {
+                picker,
+                error: None,
+            },
+            crate::app::AppOptions::new(),
+        );
+        let ctx = egui::Context::default();
+        let keyboard = |command: &mut Option<ScreenCommand>| {
+            let raw = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ui| screen_keyboard(&model, ui, command));
+            output.textures_delta.clear();
+        };
+        // Another action owns this Enter: it is not replaced by a launch.
+        let mut command = Some(ScreenCommand::SaveForm);
+        keyboard(&mut command);
+        assert!(matches!(command, Some(ScreenCommand::SaveForm)));
+        let mut command = Some(ScreenCommand::Navigate("/tmp".to_owned()));
+        keyboard(&mut command);
+        assert!(matches!(command, Some(ScreenCommand::Navigate(_))));
+        // A focused TUI button took the Enter too: Terminal is still the
+        // Cmd/Ctrl+Enter target, and only one launch runs.
+        let mut command = Some(ScreenCommand::Launch(LaunchKind::Tui(OPENCODE)));
+        keyboard(&mut command);
+        assert!(matches!(
+            command,
+            Some(ScreenCommand::Launch(LaunchKind::Terminal))
+        ));
+        // Otherwise Cmd/Ctrl+Enter opens Terminal.
+        let mut command = None;
+        keyboard(&mut command);
+        assert!(matches!(
+            command,
+            Some(ScreenCommand::Launch(LaunchKind::Terminal))
+        ));
+    }
 
     #[test]
     fn every_vendored_mark_of_the_product_resolves() {
@@ -5630,6 +6761,7 @@ mod tests {
                 active: Some("s0"),
                 selected: Some("s1"),
                 in_flight: true,
+                owner: None,
             };
             strip_output = Some(tab_strip_ui(ui, rect, &layout, &rows, &state));
         });
@@ -5735,36 +6867,38 @@ mod tests {
     }
 
     #[test]
-    fn picker_rows_are_cached_until_the_tree_or_refresh_changes() {
+    fn screen_rows_are_cached_until_the_tree_or_refresh_changes() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..100 {
             std::fs::create_dir(temp.path().join(format!("dir-{index:03}"))).unwrap();
         }
-        let mut picker = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
+        let picker = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
+        let mut model = AppModel::from_launch(
+            crate::workspace::WorkspaceLaunch::Picker {
+                picker,
+                error: None,
+            },
+            crate::app::AppOptions::new(),
+        );
         let ctx = egui::Context::default();
-        let first = picker_display_rows(&ctx, &picker);
-        let second = picker_display_rows(&ctx, &picker);
+        model.sync_screen(&ctx);
+        let first = model.screen_rows();
+        let second = model.screen_rows();
         assert_eq!(first.len(), 100);
         assert!(
             Arc::ptr_eq(&first, &second),
             "unchanged tree must reuse sanitized rows"
         );
         std::fs::rename(temp.path().join("dir-050"), temp.path().join("renamed-050")).unwrap();
-        let revision = picker.revision();
-        picker.refresh().unwrap();
-        assert!(picker.revision() > revision);
-        let third = picker_display_rows(&ctx, &picker);
+        model.screen_refresh();
+        let third = model.screen_rows();
         assert!(!Arc::ptr_eq(&first, &third));
         assert!(third.iter().any(|row| row.name == "renamed-050"));
         assert!(third.iter().all(|row| row.name != "dir-050"));
-        picker.select(0).unwrap();
-        picker.toggle_selected().unwrap();
-        let expanded = picker_display_rows(&ctx, &picker);
+        model.screen_toggle(0);
+        let expanded = model.screen_rows();
         assert!(!Arc::ptr_eq(&third, &expanded));
-        let other = crate::workspace_picker::WorkspacePicker::new(temp.path()).unwrap();
-        assert_ne!(picker.instance_id(), other.instance_id());
-        let fourth = picker_display_rows(&ctx, &other);
-        assert!(!Arc::ptr_eq(&expanded, &fourth));
+        model.shutdown();
     }
 
     #[test]
@@ -5960,11 +7094,6 @@ mod tests {
         });
         assert!(!output.shapes.is_empty());
         output.textures_delta.clear();
-    }
-
-    #[test]
-    fn picker_primary_action_is_the_accent_control() {
-        assert_eq!(picker_primary_label(), "Use current folder");
     }
 
     #[test]

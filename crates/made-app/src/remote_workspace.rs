@@ -2157,3 +2157,990 @@ fn remote_git_groups(
         })
         .collect())
 }
+
+// ---- Open workspace browse grant, client side (SSH-12) ----------------------
+//
+// A screen-scoped, read-only grant on one server: folder listings, directory
+// checks for the address bar and for launch, and the fixed read-only git reads
+// of the launch target and the worktrees the repository reports. Like
+// `RemoteWorkspace` this is a transport-independent model; `BrowseConnection`
+// pumps it over one companion stdio stream without ever blocking.
+
+use crate::open_workspace::{CountsState, GitState, LaunchKind, WorktreeItem};
+use crate::remote_session::SshFailureClass;
+use crate::tui::TerminalTarget;
+use crate::workspace_picker::AddressError;
+use made_platform::ssh_askpass::{PromptAnswer, PromptRequest};
+use made_remote::protocol::{
+    AuthorityId, BrowseEnvelope, BrowseFrameDecoder, BrowseGrant, BrowseIdentity, BrowseOperation,
+    BrowseReplyProgress, DirectoryCheck, EntryKind,
+};
+use std::path::PathBuf;
+
+/// How long one browse request may stay unanswered once it is on the wire.
+/// The open request's clock is paused while an SSH prompt awaits the user.
+pub const BROWSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most working trees one repository read shows. Later and duplicate entries
+/// of the server's list are dropped; [`RemoteBrowse::git_truncated`] reports
+/// the cut.
+pub const MAX_WORKTREES: usize = 256;
+
+/// Most requests waiting behind the [`MAX_IN_FLIGHT`] requests on the wire.
+const MAX_QUEUED_BROWSE: usize = 1024;
+
+/// Most frames, and bytes, one [`BrowseConnection::pump`] reads before it
+/// yields to the UI; the rest waits for the next pump.
+const PUMP_FRAME_BUDGET: usize = 256;
+const PUMP_BYTE_BUDGET: usize = 256 * 1024;
+
+/// The terminal target an Open workspace launch button starts on a server.
+/// Never resolves a host executable.
+pub fn remote_launch_target(kind: LaunchKind, authority: AuthorityId) -> TerminalTarget {
+    match kind {
+        LaunchKind::Tui(tui) if tui == crate::integrations::OPENCODE => {
+            TerminalTarget::RemoteOpenCode { authority }
+        }
+        LaunchKind::Tui(tui) if tui == crate::integrations::GROK => {
+            TerminalTarget::RemoteGrok { authority }
+        }
+        LaunchKind::Tui(tui) if tui == crate::integrations::CLAUDE_CODE => {
+            TerminalTarget::RemoteClaude { authority }
+        }
+        LaunchKind::Terminal | LaunchKind::Tui(_) => TerminalTarget::RemoteShell { authority },
+    }
+}
+
+/// Whether browsing may start on a server under the SSH-06 staging consent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowseConsent {
+    /// Consent for this version exists or was just given.
+    Proceed,
+    /// Ask with the existing consent flow before anything is written.
+    Ask,
+    /// Refused: nothing is staged, the reason is shown in the folder area.
+    Refused(&'static str),
+}
+
+/// Decide browsing from the saved consent and the user's answer, if any.
+pub fn browse_consent(consented: bool, answer: Option<bool>) -> BrowseConsent {
+    match (consented, answer) {
+        (true, _) | (false, Some(true)) => BrowseConsent::Proceed,
+        (false, None) => BrowseConsent::Ask,
+        (false, Some(false)) => BrowseConsent::Refused(
+            "Browsing this server needs Made's helper there. Select the host again to approve it. Nothing was written.",
+        ),
+    }
+}
+
+/// Parse an address-bar path for a server: surrounding whitespace and
+/// trailing separators are ignored, and it must be absolute. Existence is
+/// checked on the server, never on this computer.
+pub fn parse_remote_address(text: &str) -> Result<RemotePath, AddressError> {
+    let text = text.trim();
+    if !text.starts_with('/') {
+        return Err(AddressError::NotAbsolute);
+    }
+    let trimmed = text.trim_end_matches('/');
+    let text = if trimmed.is_empty() { "/" } else { trimmed };
+    RemotePath::new(text.as_bytes().to_vec()).map_err(|_| AddressError::NotFound)
+}
+
+fn check_result(check: &DirectoryCheck) -> Result<RemotePath, AddressError> {
+    match check {
+        DirectoryCheck::Directory { path } => Ok(path.clone()),
+        DirectoryCheck::Missing => Err(AddressError::NotFound),
+        DirectoryCheck::Unreadable => Err(AddressError::NotReadable),
+        DirectoryCheck::NotDirectory => Err(AddressError::NotAFolder),
+    }
+}
+
+/// One folder of a remote listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFolder {
+    /// Server path; never resolved on this computer.
+    pub path: RemotePath,
+    /// Sanitized display name.
+    pub name: String,
+}
+
+/// A finished browse result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowseEvent {
+    /// The server accepted the grant and reported its user's home: a
+    /// server-side absolute readable directory, or `None` when unknown.
+    Opened { home: Option<RemotePath> },
+    /// The folders of `path`, capped at 1000 entries.
+    Listed {
+        path: RemotePath,
+        folders: Vec<RemoteFolder>,
+        truncated: bool,
+    },
+    /// The listing of `path` failed; the row stays collapsed.
+    ListFailed { path: RemotePath },
+    /// The address-bar path check.
+    AddressChecked {
+        requested: RemotePath,
+        result: Result<RemotePath, AddressError>,
+    },
+    /// The launch-time revalidation of the effective launch path.
+    LaunchChecked {
+        kind: LaunchKind,
+        requested: RemotePath,
+        result: Result<RemotePath, AddressError>,
+    },
+    /// The git state of the launch target for `generation`.
+    Git { generation: u64, state: GitState },
+    /// Change counts of one working tree for `generation`.
+    Counts {
+        generation: u64,
+        path: PathBuf,
+        counts: CountsState,
+    },
+    /// The grant ended; no tab was affected.
+    Ended,
+}
+
+/// Lifecycle of the grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowsePhase {
+    Opening,
+    Open,
+    Closing,
+    Ended,
+}
+
+#[derive(Debug, Clone)]
+enum BrowsePurpose {
+    Open,
+    Close,
+    List(RemotePath),
+    Address(RemotePath),
+    Launch(LaunchKind, RemotePath),
+    Toplevel(u64),
+    Worktrees(u64),
+    WorktreeCheck(u64, usize),
+    Status(u64, PathBuf),
+}
+
+struct BrowsePending {
+    request: BrowseEnvelope,
+    progress: BrowseReplyProgress,
+    purpose: BrowsePurpose,
+    sent: Instant,
+    data: Vec<u8>,
+    entries: Vec<DirectoryEntry>,
+    truncated: bool,
+}
+
+struct GitSequence {
+    generation: u64,
+    target: RemotePath,
+    toplevel: Option<RemotePath>,
+    worktrees: Vec<WorktreeItem>,
+    checks: usize,
+    truncated: bool,
+}
+
+/// The client side of one screen-scoped browse grant.
+pub struct RemoteBrowse {
+    identity: BrowseIdentity,
+    phase: BrowsePhase,
+    next_id: u64,
+    root: Option<RemotePath>,
+    outbox: VecDeque<BrowseEnvelope>,
+    /// Requests on the wire, at most [`MAX_IN_FLIGHT`].
+    pending: Vec<BrowsePending>,
+    /// Requests waiting for a free in-flight slot, in order.
+    queued: VecDeque<BrowsePending>,
+    git: Option<GitSequence>,
+    open_paused: bool,
+}
+
+impl std::fmt::Debug for RemoteBrowse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteBrowse")
+            .field("phase", &self.phase)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
+impl RemoteBrowse {
+    /// Start a grant with a fresh random capability; its first frame is
+    /// `BrowseOpen`.
+    pub fn open(authority: AuthorityId, epoch: u64) -> Result<Self, ProtocolError> {
+        let identity = BrowseIdentity {
+            authority,
+            grant: BrowseGrant::random()?,
+            epoch,
+        };
+        identity.validate()?;
+        let mut browse = Self {
+            identity,
+            phase: BrowsePhase::Opening,
+            next_id: 1,
+            root: None,
+            outbox: VecDeque::new(),
+            pending: Vec::new(),
+            queued: VecDeque::new(),
+            git: None,
+            open_paused: false,
+        };
+        browse.send(BrowseOperation::BrowseOpen, BrowsePurpose::Open)?;
+        Ok(browse)
+    }
+
+    pub fn identity(&self) -> &BrowseIdentity {
+        &self.identity
+    }
+
+    pub fn phase(&self) -> BrowsePhase {
+        self.phase
+    }
+
+    /// Unanswered requests: on the wire or waiting for a slot.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len() + self.queued.len()
+    }
+
+    /// Whether the current repository read listed more than
+    /// [`MAX_WORKTREES`] distinct working trees.
+    pub fn git_truncated(&self) -> bool {
+        self.git.as_ref().is_some_and(|sequence| sequence.truncated)
+    }
+
+    /// Pause the open request's [`BROWSE_TIMEOUT`] while an SSH prompt awaits
+    /// the user. Resuming gives the open request a fresh window.
+    pub fn pause_open_timeout(&mut self, paused: bool) {
+        if self.open_paused && !paused {
+            let now = Instant::now();
+            for pending in &mut self.pending {
+                if matches!(pending.purpose, BrowsePurpose::Open) {
+                    pending.sent = now;
+                }
+            }
+        }
+        self.open_paused = paused;
+    }
+
+    /// The next frame to write to the companion, in order.
+    pub fn next_frame(&mut self) -> Option<BrowseEnvelope> {
+        self.outbox.pop_front()
+    }
+
+    /// The tree root; listings outside it are stale and dropped.
+    pub fn set_root(&mut self, root: RemotePath) {
+        self.root = Some(root);
+    }
+
+    /// List the folders of `path`.
+    pub fn list(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
+        self.send(
+            BrowseOperation::BrowseList { path: path.clone() },
+            BrowsePurpose::List(path),
+        )
+    }
+
+    /// Check an address-bar path on the server.
+    pub fn check_address(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
+        self.send(
+            BrowseOperation::BrowseCheck { path: path.clone() },
+            BrowsePurpose::Address(path),
+        )
+    }
+
+    /// Revalidate the effective launch path on the server before `kind`
+    /// starts.
+    pub fn check_launch(
+        &mut self,
+        kind: LaunchKind,
+        path: RemotePath,
+    ) -> Result<u64, ProtocolError> {
+        self.send(
+            BrowseOperation::BrowseCheck { path: path.clone() },
+            BrowsePurpose::Launch(kind, path),
+        )
+    }
+
+    /// Read the git state of `target` for `generation`, superseding any
+    /// earlier read: its late replies are dropped and it issues nothing more.
+    pub fn read_git(&mut self, generation: u64, target: RemotePath) -> Result<(), ProtocolError> {
+        self.git = Some(GitSequence {
+            generation,
+            target: target.clone(),
+            toplevel: None,
+            worktrees: Vec::new(),
+            checks: 0,
+            truncated: false,
+        });
+        // Waiting reads of a superseded sequence are never sent.
+        self.queued
+            .retain(|pending| git_generation(&pending.purpose).is_none_or(|g| g == generation));
+        self.git_read(
+            target,
+            GitRead::ShowToplevel,
+            BrowsePurpose::Toplevel(generation),
+        )?;
+        Ok(())
+    }
+
+    /// End the grant with the server; pending results are dropped.
+    pub fn close(&mut self) {
+        if matches!(self.phase, BrowsePhase::Opening | BrowsePhase::Open) {
+            self.pending.clear();
+            self.queued.clear();
+            self.outbox.clear();
+            self.git = None;
+            if self
+                .send(BrowseOperation::BrowseClose, BrowsePurpose::Close)
+                .is_ok()
+            {
+                self.phase = BrowsePhase::Closing;
+            } else {
+                self.end();
+            }
+        }
+    }
+
+    /// The transport ended or the host changed: drop everything at once.
+    pub fn end(&mut self) {
+        self.phase = BrowsePhase::Ended;
+        self.pending.clear();
+        self.queued.clear();
+        self.outbox.clear();
+        self.git = None;
+    }
+
+    /// Fail every request on the wire for [`BROWSE_TIMEOUT`] at `now`, except
+    /// the open request while its timeout is paused. Waiting requests do not
+    /// age; freed slots send the next ones.
+    pub fn expire(&mut self, now: Instant) -> Vec<BrowseEvent> {
+        let mut events = Vec::new();
+        let mut index = 0;
+        while index < self.pending.len() {
+            let paused =
+                self.open_paused && matches!(self.pending[index].purpose, BrowsePurpose::Open);
+            if !paused && now.saturating_duration_since(self.pending[index].sent) >= BROWSE_TIMEOUT
+            {
+                let pending = self.pending.remove(index);
+                self.fail(pending.purpose, &mut events);
+            } else {
+                index += 1;
+            }
+        }
+        self.release();
+        events
+    }
+
+    /// Apply one reply. A reply for no pending request, or under another
+    /// grant, authority or epoch, is rejected without changing state.
+    pub fn accept(&mut self, reply: BrowseEnvelope) -> Result<Vec<BrowseEvent>, ProtocolError> {
+        let index = self
+            .pending
+            .iter()
+            .position(|pending| pending.request.request_id == reply.request_id)
+            .ok_or(ProtocolError::UnexpectedResponse)?;
+        reply.validate_reply(&self.pending[index].request)?;
+        let mut events = Vec::new();
+        let accepted = self.pending[index].progress.accept(&reply);
+        if accepted.is_err() || matches!(reply.operation, BrowseOperation::Error { .. }) {
+            let pending = self.pending.remove(index);
+            self.release();
+            self.fail(pending.purpose, &mut events);
+            return Ok(events);
+        }
+        let pending = &mut self.pending[index];
+        match &reply.operation {
+            BrowseOperation::BrowseListed {
+                entries, truncated, ..
+            } => {
+                pending.entries.extend(entries.iter().cloned());
+                pending.truncated = *truncated;
+            }
+            BrowseOperation::BrowseGitResult { data, .. } => {
+                pending.data.extend_from_slice(data.as_bytes());
+            }
+            _ => {}
+        }
+        if !pending.progress.is_done() {
+            return Ok(events);
+        }
+        let pending = self.pending.remove(index);
+        self.release();
+        self.complete(pending, &reply.operation, &mut events);
+        Ok(events)
+    }
+
+    fn send(
+        &mut self,
+        operation: BrowseOperation,
+        purpose: BrowsePurpose,
+    ) -> Result<u64, ProtocolError> {
+        let allowed = match purpose {
+            BrowsePurpose::Open => self.phase == BrowsePhase::Opening && self.next_id == 1,
+            _ => matches!(self.phase, BrowsePhase::Opening | BrowsePhase::Open),
+        };
+        if !allowed {
+            return Err(ProtocolError::UnexpectedResponse);
+        }
+        if self.queued.len() >= MAX_QUEUED_BROWSE {
+            return Err(ProtocolError::Limit);
+        }
+        let id = self.next_id;
+        let request = BrowseEnvelope::new(self.identity.clone(), id, operation);
+        let progress = BrowseReplyProgress::new(request.clone())?;
+        self.next_id += 1;
+        self.queued.push_back(BrowsePending {
+            request,
+            progress,
+            purpose,
+            sent: Instant::now(),
+            data: Vec::new(),
+            entries: Vec::new(),
+            truncated: false,
+        });
+        self.release();
+        Ok(id)
+    }
+
+    /// Move waiting requests onto the wire, in order, while fewer than
+    /// [`MAX_IN_FLIGHT`] are unanswered. At most one git read is on the wire:
+    /// the server runs them one after another, so a waiting read would
+    /// otherwise age behind slow ones. Listings and checks pass a waiting git
+    /// read. A waiting read of a superseded git sequence is dropped unsent.
+    /// The timeout starts here.
+    fn release(&mut self) {
+        let current = self.git.as_ref().map(|sequence| sequence.generation);
+        let mut git_busy = self
+            .pending
+            .iter()
+            .any(|pending| is_git_read(&pending.purpose));
+        let mut index = 0;
+        while self.pending.len() < MAX_IN_FLIGHT && index < self.queued.len() {
+            let purpose = &self.queued[index].purpose;
+            if git_generation(purpose).is_some_and(|g| Some(g) != current) {
+                self.queued.remove(index);
+                continue;
+            }
+            let git = is_git_read(purpose);
+            if git && git_busy {
+                index += 1;
+                continue;
+            }
+            git_busy |= git;
+            let Some(mut next) = self.queued.remove(index) else {
+                return;
+            };
+            next.sent = Instant::now();
+            self.outbox.push_back(next.request.clone());
+            self.pending.push(next);
+        }
+    }
+
+    fn git_read(
+        &mut self,
+        path: RemotePath,
+        command: GitRead,
+        purpose: BrowsePurpose,
+    ) -> Result<u64, ProtocolError> {
+        self.send(BrowseOperation::BrowseGitRead { path, command }, purpose)
+    }
+
+    fn current_git(&mut self, generation: u64) -> Option<&mut GitSequence> {
+        self.git
+            .as_mut()
+            .filter(|sequence| sequence.generation == generation)
+    }
+
+    fn complete(
+        &mut self,
+        pending: BrowsePending,
+        operation: &BrowseOperation,
+        events: &mut Vec<BrowseEvent>,
+    ) {
+        match pending.purpose {
+            BrowsePurpose::Open => {
+                self.phase = BrowsePhase::Open;
+                let home = match operation {
+                    BrowseOperation::BrowseOpened { home } => home.clone(),
+                    _ => None,
+                };
+                events.push(BrowseEvent::Opened { home });
+            }
+            BrowsePurpose::Close => {
+                self.end();
+                events.push(BrowseEvent::Ended);
+            }
+            BrowsePurpose::List(path) => {
+                if !self.root.as_ref().is_some_and(|root| path.is_within(root)) {
+                    return;
+                }
+                let folders = pending
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == EntryKind::Directory)
+                    .map(|entry| RemoteFolder {
+                        path: entry.path.clone(),
+                        name: crate::sanitize::sanitize_display(
+                            &String::from_utf8_lossy(remote_name(&entry.path)),
+                            255,
+                        ),
+                    })
+                    .collect();
+                events.push(BrowseEvent::Listed {
+                    path,
+                    folders,
+                    truncated: pending.truncated,
+                });
+            }
+            BrowsePurpose::Address(_) | BrowsePurpose::Launch(..) => {
+                let BrowseOperation::BrowseChecked { result, .. } = operation else {
+                    return self.fail(pending.purpose, events);
+                };
+                let result = check_result(result);
+                events.push(match pending.purpose {
+                    BrowsePurpose::Launch(kind, requested) => BrowseEvent::LaunchChecked {
+                        kind,
+                        requested,
+                        result,
+                    },
+                    BrowsePurpose::Address(requested) => {
+                        BrowseEvent::AddressChecked { requested, result }
+                    }
+                    _ => return,
+                });
+            }
+            BrowsePurpose::Toplevel(generation) => {
+                let toplevel = std::str::from_utf8(&pending.data)
+                    .ok()
+                    .map(str::trim)
+                    .and_then(|text| RemotePath::new(text.as_bytes().to_vec()).ok());
+                let Some(toplevel) = toplevel else {
+                    return self.fail(pending.purpose, events);
+                };
+                let Some(sequence) = self.current_git(generation) else {
+                    return;
+                };
+                sequence.toplevel = Some(toplevel);
+                let target = sequence.target.clone();
+                if self
+                    .git_read(
+                        target,
+                        GitRead::WorktreeList,
+                        BrowsePurpose::Worktrees(generation),
+                    )
+                    .is_err()
+                {
+                    self.fail(BrowsePurpose::Worktrees(generation), events);
+                }
+            }
+            BrowsePurpose::Worktrees(generation) => {
+                let entries = made_remote::git::parse_worktree_entries(&String::from_utf8_lossy(
+                    &pending.data,
+                ));
+                let Some(sequence) = self.current_git(generation) else {
+                    return;
+                };
+                let toplevel = sequence.toplevel.clone();
+                // Distinct paths only, at most `MAX_WORKTREES`, in list order.
+                let mut seen = HashSet::new();
+                let mut truncated = false;
+                let mut items: Vec<(WorktreeItem, Option<RemotePath>)> = Vec::new();
+                for entry in &entries {
+                    let Some(remote) = entry
+                        .path
+                        .to_str()
+                        .and_then(|text| RemotePath::new(text.as_bytes().to_vec()).ok())
+                    else {
+                        continue;
+                    };
+                    let Some(path) = remote_path_buf(&remote) else {
+                        continue;
+                    };
+                    if !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    if items.len() == MAX_WORKTREES {
+                        truncated = true;
+                        break;
+                    }
+                    items.push((
+                        WorktreeItem {
+                            path,
+                            label: entry.head_label(),
+                            missing: entry.missing,
+                            counts: CountsState::Pending,
+                        },
+                        (!entry.missing).then_some(remote),
+                    ));
+                }
+                if !items
+                    .iter()
+                    .any(|(_, remote)| remote.is_some() && *remote == toplevel)
+                {
+                    let Some(top) = toplevel.as_ref().and_then(remote_path_buf) else {
+                        return self.fail(BrowsePurpose::Toplevel(generation), events);
+                    };
+                    items = vec![(
+                        WorktreeItem {
+                            path: top,
+                            label: None,
+                            missing: false,
+                            counts: CountsState::Pending,
+                        },
+                        None,
+                    )];
+                }
+                let sequence = self.current_git(generation).expect("current sequence");
+                sequence.truncated = truncated;
+                sequence.worktrees = items.iter().map(|(item, _)| item.clone()).collect();
+                let checks: Vec<(usize, RemotePath)> = items
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, (_, remote))| Some((index, remote?)))
+                    .collect();
+                sequence.checks = checks.len();
+                if checks.is_empty() {
+                    return self.publish_git(generation, events);
+                }
+                for (index, path) in checks {
+                    if self
+                        .send(
+                            BrowseOperation::BrowseCheck { path },
+                            BrowsePurpose::WorktreeCheck(generation, index),
+                        )
+                        .is_err()
+                    {
+                        self.fail(BrowsePurpose::WorktreeCheck(generation, index), events);
+                    }
+                }
+            }
+            BrowsePurpose::WorktreeCheck(generation, _) => {
+                let usable = matches!(
+                    operation,
+                    BrowseOperation::BrowseChecked {
+                        result: DirectoryCheck::Directory { .. },
+                        ..
+                    }
+                );
+                if !usable {
+                    return self.fail(pending.purpose, events);
+                }
+                let Some(sequence) = self.current_git(generation) else {
+                    return;
+                };
+                sequence.checks = sequence.checks.saturating_sub(1);
+                if sequence.checks == 0 {
+                    self.publish_git(generation, events);
+                }
+            }
+            BrowsePurpose::Status(generation, path) => {
+                if self.current_git(generation).is_none() {
+                    return;
+                }
+                let records =
+                    made_remote::git::parse_porcelain_v1_z(&String::from_utf8_lossy(&pending.data));
+                events.push(BrowseEvent::Counts {
+                    generation,
+                    path,
+                    counts: CountsState::Ready(made_remote::git::ChangeCounts::from_records(
+                        &records,
+                    )),
+                });
+            }
+        }
+    }
+
+    fn fail(&mut self, purpose: BrowsePurpose, events: &mut Vec<BrowseEvent>) {
+        match purpose {
+            BrowsePurpose::Open | BrowsePurpose::Close => {
+                self.end();
+                events.push(BrowseEvent::Ended);
+            }
+            BrowsePurpose::List(path) => {
+                if self.root.as_ref().is_some_and(|root| path.is_within(root)) {
+                    events.push(BrowseEvent::ListFailed { path });
+                }
+            }
+            BrowsePurpose::Address(requested) => events.push(BrowseEvent::AddressChecked {
+                requested,
+                result: Err(AddressError::NotReadable),
+            }),
+            BrowsePurpose::Launch(kind, requested) => events.push(BrowseEvent::LaunchChecked {
+                kind,
+                requested,
+                result: Err(AddressError::NotReadable),
+            }),
+            BrowsePurpose::Toplevel(generation) => {
+                if self.current_git(generation).is_some() {
+                    self.git = None;
+                    events.push(BrowseEvent::Git {
+                        generation,
+                        state: GitState::NoRepository,
+                    });
+                }
+            }
+            BrowsePurpose::Worktrees(generation) => {
+                // Without a list the working tree itself is the only item.
+                let Some(top) = self
+                    .current_git(generation)
+                    .and_then(|sequence| sequence.toplevel.as_ref())
+                    .and_then(remote_path_buf)
+                else {
+                    return;
+                };
+                let sequence = self.current_git(generation).expect("current sequence");
+                sequence.worktrees = vec![WorktreeItem {
+                    path: top,
+                    label: None,
+                    missing: false,
+                    counts: CountsState::Pending,
+                }];
+                self.publish_git(generation, events);
+            }
+            BrowsePurpose::WorktreeCheck(generation, index) => {
+                let Some(sequence) = self.current_git(generation) else {
+                    return;
+                };
+                if let Some(item) = sequence.worktrees.get_mut(index) {
+                    item.missing = true;
+                }
+                sequence.checks = sequence.checks.saturating_sub(1);
+                if sequence.checks == 0 {
+                    self.publish_git(generation, events);
+                }
+            }
+            BrowsePurpose::Status(generation, path) => {
+                if self.current_git(generation).is_some() {
+                    events.push(BrowseEvent::Counts {
+                        generation,
+                        path,
+                        counts: CountsState::Failed,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Publish the repository state, then read the counts of every listed
+    /// worktree when the target is a top level with linked worktrees, else of
+    /// the working tree that contains the target.
+    fn publish_git(&mut self, generation: u64, events: &mut Vec<BrowseEvent>) {
+        let Some(sequence) = self.current_git(generation) else {
+            return;
+        };
+        let Some(toplevel) = sequence.toplevel.as_ref().and_then(remote_path_buf) else {
+            return;
+        };
+        let target = remote_path_buf(&sequence.target);
+        let worktrees = sequence.worktrees.clone();
+        let counted: Vec<PathBuf> = if Some(&toplevel) == target.as_ref() && worktrees.len() > 1 {
+            worktrees
+                .iter()
+                .filter(|item| !item.missing)
+                .map(|item| item.path.clone())
+                .collect()
+        } else {
+            vec![toplevel.clone()]
+        };
+        events.push(BrowseEvent::Git {
+            generation,
+            state: GitState::Repository {
+                toplevel,
+                worktrees,
+                counts: CountsState::Pending,
+            },
+        });
+        for path in counted {
+            let Some(remote) = path
+                .to_str()
+                .and_then(|text| RemotePath::new(text.as_bytes().to_vec()).ok())
+            else {
+                continue;
+            };
+            if self
+                .git_read(
+                    remote,
+                    GitRead::Status,
+                    BrowsePurpose::Status(generation, path.clone()),
+                )
+                .is_err()
+            {
+                self.fail(BrowsePurpose::Status(generation, path), events);
+            }
+        }
+    }
+}
+
+/// Whether a request is a git read rather than a directory check.
+fn is_git_read(purpose: &BrowsePurpose) -> bool {
+    matches!(
+        purpose,
+        BrowsePurpose::Toplevel(_) | BrowsePurpose::Worktrees(_) | BrowsePurpose::Status(..)
+    )
+}
+
+/// The git sequence a request belongs to, if any.
+fn git_generation(purpose: &BrowsePurpose) -> Option<u64> {
+    match purpose {
+        BrowsePurpose::Toplevel(generation)
+        | BrowsePurpose::Worktrees(generation)
+        | BrowsePurpose::WorktreeCheck(generation, _)
+        | BrowsePurpose::Status(generation, _) => Some(*generation),
+        _ => None,
+    }
+}
+
+fn remote_name(path: &RemotePath) -> &[u8] {
+    let bytes = path.as_bytes();
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(bytes, |index| &bytes[index + 1..])
+}
+
+fn remote_path_buf(path: &RemotePath) -> Option<PathBuf> {
+    crate::open_workspace::remote_key(path)
+}
+
+/// Pumps one [`RemoteBrowse`] over the companion's stdio stream. Every call
+/// returns at once: writes are queued by the stream and reads are polled.
+pub struct BrowseConnection<S> {
+    stream: S,
+    decoder: BrowseFrameDecoder,
+    browse: RemoteBrowse,
+    /// An encoded frame the stream refused with `WouldBlock`; written first
+    /// on the next pump.
+    unwritten: Option<Vec<u8>>,
+    end_failure: Option<SshFailureClass>,
+}
+
+impl<S: made_remote::client::ClientStream> BrowseConnection<S> {
+    /// Pump `browse` over `stream`, whose companion header is already written.
+    pub fn new(stream: S, browse: RemoteBrowse) -> Self {
+        Self {
+            stream,
+            decoder: BrowseFrameDecoder::new(),
+            browse,
+            unwritten: None,
+            end_failure: None,
+        }
+    }
+
+    /// Why the transport ended the grant, when SSH reported a failure: the
+    /// same classification as the connection test, so a changed host key is
+    /// [`SshFailureClass::ChangedHostKey`]. `None` while running and after a
+    /// plain end (close, end of stream, protocol error or timeout).
+    pub fn end_failure(&self) -> Option<SshFailureClass> {
+        self.end_failure
+    }
+
+    /// The transport's next interactive SSH prompt. While it awaits the user
+    /// the open request does not time out.
+    pub fn poll_prompt(&mut self) -> Option<PromptRequest> {
+        let prompt = self.stream.poll_prompt();
+        if prompt.is_some() {
+            self.browse.pause_open_timeout(true);
+        }
+        prompt
+    }
+
+    /// Answer (or, with `None`, cancel) prompt `id`; the open request's
+    /// timeout resumes with a fresh window.
+    pub fn answer_prompt(&mut self, id: u64, answer: Option<PromptAnswer>) -> std::io::Result<()> {
+        self.browse.pause_open_timeout(false);
+        self.stream.answer_prompt(id, answer)
+    }
+
+    pub fn browse(&self) -> &RemoteBrowse {
+        &self.browse
+    }
+
+    pub fn browse_mut(&mut self) -> &mut RemoteBrowse {
+        &mut self.browse
+    }
+
+    /// The transport, for answering its interactive SSH prompts.
+    pub fn stream_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
+    /// Write queued frames, apply the replies received so far, up to a
+    /// per-pump budget, and expire stalled requests. A frame the stream
+    /// cannot take yet is retried on the next pump. Malformed or foreign
+    /// replies are discarded; a broken stream ends the grant only.
+    pub fn pump(&mut self, now: Instant) -> Vec<BrowseEvent> {
+        let mut events = Vec::new();
+        if self.browse.phase() == BrowsePhase::Ended {
+            return events;
+        }
+        loop {
+            let bytes = match self.unwritten.take() {
+                Some(bytes) => bytes,
+                None => match self.browse.next_frame() {
+                    Some(frame) => match made_remote::protocol::encode_browse(&frame) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return self.end(events),
+                    },
+                    None => break,
+                },
+            };
+            match self.stream.write(&bytes) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.unwritten = Some(bytes);
+                    break;
+                }
+                Err(_) => return self.end(events),
+            }
+        }
+        let (mut frames, mut read) = (0, 0);
+        while frames < PUMP_FRAME_BUDGET && read < PUMP_BYTE_BUDGET {
+            let Some(event) = self.stream.poll() else {
+                break;
+            };
+            match event {
+                made_platform::ssh::SshEvent::Data(bytes) => {
+                    read += bytes.len();
+                    let mut rest = bytes.as_slice();
+                    while !rest.is_empty() {
+                        match self.decoder.push(rest) {
+                            Ok((used, frame)) => {
+                                rest = &rest[used..];
+                                if let Some(frame) = frame {
+                                    frames += 1;
+                                    if let Ok(found) = self.browse.accept(frame) {
+                                        events.extend(found);
+                                    }
+                                }
+                                if used == 0 {
+                                    break;
+                                }
+                            }
+                            Err(_) => return self.end(events),
+                        }
+                    }
+                    if self.browse.phase() == BrowsePhase::Ended {
+                        self.stream.detach();
+                        return events;
+                    }
+                }
+                made_platform::ssh::SshEvent::Failed(failure) => {
+                    self.end_failure = Some(crate::remote_session::class_from_kind(failure.kind()));
+                    return self.end(events);
+                }
+                _ => return self.end(events),
+            }
+        }
+        events.extend(self.browse.expire(now));
+        events
+    }
+
+    fn end(&mut self, mut events: Vec<BrowseEvent>) -> Vec<BrowseEvent> {
+        self.browse.end();
+        self.stream.detach();
+        events.push(BrowseEvent::Ended);
+        events
+    }
+}

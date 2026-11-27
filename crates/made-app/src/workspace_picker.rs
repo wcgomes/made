@@ -16,7 +16,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::workspace::{LaunchPlan, WorkspaceError, WorkspaceRoot, WorkspaceSource};
+use crate::workspace::{
+    LaunchPlan, WorkspaceError, WorkspaceErrorKind, WorkspaceRoot, WorkspaceSource,
+};
 
 /// One root child directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +133,39 @@ impl From<WorkspaceError> for PickerError {
         Self::Workspace(error)
     }
 }
+
+/// Why an address-bar path was not navigated to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressError {
+    /// The text is not an absolute path.
+    NotAbsolute,
+    /// Nothing exists at the path.
+    NotFound,
+    /// The folder exists but cannot be read.
+    NotReadable,
+    /// The path exists but is not a folder.
+    NotAFolder,
+}
+
+impl AddressError {
+    /// Inline reason shown below the address bar.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::NotAbsolute => "Path must be absolute",
+            Self::NotFound => "Folder not found",
+            Self::NotReadable => "Folder is not readable",
+            Self::NotAFolder => "Not a folder",
+        }
+    }
+}
+
+impl fmt::Display for AddressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl Error for AddressError {}
 
 /// Headless folder picker tree state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +473,37 @@ impl WorkspacePicker {
                 Err(error)
             }
         }
+    }
+
+    /// Re-root the picker at a typed or pasted absolute folder path.
+    ///
+    /// Surrounding whitespace and trailing separators are ignored. On success
+    /// the tree starts at the top with no expansion or selection, so the new
+    /// root is the launch target. On failure nothing changes, including the
+    /// stored error.
+    pub fn navigate_to(&mut self, text: &str) -> Result<(), AddressError> {
+        let mut text = text.trim();
+        while text.len() > 1 && text.ends_with(std::path::is_separator) {
+            // Separators are ASCII, so dropping one byte stays on a boundary.
+            let shorter = &text[..text.len() - 1];
+            if !Path::new(shorter).is_absolute() {
+                break;
+            }
+            text = shorter;
+        }
+        let path = Path::new(text);
+        if text.is_empty() || !path.is_absolute() {
+            return Err(AddressError::NotAbsolute);
+        }
+        let next = Self::new(path).map_err(|error| match error.kind() {
+            WorkspaceErrorKind::Missing => AddressError::NotFound,
+            WorkspaceErrorKind::NotADirectory => AddressError::NotAFolder,
+            WorkspaceErrorKind::Unreadable | WorkspaceErrorKind::InvalidPath => {
+                AddressError::NotReadable
+            }
+        })?;
+        *self = next;
+        Ok(())
     }
 
     /// Confirm the selected row path, or the tree root when nothing is selected.

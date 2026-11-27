@@ -602,9 +602,9 @@ fn view_directory_follow_switches_root_invalidates_preview_and_reports_source() 
             "active session: none",
             "root source: opencode",
             "view directory available: yes",
-            "plugin version: test",
+            "opencode plugin version: test",
             "opencode version: 2.1.4",
-            "protocol version: 1",
+            "opencode protocol version: 1",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
@@ -3068,7 +3068,14 @@ fn failed_plugin_install_still_starts_grok_and_records_hooks_unavailable() {
         .workspace(shell_id)
         .and_then(made_app::Workbench::terminal)
         .is_some());
-    model.begin_tui_workspace(made_app::integrations::GROK);
+    model
+        .begin_tui_workspace_in(made_app::integrations::GROK, &{
+            use made_platform::Platform;
+            made_platform::host_platform()
+                .home_dir()
+                .expect("home directory")
+        })
+        .expect("grok launches in the home folder");
     let grok_deadline = Instant::now() + Duration::from_secs(6);
     let grok_id = loop {
         model.logic(&ctx);
@@ -3245,14 +3252,20 @@ fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
     let local_id = model.active_workspace_id().expect("local tab");
 
     // The launch is immediate: no folder picker step, no SSH panel draft.
+    let slash = || RemotePath::new(b"/".to_vec()).unwrap();
     model
-        .begin_remote_grok_launch(with_grok)
+        .begin_remote_workspace_in(
+            TerminalTarget::RemoteGrok {
+                authority: with_grok,
+            },
+            slash(),
+        )
         .expect("grok ssh starts");
     let grok_id = model.active_workspace_id().expect("remote grok tab");
     assert_ne!(grok_id, local_id, "the launch opens a new tab");
     assert!(
-        !model.remote_launch_pending(),
-        "a direct Grok SSH launch must not open a folder picker draft"
+        !model.is_picker(),
+        "a direct Grok SSH launch must not open a folder picker"
     );
     assert_eq!(
         model.workspace(grok_id).unwrap().terminal_target(),
@@ -3272,7 +3285,14 @@ fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
     // An undetected server never starts a launch, locally or remotely.
     let before = model.workspace_count();
     assert!(
-        model.begin_remote_grok_launch(without_grok).is_err(),
+        model
+            .begin_remote_workspace_in(
+                TerminalTarget::RemoteGrok {
+                    authority: without_grok
+                },
+                slash(),
+            )
+            .is_err(),
         "Grok SSH must refuse a server whose probe did not detect grok"
     );
     assert_eq!(
@@ -4123,14 +4143,20 @@ fn claude_ssh_requires_detection_and_launches_remote_claude_directly() {
     model.ensure_workbench();
     let local_id = model.active_workspace_id().expect("local tab");
 
+    let slash = || made_remote::protocol::RemotePath::new(b"/".to_vec()).unwrap();
     model
-        .begin_remote_claude_launch(with_claude)
+        .begin_remote_workspace_in(
+            TerminalTarget::RemoteClaude {
+                authority: with_claude,
+            },
+            slash(),
+        )
         .expect("claude ssh starts");
     let claude_id = model.active_workspace_id().expect("remote claude tab");
     assert_ne!(claude_id, local_id, "the launch opens a new tab");
     assert!(
-        !model.remote_launch_pending(),
-        "a direct Claude Code SSH launch must not open a folder picker draft"
+        !model.is_picker(),
+        "a direct Claude Code SSH launch must not open a folder picker"
     );
     assert_eq!(
         model.workspace(claude_id).unwrap().terminal_target(),
@@ -4148,7 +4174,14 @@ fn claude_ssh_requires_detection_and_launches_remote_claude_directly() {
 
     // An undetected server never starts a launch, locally or remotely.
     let before = model.workspace_count();
-    assert!(model.begin_remote_claude_launch(without_claude).is_err());
+    assert!(model
+        .begin_remote_workspace_in(
+            TerminalTarget::RemoteClaude {
+                authority: without_claude
+            },
+            slash(),
+        )
+        .is_err());
     assert_eq!(model.workspace_count(), before);
 }
 
@@ -5258,8 +5291,8 @@ fn clicking_another_workspace_tab_keeps_terminal_ime_allowed() {
 }
 
 #[test]
-fn returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed() {
-    if isolated("returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed") {
+fn returning_from_an_open_workspace_field_to_the_terminal_keeps_ime_allowed() {
+    if isolated("returning_from_an_open_workspace_field_to_the_terminal_keeps_ime_allowed") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -5272,54 +5305,40 @@ fn returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed() {
         ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
     }
     assert!(window.window_allows, "a focused terminal allows IME");
-    let terminal_focus = model
-        .workbench()
-        .unwrap()
-        .terminal()
-        .unwrap()
-        .focus_id()
-        .expect("terminal focus id");
 
-    let ssh = ctx
-        .read_response(made_app::ui::top_action_id("ssh-servers"))
-        .expect("SSH servers action is painted")
-        .rect
-        .center();
-    ime_click(&mut model, &ctx, &mut window, ssh);
+    // The Open workspace screen's address bar and host form fields are text
+    // fields: each allows IME while focused, without the terminal purpose.
+    model.begin_new_workspace();
     for _ in 0..2 {
         ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
     }
-    let field = made_app::ui::ssh_field_id("name");
-    let field_pos = ctx
-        .read_response(field)
-        .expect("SSH name field is painted")
-        .rect
-        .center();
-    ime_click(&mut model, &ctx, &mut window, field_pos);
+    model.screen_add_host();
     for _ in 0..2 {
         ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
     }
-    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field));
-    assert!(!model.workbench().unwrap().terminal().unwrap().is_focused());
-    assert!(window.window_allows, "the focused text field allows IME");
-    assert_ne!(window.purpose, Some(egui::IMEPurpose::Terminal));
+    for field in [
+        made_app::ui::picker_path_id(),
+        made_app::ui::host_form_field_id(made_app::ssh_servers::HostField::Name),
+    ] {
+        let pos = ctx
+            .read_response(field)
+            .unwrap_or_else(|| panic!("{field:?} is painted"))
+            .rect
+            .center();
+        ime_click(&mut model, &ctx, &mut window, pos);
+        for _ in 0..2 {
+            ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+        }
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(field));
+        assert!(
+            window.window_allows,
+            "the focused field {field:?} allows IME"
+        );
+        assert_ne!(window.purpose, Some(egui::IMEPurpose::Terminal));
+    }
 
-    let dialog = ctx
-        .memory(|memory| memory.area_rect(made_app::ui::ssh_servers_window_id()))
-        .expect("SSH window rect");
-    let terminal = ctx
-        .read_response(terminal_focus)
-        .expect("terminal is painted")
-        .rect;
-    let back = [
-        terminal.left_bottom() + egui::vec2(24.0, -24.0),
-        terminal.right_bottom() + egui::vec2(-24.0, -24.0),
-        terminal.left_top() + egui::vec2(24.0, 24.0),
-    ]
-    .into_iter()
-    .find(|pos| !dialog.contains(*pos))
-    .expect("a terminal point outside the SSH window");
-    ime_click(&mut model, &ctx, &mut window, back);
+    // Back to the running workspace: the terminal composes dead keys again.
+    assert!(model.cancel_picker());
     for _ in 0..5 {
         ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
     }
@@ -5330,4 +5349,111 @@ fn returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed() {
         "dead keys need IME allowed once the terminal has focus again"
     );
     assert_eq!(window.ime_commands, 0);
+}
+
+/// SSH-01 `Failed probe or vanished executable`, second half: OpenCode was
+/// detected on the server, then disappeared before an Open workspace launch.
+/// The new tab's own launch probe finds it gone and reports a scoped error;
+/// nothing runs locally, no other program or server is substituted, and the
+/// running tab is untouched.
+#[cfg(unix)]
+#[test]
+fn a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_locally() {
+    if isolated("a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_locally")
+    {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    use made_remote::protocol::{Capabilities, RemotePath, RemoteTarget};
+    use std::os::unix::fs::PermissionsExt;
+
+    // The server's OpenSSH answers every probe: OpenCode is no longer on its PATH.
+    let bin = PathBuf::from(std::env::var_os("HOME").unwrap()).join("bin");
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nif [ \"$1\" = -V ]; then echo 'OpenSSH_9.6p1, LibreSSL 3.3.6' >&2; exit 0; fi\ncat >/dev/null &\nprintf 'MADE-PROBE-1\\nLinux\\nx86_64\\n\\n\\n\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let server = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "lab".into(),
+            host: "lab.invalid".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .unwrap();
+    let other = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "other".into(),
+            host: "other.invalid".into(),
+            user: None,
+            port: None,
+            key_file: None,
+            initial_directory: None,
+        })
+        .unwrap();
+    // Detected earlier: the launch bar offered OpenCode on this server.
+    let detected = Capabilities {
+        target: RemoteTarget::LinuxX64,
+        tmux: false,
+        opencode: true,
+        shell_cwd: false,
+        helper_version: "probe".to_owned(),
+        grok: false,
+        python3: false,
+    };
+    model.hold_ssh_probe_result(server, Ok(detected)).unwrap();
+    open(&mut model, &root);
+    let local = model.active_workspace_id().unwrap();
+
+    // The screen is open over the running tab, then OpenCode SSH is launched.
+    model.begin_new_workspace();
+    let target = TerminalTarget::RemoteOpenCode { authority: server };
+    model
+        .begin_remote_workspace_in(target, RemotePath::new(b"/srv".to_vec()).unwrap())
+        .expect("the launch starts on that server");
+    let remote = model.active_workspace_id().unwrap();
+    assert_ne!(remote, local);
+
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let detail = "OpenCode was not detected on this server. Nothing ran locally.";
+    while model.workspace(remote).unwrap().remote_detail() != Some(detail) {
+        assert!(
+            Instant::now() < deadline,
+            "no scoped failure: {:?}",
+            model.workspace(remote).unwrap().remote_detail()
+        );
+        model.logic(&ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let workbench = model.workspace(remote).unwrap();
+    assert_eq!(
+        workbench.terminal_target(),
+        target,
+        "no program substituted"
+    );
+    assert_eq!(
+        workbench.remote_authority(),
+        Some(server),
+        "no server substituted"
+    );
+    assert_ne!(workbench.remote_authority(), Some(other));
+    assert!(
+        model
+            .workspace(local)
+            .and_then(made_app::Workbench::terminal)
+            .is_some_and(made_app::TerminalPane::is_running),
+        "the other tab keeps running"
+    );
+    assert_eq!(model.workspace_count(), 2);
+    model.shutdown();
 }

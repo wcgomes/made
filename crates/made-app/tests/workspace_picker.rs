@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use made_app::workspace::{Surfaces, WorkspaceLaunch};
-use made_app::workspace_picker::{PickerError, WorkspacePicker, MAX_PICKER_ENTRIES};
+use made_app::workspace_picker::{AddressError, PickerError, WorkspacePicker, MAX_PICKER_ENTRIES};
 
 fn fixture(temp: &tempfile::TempDir) -> PathBuf {
     let root = temp.path().join("root");
@@ -421,4 +421,129 @@ fn picker_refresh_and_recreation_invalidate_ui_cache_identity() {
     assert!(picker.revision() > revision);
     let other = WorkspacePicker::new(&root).unwrap();
     assert_ne!(instance, other.instance_id());
+}
+
+// open-workspace-redesign: the address bar's `navigate_to`.
+
+#[test]
+fn navigate_to_an_absolute_folder_reroots_with_no_selection_or_expansion() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture(&temp);
+    let mut picker = WorkspacePicker::new(&root).unwrap();
+    picker.toggle(0).unwrap();
+    assert!(picker.rows()[0].expanded());
+    let alpha = canonical(root.join("alpha"));
+
+    picker.navigate_to(&alpha.to_string_lossy()).unwrap();
+    assert_eq!(picker.current_dir(), alpha.as_path());
+    assert_eq!(picker.selection(), None);
+    assert_eq!(names(&picker), vec!["nested"]);
+    assert!(picker.rows().iter().all(|row| !row.expanded()));
+    assert_eq!(
+        picker.path_target(),
+        alpha.as_path(),
+        "the root is the target"
+    );
+    assert!(picker.error().is_none());
+}
+
+#[test]
+fn navigate_to_ignores_surrounding_whitespace_and_trailing_separators() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture(&temp);
+    let nested = canonical(root.join("alpha").join("nested"));
+    for typed in [
+        format!("  {}/ ", nested.display()),
+        format!("{}//", nested.display()),
+        format!("\t{}\n", nested.display()),
+    ] {
+        let mut picker = WorkspacePicker::new(&root).unwrap();
+        picker.navigate_to(&typed).unwrap();
+        assert_eq!(picker.current_dir(), nested.as_path(), "{typed:?}");
+        assert_eq!(picker.path_target(), nested.as_path());
+    }
+    #[cfg(unix)]
+    {
+        let mut picker = WorkspacePicker::new(&root).unwrap();
+        picker.navigate_to(" / ").unwrap();
+        assert_eq!(picker.current_dir(), Path::new("/"));
+    }
+}
+
+/// Root, selection and target after an attempt, for unchanged-state checks.
+fn state(picker: &WorkspacePicker) -> (PathBuf, Option<usize>, PathBuf, Vec<String>) {
+    (
+        picker.current_dir().to_path_buf(),
+        picker.selection(),
+        picker.path_target().to_path_buf(),
+        picker
+            .rows()
+            .iter()
+            .map(|row| row.name().to_owned())
+            .collect(),
+    )
+}
+
+#[test]
+fn invalid_addresses_name_the_reason_and_keep_root_selection_and_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture(&temp);
+    let mut picker = WorkspacePicker::new(&root).unwrap();
+    picker.toggle(0).unwrap();
+    picker.select(1).unwrap();
+    let before = state(&picker);
+    let file = canonical(root.join("not-a-folder.txt"));
+    let missing = canonical(&root).join("does-not-exist");
+    let cases: Vec<(String, AddressError, &str)> = vec![
+        (
+            "Repos/made".to_owned(),
+            AddressError::NotAbsolute,
+            "Path must be absolute",
+        ),
+        (
+            "   ".to_owned(),
+            AddressError::NotAbsolute,
+            "Path must be absolute",
+        ),
+        (
+            missing.display().to_string(),
+            AddressError::NotFound,
+            "Folder not found",
+        ),
+        (
+            file.display().to_string(),
+            AddressError::NotAFolder,
+            "Not a folder",
+        ),
+    ];
+    for (typed, expected, message) in cases {
+        let error = picker.navigate_to(&typed).unwrap_err();
+        assert_eq!(error, expected, "{typed:?}");
+        assert_eq!(error.message(), message);
+        assert_eq!(state(&picker), before, "{typed:?} must not change the tree");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_address_keeps_the_tree() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture(&temp);
+    let locked = canonical(root.join("Beta"));
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("permissions are not enforced for this user; unreadable case skipped");
+        return;
+    }
+    let mut picker = WorkspacePicker::new(&root).unwrap();
+    picker.select(0).unwrap();
+    let before = state(&picker);
+    let error = picker.navigate_to(&locked.to_string_lossy()).unwrap_err();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(error, AddressError::NotReadable);
+    assert_eq!(error.message(), "Folder is not readable");
+    assert_eq!(state(&picker), before);
 }

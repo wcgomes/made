@@ -219,10 +219,10 @@ mod neutrality {
     /// changes the count and trips the pin, so a region cannot be added to
     /// hide code from the scans without this list changing in review.
     const REGION_COUNTS: &[(&str, usize)] = &[
-        ("app.rs", 10),
+        ("app.rs", 9),
         ("diagnostics.rs", 2),
         ("tui.rs", 7),
-        ("ui.rs", 10),
+        ("ui.rs", 5),
         ("workbench.rs", 23),
     ];
 
@@ -230,11 +230,11 @@ mod neutrality {
     /// markers, nested regions included). Widening a region changes the
     /// count and shows in the diff of this list.
     const EXEMPT_LINE_COUNTS: &[(&str, usize)] = &[
-        ("app.rs", 1075),
-        ("diagnostics.rs", 241),
+        ("app.rs", 773),
+        ("diagnostics.rs", 222),
         ("tui.rs", 40),
-        ("ui.rs", 286),
-        ("workbench.rs", 415),
+        ("ui.rs", 193),
+        ("workbench.rs", 410),
     ];
 
     /// Core-named items that stay outside remote-path regions, in two named
@@ -290,13 +290,6 @@ mod neutrality {
     /// verbatim. They name integrations as product copy or as a scope fact,
     /// not as session-channel vocabulary.
     const PRESERVED_PRODUCT_COPY: &[AllowedRow] = &[
-        // The restart confirmation, which lists the sessions a restart closes.
-        (
-            "ui.rs",
-            &["opencode", "grok"],
-            "including OpenCode, Grok and SSH sessions",
-            1,
-        ),
         // The scope declaration that Made starts no OpenCode server of its own.
         (
             "integration_status.rs",

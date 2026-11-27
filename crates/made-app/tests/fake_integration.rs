@@ -42,9 +42,7 @@ use made_app::integrations::{
 };
 use made_app::session_follow::{RootSource, SessionFollowCoordinator};
 use made_app::session_map::SessionActivity;
-use made_app::ui::{
-    about_integration_rows, new_tab_menu_entries, workspace_tab_summaries, TabSummary,
-};
+use made_app::ui::{about_integrations, workspace_tab_summaries, TabSummary};
 use made_app::workspace::{LaunchPlan, WorkspaceSource};
 use made_app::{TerminalTarget, Workbench};
 use made_terminal::PtyOptions;
@@ -618,7 +616,9 @@ fn empty_model(list: IntegrationList) -> AppModel {
 fn model_with_tab(list: IntegrationList, entry: Option<IntegrationRef>) -> AppModel {
     let mut model = empty_model(list);
     match entry {
-        Some(entry) => model.begin_tui_workspace(entry),
+        Some(entry) => model
+            .begin_tui_workspace_in(entry, &std::env::temp_dir())
+            .expect("the entry's tab starts"),
         None => {
             let root = std::env::temp_dir();
             open_shell(&mut model, &root);
@@ -919,26 +919,53 @@ fn no_production_source_names_the_fake() {
     );
 }
 
-// ---- Menu ----
+// ---- Launch buttons ----
+
+/// A launch showing the Open workspace screen, over a folder no other test
+/// replaces (tests here repoint the temp directory).
+fn screen_launch() -> made_app::workspace::WorkspaceLaunch {
+    made_app::workspace::WorkspaceLaunch::Picker {
+        picker: made_app::WorkspacePicker::new(env!("CARGO_MANIFEST_DIR")).unwrap(),
+        error: None,
+    }
+}
+
+/// The Open workspace screen's Local launch buttons after Terminal: the
+/// entries of the model's list that detection found, in list order.
+fn launch_entries(mut model: AppModel) -> Vec<IntegrationRef> {
+    model.logic(&egui::Context::default());
+    let entries = model
+        .open_workspace()
+        .expect("the Open workspace screen is shown")
+        .launch_buttons()
+        .into_iter()
+        .filter_map(|button| match button.kind {
+            made_app::open_workspace::LaunchKind::Tui(entry) => Some(entry),
+            made_app::open_workspace::LaunchKind::Terminal => None,
+        })
+        .collect();
+    model.shutdown();
+    entries
+}
 
 #[test]
-fn menu_rows_follow_the_list_with_and_without_detection() {
+fn launch_buttons_follow_the_list_with_and_without_detection() {
     let model = |list, found: &[IntegrationRef]| {
         AppModel::from_launch(
-            made_app::workspace::WorkspaceLaunch::waiting_for_picker(),
+            screen_launch(),
             AppOptions::new().with_compatible_tuis(found.iter().copied()),
         )
         .with_integrations(list)
     };
     // Detected: the fake's row appears, in list order, whatever order the
     // detection result had.
-    let rows = new_tab_menu_entries(&model(WITH_FAKE, &[FAKE_ENTRY, CLAUDE_CODE, OPENCODE]));
+    let rows = launch_entries(model(WITH_FAKE, &[FAKE_ENTRY, CLAUDE_CODE, OPENCODE]));
     assert_eq!(rows, [OPENCODE, CLAUDE_CODE, FAKE_ENTRY]);
     // Not detected: no row.
-    let rows = new_tab_menu_entries(&model(WITH_FAKE, &[OPENCODE, GROK, CLAUDE_CODE]));
+    let rows = launch_entries(model(WITH_FAKE, &[OPENCODE, GROK, CLAUDE_CODE]));
     assert_eq!(rows, [OPENCODE, GROK, CLAUDE_CODE]);
     // Detected but not in the list: no row.
-    let rows = new_tab_menu_entries(&model(PRODUCT, &[OPENCODE, FAKE_ENTRY]));
+    let rows = launch_entries(model(PRODUCT, &[OPENCODE, FAKE_ENTRY]));
     assert_eq!(rows, [OPENCODE]);
     let descriptor = FAKE_ENTRY.descriptor();
     assert_eq!(
@@ -955,7 +982,7 @@ fn detection_reaction_is_recorded_once_in_list_order() {
         return;
     }
     let mut model = AppModel::from_launch(
-        made_app::workspace::WorkspaceLaunch::waiting_for_picker(),
+        screen_launch(),
         AppOptions::new().with_compatible_tui_detection(),
     )
     .with_integrations(PRODUCT_AND_TWO);
@@ -973,7 +1000,8 @@ fn detection_reaction_is_recorded_once_in_list_order() {
         model.compatible_tuis(),
         [OPENCODE, GROK, CLAUDE_CODE, FAKE_ENTRY]
     );
-    assert_eq!(new_tab_menu_entries(&model), model.compatible_tuis());
+    let detected = model.compatible_tuis().to_vec();
+    assert_eq!(launch_entries(model), detected);
 }
 
 // ---- Launch ----
@@ -1427,12 +1455,15 @@ fn rows_about_report_and_markers_follow_the_list() {
         (fake.pill, fake.sentence.as_str()),
         (DiagnosticsPill::Inactive, "Fake Agent is not on PATH.")
     );
-    let about: Vec<_> = about_integration_rows(&snapshot)
+    // OpenCode is an ordinary About row first, then the declared rows.
+    let about: Vec<_> = about_integrations(&snapshot, WITH_FAKE, None)
+        .rows
         .into_iter()
-        .map(|(_, sentence)| sentence.to_owned())
+        .map(|row| row.sentence.to_owned())
         .collect();
-    assert_eq!(about.len(), 3);
-    assert_eq!(about[2], "Fake Agent is not on PATH.");
+    assert_eq!(about.len(), 4);
+    assert_eq!(about[0], "OpenCode is not running.");
+    assert_eq!(about[3], "Fake Agent is not on PATH.");
     let report = snapshot.to_text();
     let position = |needle: &str| report.find(needle).unwrap_or_else(|| panic!("{needle}"));
     assert!(position("grok status:") < position("claude status:"));
@@ -1476,11 +1507,11 @@ fn menu_and_launch_output_is_exactly_the_lists_entries() {
     let bin = std::env::join_paths([temp.path()]).unwrap();
     for list in [PRODUCT, WITH_FAKE, WITH_ABOVE, WITHOUT_CLAUDE] {
         let model = AppModel::from_launch(
-            made_app::workspace::WorkspaceLaunch::waiting_for_picker(),
+            screen_launch(),
             AppOptions::new().with_compatible_tuis(PRODUCT.iter().copied().chain([FAKE_ENTRY])),
         )
         .with_integrations(list);
-        assert_eq!(new_tab_menu_entries(&model), list, "menu");
+        assert_eq!(launch_entries(model), list, "launch buttons");
         let launched: Vec<_> = list
             .iter()
             .map(|entry| {
@@ -1566,7 +1597,10 @@ fn rows_about_report_and_markers_are_exactly_the_lists_entries() {
         let snapshot = snapshot_over(list);
         let rows: Vec<_> = snapshot.rows.iter().map(|row| row.status_key).collect();
         assert_eq!(rows, declared(list));
-        assert_eq!(about_integration_rows(&snapshot).len(), rows.len());
+        assert_eq!(
+            about_integrations(&snapshot, list, None).rows.len(),
+            rows.len() + 1
+        );
         let text = snapshot.to_text();
         for key in ["grok status", "claude status", "fake status"] {
             assert_eq!(
