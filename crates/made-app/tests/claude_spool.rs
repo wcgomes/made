@@ -53,6 +53,26 @@ fn fill_to_the_bound(spool: &Path) -> usize {
     count
 }
 
+/// Sweep until `gone_dir` is removed and return how many directories the
+/// sweeps removed, or stop at a deadline.
+///
+/// An instance simulated in this process "exits" when its `SpoolInstance` is
+/// dropped, but a sibling test that spawns a program by name forks first, and
+/// the forked child holds every open file, `owner.lock` included, until it
+/// execs. Its lock can therefore stay held for a moment after the drop, which a
+/// real exited process never does; the sweep then rightly leaves the directory
+/// for a later start. Waiting for the sweep to observe the release keeps the
+/// test about the sweep rather than about fork timing.
+fn sweep_until_removed(instance: &SpoolInstance, gone_dir: &Path) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut removed = instance.remove_stale();
+    while gone_dir.exists() && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+        removed += instance.remove_stale();
+    }
+    removed
+}
+
 #[cfg(unix)]
 #[test]
 fn spool_directory_and_file_are_private_to_the_user() {
@@ -113,7 +133,7 @@ fn startup_removes_only_spools_of_instances_that_are_gone() {
     let ours = SpoolInstance::create(temp.path()).unwrap();
     let ours_spool = ours.create_spool("tab-1").unwrap();
     let mut reader = SpoolReader::new(&ours_spool);
-    let removed = ours.remove_stale();
+    let removed = sweep_until_removed(&ours, &dead_dir);
 
     assert_eq!(removed, 1);
     assert!(!dead_dir.exists(), "the exited run's spools are removed");
@@ -131,7 +151,7 @@ fn startup_removes_only_spools_of_instances_that_are_gone() {
     // Once the second instance exits, the next startup removes it too.
     let second_dir = second.dir().to_path_buf();
     drop(second);
-    assert_eq!(ours.remove_stale(), 1);
+    assert_eq!(sweep_until_removed(&ours, &second_dir), 1);
     assert!(!second_dir.exists());
     assert!(ours.dir().exists());
 }
