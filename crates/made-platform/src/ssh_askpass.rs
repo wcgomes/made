@@ -288,7 +288,7 @@ fn publish_socket(fd: std::os::fd::RawFd, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn same_user_peer(fd: std::os::fd::RawFd) -> io::Result<()> {
+pub(crate) fn same_user_peer(fd: std::os::fd::RawFd) -> io::Result<()> {
     let peer = peer_uid(fd)?;
     if peer != current_euid() {
         return Err(io::Error::new(
@@ -389,7 +389,7 @@ pub fn run_helper(pipe: &Path, prompt: &str, output: &mut impl io::Write) -> io:
 }
 
 #[cfg(windows)]
-mod windows_pipe {
+pub(crate) mod windows_pipe {
     use super::{read_blob as decode_blob, write_blob as encode_blob, Reply};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
@@ -424,14 +424,14 @@ mod windows_pipe {
     /// `CancelIoEx` must use the same handle that issued `ConnectNamedPipe`. A
     /// duplicated handle would not wake that call, so this token stores the
     /// raw value without taking ownership or closing it.
-    pub(super) struct PipeInterrupt(RawHandle);
+    pub(crate) struct PipeInterrupt(RawHandle);
 
     // SAFETY: the token never closes or frees the handle. `CancelIoEx` on a
     // live named pipe is safe from any thread, and the broker uses this token
     // only while the serve thread still owns that pipe.
     unsafe impl Send for PipeInterrupt {}
 
-    pub(super) fn interrupt(pipe: &OwnedHandle) -> PipeInterrupt {
+    pub(crate) fn interrupt(pipe: &OwnedHandle) -> PipeInterrupt {
         PipeInterrupt(pipe.as_raw_handle())
     }
 
@@ -439,7 +439,7 @@ mod windows_pipe {
         pipe.as_raw_handle() as HANDLE
     }
 
-    pub fn create(name: &str) -> io::Result<OwnedHandle> {
+    pub(crate) fn create(name: &str) -> io::Result<OwnedHandle> {
         let wide = wide(std::ffi::OsStr::new(name));
         let sddl = wide_literal("D:P(A;;GA;;;CU)");
         let mut descriptor = std::ptr::null_mut();
@@ -486,7 +486,7 @@ mod windows_pipe {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 
-    pub fn serve(
+    pub(super) fn serve(
         owner: OwnedHandle,
         stop: std::sync::Arc<AtomicBool>,
         timeout: Duration,
@@ -572,7 +572,7 @@ mod windows_pipe {
         // `owner` drops here and is the only closer of the server pipe.
     }
 
-    pub fn cancel(pipe: &PipeInterrupt) {
+    pub(crate) fn cancel(pipe: &PipeInterrupt) {
         let handle = pipe.0 as HANDLE;
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return;
@@ -585,7 +585,7 @@ mod windows_pipe {
         }
     }
 
-    pub fn connect(path: &Path) -> io::Result<HANDLE> {
+    pub(crate) fn connect(path: &Path) -> io::Result<HANDLE> {
         let wide = wide(path.as_os_str());
         // SAFETY: the path is NUL-terminated. OPEN_EXISTING refuses to create
         // a different file. The handle is uniquely owned by the helper.
@@ -606,15 +606,15 @@ mod windows_pipe {
         Ok(handle)
     }
 
-    pub fn read_blob(handle: HANDLE, cap: usize) -> io::Result<Vec<u8>> {
+    pub(crate) fn read_blob(handle: HANDLE, cap: usize) -> io::Result<Vec<u8>> {
         decode_blob(&mut PipeIo(handle), cap)
     }
 
-    pub fn write_blob(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_blob(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
         encode_blob(&mut PipeIo(handle), bytes)
     }
 
-    pub fn close(handle: HANDLE) {
+    pub(crate) fn close(handle: HANDLE) {
         if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle);
@@ -622,7 +622,7 @@ mod windows_pipe {
         }
     }
 
-    fn same_user(pipe: HANDLE) -> bool {
+    pub(crate) fn same_user(pipe: HANDLE) -> bool {
         let mut pid = 0u32;
         // SAFETY: pipe is a connected server handle. The pid is written only
         // on success. A failed query rejects the client.

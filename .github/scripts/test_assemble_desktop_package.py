@@ -77,6 +77,7 @@ class AssembleDesktopPackageTest(unittest.TestCase):
         self.askpass_dir.mkdir()
         self.askpass = self.askpass_dir / "made-askpass"
         self.askpass.write_bytes(b"fake askpass")
+        (self.askpass_dir / "made-open").write_bytes(b"fake open")
         (self.askpass_dir / "manifest.json").write_text(
             json.dumps(
                 {
@@ -86,6 +87,11 @@ class AssembleDesktopPackageTest(unittest.TestCase):
                     "target": DESKTOP_TARGET,
                     "size": len(b"fake askpass"),
                     "sha256": digest(b"fake askpass"),
+                    "open_url": {
+                        "name": "made-open",
+                        "size": len(b"fake open"),
+                        "sha256": digest(b"fake open"),
+                    },
                 }
             )
         )
@@ -116,6 +122,15 @@ class AssembleDesktopPackageTest(unittest.TestCase):
         for name in CLAUDE_FILES:
             self.assertTrue((self.stage / name).is_file(), name)
         self.assertTrue((self.stage / "remote/manifest.json").is_file())
+        self.assertEqual((self.stage / "made-open").read_bytes(), b"fake open")
+        manifest = json.loads((self.stage / "remote/manifest.json").read_text())
+        self.assertEqual(manifest["open_url"]["name"], "made-open")
+
+    def test_missing_or_tampered_made_open_fails(self) -> None:
+        (self.askpass_dir / "made-open").write_bytes(b"tampered")
+        self.assert_refuses("made-open hash or size")
+        (self.askpass_dir / "made-open").unlink()
+        self.assert_refuses("made-open missing")
 
     def test_each_companion_set_carries_fourteen_artifacts_and_the_target_claude_hook(self) -> None:
         self.assertEqual(len(assemble.FILES), 14)

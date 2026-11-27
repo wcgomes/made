@@ -132,6 +132,12 @@ The remote private `clipboard-images` directory MUST be `0700`, PNGs `0600`, cre
 - When each remote paste chord is exercised and helper startup/upload/close/reconnect cleanup occurs
 - Then image priority and size/private-file limits hold, failed/disconnected paste sends no payload or automatic retry, only eligible app PNGs are cleaned by seven-day/64-file policy, the current image survives close, cleanup failure leaves its path usable, and no image/text bytes enter logs
 
+#### Scenario: Remote browser open requires the same user confirmation as local
+
+- Given an attached remote shell or TUI tab whose child runs `$BROWSER <url>`, as Claude Code does for its login URL
+- When the remote child asks to open an absolute `http`/`https` URL
+- Then the tab shows the same inline URL confirmation card as a local pane, labeled `from <server>`, nothing opens on the host until the user chooses Open, and Copy and Dismiss behave as they do locally
+
 ### Requirement: Remote OpenCode session and cwd follow (SSH-06)
 
 Supported remote integration MUST expose the current optional session-map data/actions, activity indicators and focus correlation within the owning remote OpenCode instance. Root precedence MUST remain active OpenCode session directory, then usable connected sessionless view directory when tabs are enabled, then latest validated remote shell cwd, then remote launch directory. Shell cwd MUST continue to be recorded while OpenCode takes precedence. Integration disconnect/normal exit/unsupported state/tabs disabled/new epoch MUST clear view-directory state and resume remote shell fallback without using the host cwd. Worktree/session changes MUST not restart terminal processes or manage worktrees. Missing or incompatible OpenCode/plugin MUST be distinguished from loss of SSH transport; optional integration failure MUST NOT by itself disable a healthy remote filesystem or terminal. Safe shell hooks MUST preserve remote user startup files and existing hooks; unsupported reporting MUST be reported honestly, never replaced by prompt scraping or injected commands in a running shell.
@@ -256,6 +262,8 @@ For Made-generated operations, the client MUST constrain requests to the authori
 
 Registration/authentication, provisioning, paste and lifecycle decisions are resolved by SSH-01/05/06/07; none authorizes removing the filesystem guards or the compromised-server limitation above.
 
+A remote child's request to open a URL in the host browser is untrusted server content and MUST NOT cause any host action by itself. The supervisor MUST set the remote child's `BROWSER` to an app-owned companion helper path in the tab's private runtime directory, preserving a pre-existing `BROWSER` as `MADE_ORIGINAL_BROWSER`, and MUST NOT change the remote user's shell or configuration files to do so. The helper MUST accept only one absolute `http`/`https` URL of at most 2048 bytes with a host and without user information, control, whitespace or bidirectional-formatting characters, and MUST exit non-zero, so the child prints the URL itself, when the tab's endpoint or token is absent or wrong, the URL is refused, or no acknowledgement arrives within 1 second. The supervisor MUST route a request only by the tab's own per-launch token, MUST forward it as one bounded `OpenUrlRequest` frame only to an attached client whose resnapshot completed, MUST coalesce a repeat and drop a different URL within about one second, and, while no client is attached, MUST refuse and drop it: no request is queued for, or replayed on, a later attach or resnapshot. The client MUST validate the frame again, accept it only under the current attach request, and present it only through the user-confirmed URL card of `specs/made-ui-ux.md`; Made MUST open the URL only after that user action, using the host opener with the URL as a single argument, and MUST NOT log the URL.
+
 #### Scenario: Unknown or changed host key
 
 - Given a never-trusted server and then a server whose trusted key has changed
@@ -291,6 +299,12 @@ Registration/authentication, provisioning, paste and lifecycle decisions are res
 - Given a remote user with Claude Code settings, installed plugins, hooks, sessions and an existing `CLAUDE_CODE_PLUGIN_DIRS`, plus a staged companion set with the Claude Code package
 - When remote Claude Code runs in remote shell and `Claude Code SSH` tabs, the listing runs, tabs close and the client reconnects
 - Then Made wrote only inside app-owned remote storage, read no file under the remote user's Claude Code home, ran no `claude` subcommand other than `claude agents --json`, persisted no change to the remote user's environment or shell startup files, and relayed no prompt, `msg`, tool or transcript content
+
+#### Scenario: Remote URL open is confirmed, bounded and never replayed
+
+- Given an attached remote tab whose child runs `$BROWSER` with a valid URL, with a `file:`, `javascript:` or custom-scheme URL, with a URL carrying user information or a bidirectional override, with a stale or foreign token, and after the client detached
+- When each request reaches the companion helper and the supervisor
+- Then only the valid request from the tab's own token reaches the attached client as one bounded frame and its helper exits 0; every other helper exits non-zero without a frame; a request made while detached is dropped and is not delivered on reattach or resnapshot; malformed or non-normalized `OpenUrlRequest` frames are rejected; and the URL appears in no diagnostics
 
 ### Requirement: Local preservation and truthful parity evidence (SSH-09)
 
@@ -507,3 +521,9 @@ Revealed About diagnostics MUST show the single Claude Code row for a remote wor
 - Given remote workspaces where claude is undetected, not running, started less than about 10 seconds ago with no live owned session, running with `--bare` for longer than the grace period, running with a live owned session and no session-level emission for longer than the grace period, and running with a live owned session and observed emissions
 - When the user reveals About diagnostics and copies the report
 - Then each row is driven by that tab's remote state with `Claude Code is not on PATH.`, `Claude Code is not running.`, `Claude Code is starting.`, `Claude Code session-status hooks are unavailable.`, `Claude Code status protocol is unavailable.` and the ready pill with `Claude Code session follow is ready.` respectively, no row mentions an interpreter, the rows stay out of routine chrome, and the copied report includes them
+
+#### Scenario: Remote Claude Code login opens only after confirmation
+
+- Given a `Claude Code SSH` tab, or claude typed in a remote shell, that starts a login and runs `$BROWSER` with its sign-in URL
+- When the request reaches the attached client
+- Then the tab shows the URL card `from <server>` with the host emphasized, the host browser opens that URL only when the user chooses Open, Copy places the URL on the host clipboard, and when the client is detached the helper fails so claude prints the URL in the terminal instead

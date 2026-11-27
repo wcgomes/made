@@ -402,14 +402,14 @@ pub struct CwdReportSink {
 /// AF_UNIX `sockaddr_un.sun_path` holds 104 bytes on macOS and 108 on Linux,
 /// terminator included. 103 is the strictest portable endpoint-path budget.
 #[cfg(unix)]
-const AF_UNIX_ENDPOINT_CHARS: usize = 103;
+pub(crate) const AF_UNIX_ENDPOINT_CHARS: usize = 103;
 
 /// Temp-root sink name for one exclusive directory. Clock nanoseconds keep
 /// the name unknowable before its creation, so a hostile local user cannot
 /// pre-create the path and displace the sink; the process-unique counter
 /// keeps concurrent attempts distinct.
 #[cfg(unix)]
-fn sink_directory_name(next: &AtomicU64) -> String {
+pub(crate) fn sink_directory_name(next: &AtomicU64) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
@@ -431,7 +431,7 @@ fn sink_directory_name(next: &AtomicU64) -> String {
 /// or its owner is encoded in the name. A crashed owner leaves one 0700
 /// directory for the OS temp cleaner.
 #[cfg(unix)]
-fn temp_root_sink_directory(name: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn temp_root_sink_directory(name: &str) -> std::io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     // SAFETY: getuid only reads the real user id.
     let uid = unsafe { libc::getuid() };

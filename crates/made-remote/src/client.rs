@@ -303,6 +303,7 @@ impl State {
                 | Operation::GrokEvent { .. }
                 | Operation::ClaudeEvent { .. }
                 | Operation::ClaudeListing { .. }
+                | Operation::OpenUrlRequest { .. }
         ) && self.attach_request == Some(frame.request_id);
         if !unsolicited_plugin
             && !self.pending.contains_key(&frame.request_id)
@@ -314,6 +315,15 @@ impl State {
         }
         match &frame.operation {
             Operation::ShellCwd { .. } => return self.deliver(frame),
+            // A URL request is never a reply and rides only the attach id.
+            Operation::OpenUrlRequest { .. } => {
+                if self.attach_request != Some(frame.request_id)
+                    || self.pending.contains_key(&frame.request_id)
+                {
+                    return Ok(());
+                }
+                return self.deliver(frame);
+            }
             Operation::Changed { path } if !self.pending.contains_key(&frame.request_id) => {
                 if !generation_current || !path.is_within(&self.root) {
                     return Ok(());

@@ -1224,3 +1224,51 @@ fn claude_frames_are_bounded_and_oversized_ones_are_rejected() {
     oversized.extend_from_slice(b"{");
     assert!(FrameDecoder::new().push(&oversized).is_err());
 }
+
+#[test]
+fn open_url_request_is_bounded_normalized_and_server_only() {
+    fn wire(payload: &[u8]) -> Vec<u8> {
+        [(payload.len() as u32).to_be_bytes().as_slice(), payload].concat()
+    }
+    let ok = frame(Operation::OpenUrlRequest {
+        url: "https://example.com/a?b=1".into(),
+    });
+    assert!(ok.validate().is_ok());
+    let bytes = encode(&ok).unwrap();
+    assert_eq!(
+        FrameDecoder::new().push(&bytes).unwrap().1,
+        Some(ok.clone())
+    );
+    assert!(!format!("{:?}", ok.operation).contains("example"));
+    let max = format!(
+        "https://e.co/{}",
+        "a".repeat(made_platform::open_url::MAX_URL_BYTES - 13)
+    );
+    for bad in [
+        String::new(),
+        "file:///etc/passwd".into(),
+        "javascript:alert(1)".into(),
+        "https://user@example.com/".into(),
+        "https://example.com/\u{202e}x".into(),
+        "https://example.com/\u{1b}[2J".into(),
+        "HTTPS://example.com/".into(),
+        format!("{max}a"),
+    ] {
+        let hostile = frame(Operation::OpenUrlRequest { url: bad });
+        assert_eq!(hostile.validate(), Err(ProtocolError::Malformed));
+        let payload = serde_json::to_vec(&hostile).unwrap();
+        assert!(FrameDecoder::new().push(&wire(&payload)).is_err());
+    }
+    assert!(frame(Operation::OpenUrlRequest { url: max })
+        .validate()
+        .is_ok());
+    // A client never sends it: it is not a request verb.
+    assert_eq!(
+        ok.validate_request(&path("/project"), None),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    assert!(serde_json::from_str::<Operation>(
+        r#"{"op":"OpenUrlRequest","data":{"url":"https://a.example/","open":true}}"#
+    )
+    .is_err());
+}

@@ -651,6 +651,8 @@ pub struct Workbench {
     remote_preview: RemotePreviewView,
     remote_explorer_cache: crate::explorer_view::RemoteExplorerCache,
     pub(crate) remote_preview_focus_pending: bool,
+    /// The pane's URL request endpoint, launch token and confirmation card.
+    url_open: crate::url_open::PaneUrlOpen,
 }
 
 impl std::fmt::Debug for Workbench {
@@ -965,6 +967,7 @@ impl Workbench {
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
+            url_open: crate::url_open::PaneUrlOpen::default(),
         };
 
         if let Some(error) = path_error {
@@ -1204,6 +1207,20 @@ impl Workbench {
             };
             configured |= entry.configures_launch(&contribution);
             contributions.push(contribution);
+        }
+        // The core BROWSER contribution comes first, so it wins over any
+        // integration's. Remote targets never receive local variables.
+        if !target.is_remote() {
+            let helper = crate::url_open::packaged_url_helper();
+            let inherited = std::env::var_os(made_platform::open_url::BROWSER_ENV);
+            contributions.insert(
+                0,
+                self.url_open.launch_contribution(
+                    self.paths.as_ref(),
+                    helper.as_deref(),
+                    inherited.as_deref(),
+                ),
+            );
         }
         (contributions, configured)
     }
@@ -1952,6 +1969,41 @@ impl Workbench {
         self.follow
             .as_ref()
             .and_then(SessionFollowCoordinator::active_session)
+    }
+
+    /// The pane's URL confirmation card, if one is showing.
+    pub fn url_card(&self) -> Option<&crate::url_open::UrlCard> {
+        self.url_open.prompt().card()
+    }
+
+    /// Apply the user's card action. Open hands the URL to the host browser;
+    /// Copy returns the text for the UI to put on the clipboard. Nothing else
+    /// ever opens a URL.
+    pub fn act_on_url_card(&mut self, action: crate::url_open::UrlCardAction) -> Option<String> {
+        match self.url_open.prompt_mut().act(action, Instant::now())? {
+            crate::url_open::UrlEffect::Open(url) => {
+                if made_platform::open_url(&url).is_err() {
+                    self.diag
+                        .log_mut()
+                        .record(LogLevel::Warn, "default browser could not be started");
+                    self.set_notice("The default browser could not be started.");
+                }
+                None
+            }
+            crate::url_open::UrlEffect::Copy(text) => {
+                self.set_notice("Link copied.");
+                Some(text)
+            }
+        }
+    }
+
+    /// Counts only: a URL never reaches diagnostics.
+    fn note_url_card(&mut self) {
+        let (shown, refused) = self.url_open.counts();
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!("URL open request awaiting confirmation ({shown} shown, {refused} refused on this tab)"),
+        );
     }
 
     /// Current task notice, if one is still fresh.
@@ -3388,6 +3440,7 @@ impl Workbench {
     }
 
     fn pump_remote_client(&mut self) {
+        let mut remote_urls = Vec::new();
         let (attach_reply, upload_replies, disconnected) =
             {
                 let Some(remote) = self.remote.as_mut() else {
@@ -3421,6 +3474,17 @@ impl Workbench {
                                 let mut identity = reply.identity;
                                 identity.generation = remote.workspace.identity().generation;
                                 let _ = remote.workspace.report_shell_cwd(&identity, path);
+                            }
+                            continue;
+                        }
+                        // A remote child's URL request: shown on this tab's
+                        // card, never opened. The companion already routed it
+                        // by the tab's token; the URL is validated again here.
+                        if let made_remote::protocol::Operation::OpenUrlRequest { url } =
+                            &reply.operation
+                        {
+                            if let Ok(url) = made_platform::open_url::validate_url(url) {
+                                remote_urls.push(url);
                             }
                             continue;
                         }
@@ -3576,6 +3640,16 @@ impl Workbench {
                     (attach_reply, upload_replies, false)
                 }
             };
+        if !remote_urls.is_empty() {
+            let server = self.remote_label().unwrap_or_default();
+            let now = Instant::now();
+            for url in remote_urls {
+                let origin = crate::url_open::UrlOrigin::Remote(server.clone());
+                if self.url_open.offer(url, origin, now) {
+                    self.note_url_card();
+                }
+            }
+        }
         if disconnected {
             self.fail_remote_transport();
             return;
@@ -4269,6 +4343,11 @@ impl Workbench {
             if update.outcome != FocusOutcome::Idle {
                 self.handle_focus_update(update);
             }
+        }
+        if self.url_open.poll(now) > 0 {
+            active = true;
+            self.last_activity = now;
+            self.note_url_card();
         }
 
         let explorer_ready = self
@@ -6143,6 +6222,7 @@ mod tests {
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
+            url_open: crate::url_open::PaneUrlOpen::default(),
         }
     }
 

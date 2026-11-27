@@ -22,6 +22,21 @@ use std::{
 };
 
 fn main() {
+    // URL helper mode: `BROWSER` names a `made-open` link to this executable
+    // because it cannot carry a mode argument. Silent: the child prints the
+    // URL itself when this exits non-zero.
+    let mut argv = std::env::args_os();
+    let invoked_as_helper = argv.next().is_some_and(|argv0| {
+        Path::new(&argv0).file_name()
+            == Some(OsStr::new(made_platform::open_url::REMOTE_HELPER_NAME))
+    });
+    if invoked_as_helper {
+        let args: Vec<OsString> = argv.collect();
+        if made_platform::open_url::run_helper(&args).is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     match run() {
         Ok(()) => {}
         // Fixed, sanitized update-required result. No path, hash or stderr is

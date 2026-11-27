@@ -3138,6 +3138,20 @@ impl Workbench {
             top += slot_height;
         }
 
+        if let Some(card) = self.url_card().cloned() {
+            let height = url_card_height(layout);
+            let card_strip = egui::Rect::from_min_size(
+                egui::pos2(card_rect.left(), top),
+                egui::vec2(card_rect.width(), height),
+            );
+            if let Some(action) = url_card_ui(ui, card_strip, layout, &card, self.pane_id()) {
+                if let Some(text) = self.act_on_url_card(action) {
+                    ui.ctx().copy_text(text);
+                }
+            }
+            top += height;
+        }
+
         let body_rect = egui::Rect::from_min_max(egui::pos2(card_rect.left(), top), card_rect.max);
         let mut body_ui = ui.new_child(
             UiBuilder::new()
@@ -4545,6 +4559,126 @@ fn tab_width(row: &SessionRow, layout: &Layout) -> f32 {
         width += 10.0;
     }
     width.clamp(112.0, if layout.compact { 184.0 } else { 220.0 })
+}
+
+pub fn url_card_action_id(pane_id: &str, action: &str) -> egui::Id {
+    egui::Id::unique(("made-url-card", pane_id, action))
+}
+
+fn url_card_height(layout: &Layout) -> f32 {
+    layout.button_height + if layout.compact { 10.0 } else { 14.0 }
+}
+
+/// The URL a terminal child asked to open, with the host emphasized, and the
+/// only controls that act on it. Open is disabled until the card is armed.
+fn url_card_ui(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    layout: &Layout,
+    card: &crate::url_open::UrlCard,
+    pane_id: &str,
+) -> Option<crate::url_open::UrlCardAction> {
+    use crate::url_open::{UrlCardAction, UrlOrigin, OPEN_ARM_DELAY};
+    ui.painter().rect_filled(rect, 0.0, theme::BG_ELEVATED);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+        CornerRadius::same(2),
+        theme::ACCENT,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.left(), rect.bottom() - 0.5),
+            egui::pos2(rect.right(), rect.bottom() - 0.5),
+        ],
+        Stroke::new(1.0, theme::BORDER_HEADER),
+    );
+    let now = std::time::Instant::now();
+    let armed = card.armed(now);
+    if !armed {
+        ui.ctx().request_repaint_after(
+            OPEN_ARM_DELAY.saturating_sub(now.saturating_duration_since(card.shown_at)),
+        );
+    }
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
+            .layout(egui::Layout::right_to_left(Align::Center)),
+    );
+    let mut action = None;
+    let dismiss = theme::ghost_action(
+        &mut row,
+        url_card_action_id(pane_id, "dismiss"),
+        "Dismiss",
+        false,
+        layout.button_height,
+        theme::BG_ELEVATED,
+    );
+    if dismiss.activated {
+        action = Some(UrlCardAction::Dismiss);
+    }
+    let copy = theme::secondary_action(
+        &mut row,
+        url_card_action_id(pane_id, "copy"),
+        "Copy",
+        layout.button_height,
+        true,
+        theme::BG_ELEVATED,
+    );
+    if copy.activated {
+        action = Some(UrlCardAction::Copy);
+    }
+    let open = theme::primary_action(
+        &mut row,
+        url_card_action_id(pane_id, "open"),
+        "Open",
+        layout.button_height,
+        armed,
+        theme::BG_ELEVATED,
+    );
+    open.response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, armed, "Open link in browser")
+    });
+    if open.activated && armed {
+        action = Some(UrlCardAction::Open);
+    }
+    let rest_chars = if layout.compact { 28 } else { 72 };
+    let host = sanitize_display(card.url.host(), 255);
+    let rest = truncate_end(&sanitize_display(card.url.rest(), 2048), rest_chars);
+    let origin = match &card.origin {
+        UrlOrigin::Local => String::new(),
+        UrlOrigin::Remote(server) => format!(" from {}", sanitize_display(server, 80)),
+    };
+    let font = FontId::proportional(10.5);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.max_width = row.available_width().max(40.0);
+    let part = |color: Color32| egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    job.append(
+        &format!("Open link{origin}?  "),
+        0.0,
+        part(theme::TEXT_TERTIARY),
+    );
+    job.append(card.url.prefix(), 0.0, part(theme::TEXT_TERTIARY));
+    job.append(
+        &host,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::proportional(11.5),
+            color: theme::TEXT_PRIMARY,
+            ..Default::default()
+        },
+    );
+    job.append(&rest, 0.0, part(theme::TEXT_TERTIARY));
+    row.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
+        ui.label(job)
+            .on_hover_text(sanitize_display(card.url.as_str(), 2048));
+    });
+    action
 }
 
 fn focus_error_strip_ui(ui: &mut Ui, rect: egui::Rect, error: &str, layout: &Layout) -> bool {

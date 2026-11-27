@@ -594,6 +594,12 @@ pub enum Operation {
     ShellCwd {
         path: RemotePath,
     },
+    /// Unsolicited, under the attach request id: a terminal child asked to
+    /// open this URL. Shown to the user for confirmation, never opened
+    /// automatically. Sent only to an attached client and never replayed.
+    OpenUrlRequest {
+        url: String,
+    },
     TerminalInput {
         data: Chunk,
     },
@@ -738,6 +744,15 @@ impl Operation {
                 snapshot.validate()?
             }
             Self::ClaudeListing { listing } => listing.validate()?,
+            // The same validator the helper and the client apply; the wire
+            // value must already be in its normalized form.
+            Self::OpenUrlRequest { url } => {
+                if !made_platform::open_url::validate_url(url)
+                    .is_ok_and(|safe| safe.as_str() == url)
+                {
+                    return Err(ProtocolError::Malformed);
+                }
+            }
             Self::UploadResult { path, .. } => {
                 if path.to_utf8()?.chars().any(char::is_control) {
                     return Err(ProtocolError::Path);

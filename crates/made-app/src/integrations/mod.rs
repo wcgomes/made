@@ -399,6 +399,29 @@ pub fn apply_contributions(contributions: &[EnvContribution], options: PtyOption
         .fold(options, |options, contribution| contribution.apply(options))
 }
 
+/// The core `BROWSER` contribution of a local shell or TUI launch. It is not an
+/// integration's: the launch applies it after every integration contribution,
+/// so it wins. With `(helper, socket, token)` the child's `BROWSER` names the
+/// URL helper, and a user `BROWSER` is kept as `MADE_ORIGINAL_BROWSER`.
+/// Without them nothing is set, the user's `BROWSER` stays, and URL routing
+/// variables inherited from an enclosing Made are removed.
+pub fn browser_contribution(
+    helper: Option<(&Path, &Path, &made_platform::open_url::UrlToken)>,
+    inherited_browser: Option<&std::ffi::OsStr>,
+) -> EnvContribution {
+    use made_platform::open_url::{browser_environment, URL_SOCKET_ENV, URL_TOKEN_ENV};
+    match helper {
+        Some((helper, socket, token)) => EnvContribution {
+            set: browser_environment(helper, socket, token, inherited_browser),
+            strip: Vec::new(),
+        },
+        None => EnvContribution {
+            set: Vec::new(),
+            strip: vec![URL_SOCKET_ENV, URL_TOKEN_ENV],
+        },
+    }
+}
+
 /// What a tab poll asks the core to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TabReport {
