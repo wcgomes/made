@@ -492,7 +492,7 @@ class ContainerSession:
             '      cwd=$(readlink "/proc/$1/cwd" 2>/dev/null || true)\n'
             '      kill "$1" 2>/dev/null || true\n'
             '      case "$cwd" in\n'
-            '        "$root"/*|/tmp/made-detach-*) rm -rf -- "$cwd" ;;\n'
+            '        "$root"/*) rm -rf -- "$cwd" ;;\n'
             '      esac\n'
             '      ;;\n'
             '  esac\n'

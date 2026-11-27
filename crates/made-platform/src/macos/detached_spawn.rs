@@ -36,11 +36,12 @@ impl DetachedChild {
     }
 }
 
-/// Start `program` (absolute) with `args`, in `cwd`, reading `stdin`.
+/// Start `program` (absolute) with `args`, in the open directory `cwd`,
+/// reading `stdin`.
 pub(crate) fn spawn_detached_child(
     program: &Path,
     args: &[OsString],
-    cwd: &Path,
+    cwd: BorrowedFd<'_>,
     stdin: BorrowedFd<'_>,
 ) -> io::Result<DetachedChild> {
     let env: Vec<(OsString, OsString)> = std::env::vars_os()
@@ -56,7 +57,10 @@ pub(crate) fn spawn_detached_child(
         default_signals: &[libc::SIGPIPE],
     };
     let mut actions = FileActions::new("detached child")?;
-    actions.chdir(cwd)?;
+    // By descriptor: the directory the caller validated, never a path that
+    // could have been replaced since. The descriptor is not dup'd onto 0-2, so
+    // POSIX_SPAWN_CLOEXEC_DEFAULT closes it at exec, after the file actions.
+    actions.fchdir(cwd.as_raw_fd())?;
     actions.dup2(stdin.as_raw_fd(), 0)?;
     actions.open(1, Path::new("/dev/null"), libc::O_WRONLY)?;
     actions.open(2, Path::new("/dev/null"), libc::O_WRONLY)?;

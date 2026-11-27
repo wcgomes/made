@@ -2,7 +2,7 @@
 //! already calls.
 //!
 //! Unix detach starts a new session, ignores `SIGHUP`, closes inherited stdio,
-//! and changes to a private runtime directory. Windows and other unsupported
+//! and changes to the caller's private runtime directory by descriptor. Windows and other unsupported
 //! families fail preflight. There is no multiplexer fallback.
 //!
 //! Companion-facing signatures, kept stable for the parallel remote runtime:
@@ -15,7 +15,9 @@
 //! - `create_private_file_new(&Path, bool) -> Result<File, _>`
 //! - `lock_private_file(&Path, Duration) -> Result<File, _>` held until drop
 //! - `read_private_file(&Path, usize) -> Result<Vec<u8>, _>`
-//! - `spawn_detached_command(&Path, &[OsString], &[u8]) -> Result<(), _>`
+//! - `spawn_detached_command(&Path, &[OsString], &[u8], &Path) -> Result<(), _>`;
+//!   the last argument is the caller's private runtime directory, the child's
+//!   cwd, which is created owner-only if missing and never removed
 //! - `exec_remote_child(&PtyRequest) -> Result<(), _>` does not return on success
 //!
 //! `exec_remote_child` requires an absolute program. A relative shell name fails
@@ -521,11 +523,18 @@ mod unix {
     use std::time::{Duration, Instant};
 
     pub(super) fn ensure_private_directory(path: &Path) -> Result<(), PlatformError> {
+        open_private_directory(path).map(drop)
+    }
+
+    /// [`ensure_private_directory`], returning the validated final directory
+    /// opened `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, so a caller can use that
+    /// directory by descriptor instead of resolving the path again.
+    pub(super) fn open_private_directory(path: &Path) -> Result<File, PlatformError> {
         let (ancestor, pending) = split_existing_ancestor(path)?;
         let mut directory = open_directory(&ancestor)?;
         if pending.is_empty() {
             publish_directory(&directory)?;
-            return Ok(());
+            return Ok(directory);
         }
         for (index, name) in pending.iter().enumerate() {
             let created = match mkdir_at(&directory, name) {
@@ -547,7 +556,7 @@ mod unix {
             }
             directory = next;
         }
-        Ok(())
+        Ok(directory)
     }
 
     pub(super) fn create_private_directory_new(path: &Path) -> Result<(), PlatformError> {
@@ -691,8 +700,21 @@ mod unix {
                 ),
             ));
         }
-        ensure_private_directory(runtime)?;
-        let runtime = runtime.to_path_buf();
+        // The child enters the validated directory by descriptor, so a path
+        // swapped after validation (for example for a symlink) is never
+        // followed. The descriptor is close-on-exec and is closed here once
+        // the spawn returns.
+        let runtime = open_private_directory(runtime)?;
+        spawn_detached_in(program, args, stdin_payload, &runtime)
+    }
+
+    /// Spawn with the cwd given as an open, validated directory.
+    pub(super) fn spawn_detached_in(
+        program: &Path,
+        args: &[OsString],
+        stdin_payload: &[u8],
+        runtime: &File,
+    ) -> Result<(), PlatformError> {
         #[cfg(target_os = "macos")]
         return spawn_detached_posix(program, args, stdin_payload, runtime);
         #[cfg(not(target_os = "macos"))]
@@ -707,13 +729,13 @@ mod unix {
         program: &Path,
         args: &[OsString],
         stdin_payload: &[u8],
-        runtime: PathBuf,
+        runtime: &File,
     ) -> Result<(), PlatformError> {
         use std::os::fd::AsFd;
 
         let spawned = std::io::pipe().and_then(|(reader, writer)| {
             let child =
-                crate::macos::spawn_detached_child(program, args, &runtime, reader.as_fd())?;
+                crate::macos::spawn_detached_child(program, args, runtime.as_fd(), reader.as_fd())?;
             Ok((child, writer))
         });
         let (child, mut stdin) = match spawned {
@@ -740,20 +762,12 @@ mod unix {
         program: &Path,
         args: &[OsString],
         stdin_payload: &[u8],
-        runtime: PathBuf,
+        runtime: &File,
     ) -> Result<(), PlatformError> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
 
-        let runtime_c = CString::new(runtime.as_os_str().as_bytes()).map_err(|_| {
-            PlatformError::io(
-                "spawn detached command",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "private runtime path is invalid",
-                ),
-            )
-        })?;
+        let runtime_fd = runtime.as_raw_fd();
         let mut command = Command::new(program);
         command
             .args(args)
@@ -763,16 +777,18 @@ mod unix {
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
         // SAFETY: the closure runs in the forked child before exec. It only
-        // calls setsid, sigaction, chdir, and close. The CString is owned and
-        // already allocated. Failure aborts the child and spawn returns that
-        // error; the runtime directory is then removed below.
+        // calls setsid, sigaction, fchdir, and close, all async-signal-safe,
+        // and allocates nothing. `runtime_fd` stays open in the parent until
+        // spawn returns, so the child inherits it; close_extra_fds closes it
+        // after the fchdir, and it is close-on-exec as well. Failure aborts
+        // the child and spawn returns that error.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 ignore_sighup()?;
-                if libc::chdir(runtime_c.as_ptr()) < 0 {
+                if libc::fchdir(runtime_fd) < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 close_extra_fds();
@@ -1070,5 +1086,55 @@ mod unix {
 
     fn invalid_io() -> io::Error {
         io::Error::new(io::ErrorKind::InvalidInput, "invalid private path")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_descriptor_tests {
+    use super::unix::{open_private_directory, spawn_detached_in};
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// The child's cwd is the directory validated by `open_private_directory`,
+    /// even when its path is renamed away and replaced before the spawn: the
+    /// child enters it by descriptor, not by path.
+    #[test]
+    fn the_child_enters_the_validated_directory_even_if_its_path_is_replaced() {
+        // A forked spawn on non-macOS hosts holds every descriptor until exec;
+        // keep it off the flock-release tests.
+        #[cfg(any(target_os = "macos", feature = "desktop"))]
+        let _fork = crate::FORK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let path = base.join("detach");
+        let validated = open_private_directory(&path).unwrap();
+        let moved = base.join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let report = base.join("cwd");
+
+        spawn_detached_in(
+            Path::new("/bin/sh"),
+            &[
+                OsString::from("-c"),
+                OsString::from(r#"pwd -P > "$1.tmp" && mv "$1.tmp" "$1""#),
+                OsString::from("sh"),
+                report.clone().into_os_string(),
+            ],
+            b"",
+            &validated,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !report.exists() {
+            assert!(Instant::now() < deadline, "detached child never reported");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let cwd = std::fs::read_to_string(&report).unwrap();
+        assert_eq!(Path::new(cwd.trim_end()), moved);
     }
 }
