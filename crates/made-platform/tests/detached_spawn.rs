@@ -6,8 +6,8 @@
 //! one-time libSystem initialization at the fork. `posix_spawn` runs none.
 //!
 //! Keep this the only test in this binary: it changes process-wide state (an
-//! atfork handler, descriptor 77, `TMUX` and `TMPDIR` in the environment) and
-//! counts every fork in the process.
+//! atfork handler, descriptor 77, `TMUX` in the environment) and counts every
+//! fork in the process.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -48,7 +48,7 @@ fn detached_child_is_spawned_without_fork_and_keeps_its_detachment() {
     let temp_root = temp.path().canonicalize().unwrap();
     // The runtime directory goes under this test's temp directory, so the run
     // leaves nothing behind.
-    std::env::set_var("TMPDIR", &temp_root);
+    let runtime = temp_root.join("detach");
     let report = temp_root.join("report");
     let script = r#"
 read -r payload
@@ -77,6 +77,7 @@ while [ ! -e "$1.release" ] && [ -e "$1" ]; do sleep 0.05; done
             report.clone().into_os_string(),
         ],
         b"made-detach-payload\n",
+        &runtime,
     )
     .expect("spawn detached child");
     assert_eq!(
@@ -109,12 +110,10 @@ while [ ! -e "$1.release" ] && [ -e "$1" ]; do sleep 0.05; done
         "unset,unset",
         "TMUX and TMUX_PANE are removed"
     );
-    assert!(
-        Path::new(&field("cwd"))
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("made-detach-")),
-        "the child runs in its private runtime directory: {output}"
+    assert_eq!(
+        Path::new(&field("cwd")),
+        runtime,
+        "the child runs in the given runtime directory"
     );
     assert_eq!(field("sighup"), "survived", "SIGHUP is ignored");
     // The child waits for the release file, so it is alive here.

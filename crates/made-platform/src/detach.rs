@@ -219,15 +219,17 @@ pub fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Platf
 ///
 /// `stdin_payload` is written to a fresh pipe and that pipe is closed. Stdout
 /// and stderr are `/dev/null`. Extra inherited descriptors are closed. The
-/// child ignores `SIGHUP` and uses a private per-user directory under the temp
-/// directory as its cwd; that directory is shared by every detached spawn of
-/// the user and is never removed, so a live child keeps its cwd and repeated
-/// spawns leave nothing behind. The caller does not wait. Windows fails
-/// preflight.
+/// child ignores `SIGHUP` and uses `runtime` as its cwd. `runtime` must be
+/// absolute and should be under app-owned per-user storage: it is created or
+/// validated with [`ensure_private_directory`] (owner-only `0700`, no symlink
+/// at the final path), shared by every detached spawn that passes it, and never
+/// removed, because a live detached child may hold it as its cwd. The caller
+/// does not wait. Windows fails preflight.
 pub fn spawn_detached_command(
     program: &Path,
     args: &[OsString],
     stdin_payload: &[u8],
+    runtime: &Path,
 ) -> Result<(), PlatformError> {
     if stdin_payload.len() > DETACH_STDIN_MAX_BYTES {
         return Err(PlatformError::io(
@@ -240,11 +242,11 @@ pub fn spawn_detached_command(
     }
     #[cfg(unix)]
     {
-        unix::spawn_detached_command(program, args, stdin_payload)
+        unix::spawn_detached_command(program, args, stdin_payload, runtime)
     }
     #[cfg(not(unix))]
     {
-        let _ = (program, args);
+        let _ = (program, args, runtime);
         Err(preflight("supervisor detach"))
     }
 }
@@ -669,6 +671,7 @@ mod unix {
         program: &Path,
         args: &[OsString],
         stdin_payload: &[u8],
+        runtime: &Path,
     ) -> Result<(), PlatformError> {
         if !program.is_absolute() {
             return Err(PlatformError::io(
@@ -679,7 +682,17 @@ mod unix {
                 ),
             ));
         }
-        let runtime = create_detach_runtime()?;
+        if !runtime.is_absolute() {
+            return Err(PlatformError::io(
+                "spawn detached command",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "detached runtime directory must be absolute",
+                ),
+            ));
+        }
+        ensure_private_directory(runtime)?;
+        let runtime = runtime.to_path_buf();
         #[cfg(target_os = "macos")]
         return spawn_detached_posix(program, args, stdin_payload, runtime);
         #[cfg(not(target_os = "macos"))]
@@ -825,23 +838,6 @@ mod unix {
             });
         }
         Err(PlatformError::io("exec remote child", command.exec()))
-    }
-
-    /// The private cwd of detached children: `made-detach-<euid>` in the temp
-    /// directory, created owner-only on first use and reused afterwards.
-    /// Nothing is written there, so one directory serves every spawn; it is
-    /// never removed, because a live detached child may be using it.
-    fn create_detach_runtime() -> Result<PathBuf, PlatformError> {
-        let parent = std::env::temp_dir();
-        if std::fs::symlink_metadata(&parent)
-            .map(|meta| meta.file_type().is_symlink() || !meta.is_dir())
-            .unwrap_or(true)
-        {
-            return Err(denied("temp directory is not a real directory"));
-        }
-        let path = parent.join(format!("made-detach-{}", current_euid()));
-        ensure_private_directory(&path)?;
-        Ok(path)
     }
 
     fn split_existing_ancestor(path: &Path) -> Result<(PathBuf, Vec<OsString>), PlatformError> {

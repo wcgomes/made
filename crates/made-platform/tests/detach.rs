@@ -254,8 +254,9 @@ fn detach_survives_parent_hangup_without_invoking_tmux() {
     );
     assert!(!tmux_marker.exists(), "detach invoked tmux");
     let cwd = std::fs::read_to_string(&cwd_file).unwrap();
-    assert!(
-        cwd.contains("made-detach-"),
+    assert_eq!(
+        Path::new(cwd.trim()),
+        temp.path().canonicalize().unwrap().join("detach"),
         "detached cwd is not the private runtime: {cwd}"
     );
     #[cfg(unix)]
@@ -297,9 +298,6 @@ fn detach_parent_role() {
     prefixed.push(path);
     path = prefixed;
     std::env::set_var("PATH", &path);
-    // The detached runtime directory goes under the test's temp directory, so
-    // the run leaves nothing behind. This role process runs one test.
-    std::env::set_var("TMPDIR", &home);
     let script = r#"
 set -eu
 read -r payload
@@ -332,6 +330,8 @@ sleep 60
             std::ffi::OsString::from(script),
         ],
         b"made-detach-payload\n",
+        // Under the test's temp directory, so the run leaves nothing behind.
+        &Path::new(&home).join("detach"),
     )
     .unwrap();
     let ready = std::env::var_os("MADE_DETACH_READY").unwrap();
@@ -398,8 +398,13 @@ fn pid_alive(pid: u32) -> bool {
 #[test]
 #[cfg(not(unix))]
 fn windows_detach_preflight_fails_without_a_multiplexer_fallback() {
-    let error =
-        spawn_detached_command(Path::new("C:\\Windows\\System32\\cmd.exe"), &[], b"").unwrap_err();
+    let error = spawn_detached_command(
+        Path::new("C:\\Windows\\System32\\cmd.exe"),
+        &[],
+        b"",
+        Path::new("C:\\"),
+    )
+    .unwrap_err();
     let text = error.to_string();
     assert!(text.contains("unsupported"), "{text}");
     assert!(text.contains("no multiplexer fallback"), "{text}");

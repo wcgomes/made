@@ -3,8 +3,7 @@
 //! and mask) afterwards, on success and on failure.
 //!
 //! Keep this the only test in this binary: it installs a process-wide
-//! `SIGHUP` handler and reads the disposition back, and points `TMPDIR` at its
-//! own temporary directory.
+//! `SIGHUP` handler and reads the disposition back.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -52,8 +51,8 @@ fn the_callers_sighup_action_is_restored_after_success_and_failure() {
 
     let temp = tempfile::tempdir().unwrap();
     // The runtime directory goes under this test's temp directory, so the run
-    // leaves nothing behind. No other test runs in this binary.
-    std::env::set_var("TMPDIR", temp.path());
+    // leaves nothing behind.
+    let runtime = temp.path().join("detach");
     let report = temp.path().join("cwd");
     spawn_detached_command(
         Path::new("/bin/sh"),
@@ -64,12 +63,13 @@ fn the_callers_sighup_action_is_restored_after_success_and_failure() {
             report.clone().into_os_string(),
         ],
         b"",
+        &runtime,
     )
     .expect("spawn /bin/sh");
     assert_eq!(sighup_action(), installed, "restored after a spawn");
 
     let missing = temp.path().join("missing-program");
-    let error = spawn_detached_command(&missing, &[], b"").expect_err("missing program");
+    let error = spawn_detached_command(&missing, &[], b"", &runtime).expect_err("missing program");
     assert!(
         error.to_string().contains("spawn detached command"),
         "{error}"

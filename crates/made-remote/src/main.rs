@@ -160,11 +160,14 @@ fn frontend() -> io::Result<()> {
             let executable = std::env::current_exe()?;
             // Real detach API. `detach` is a private module; this re-export
             // starts a new session, ignores SIGHUP, and closes inherited stdio.
-            // The open frame is the stdin payload, never argv.
+            // The open frame is the stdin payload, never argv. The supervisor's
+            // cwd is one private directory under this user's data root, shared
+            // by every supervisor and never removed.
             convert(made_platform::spawn_detached_command(
                 &executable,
                 &[OsString::from("--supervisor")],
                 &encode(&first).map_err(|_| fail())?,
+                &paths.data_dir.join("remote/detach"),
             ))?;
         }
         Operation::Attach { .. } => {}
