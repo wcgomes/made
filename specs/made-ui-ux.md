@@ -384,6 +384,28 @@ Made MUST keep the UI usable at 1280×800 and 720×480 with the documented gutte
 - When motion is unavailable or reduced
 - Then no essential status, selection, action, or error is communicated only through animation
 
+### Requirement: URL Open Confirmation Card
+
+When a terminal child of a pane asks to open a URL in the browser (by running `$BROWSER <url>`), Made MUST show the request as an inline card at the top of that pane's terminal body, inside the terminal card and below its chrome rows, and MUST NOT open anything until the user acts on the card. The card MUST show the URL sanitized for display with its scheme and path de-emphasized and its host emphasized, the full sanitized URL in a tooltip, and, for a remote tab, the label `from <server>` with the saved server's display name. It MUST offer exactly three actions: Open, which hands the URL to the host's default browser with the URL as a single argument (macOS `/usr/bin/open`, Linux `xdg-open`, Windows `ShellExecuteW`, never through a shell); Copy, which places the URL on the clipboard; and Dismiss, which removes the card. Each action removes the card. Open MUST be disabled for about 400 ms after a card appears or is replaced, so a click aimed at one URL cannot land on another. A pane MUST show at most one card; a repeat of the shown URL MUST be coalesced into it, and a different URL MUST be refused within about one second of the last card (half a second for a remote tab, whose companion already limits it), so its child prints the URL instead. Only absolute `http`/`https` URLs of at most 2048 bytes with a host and without user information, control, whitespace or bidirectional-formatting characters MUST reach the card. A request from an earlier launch of the pane or from another pane MUST be refused. A failure to start the browser MUST show a short notice. Diagnostics MUST record only counts of shown and refused requests, never a URL. The card MUST be keyboard reachable with a visible focus ring and accessible names, and MUST remain usable at 720×480.
+
+#### Scenario: A TUI login URL waits for the user
+
+- Given a local or remote pane whose TUI runs `$BROWSER https://example.com/login`
+- When the request arrives
+- Then the pane shows the card with `example.com` emphasized (labeled `from <server>` for a remote tab), no browser opens, and the TUI's helper exits successfully
+
+#### Scenario: Open, Copy and Dismiss
+
+- Given a card is showing
+- When the user chooses Open after it is armed, Copy, or Dismiss
+- Then Open starts the default browser with that URL only, Copy puts the URL on the clipboard, Dismiss opens nothing, and each removes the card; Open before the card is armed does nothing
+
+#### Scenario: Refused and coalesced requests
+
+- Given a pane showing a card
+- When the same URL arrives again, a different URL arrives within the window, a request carries a stale or foreign token, or a `file:`, `javascript:` or custom-scheme URL is requested
+- Then the repeat is coalesced into the visible card, every other request is refused so its child prints the URL, no second card appears, and diagnostics record counts only
+
 ### Requirement: Keyboard Focus and Accessibility
 
 Made MUST make every persistent interactive control keyboard reachable with a visible focus state, never relying on fill change alone. Icon-only actions MUST expose matching tooltip and accessibility-name metadata; the MADE wordmark About trigger MUST expose the matching tooltip and accessibility name `About`, or `About, update ready` while the update indicator is shown, show a visible focus ring, and open or close the About card on Enter or Space while a workspace is active. Workspace and optional session tabs MUST support keyboard entry, Left/Right movement, and Enter/Space activation; the terminal MUST remain one focus stop; the explorer tree, preview actions/return, picker, and the About card's diagnostics detail MUST remain keyboard operable. Focusing the tree before any row is selected MUST select the first visible row (fill plus primary text only, no preview). The explorer tree row/container and picker rows are a deliberate focus-outline exception: while focus moves there, it MUST be conveyed by the inset `BG_SELECTED` fill plus `TEXT_PRIMARY` text (luminance and text, not hue alone) with no outline; every other persistent control, including the wordmark trigger, the About diagnostics toggle, the picker card, and picker buttons, MUST keep its visible focus ring. The wordmark's focus cue MUST be its visible focus ring, not a fill change. The pointer-only explorer divider MUST NOT be a keyboard stop; hide/restore remains the keyboard path. Interactive targets MUST be at least 24×24, text MUST not fall below 10px, and status MUST use shape plus text plus color. Platform screen-reader exposure MUST NOT be claimed while the accesskit integration is absent.

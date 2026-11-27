@@ -193,6 +193,21 @@ def verify_askpass(path: Path, manifest_path: Path, expected_target: str) -> dic
     return {"name": path.name, "size": size, "sha256": digest}
 
 
+def verify_open_url(askpass: Path, manifest_path: Path) -> tuple[Path, dict]:
+    """The made-open URL helper staged beside askpass, as its manifest records."""
+    record = load_json(manifest_path).get("open_url")
+    if not isinstance(record, dict) or record.get("name") not in ("made-open", "made-open.exe"):
+        fail("askpass manifest has no made-open record")
+    path = askpass.parent / record["name"]
+    if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
+        fail(f"made-open missing or empty: {path}")
+    digest = sha256(path)
+    size = path.stat().st_size
+    if record.get("size") != size or record.get("sha256") != digest:
+        fail("made-open hash or size does not match its manifest")
+    return path, {"name": path.name, "size": size, "sha256": digest}
+
+
 def rehash_installed(stage: Path, target: str, expected: list[dict]) -> None:
     root = stage / "remote" / target
     for record in expected:
@@ -229,6 +244,7 @@ def main() -> None:
 
     verified = {target: verify_companion(args.companions / target, target) for target in TARGETS}
     askpass = verify_askpass(args.askpass, args.askpass_manifest, args.desktop_target)
+    open_url_source, open_url = verify_open_url(args.askpass, args.askpass_manifest)
 
     remote = stage / "remote"
     if remote.exists():
@@ -252,6 +268,14 @@ def main() -> None:
         destination_askpass.chmod(destination_askpass.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     if sha256(destination_askpass) != askpass["sha256"]:
         fail("copied askpass hash diverged")
+    destination_open_url = stage / open_url["name"]
+    if destination_open_url.exists():
+        fail(f"refusing to overwrite {destination_open_url}")
+    shutil.copy2(open_url_source, destination_open_url)
+    if not open_url["name"].endswith(".exe"):
+        destination_open_url.chmod(destination_open_url.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if sha256(destination_open_url) != open_url["sha256"]:
+        fail("copied made-open hash diverged")
 
     package_manifest = {
         "schema": 1,
@@ -260,6 +284,7 @@ def main() -> None:
         "runtime_download": "none",
         "targets": verified,
         "askpass": askpass,
+        "open_url": open_url,
     }
     manifest_path = remote / "manifest.json"
     manifest_path.write_text(json.dumps(package_manifest, indent=2) + "\n", encoding="utf-8")
@@ -270,12 +295,14 @@ def main() -> None:
         rehash_installed(stage, target, reread["targets"][target]["files"])
     if sha256(destination_askpass) != reread["askpass"]["sha256"]:
         fail("askpass diverged from the written manifest")
+    if sha256(destination_open_url) != reread["open_url"]["sha256"]:
+        fail("made-open diverged from the written manifest")
     if not plugin.is_file():
         fail("assembly removed the desktop plugin")
     if not grok_plugin.is_file():
         fail("assembly removed the shipped grok-made plugin")
     require_claude_plugin(stage, args.desktop_target, "assembly removed the shipped plugin")
-    print(f"assembled companions and {askpass['name']} into {stage}")
+    print(f"assembled companions, {askpass['name']} and {open_url['name']} into {stage}")
 
 
 if __name__ == "__main__":

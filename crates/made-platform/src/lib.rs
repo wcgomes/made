@@ -3143,6 +3143,7 @@ pub fn in_memory_clipboard() -> InMemoryClipboard {
 }
 mod detach;
 pub mod locale;
+pub mod open_url;
 mod process;
 pub mod shell_integration;
 pub mod ssh;
@@ -3154,6 +3155,7 @@ pub use detach::{
     spawn_detached_command,
 };
 pub use detach::{kill_child_and_group, kill_reaped_child_group, own_process_group};
+pub use open_url::{open_url, url_helper_file_name};
 pub use process::{process_parent, process_parent_map};
 pub use shell_integration::{
     local_cmd_prompt_cwd, local_cwd_path, ShellCwdCapability, ShellLaunchPlan,

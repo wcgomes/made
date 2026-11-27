@@ -662,7 +662,7 @@ const GOLDEN_PLUGIN_AND_SPOOL: &str = r#"== shell
 program: <platform shell>
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>", "OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -677,7 +677,7 @@ log:
 program: <bin>/opencode
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -692,7 +692,7 @@ log:
 program: <bin>/grok
 args: ["dashboard"]
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -708,7 +708,7 @@ log:
 program: <bin>/claude
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -726,7 +726,7 @@ const GOLDEN_NO_PLUGIN: &str = r#"== shell
 program: <platform shell>
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -742,7 +742,7 @@ log:
 program: <bin>/opencode
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -757,7 +757,7 @@ log:
 program: <bin>/grok
 args: ["dashboard"]
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -773,7 +773,7 @@ log:
 program: <bin>/claude
 args: []
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -792,7 +792,7 @@ const GOLDEN_PLUGIN_NO_SPOOL: &str = r#"== shell
 program: <platform shell>
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -809,7 +809,7 @@ log:
 program: <bin>/opencode
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -824,7 +824,7 @@ log:
 program: <bin>/grok
 args: ["dashboard"]
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -840,7 +840,7 @@ log:
 program: <bin>/claude
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -860,7 +860,7 @@ const GOLDEN_RETRY_PLUGIN_AND_SPOOL: &str = r#"== shell
 program: <platform shell>
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>", "OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -875,7 +875,7 @@ log:
 program: <bin>/opencode
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -890,7 +890,7 @@ log:
 program: <bin>/grok
 args: ["dashboard"]
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -905,7 +905,7 @@ log:
 program: <bin>/claude
 args: []
 set: ["CLAUDE_CODE_PLUGIN_DIRS=/user/one:/user/two:<install>/plugins/claude-code-made", "MADE_CLAUDE_SPOOL=<spool>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -922,7 +922,7 @@ const GOLDEN_RETRY_NO_PLUGIN: &str = r#"== shell
 program: <platform shell>
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -938,7 +938,7 @@ log:
 program: <bin>/opencode
 args: []
 set: ["OPENCODE_CLI_CONFIG_CONTENT=<composed configuration>"]
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -953,7 +953,7 @@ log:
 program: <bin>/grok
 args: ["dashboard"]
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)
@@ -968,7 +968,7 @@ log:
 program: <bin>/claude
 args: []
 set: []
-removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL"]
+removed: ["SHELLOPTS", "BASH_ENV", "ENV", "MADE_CLAUDE_SPOOL", "MADE_URL_SOCKET", "MADE_URL_TOKEN"]
 cwd: <home>
 log:
   info: Made <version> starting (invalid-workspace)

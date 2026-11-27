@@ -21,6 +21,7 @@ profile=debug
 for arg in "$@"; do [ "$arg" = "--release" ] && profile=release; done
 mkdir -p "target/{target}/$profile"
 printf 'fake askpass %s' "$profile" > "target/{target}/$profile/made-askpass"
+printf 'fake open %s' "$profile" > "target/{target}/$profile/made-open"
 """
 
 
@@ -62,6 +63,12 @@ class StageAskpassTest(unittest.TestCase):
         content, manifest = self.staged()
         self.assertEqual(content, "fake askpass debug")
         self.assertEqual(manifest["target"], TARGET)
+        self.assertIn("--bin made-open", self.log.read_text())
+        out = self.root / "dist" / f"ssh-askpass-{TARGET}"
+        self.assertEqual((out / "made-open").read_text(), "fake open debug")
+        self.assertEqual(manifest["open_url"]["name"], "made-open")
+        self.assertEqual(manifest["open_url"]["size"], len("fake open debug"))
+        self.assertEqual(len(manifest["open_url"]["sha256"]), 64)
 
     def test_release_profile_builds_release(self) -> None:
         result = self.stage(PROFILE="release")

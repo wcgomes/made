@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 portable-pty = "0.9"
 # Unix file modes, process-group signalling, and O_NOFOLLOW for local logs.
 libc = "0.2"
+# Per-pane URL request tokens and the Windows URL pipe name nonce.
+getrandom = "0.4"
 # Narrow window-handle contract used by the optional native backdrop.
 raw-window-handle = { version = "0.6", optional = true }
 # In-app updates (REL-06 to REL-12): Velopack's locator, startup hook,
@@ -73,11 +75,19 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [[bin]]
 name = "made-askpass"
 path = "src/bin/made-askpass.rs"
+
+# BROWSER target for terminal children: forwards one URL to the owning pane
+# for user confirmation and never opens anything itself.
+[[bin]]
+name = "made-open"
+path = "src/bin/made-open.rs"
 
 [dev-dependencies]
 tempfile = "3"

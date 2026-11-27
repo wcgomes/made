@@ -376,6 +376,17 @@ mod live {
             claude_spool: bool,
             plant: impl FnOnce(&Path),
         ) -> (Self, TcpStream) {
+            Self::start_with_env(args, claude_spool, plant, &[])
+        }
+
+        /// Like [`Self::start_with`], with `extra` added to the child launch
+        /// environment the companion composes.
+        pub fn start_with_env(
+            args: &[&str],
+            claude_spool: bool,
+            plant: impl FnOnce(&Path),
+            extra: &[(&str, &str)],
+        ) -> (Self, TcpStream) {
             let temp = tempfile::tempdir().unwrap();
             let workspace = std::fs::canonicalize(temp.path()).unwrap().join("work");
             std::fs::create_dir_all(&workspace).unwrap();
@@ -412,6 +423,7 @@ mod live {
                     made_remote::claude::spool_path(&runtime).into(),
                 )
             }))
+            .chain(extra.iter().map(|(k, v)| ((*k).into(), (*v).into())))
             .collect();
             let supervisor = Supervisor::create(
                 &first,
@@ -956,5 +968,103 @@ fn claude_state_follows_the_completing_resnapshot_and_reattach_gets_a_fresh_snap
         matches!(operation, Operation::Ack).then_some(())
     });
     session.type_text(&mut stream, 7, "kill %1\n");
+    session.close(stream);
+}
+
+#[test]
+#[cfg(unix)]
+fn browser_reaches_the_attached_client_and_is_dropped_while_detached() {
+    use made_platform::open_url::{BROWSER_ENV, ORIGINAL_BROWSER_ENV, URL_SOCKET_ENV};
+    let (mut session, mut stream) = live::Session::start_with_env(
+        &["--noprofile", "--norc"],
+        false,
+        |_| {},
+        &[(BROWSER_ENV, "firefox")],
+    );
+    let mut wire = Vec::new();
+    live::prompt_until(&mut stream, &mut wire);
+    session.type_text(
+        &mut stream,
+        2,
+        &format!(
+            "echo \"orig=${ORIGINAL_BROWSER_ENV} helper=${{BROWSER##*/}} sock=${{{URL_SOCKET_ENV}:+set}}\"\n"
+        ),
+    );
+    live::output_until(
+        &mut stream,
+        &mut wire,
+        "orig=firefox helper=made-open sock=set",
+    );
+
+    // Attached: the request reaches the client and the helper exits 0.
+    session.type_text(
+        &mut stream,
+        3,
+        "\"$BROWSER\" 'https://example.com/login?x=1'; echo \"rc=$?\"\n",
+    );
+    let url = live::frames_until(&mut stream, |operation| match operation {
+        Operation::OpenUrlRequest { url } => Some(url.clone()),
+        _ => None,
+    });
+    assert_eq!(url, "https://example.com/login?x=1");
+    live::output_until(&mut stream, &mut wire, "rc=0");
+
+    // A rejected URL never leaves the child.
+    session.type_text(
+        &mut stream,
+        4,
+        "\"$BROWSER\" 'file:///etc/passwd'; echo \"bad=$?\"\n",
+    );
+    live::output_until(&mut stream, &mut wire, "bad=1");
+
+    // Detached: the request is refused (the child falls back) and dropped.
+    let marker = session.workspace.join("detached-rc");
+    session.type_text(
+        &mut stream,
+        5,
+        &format!(
+            "sleep 1.5; \"$BROWSER\" https://example.com/while-detached; echo $? > '{}'\n",
+            marker.display()
+        ),
+    );
+    thread::sleep(Duration::from_millis(200));
+    drop(stream);
+    let limit = Instant::now() + Duration::from_secs(10);
+    let rc = loop {
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            if !text.is_empty() {
+                break text;
+            }
+        }
+        assert!(Instant::now() < limit, "the detached helper never finished");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(rc.trim(), "1", "no client attached: the helper must fail");
+
+    // Reattach: the resnapshot and what follows never replay a URL request.
+    let mut stream = session.reattach(2, 24, 80);
+    let quiet_until = Instant::now() + Duration::from_millis(1500);
+    let mut resnapshot_done = false;
+    while Instant::now() < quiet_until {
+        match made_remote::supervisor::read_envelope(&mut stream) {
+            Ok(frame) => {
+                assert!(
+                    !matches!(frame.operation, Operation::OpenUrlRequest { .. }),
+                    "a dropped URL request was replayed"
+                );
+                resnapshot_done |= matches!(
+                    frame.operation,
+                    Operation::TerminalOutput { done: true, .. }
+                );
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("attachment socket failed: {error}"),
+        }
+    }
+    assert!(resnapshot_done, "the reattach resnapshot completed");
     session.close(stream);
 }
