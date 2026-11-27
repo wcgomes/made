@@ -411,8 +411,8 @@ pub(crate) mod windows_pipe {
         EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -775,8 +775,16 @@ pub(crate) mod windows_pipe {
             }
         }
 
+        /// Wait until the peer has read everything written. The serve loops
+        /// disconnect right after a reply, and DisconnectNamedPipe discards
+        /// unread data, so the reply must be flushed first.
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            // SAFETY: the pipe handle is connected and owned by the caller.
+            if unsafe { FlushFileBuffers(self.0) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         }
     }
 
