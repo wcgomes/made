@@ -6,12 +6,12 @@
 
 <p align="center"><strong>Minimal Agentic Development Environment</strong></p>
 
-A native, terminal-first desktop workspace for developers: one window, independent live workspace tabs, and a real shell plus file explorer in every tab. Use it without an agent installed; when you run OpenCode v2 in a tab — yourself or from the `+` menu — Made follows the active session and worktree.
+A native, terminal-first desktop workspace for developers: one window, independent live workspace tabs, and a real shell plus file explorer in every tab. Use it without an agent installed; when you run OpenCode v2, Claude Code or Grok Build in a tab — yourself or from the `+` menu, locally or over SSH — Made follows the active session.
 
 ## Why Made
 
 - **Terminal-first, not agent-gated.** A shell and explorer open immediately. Made never installs, version-probes, or waits for an agent, and never starts one automatically.
-- **Your workspace follows you.** `cd` in a supported shell and the explorer follows. If OpenCode v2 is running with an active session, that session's directory and worktree take precedence; disconnect returns to the shell cwd.
+- **Your workspace follows you.** `cd` in a supported shell and the explorer follows. If OpenCode v2, Claude Code or Grok Build is running with an active session, that session's directory takes precedence (OpenCode also reports its worktree); disconnect returns to the shell cwd.
 - **Independent tabs for real work.** Each workspace tab owns its own shell, process, explorer, preview, and focus. Close one without disturbing the others.
 - **Native and fast.** Rust, `egui`, and a real PTY-backed terminal renderer. No webview.
 - **Quiet by design.** Full-height explorer, full-left read-only preview, icon-only controls, and a mint-accented, card-edge-aligned floating header over a frosted explorer that keeps the terminal readable.
@@ -20,8 +20,10 @@ A native, terminal-first desktop workspace for developers: one window, independe
 
 - **Independent live workspace tabs** — switch folders, keep every shell running, and close only what you mean to close.
 - **Shell cwd follow** — launch-local bash, zsh, fish, and PowerShell hooks with spaces and Unicode support. Real bash is verified; other shell runs are pending.
-- **Optional OpenCode session follow** — run `opencode` yourself or start it from the `+` menu; Made follows the active session directory and worktree when available.
-- **Tabs that read at a glance** — a terminal or OpenCode icon leads every workspace tab, and session dots mark busy (pulsing), idle (neutral), and attention (yellow) states without opening a tab.
+- **Optional agent session follow** — run `opencode`, `claude` or `grok` yourself, or start a detected one from the `+` menu; Made follows the active session directory (and OpenCode's worktree) when available.
+- **SSH remote workspaces** — register servers from the header, then open a remote terminal or a remote OpenCode, Grok Build or Claude Code tab with the explorer, preview and session follow on the server.
+- **Self-updating releases** — installers for Windows, macOS and Linux that check GitHub Releases and update in place (see [Updates](#updates)).
+- **Tabs that read at a glance** — a terminal or agent icon leads every workspace tab, and session dots mark busy (pulsing), idle (neutral), and attention (yellow) states without opening a tab.
 - **Full-height explorer** — hide, restore, and pointer-resize it without stopping the shell.
 - **Full-left read-only preview** — inspect a file over the still-running terminal, then return without relaunching anything.
 - **Clipboard image paste** — Cmd/Ctrl+V forwards the paste so agent TUIs read the image natively; Cmd/Ctrl+Shift+V saves it as a private PNG (7-day/64-file retention) and pastes the path as a fallback.
@@ -59,8 +61,9 @@ Maintainers: the bump-and-release procedure is in [`wiki/operations/release-ci.m
 
 - **Rust stable** via `rustup`.
 - **Linux x64 on X11 or Wayland**, **macOS arm64/x64**, or **Windows x64**.
-- **OpenCode v2** is optional. Install the native distribution for your OS if you want session follow. Made never launches it automatically; when `opencode` is on `PATH`, the `+` menu can start it in a home-directory tab.
-- **Node.js 24** is only needed for the OpenCode plugin tests.
+- **OpenCode v2** is optional. Install the native distribution for your OS if you want OpenCode session follow. Made never launches it automatically; when `opencode` is on `PATH`, the `+` menu can start it in a home-directory tab.
+- **Grok Build**, **Claude Code**, **OpenSSH** and **git** are optional. The `+` menu lists the agents it finds on `PATH`; OpenSSH is needed only for SSH workspaces.
+- **Node.js 24** is only needed for the OpenCode plugin tests; the Grok and Claude Code hooks are native and need no interpreter.
 
 ### Platform setup
 
@@ -89,7 +92,7 @@ Build with Rust from [rustup](https://rustup.rs); `rust-toolchain.toml` selects 
 
 **WSL2 with WSLg:** install the same packages inside the distribution and the window opens on the Windows desktop. GPU support depends on the WSL version and its Vulkan stack, so a machine without a usable adapter falls back to software rendering with `LIBGL_ALWAYS_SOFTWARE=1`. WSL2 is a Linux host, not a native Linux desktop, and it does not stand in for the Windows build.
 
-CI produces the Linux artifacts on Ubuntu 24.04, so building on a newer distribution links a newer glibc than older targets can run.
+Releases are built on Ubuntu 22.04 and checked against a glibc 2.35 baseline; CI development artifacts are built on Ubuntu 24.04. Building on a newer distribution links a newer glibc than older targets can run.
 
 #### macOS (arm64 or x64)
 
@@ -136,7 +139,7 @@ MADE_NATIVE_BACKDROP=off cargo run -p made-app
 
 On PowerShell, set `$env:MADE_NATIVE_BACKDROP="off"` before launching.
 
-Start `opencode` inside a tab — or choose OpenCode from the `+` menu when it is on `PATH` — when you want agent session follow.
+Start `opencode`, `claude` or `grok` inside a tab — or choose it from the `+` menu when it is on `PATH` — when you want agent session follow.
 
 ### Test
 
@@ -151,9 +154,9 @@ npm run typecheck
 
 ## Status
 
-Made is an **initial UX validation build**, not a production-ready release.
+Made is an early **0.1.x** release: installable and self-updating, but not production-ready.
 
-Automated tests and smoke checks pass in CI across the supported targets, and development artifacts are produced. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, and launching the packaged artifacts. Native macOS vibrancy and Windows 11 Acrylic (22H2+, build 22621) have not been validated interactively.
+Automated tests and smoke checks pass in CI across the supported targets, and release builds pass an installed-layout smoke on hosted runners. Interactive native desktop validation remains pending, including IME/clipboard/pointer behavior, hardware-GPU pacing, live OpenCode workflows, live SSH workspaces, and fresh-machine installs of the packaged artifacts. Native macOS vibrancy and Windows 11 Acrylic (22H2+, build 22621) have not been validated interactively.
 
 The file preview is read-only: no editing, saving, LSP, or diff view. Releases are installable and update themselves, but they are not signed or notarized.
 
@@ -162,11 +165,15 @@ The file preview is read-only: no editing, saving, LSP, or diff view. Releases a
 - `aarch64-apple-darwin` — macOS arm64
 - `x86_64-apple-darwin` — macOS x64
 - `x86_64-unknown-linux-gnu` — Linux x64 on X11 and Wayland
-- `x86_64-pc-windows-msvc` — Windows x64 with native OpenCode
+- `x86_64-pc-windows-msvc` — Windows x64 (native ConPTY; WSL-hosted OpenCode is out of scope)
 
 ## Documentation
 
 - [Made wiki](wiki/index.md)
-- [Core product spec](specs/changes/archive/20261029-opencode-session-follow-v1/)
-- [UI/UX spec](specs/changes/archive/20261029-made-ui-ux-v1/)
-- [End-to-end test checklist](tests/e2e/ux_validation.md)
+- [Core product spec](specs/opencode-session-follow.md)
+- [UI/UX spec](specs/made-ui-ux.md)
+- [Agent integration architecture](specs/agent-integration-architecture.md)
+- [SSH remote workspaces spec](specs/ssh-remote-workspaces.md)
+- [Release and auto-update spec](specs/release-distribution.md)
+- [UX validation checklist (v1)](tests/e2e/ux_validation.md)
+- [Release acceptance record](tests/e2e/release_validation.md)
