@@ -217,10 +217,19 @@ pub fn workspace_tab_stroke() -> Stroke {
 
 /// Explorer splitter fade duration in seconds.
 pub const SPLITTER_FADE_TIME: f32 = 0.14;
-/// Peak hover opacity of the splitter line/grip.
+/// Peak hover opacity of the splitter capsule.
 pub const SPLITTER_HOVER_OPACITY: f32 = 0.55;
-/// Peak drag opacity of the accent splitter line/grip.
+/// Peak drag opacity of the accent splitter capsule.
 pub const SPLITTER_DRAG_OPACITY: f32 = 0.70;
+/// Splitter pointer hit width, centered on the pane gap.
+///
+/// The 4px gap plus the 1px border of each adjacent card: wide enough to grab,
+/// and it never reaches card content such as the terminal scrollback bar, the
+/// preview scrollbar or explorer rows. egui's interact radius still grows the
+/// target when no other widget is under the pointer.
+pub const SPLITTER_HIT_WIDTH: f32 = 6.0;
+/// Size of the hover/drag capsule painted in the pane gap.
+pub const SPLITTER_CAPSULE_SIZE: egui::Vec2 = egui::vec2(2.0, 32.0);
 
 /// Splitter opacity after `progress` of the fade.
 pub fn splitter_opacity(progress: f32, dragged: bool) -> f32 {
@@ -241,14 +250,14 @@ pub fn splitter_tone(dragged: bool) -> Color32 {
     }
 }
 
-/// Splitter line/stroke color with the fade opacity baked in.
-pub fn splitter_line_color(progress: f32, dragged: bool) -> Color32 {
+/// Splitter capsule fill with the fade opacity baked in.
+pub fn splitter_capsule_color(progress: f32, dragged: bool) -> Color32 {
     splitter_tone(dragged).gamma_multiply(splitter_opacity(progress, dragged))
 }
 
-/// Splitter grip fill with the fade opacity baked in.
-pub fn splitter_grip_fill(progress: f32, dragged: bool) -> Color32 {
-    BG_ELEVATED.gamma_multiply(splitter_opacity(progress, dragged))
+/// The splitter capsule centered on `center`, the middle of the pane gap.
+pub fn splitter_capsule_rect(center: egui::Pos2) -> egui::Rect {
+    egui::Rect::from_center_size(center, SPLITTER_CAPSULE_SIZE)
 }
 
 /// The two-tone `MADE` wordmark: accent initial, primary remainder.
@@ -528,6 +537,8 @@ pub struct Layout {
     pub window_height: f32,
     pub gutter: f32,
     pub gap: f32,
+    /// Gap between the left surface and the explorer card.
+    pub pane_gap: f32,
     pub top_height: f32,
     pub card_radius: u8,
     pub card_header_height: f32,
@@ -554,7 +565,7 @@ impl Layout {
     /// Derive all metrics from the native window size.
     pub fn for_window(width: f32, height: f32) -> Self {
         let compact = width < 900.0;
-        let gutter = if compact { 8.0 } else { 10.0 };
+        let gutter = 4.0;
         let content_width = (width - 2.0 * gutter).max(1.0);
         let right_card_width = if width >= 1100.0 {
             EXPLORER_DEFAULT_WIDTH_WIDE
@@ -571,6 +582,7 @@ impl Layout {
             window_height: height,
             gutter,
             gap: if compact { 6.0 } else { 8.0 },
+            pane_gap: 4.0,
             top_height: if compact { 24.0 } else { 26.0 },
             card_radius: if compact { 8 } else { 10 },
             card_header_height: if compact { 30.0 } else { 34.0 },
@@ -597,14 +609,16 @@ impl Layout {
         (self.window_width - 2.0 * self.gutter).max(1.0)
     }
 
-    /// Top edge of the floating workspace header: one pane gap below the window.
+    /// Top edge of the floating workspace header, which is vertically
+    /// centered in the header band above the cards (6/5 above and below).
     pub fn header_top(&self) -> f32 {
-        self.gap
+        (self.content_top() - self.top_height) / 2.0
     }
 
-    /// Top edge of the main content cards: one pane gap below the header strip.
+    /// Top edge of the main content cards: the header band is one gutter, the
+    /// strip and one pane gap tall (38/34).
     pub fn content_top(&self) -> f32 {
-        self.header_top() + self.top_height + self.gap
+        self.gutter + self.top_height + self.gap
     }
 
     /// Toast inset from the bottom-right corner. There is no status bar.
@@ -628,7 +642,7 @@ impl Layout {
 
     /// Largest explorer width that leaves a usable left surface.
     pub fn explorer_max_width(&self, available_width: f32) -> f32 {
-        (available_width - self.gap - self.min_left_width()).max(EXPLORER_MIN_WIDTH)
+        (available_width - self.pane_gap - self.min_left_width()).max(EXPLORER_MIN_WIDTH)
     }
 
     /// Apply compact defaults and viewport bounds to a stored explorer width.
@@ -2162,27 +2176,32 @@ mod tests {
         assert_eq!(splitter_tone(false), BORDER_CONTROL);
         assert_eq!(splitter_tone(true), ACCENT);
 
-        let hover_line = splitter_line_color(1.0, false).to_srgba_unmultiplied();
+        let hover_line = splitter_capsule_color(1.0, false).to_srgba_unmultiplied();
         let border = BORDER_CONTROL.to_srgba_unmultiplied();
         assert!(hover_line[..3]
             .iter()
             .zip(&border[..3])
             .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
         assert!(hover_line[3] > 0 && hover_line[3] < 255);
-        let drag_line = splitter_line_color(1.0, true).to_srgba_unmultiplied();
+        let drag_line = splitter_capsule_color(1.0, true).to_srgba_unmultiplied();
         let accent = ACCENT.to_srgba_unmultiplied();
         assert!(drag_line[..3]
             .iter()
             .zip(&accent[..3])
             .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
         assert!(drag_line[3] > 0 && drag_line[3] < 255);
-        let grip = splitter_grip_fill(1.0, false).to_srgba_unmultiplied();
-        let elevated = BG_ELEVATED.to_srgba_unmultiplied();
-        assert!(grip[..3]
-            .iter()
-            .zip(&elevated[..3])
-            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1));
-        assert!(grip[3] > 0 && grip[3] < 255);
+    }
+
+    #[test]
+    fn splitter_capsule_fits_inside_the_pane_gap() {
+        for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+            let layout = Layout::for_window(width, height);
+            assert_eq!(layout.pane_gap, 4.0);
+            let capsule = splitter_capsule_rect(egui::pos2(100.0, 300.0));
+            assert_eq!(capsule.size(), egui::vec2(2.0, 32.0));
+            assert!(capsule.width() < layout.pane_gap);
+            assert!(SPLITTER_HIT_WIDTH >= layout.pane_gap + 2.0);
+        }
     }
 
     #[test]
@@ -2545,7 +2564,7 @@ mod tests {
     fn layout_switches_to_compact_below_nine_hundred() {
         let wide = Layout::for_window(1280.0, 800.0);
         assert!(!wide.compact);
-        assert_eq!(wide.gutter, 10.0);
+        assert_eq!(wide.gutter, 4.0);
         assert_eq!(wide.right_card_width, 360.0);
         assert_eq!(wide.explorer_default_width(), 360.0);
         assert!(wide.explorer_max_width(wide.content_width()) > 360.0);
@@ -2563,18 +2582,18 @@ mod tests {
         assert_eq!(wide.tab_height, 26.0);
         assert_eq!(wide.session_tab_height, 28.0);
         assert_eq!(wide.tab_strip_height, 36.0);
-        assert_eq!(wide.header_top(), 8.0);
-        assert_eq!(wide.content_top(), 42.0);
+        assert_eq!(wide.header_top(), 6.0);
+        assert_eq!(wide.content_top(), 38.0);
 
         let compact = Layout::for_window(720.0, 480.0);
         assert!(compact.compact);
-        assert_eq!(compact.gutter, 8.0);
+        assert_eq!(compact.gutter, 4.0);
         assert_eq!(compact.top_height, 24.0);
         assert_eq!(compact.tab_height, 24.0);
         assert_eq!(compact.session_tab_height, 26.0);
         assert_eq!(compact.tab_strip_height, 34.0);
-        assert_eq!(compact.header_top(), 6.0);
-        assert_eq!(compact.content_top(), 36.0);
+        assert_eq!(compact.header_top(), 5.0);
+        assert_eq!(compact.content_top(), 34.0);
         assert_eq!(compact.right_card_width, 288.0);
         assert_eq!(
             compact.explorer_width(440.0, compact.content_width()),
@@ -2598,7 +2617,7 @@ mod tests {
         let max = compact.explorer_max_width(compact.content_width());
         assert!(max >= EXPLORER_MIN_WIDTH);
         assert!(
-            compact.content_width() - compact.gap - max >= compact.min_left_width(),
+            compact.content_width() - compact.pane_gap - max >= compact.min_left_width(),
             "left surface lost its usable width"
         );
         assert_eq!(
@@ -2633,7 +2652,7 @@ mod tests {
         );
         let max = wide.explorer_max_width(wide.content_width());
         assert!(
-            wide.content_width() - wide.gap - max >= wide.min_left_width(),
+            wide.content_width() - wide.pane_gap - max >= wide.min_left_width(),
             "left surface lost its usable width"
         );
     }
