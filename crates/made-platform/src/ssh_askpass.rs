@@ -411,7 +411,8 @@ pub(crate) mod windows_pipe {
         EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -465,11 +466,14 @@ pub(crate) mod windows_pipe {
             bInheritHandle: 0,
         };
         // SAFETY: name and attributes are valid for the call. PIPE_REJECT_REMOTE_CLIENTS
-        // refuses a remote client. The returned handle is uniquely owned.
+        // refuses a remote client. FILE_FLAG_FIRST_PIPE_INSTANCE fails instead
+        // of joining a pipe someone else already created under this name (and
+        // its DACL). This is the only instance: the serve loops reuse it after
+        // DisconnectNamedPipe. The returned handle is uniquely owned.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 8192,
@@ -773,6 +777,45 @@ pub(crate) mod windows_pipe {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES;
+
+        #[test]
+        fn create_refuses_a_name_another_pipe_already_holds() {
+            let name = format!(r"\\.\pipe\made-squat-test-{}", std::process::id());
+            let wide = wide(std::ffi::OsStr::new(&name));
+            // A squatter's open pipe: default DACL, any number of instances.
+            // SAFETY: wide is NUL-terminated; null security attributes use the
+            // default descriptor. The handle is owned below.
+            let squatter = unsafe {
+                CreateNamedPipeW(
+                    wide.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                    PIPE_UNLIMITED_INSTANCES,
+                    8192,
+                    8192,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(squatter != INVALID_HANDLE_VALUE && !squatter.is_null());
+            // SAFETY: CreateNamedPipeW returned a unique live handle.
+            let squatter = unsafe { OwnedHandle::from_raw_handle(squatter as RawHandle) };
+
+            let joined = create(&name).expect_err("a taken name is not joined");
+            assert_eq!(joined.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+
+            drop(squatter);
+            let own = create(&name).expect("a free name is created");
+            assert!(create(&name).is_err(), "our own name is not joined either");
+            drop(own);
         }
     }
 }
