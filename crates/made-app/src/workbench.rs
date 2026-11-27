@@ -6216,6 +6216,8 @@ mod tests {
                 "{target:?}"
             );
             let socket = env_value(&first, "MADE_URL_SOCKET").expect("socket");
+            // A Windows endpoint is a named pipe, not a filesystem entry.
+            #[cfg(unix)]
             assert!(Path::new(&socket).exists(), "{target:?} endpoint is bound");
             // A relaunch (fallback retry or TUI replaced by its shell) gets a
             // fresh token on the same endpoint.
