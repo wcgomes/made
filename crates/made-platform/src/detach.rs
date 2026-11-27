@@ -472,11 +472,19 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
+/// Close every inheritable descriptor above stderr, in a `pre_exec` child.
+///
+/// Close-on-exec descriptors are left for `exec` to close. One of them is the
+/// pipe std uses to report an `exec` failure to the parent; closing it here
+/// made a failed `exec` look like a successful spawn. Every descriptor above 2
+/// is still gone once the new image runs.
 #[cfg(unix)]
 fn close_extra_fds() {
-    // SAFETY: sysconf(_SC_OPEN_MAX) has no pointer arguments. close on an
-    // unused descriptor returns EBADF, which is ignored. Descriptors 0, 1, and
-    // 2 are the caller's arranged stdio and are left open.
+    // SAFETY: sysconf(_SC_OPEN_MAX) has no pointer arguments, and fcntl
+    // F_GETFD and close take only a descriptor number; all three are
+    // async-signal-safe. EBADF on an unused descriptor is ignored.
+    // Descriptors 0, 1, and 2 are the caller's arranged stdio and are left
+    // open.
     let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
     let max = if !(3..=1024).contains(&max) {
         256
@@ -485,7 +493,10 @@ fn close_extra_fds() {
     };
     for fd in 3..max {
         unsafe {
-            libc::close(fd);
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
         }
     }
 }
@@ -777,11 +788,11 @@ mod unix {
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
         // SAFETY: the closure runs in the forked child before exec. It only
-        // calls setsid, sigaction, fchdir, and close, all async-signal-safe,
-        // and allocates nothing. `runtime_fd` stays open in the parent until
-        // spawn returns, so the child inherits it; close_extra_fds closes it
-        // after the fchdir, and it is close-on-exec as well. Failure aborts
-        // the child and spawn returns that error.
+        // calls setsid, sigaction, fchdir, fcntl, and close, all
+        // async-signal-safe, and allocates nothing. `runtime_fd` stays open in
+        // the parent until spawn returns, so the child inherits it; it is
+        // close-on-exec, so exec closes it after the fchdir. Failure, including
+        // a failed exec, is reported back and spawn returns that error.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() < 0 {
