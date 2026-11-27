@@ -265,21 +265,13 @@ pub fn wordmark_job() -> LayoutJob {
     job
 }
 
-fn wordmark_cache_id(ctx: &egui::Context) -> egui::Id {
-    egui::Id::unique(("made-wordmark-galley", ctx.pixels_per_point().to_bits()))
-}
-
-/// Cached wordmark galley. The cache is keyed by pixels-per-point so a DPI
-/// change cannot leave a stale layout behind.
+/// Wordmark galley from egui's galley cache.
+///
+/// Galleys hold UVs into the font atlas, so the layout is not cached here:
+/// egui's cache is keyed by pixels-per-point and cleared whenever the atlas
+/// is rebuilt (text-option change or atlas full), which a manual cache misses.
 pub fn wordmark_galley(ui: &Ui) -> Arc<egui::Galley> {
-    let ctx = ui.ctx();
-    let id = wordmark_cache_id(ctx);
-    if let Some(galley) = ctx.data(|data| data.get_temp::<Arc<egui::Galley>>(id)) {
-        return galley;
-    }
-    let galley = ui.painter().layout_job(wordmark_job());
-    ctx.data_mut(|data| data.insert_temp(id, galley.clone()));
-    galley
+    ui.painter().layout_job(wordmark_job())
 }
 
 /// Width of the cached wordmark without painting it.
@@ -2439,6 +2431,34 @@ mod tests {
             first.as_ref().unwrap(),
             second.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn wordmark_galley_is_relaid_after_the_atlas_rebuilds() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let input = || egui::RawInput {
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        // Pass 1 lays the wordmark out against the default-curve atlas and
+        // switches to the low-DPI curve; pass 2 starts on a rebuilt atlas.
+        let mut galleys = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                sync_text_color_transfer(ui.ctx());
+                galleys.push(wordmark_galley(ui));
+            });
+            output.textures_delta.clear();
+        }
+        assert!(!std::sync::Arc::ptr_eq(&galleys[0], &galleys[1]));
     }
 
     #[test]
