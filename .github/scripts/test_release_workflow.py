@@ -126,6 +126,21 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for job in self.upgrade["jobs"].values():
             self.assertNotIn("write", str(job.get("permissions", {})))
 
+    def test_the_app_icon_reaches_every_platform_package(self) -> None:
+        build_steps = {step.get("name"): step.get("run", "") for step in steps(self.release["jobs"]["build"])}
+        icons = "crates/made-app/assets/app-icon"
+        compose = build_steps["Compose the macOS bundle"]
+        self.assertIn(f"--icon {icons}/made-icon.icns", compose)
+        pack = build_steps["Pack with Velopack"]
+        self.assertIn(f"icons={icons}\n", pack)
+        pack = pack.replace("$icons", icons)
+        cases = {os: line for os, line in re.findall(r"^\s*(Windows|Linux)\) (.*) ;;$", pack, re.MULTILINE)}
+        self.assertIn(f'--icon "{icons}/made-icon.ico"', cases["Windows"])
+        self.assertIn(f'--icon "{icons}/made-icon-512.png"', cases["Linux"])
+        repo = WORKFLOWS.parents[1]
+        for icon in re.findall(r'--icon "?([^\s")]+)', "\n".join([compose, *cases.values()])):
+            self.assertTrue((repo / icon).is_file(), f"missing icon asset {icon}")
+
     def test_no_release_build_enables_the_test_only_update_seam(self) -> None:
         for name in ("release.yml", "upgrade-check.yml", "ci-ssh-remote.yml"):
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
