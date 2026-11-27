@@ -53,6 +53,24 @@ fn main() {
             target.display()
         )
     });
+
+    embed_windows_icon(&manifest_dir);
+}
+
+/// Embeds `assets/app-icon/made-icon.ico` as the Windows icon resource of
+/// `made-app.exe`, which is what Velopack's Start menu and desktop shortcuts
+/// and Explorer show. The icon is only compiled for Windows targets; a missing
+/// resource compiler fails the build rather than shipping a generic exe icon.
+fn embed_windows_icon(manifest_dir: &Path) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let icon = manifest_dir.join("assets/app-icon/made-icon.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
+    println!("cargo:rerun-if-changed=made-app.rc");
+    embed_resource::compile("made-app.rc", embed_resource::NONE)
+        .manifest_required()
+        .unwrap_or_else(|error| panic!("windows exe icon: {error}"));
 }
 
 /// Case folding shared with the runtime resolver. `str::to_lowercase` does not
