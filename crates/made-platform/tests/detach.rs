@@ -297,6 +297,9 @@ fn detach_parent_role() {
     prefixed.push(path);
     path = prefixed;
     std::env::set_var("PATH", &path);
+    // The detached runtime directory goes under the test's temp directory, so
+    // the run leaves nothing behind. This role process runs one test.
+    std::env::set_var("TMPDIR", &home);
     let script = r#"
 set -eu
 read -r payload

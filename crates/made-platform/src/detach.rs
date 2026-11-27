@@ -219,8 +219,11 @@ pub fn read_private_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Platf
 ///
 /// `stdin_payload` is written to a fresh pipe and that pipe is closed. Stdout
 /// and stderr are `/dev/null`. Extra inherited descriptors are closed. The
-/// child ignores `SIGHUP` and uses a new private directory as its cwd. The
-/// caller does not wait. Windows fails preflight.
+/// child ignores `SIGHUP` and uses a private per-user directory under the temp
+/// directory as its cwd; that directory is shared by every detached spawn of
+/// the user and is never removed, so a live child keeps its cwd and repeated
+/// spawns leave nothing behind. The caller does not wait. Windows fails
+/// preflight.
 pub fn spawn_detached_command(
     program: &Path,
     args: &[OsString],
@@ -513,7 +516,6 @@ mod unix {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     pub(super) fn ensure_private_directory(path: &Path) -> Result<(), PlatformError> {
@@ -704,7 +706,6 @@ mod unix {
         let (child, mut stdin) = match spawned {
             Ok(spawned) => spawned,
             Err(error) => {
-                let _ = std::fs::remove_dir(&runtime);
                 return Err(PlatformError::io("spawn detached command", error));
             }
         };
@@ -713,7 +714,6 @@ mod unix {
         if let Err(error) = write_result {
             signal_process_group(child.id(), libc::SIGKILL);
             child.wait();
-            let _ = std::fs::remove_dir(&runtime);
             return Err(PlatformError::io("write detached stdin", error));
         }
         // The child is in a new session. Reap it only if it exits while this
@@ -769,7 +769,6 @@ mod unix {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let _ = std::fs::remove_dir(&runtime);
                 return Err(PlatformError::io("spawn detached command", error));
             }
         };
@@ -785,7 +784,6 @@ mod unix {
             signal_process_group(child.id(), libc::SIGKILL);
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_dir(&runtime);
             return Err(PlatformError::io("write detached stdin", error));
         }
         // The child is in a new session. Reap it only if it exits while this
@@ -829,8 +827,11 @@ mod unix {
         Err(PlatformError::io("exec remote child", command.exec()))
     }
 
+    /// The private cwd of detached children: `made-detach-<euid>` in the temp
+    /// directory, created owner-only on first use and reused afterwards.
+    /// Nothing is written there, so one directory serves every spawn; it is
+    /// never removed, because a live detached child may be using it.
     fn create_detach_runtime() -> Result<PathBuf, PlatformError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         let parent = std::env::temp_dir();
         if std::fs::symlink_metadata(&parent)
             .map(|meta| meta.file_type().is_symlink() || !meta.is_dir())
@@ -838,33 +839,8 @@ mod unix {
         {
             return Err(denied("temp directory is not a real directory"));
         }
-        let name = format!(
-            "made-detach-{}-{}-{}",
-            current_euid(),
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = parent.join(name);
-        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            PlatformError::io(
-                "create private runtime",
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "private runtime path is invalid",
-                ),
-            )
-        })?;
-        // SAFETY: c_path is a NUL-terminated owned path. mkdir creates only the
-        // final component and does not follow it if it already exists.
-        let rc = unsafe { libc::mkdir(c_path.as_ptr(), 0o700) };
-        if rc != 0 {
-            return Err(PlatformError::io(
-                "create private runtime",
-                io::Error::last_os_error(),
-            ));
-        }
-        let file = open_directory(&path)?;
-        publish_directory(&file)?;
+        let path = parent.join(format!("made-detach-{}", current_euid()));
+        ensure_private_directory(&path)?;
         Ok(path)
     }
 
