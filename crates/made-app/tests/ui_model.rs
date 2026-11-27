@@ -52,6 +52,20 @@ fn egui_win_does_not_swallow_terminal_clipboard_keys() {
 }
 
 #[test]
+fn native_window_carries_the_embedded_app_icon() {
+    let icon = made_app::app::app_icon();
+    assert!(
+        icon.width > 0 && icon.height > 0,
+        "embedded icon must decode"
+    );
+    assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    assert!(
+        made_app::native_options().viewport.icon.is_some(),
+        "the viewport must set Made's icon instead of eframe's default"
+    );
+}
+
+#[test]
 fn app_model_without_a_workspace_opens_the_default_home_not_the_picker() {
     let mut model = AppModel::new(
         LaunchArgs {

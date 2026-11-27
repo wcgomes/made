@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compose the macOS Made.app from an assembled desktop stage (probe 1.3).
 
-Usage: compose-macos-bundle.py --stage DIR --bundle OUT/Made.app --version X.Y.Z
+Usage: compose-macos-bundle.py --stage DIR --bundle OUT/Made.app --version X.Y.Z --icon Made.icns
 
 Velopack packs a prebuilt `.app` as is. Mach-O executables (`made-app`,
 `made-askpass`, `made-open`) go to `Contents/MacOS`; everything else (plugins, LICENSE,
@@ -10,6 +10,8 @@ because files that are not Mach-O lose their code signature in Velopack's
 update package when they live in `Contents/MacOS`. `Contents/MacOS/remote` is a
 relative symlink to `../Resources/remote`, so companions still resolve beside
 the executable while `AppPaths` resolves plugins from `Contents/Resources`.
+`vpk pack --icon` is ignored for a prebuilt `.app`, so the `.icns` is installed
+here as `Contents/Resources/Made.icns` and named by `CFBundleIconFile`.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from pathlib import Path
 
 EXECUTABLES = ("made-app", "made-askpass", "made-open")
 BUNDLE_ID = "io.github.wcgomes.made"
+ICON_NAME = "Made"
 
 
 def fail(message: str) -> None:
@@ -37,6 +40,7 @@ def info_plist(version: str) -> str:
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
   <key>CFBundleExecutable</key><string>made-app</string>
+  <key>CFBundleIconFile</key><string>{ICON_NAME}</string>
   <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Made</string>
@@ -51,9 +55,11 @@ def info_plist(version: str) -> str:
 """
 
 
-def compose(stage: Path, bundle: Path, version: str) -> None:
+def compose(stage: Path, bundle: Path, version: str, icon: Path) -> None:
     if bundle.exists():
         fail(f"refusing to overwrite {bundle}")
+    if not icon.is_file():
+        fail(f"icon {icon} is not a file")
     for name in EXECUTABLES:
         if not (stage / name).is_file():
             fail(f"stage is missing {name}")
@@ -71,6 +77,7 @@ def compose(stage: Path, bundle: Path, version: str) -> None:
     if not (resources / "remote").is_dir():
         fail("stage has no remote/ companion tree")
     os.symlink("../Resources/remote", macos / "remote")
+    shutil.copy2(icon, resources / f"{ICON_NAME}.icns")
     for path in [macos / name for name in EXECUTABLES] + list((resources / "remote").rglob("made-remote")) + list(
         (resources / "remote").rglob("made-grok-status")
     ) + list((resources / "plugins").rglob("made-grok-status")):
@@ -86,8 +93,9 @@ def main() -> int:
     parser.add_argument("--stage", type=Path, required=True)
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--icon", type=Path, required=True)
     args = parser.parse_args()
-    compose(args.stage, args.bundle, args.version)
+    compose(args.stage, args.bundle, args.version, args.icon)
     return 0
 
 

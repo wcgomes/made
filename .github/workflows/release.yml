@@ -191,7 +191,7 @@ jobs:
 
       - name: Compose the macOS bundle
         if: runner.os == 'macOS'
-        run: python3 .github/scripts/compose-macos-bundle.py --stage dist/stage --bundle dist/Made.app --version "$VERSION"
+        run: python3 .github/scripts/compose-macos-bundle.py --stage dist/stage --bundle dist/Made.app --version "$VERSION" --icon crates/made-app/assets/app-icon/made-icon.icns
 
       - name: Pack with Velopack
         shell: bash
@@ -199,10 +199,13 @@ jobs:
           set -euo pipefail
           args=(pack --packId Made --packVersion "$VERSION" --packTitle Made --packAuthors Made
                 --mainExe "made-app$EXE" --channel "$CHANNEL" --outputDir dist/vpk --delta None --yes)
+          icons=crates/made-app/assets/app-icon
           case "$RUNNER_OS" in
+            # A prebuilt .app keeps its own icon: vpk ignores --icon here, so
+            # compose-macos-bundle.py installs Made.icns inside the bundle.
             macOS) args+=(--packDir dist/Made.app --signAppIdentity -) ;;
-            Windows) args+=(--packDir dist/stage --noPortable) ;;
-            Linux) args+=(--packDir dist/stage --categories Development) ;;
+            Windows) args+=(--packDir dist/stage --noPortable --icon "$icons/made-icon.ico") ;;
+            Linux) args+=(--packDir dist/stage --categories Development --icon "$icons/made-icon-512.png") ;;
           esac
           vpk "${args[@]}"
 

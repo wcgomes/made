@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_platform::native_backdrop::NativeBackdropStatus;
-use made_platform::Platform;
+use made_platform::{Platform, PlatformFamily};
 
 use crate::cli::LaunchArgs;
 use crate::integrations::{
@@ -31,6 +31,21 @@ use crate::workspace::{
 };
 use crate::{APP_NAME, APP_VERSION};
 
+/// The window and Dock icon, embedded at build time.
+///
+/// eframe sets it at runtime, which on macOS replaces the bundle's `.icns`, so
+/// macOS gets the artwork inset to Apple's icon grid; other platforms get the
+/// full-bleed tile. An undecodable PNG yields eframe's "no icon" value.
+pub fn app_icon() -> egui::IconData {
+    const MACOS_PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-macos-512.png");
+    const FULL_BLEED_PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-256.png");
+    let png = match PlatformFamily::current() {
+        PlatformFamily::MacOs => MACOS_PNG,
+        PlatformFamily::Linux | PlatformFamily::Windows => FULL_BLEED_PNG,
+    };
+    eframe::icon_data::from_png_bytes(png).unwrap_or_default()
+}
+
 /// Native window options shared by the binary and tests.
 ///
 /// `clipboard_shortcuts` must stay disabled: egui-winit otherwise consumes
@@ -39,6 +54,7 @@ pub fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Made")
+            .with_icon(app_icon())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([720.0, 480.0])
             .with_transparent(theme::TRANSLUCENT_WINDOW),

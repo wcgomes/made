@@ -65,6 +65,15 @@ Every release, including one that only ships companion changes, must bump the ve
 
 If the gate refuses the tag, read its message, fix the sites with the bump script (through a pull request) or choose a higher version, then delete the refused tag locally and remotely (`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`) before tagging again. Never re-tag a version that was published.
 
+### App icon
+
+The source of truth is `crates/made-app/assets/app-icon/made-icon.svg`: a dark full-bleed window tile with a mint `>_` prompt, a mint asterisk spark for the agent, and a dark-green explorer sidebar on the right. `scripts/gen-app-icon.py` regenerates `made-icon.ico` (16–256), `made-icon.icns`, `made-icon-512.png`, `made-icon-256.png` and `made-icon-macos-512.png`; it needs local headless Chrome and Pillow, and its output is byte-reproducible. `.github/scripts/test_release_workflow.py` asserts the icon wiring for all three platforms.
+
+- **macOS:** Velopack ignores `vpk pack --icon` when `--packDir` is a prebuilt `.app`, so `.github/scripts/compose-macos-bundle.py --icon` owns the bundle icon: it copies `Contents/Resources/Made.icns` and sets `CFBundleIconFile=Made`. eframe's runtime icon (`with_icon` in `app.rs`) overrides the bundle icon in the Dock, so the embedded macOS PNG must itself follow Apple's icon grid (824px body inside 1024).
+- **Windows:** `vpk --icon` must be a `.ico` and covers only `Setup.exe` and `Update.exe`. `made-app.exe` gets its icon (the one shortcuts show) from `build.rs` through `embed-resource` and `made-app.rc`, gated on `CARGO_CFG_TARGET_OS=windows`; a missing rc compiler fails the Windows build on purpose. The Windows target cannot be cross-checked from macOS (`ring` needs MSVC).
+- **Linux:** `vpk --icon` takes the 512 PNG, which is copied into the AppImage. On Wayland the compositor ignores the window icon.
+- Not yet verified on a real Windows runner or by an actual `vpk pack`.
+
 ### Transient runner failures
 
 GitHub-hosted runners fail release and upgrade jobs for reasons unrelated to Made. Observed during [v0.1.1](../records/20261125-v0-1-1-release.md):

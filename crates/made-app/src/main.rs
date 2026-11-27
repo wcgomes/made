@@ -116,6 +116,7 @@ fn show_startup_refusal(message: String) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Made")
+            .with_icon(made_app::app::app_icon())
             .with_inner_size([460.0, 150.0])
             .with_resizable(false),
         ..Default::default()
