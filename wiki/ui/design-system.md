@@ -4,7 +4,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 
 ## Intent
 
-- Depth comes from layered tonal surfaces, 1px borders, 8–10px gutters, and one soft painted shadow on the Explorer glass — not gradients or glows.
+- Depth comes from layered tonal surfaces, 1px borders, 4px window gutters, and one soft painted shadow on the Explorer glass — not gradients or glows.
 - One accent (mint green) marks the wordmark initial, primary action, focus, spinner, and splitter drag. Semantic teal/amber/red/blue mark a single status; success is a cooler teal than the accent.
 - Terminal and preview are high-contrast reading surfaces. The terminal card is glass on the primary screen and opaque in alternate-screen TUI mode; preview stays fully opaque. The header paints no band. Workspace-tab fills follow the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md). Selected-tab stroke follows the same spec. Explorer and the primary terminal card are the in-app glass surfaces.
 - Hover and selection share one borderless fill language across header icons, session tabs, Explorer rows, and picker rows. Selected-tab stroke follows the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md); selection still changes fill and text opacity.
@@ -36,7 +36,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 | `BG_HEADER_GLASS_NATIVE` | `rgba(20,23,28,32)` | Explorer header over an applied native backdrop. |
 | `BORDER` | `#262B34` | Card borders and decorative separators. |
 | `BORDER_HEADER` | `#20252D` | Header dividers inside cards. |
-| `BORDER_CONTROL` | `#5E697B` | Control boundary and splitter hover line/grip; never rely on `BORDER` alone. |
+| `BORDER_CONTROL` | `#5E697B` | Control boundary and splitter hover capsule; never rely on `BORDER` alone. |
 | `TEXT_PRIMARY` | `#E6E8EC` | Titles and active values. |
 | `TEXT_SECONDARY` | `#BCC2CC` | Body and default labels. |
 | `TEXT_TERTIARY` | `#9AA2B0` | Section labels, paths, metadata. |
@@ -130,7 +130,7 @@ No text below 10px. `Style.text_styles`: Small 10.0, Body 12.5, Button 12.0, Hea
 ## Spacing, radii, and motion
 
 - Base rhythm 4pt, practical spacing 8pt. Spacing scale: 2, 4, 6, 8, 10, 12, 16, 20, 24, 32.
-- Window gutter 10 wide / 8 compact; pane gap 8/6; workspace strip and tabs 26/24; card content top 42/36; card header 34/30; card content padding 12/10; tree row 24; workspace-tab radius 6; picker path-chip radius 4; buttons 26–28; interactive targets at least 24×24.
+- Window gutter 4; terminal↔Explorer pane gap 4 (`pane_gap`; `gap` 8/6 for other spacing); workspace strip and tabs 26/24, centered in a 38/34 header band (6/5 above and below); card content top 38/34; card header 34/30; card content padding 12/10; tree row 24; workspace-tab radius 6; picker path-chip radius 4; buttons 26–28; interactive targets at least 24×24.
 - Global spacing: `item_spacing(8,6)`, `button_padding(10,4)`, `interact_size(28,26)`, `window_margin 14`, `indent 14`, `tooltip_width 320`, `animation_time 0.12`.
 - Header geometry: the row spans gutter..width-gutter with no extra horizontal padding; tabs start at the card/window content left edge; the wordmark sits before the right icon group with a reserved 24/18 strip-side gap and an exact 24/18 icon-side gap; the last icon’s 26/24 target, selected/hover fill, and focus ring all end exactly at the card right (`content.right`) with no gutter overhang; the 14px glyph stays centered in its target with normal optical padding. Session-map strip/tabs remain 36/34 and 28/26.
 - Floating scrollbars are overlay-only: 8px expanded bar, 3px thin thumb, 24px minimum handle, and zero allocated width. They are hidden at rest, fade in on scroll-area hover, and expand with a faint track only on bar hover or drag.
@@ -152,7 +152,7 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 | Explorer row | transparent | borderless radius-6 `BG_HOVER` | inset radius-6 `BG_SELECTED`; primary text; no border, accent bar, or focus outline |
 | Picker tree row | transparent | borderless radius-6 `BG_HOVER` | inset radius-6 `BG_SELECTED`; primary text; app-drawn disclosure; no border, accent bar, or focus outline |
 | Picker path chip | inset `BG_SELECTED` radius 4; primary mono 10.5; no border | no fill change | selected tree-row path, or the root when nothing is selected |
-| Explorer splitter | paints nothing; 8 px hit area | 1 px line + 6×32 grip fade to partial-opacity `BORDER_CONTROL` over 0.14 s | drag: same geometry in restrained `ACCENT` |
+| Explorer splitter | paints nothing; 6 px hit area centered on the 4 px gap | filled, fully rounded 2×32 capsule fades in at partial-opacity `BORDER_CONTROL` over 0.14 s | drag: same capsule in restrained `ACCENT` |
 | Picker secondary action | borderless `BG_ELEVATED` | borderless `BG_HOVER` | borderless `BG_SELECTED` |
 | Primary action | `ACCENT` | `ACCENT_HOVER` | `ACCENT_PRESSED` |
 
@@ -165,7 +165,7 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 - Scrollbars are hidden at rest. The floating overlay fades in as a thumb over about 120–160 ms when the scroll area is hovered, expands and strengthens on bar hover/drag with a faint track only then, and fades out on leave. They allocate zero width and never shift layout. The custom terminal scrollback bar matches this behavior: full 8px hit area, thumb only on pane hover, and a track only on bar hover/drag.
 - Status uses shape + text + color: busy spinner, attention `!`, unread number, renaming `*`, tree error `!`, and shell state text. Success is a cooler teal than the mint accent, and no status relies on hue alone.
 - Git status colors reuse existing tokens. Letters and folder-dot colors are in the [UI spec](../../specs/made-ui-ux.md), painted by `change_kind_color` and `folder_mark_color` in [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
-- Close hover carries the `ERROR` tone plus the parent hover/selected fill and label; visibility is driven by hover/focus, not motion, so the state is not cue-only. The pointer-only Explorer divider is not a keyboard stop; its fade is independent of the 8px hit area, resize cursor, and tooltip, and the window-header Explorer toggle remains the keyboard hide/restore path.
+- Close hover carries the `ERROR` tone plus the parent hover/selected fill and label; visibility is driven by hover/focus, not motion, so the state is not cue-only. The pointer-only Explorer divider is not a keyboard stop; its fade is independent of the 6px hit area, resize cursor, and tooltip, and the window-header Explorer toggle remains the keyboard hide/restore path.
 - `accesskit` is not enabled in `Cargo.toml`. Icon actions set tooltip and `Response::widget_info` names, but platform screen-reader exposure is not claimed.
 
 ## Implementation notes
