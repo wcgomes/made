@@ -93,7 +93,28 @@ Process cleanup lives in `made-platform`:
 
 ## Clipboard paste
 
-Terminals have no standard inbound image-clipboard channel, so Made cannot hand raw image bytes to the child process. `Cmd+V`/`Ctrl+V` with an image on the clipboard forwards `Ctrl+V` (`0x16`) so the child TUI — OpenCode, Claude Code, and similar agent TUIs — reads the image natively; text-only clipboards keep bracketed paste. `Cmd+Shift+V`/`Ctrl+Shift+V` saves the image as a PNG under `AppPaths::temp_dir/clipboard-images/` and pastes the absolute path, which agent TUIs that attach local image paths can consume. When both text and an image are present, the image wins, and the first native image forward shows a one-time hint naming the path fallback. Images are capped at 128 MiB RGBA and 16384 px per side. App-generated clipboard PNGs are pruned after 7 days and capped at 64 files; cleanup runs after a successful save and when a workbench starts, and the just-saved image survives. macOS is user-confirmed (2026-11-01); Linux X11/Wayland and Windows have not yet been tested, with no known defect. The contract is the Clipboard image paste and Clipboard image retention requirements in [OpenCode Session Follow](../../specs/opencode-session-follow.md).
+Terminals have no standard inbound image-clipboard channel, so Made cannot hand raw image bytes to the child process. `Cmd+V`/`Ctrl+V` with an image on the clipboard forwards `Ctrl+V` (`0x16`) so the child TUI — OpenCode, Claude Code, and similar agent TUIs — reads the image natively; text-only clipboards keep bracketed paste. `Cmd+Shift+V`/`Ctrl+Shift+V` saves the image as a PNG under `AppPaths::temp_dir/clipboard-images/` and pastes the absolute path, which agent TUIs that attach local image paths can consume. When both text and an image are present, the image wins. Native image forwarding shows no hint; in a remote tab the first successful image upload shows the one-time notice "Image uploaded to the server; its file path was pasted." Images are capped at 128 MiB RGBA and 16384 px per side. App-generated clipboard PNGs are pruned after 7 days and capped at 64 files; cleanup runs after a successful save and when a workbench starts, and the just-saved image survives. macOS is user-confirmed (2026-11-01); Linux X11/Wayland and Windows have not yet been tested, with no known defect. The contract is the Clipboard image paste and Clipboard image retention requirements in [OpenCode Session Follow](../../specs/opencode-session-follow.md).
+
+## Clipboard copy (OSC 52)
+
+Programs in local and SSH panes copy to the OS clipboard with OSC 52; the contract is "OSC 52 clipboard copy" in [OpenCode Session Follow](../../specs/opencode-session-follow.md) and SSH-05 in [`ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md).
+
+- Path: alacritty `Event::ClipboardStore` → `TerminalCore::take_clipboard_store` ([`emulation.rs`](../../crates/made-terminal/src/emulation.rs)) → `TerminalPane::apply_clipboard_store` ([`terminal_view.rs`](../../crates/made-app/src/terminal_view.rs)), called each tick after the output pump.
+- Queries are refused through `Osc52::OnlyCopy`; the remote supervisor discards stores, so only the client applies them. Selector, size (`PASTE_BYTE_LIMIT`) and latest-wins rules are in the spec.
+- Residual: vte buffers a raw OSC sequence without bound before dispatch, so the 1 MiB limit applies to the decoded store, not to buffering.
+
+## Replacing a TerminalCore
+
+Anything that swaps in a new `TerminalCore` (`apply_resnapshot`, relaunch) drops state buffered in the old core's event listener: title, replies, bell, and the OSC 52 store. Take what must survive before the swap and carry it on the pane, as `TerminalPane.carried_clipboard_store` does; a store fed after the swap wins over the carried one.
+
+## URL open requests
+
+TUIs that run `$BROWSER <url>` get an ask-before-open card instead of a browser. Contracts: "URL Open Confirmation Card" in [`made-ui-ux.md`](../../specs/made-ui-ux.md), AIA-07 in [`agent-integration-architecture.md`](../../specs/agent-integration-architecture.md), and SSH-05/SSH-08/SSH-11 in [`ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md). Rationale: [ADR 0011](../decisions/0011-browser-helper-url-socket.md).
+
+- Local: a core launch contribution (applied after every integration's, so it wins) sets `BROWSER` to the `made-open` helper beside the executable, plus `MADE_URL_SOCKET` and a per-launch `MADE_URL_TOKEN`. The helper ([`made-open.rs`](../../crates/made-platform/src/bin/made-open.rs)) validates the URL and sends `{token,url}` over a same-user Unix socket or named pipe; it exits 0 only on ack, otherwise the TUI prints the URL itself. App side: [`url_open.rs`](../../crates/made-app/src/url_open.rs).
+- Remote: the supervisor symlinks `<runtime>/made-open` to `made-remote`, which runs in helper mode by argv0, and forwards `Operation::OpenUrlRequest` only to the attached client. Ack means queued, not shown; a request while detached is dropped and never replayed on reattach or resnapshot.
+- Card: a dialog centered over the requesting pane's terminal body with a scrim; the grid is not resized, the whole pane body is excluded from terminal pointer input while it is up, and it never takes keyboard input, so keys keep reaching the TUI. Host whole on its own line, full URL scrollable, arming delays and the narrow-pane rule are in the spec. The host opener strips `MADE_URL_*` and restores `MADE_ORIGINAL_BROWSER`.
+- Coverage: Claude Code and Grok honor `BROWSER`; OpenCode does not (it calls `open`/`xdg-open`), and a `PATH` shim was rejected. A `BROWSER` set in `~/.bashrc`/`~/.zshrc` overrides Made's, so no card appears. URLs are never logged.
 
 ## Bridge isolation
 

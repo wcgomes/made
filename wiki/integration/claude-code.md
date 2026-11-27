@@ -6,6 +6,7 @@ Claude Code is the third integrated TUI. Made learns about it through two indepe
 
 - Catalog order is OpenCode, Grok, Claude Code; undetected programs are omitted. The row is labeled Claude Code and paints the official mark from [`claude-code.svg`](../../crates/made-app/assets/claude-code.svg) (source URL recorded in the file).
 - Choosing it starts the absolute `claude` path with no arguments as the child of a new home-directory tab, with no shell first and no picker. Made passes no Claude Code arguments, edits no Claude Code file and runs no other `claude` subcommand except the read-only `claude agents --json` listing used for explorer follow (see [Explorer follow](#explorer-follow)).
+- Claude Code honors `BROWSER`, so its login URL goes to the ask-before-open card locally and over SSH ([URL open requests](../runtime/terminal-first.md#url-open-requests)).
 - Detection is the shared metadata-only `PATH` lookup (macOS Finder/Dock launches: [launch PATH](../runtime/terminal-first.md#macos-gui-launch-path)). Plugin loading does not depend on it, so a shell-typed `claude` is covered too.
 
 ## Channel 1: OSC 7501 status
