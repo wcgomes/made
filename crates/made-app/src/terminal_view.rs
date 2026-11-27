@@ -551,7 +551,6 @@ impl TerminalPane {
             let bytes = self.encoder.encode_focus(false);
             self.write(&bytes, log);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
     }
 
     /// Last child exit status.
@@ -1391,15 +1390,6 @@ impl TerminalPane {
             }
             let bytes = self.encoder.encode_focus(focused);
             self.write(&bytes, log);
-            // The terminal is not an egui text widget, so it must opt in to
-            // windowing-layer IME events explicitly. Only one surface in Made
-            // accepts composed text, so enabling it with terminal focus is safe.
-            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(focused));
-            if focused {
-                ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
-                    egui::IMEPurpose::Terminal,
-                ));
-            }
             if !focused {
                 self.ime_preedit.clear();
                 platform.normalize_ime(&mut self.ime, ImeEvent::Cancel);
@@ -1458,13 +1448,32 @@ impl TerminalPane {
             metrics.record_input_latency(elapsed);
         }
 
+        let cursor_position = content.origin
+            + Vec2::new(
+                snapshot.cursor.col as f32 * cell_metrics.width,
+                snapshot.cursor.row as f32 * cell_metrics.height,
+            );
+        if focused {
+            // The terminal is not an egui text widget, so it requests IME the
+            // way one does: every focused frame. egui-winit enables IME while
+            // this output is present and disables it once it is absent, which
+            // macOS needs for dead-key composition.
+            let cursor_rect = Rect::from_min_size(
+                cursor_position,
+                Vec2::new(cell_metrics.width, cell_metrics.height),
+            );
+            ctx.output_mut(|output| {
+                output.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Terminal,
+                    rect: grid_rect,
+                    cursor_rect,
+                    should_interrupt_composition: false,
+                });
+            });
+        }
+
         if !self.ime_preedit.is_empty() {
-            let cursor = snapshot.cursor;
-            let position = content.origin
-                + Vec2::new(
-                    cursor.col as f32 * cell_metrics.width,
-                    cursor.row as f32 * cell_metrics.height,
-                );
+            let position = cursor_position;
             painter.rect_filled(
                 Rect::from_min_size(
                     position,
@@ -4008,6 +4017,80 @@ mod tests {
         pane.set_visible(true);
         assert!(pane.focus_on_next_frame);
         assert_eq!(pane.grid_paint_count(), 0);
+        pane.terminate(&mut log);
+    }
+
+    #[test]
+    fn only_a_focused_drawn_terminal_requests_ime() {
+        let temp = tempfile::tempdir().unwrap();
+        let platform = made_platform::host_platform();
+        let mut pane = TerminalPane::spawn(&platform, PtyOptions::new(temp.path())).unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut metrics = Metrics::new();
+        let ctx = terminal_context();
+        for _ in 0..3 {
+            let (_, frame) = run_terminal_frame_capture(
+                &ctx,
+                &mut pane,
+                &platform,
+                &mut metrics,
+                &mut log,
+                Vec::new(),
+            );
+            assert!(pane.is_focused());
+            let ime = frame
+                .platform_output
+                .ime
+                .expect("a focused terminal requests IME every frame");
+            assert_eq!(ime.purpose, egui::IMEPurpose::Terminal);
+            assert!(ime.rect.contains_rect(ime.cursor_rect), "{ime:?}");
+            assert!(ime.cursor_rect.width() > 0.0 && ime.cursor_rect.height() > 0.0);
+        }
+
+        // Drawn but unfocused: the window lost focus, or another widget holds
+        // egui focus. Either way the terminal must not request IME.
+        let other = egui::Id::unique("ime-test-other-widget");
+        for (window_focused, other_focused) in [(false, false), (true, true)] {
+            if other_focused {
+                ctx.memory_mut(|memory| memory.request_focus(other));
+            }
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 500.0),
+                )),
+                ..Default::default()
+            };
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .focused = Some(window_focused);
+            let mut frame = ctx.run_ui(raw, |ui| {
+                let _ = pane.ui(ui, &platform, &mut metrics, &mut log);
+                ui.interact(
+                    Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(4.0)),
+                    other,
+                    Sense::click(),
+                );
+            });
+            frame.textures_delta.clear();
+            assert!(!pane.is_focused(), "window_focused={window_focused}");
+            if other_focused {
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(other));
+            }
+            assert!(
+                frame.platform_output.ime.is_none(),
+                "window_focused={window_focused} other_focused={other_focused}"
+            );
+        }
+
+        pane.set_visible(false);
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            pane.sync_visibility(ui.ctx(), &mut log);
+        });
+        frame.textures_delta.clear();
+        assert!(!pane.is_focused());
+        assert!(frame.platform_output.ime.is_none());
         pane.terminate(&mut log);
     }
 

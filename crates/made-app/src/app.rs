@@ -2468,7 +2468,6 @@ impl AppModel {
                 memory.surrender_focus(id);
             }
         });
-        ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(false));
     }
 
     /// Terminate children, stop the bridge, verify config, and log. Idempotent.
