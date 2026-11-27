@@ -930,6 +930,10 @@ impl WireEnvelope {
 /// Four-byte big-endian length + UTF-8 JSON. Allocation is bounded by the prefix.
 pub fn encode(frame: &WireEnvelope) -> Result<Vec<u8>, ProtocolError> {
     frame.validate()?;
+    encode_payload(frame)
+}
+
+fn encode_payload(frame: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
     let payload = serde_json::to_vec(frame).map_err(|_| ProtocolError::Malformed)?;
     if payload.len() > MAX_FRAME_BYTES {
         return Err(ProtocolError::Limit);
@@ -938,6 +942,49 @@ pub fn encode(frame: &WireEnvelope) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = length.to_be_bytes().to_vec();
     bytes.extend(payload);
     Ok(bytes)
+}
+
+/// Shared one-frame-at-a-time parsing for the tab and browse decoders.
+fn push_frame<T: serde::de::DeserializeOwned>(
+    buffer: &mut Vec<u8>,
+    expected: &mut Option<usize>,
+    bytes: &[u8],
+    validate: impl FnOnce(&T) -> Result<(), ProtocolError>,
+) -> Result<(usize, Option<T>), ProtocolError> {
+    let mut consumed = 0;
+    if expected.is_none() {
+        let n = (4 - buffer.len()).min(bytes.len());
+        buffer.extend_from_slice(&bytes[..n]);
+        consumed += n;
+        if buffer.len() < 4 {
+            return Ok((consumed, None));
+        }
+        let length = u32::from_be_bytes(
+            buffer[..4]
+                .try_into()
+                .map_err(|_| ProtocolError::Malformed)?,
+        ) as usize;
+        if length == 0 {
+            return Err(ProtocolError::Malformed);
+        }
+        if length > MAX_FRAME_BYTES {
+            return Err(ProtocolError::Limit);
+        }
+        buffer.clear();
+        *expected = Some(length);
+    }
+    let length = expected.ok_or(ProtocolError::Malformed)?;
+    let n = (length - buffer.len()).min(bytes.len() - consumed);
+    buffer.extend_from_slice(&bytes[consumed..consumed + n]);
+    consumed += n;
+    if buffer.len() != length {
+        return Ok((consumed, None));
+    }
+    let frame: T = serde_json::from_slice(buffer).map_err(|_| ProtocolError::Malformed)?;
+    validate(&frame)?;
+    buffer.clear();
+    *expected = None;
+    Ok((consumed, Some(frame)))
 }
 
 /// Incremental one-frame-at-a-time parser. Feed only bytes consumed by `push`;
@@ -961,42 +1008,12 @@ impl FrameDecoder {
         Self::default()
     }
     pub fn push(&mut self, bytes: &[u8]) -> Result<(usize, Option<WireEnvelope>), ProtocolError> {
-        let mut consumed = 0;
-        if self.length.is_none() {
-            let n = (4 - self.buffer.len()).min(bytes.len());
-            self.buffer.extend_from_slice(&bytes[..n]);
-            consumed += n;
-            if self.buffer.len() < 4 {
-                return Ok((consumed, None));
-            }
-            let length = u32::from_be_bytes(
-                self.buffer[..4]
-                    .try_into()
-                    .map_err(|_| ProtocolError::Malformed)?,
-            ) as usize;
-            if length == 0 {
-                return Err(ProtocolError::Malformed);
-            }
-            if length > MAX_FRAME_BYTES {
-                return Err(ProtocolError::Limit);
-            }
-            self.buffer.clear();
-            self.length = Some(length);
-        }
-        let length = self.length.ok_or(ProtocolError::Malformed)?;
-        let n = (length - self.buffer.len()).min(bytes.len() - consumed);
-        self.buffer
-            .extend_from_slice(&bytes[consumed..consumed + n]);
-        consumed += n;
-        if self.buffer.len() != length {
-            return Ok((consumed, None));
-        }
-        let frame: WireEnvelope =
-            serde_json::from_slice(&self.buffer).map_err(|_| ProtocolError::Malformed)?;
-        frame.validate()?;
-        self.buffer.clear();
-        self.length = None;
-        Ok((consumed, Some(frame)))
+        push_frame(
+            &mut self.buffer,
+            &mut self.length,
+            bytes,
+            WireEnvelope::validate,
+        )
     }
     pub fn finish(&self) -> Result<(), ProtocolError> {
         if self.buffer.is_empty() && self.length.is_none() {
@@ -1251,6 +1268,387 @@ impl UploadProgress {
     }
     pub fn total(&self) -> u64 {
         self.total
+    }
+}
+
+/// Most entries one browse listing returns; the rest is reported as truncated.
+pub const MAX_BROWSE_ENTRIES: usize = 1000;
+
+/// Screen-scoped, read-only remote browse grant (SSH-12): random per Open
+/// workspace screen instance and selected server. It is a distinct wire type
+/// and field from every tab capability, so neither can address the other.
+/// Never persist on the desktop or use in argv.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BrowseGrant([u8; 32]);
+impl BrowseGrant {
+    pub fn random() -> Result<Self, ProtocolError> {
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).map_err(|_| ProtocolError::Random)?;
+        Ok(Self(bytes))
+    }
+    /// Constant-work comparison, as for tab capabilities.
+    pub fn authenticates(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0)
+            .fold(0, |diff, (a, b)| diff | (a ^ b))
+            == 0
+    }
+}
+impl fmt::Debug for BrowseGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BrowseGrant(<redacted>)")
+    }
+}
+
+/// Routing for one browse grant. There is no tab and no root generation: the
+/// grant owns no root, and the client discards replies for a stale root or
+/// launch target by the echoed path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseIdentity {
+    pub authority: AuthorityId,
+    pub grant: BrowseGrant,
+    pub epoch: u64,
+}
+impl BrowseIdentity {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.epoch == 0 {
+            Err(ProtocolError::Identity)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn matches(&self, expected: &Self) -> bool {
+        self.grant.authenticates(&expected.grant)
+            && self.authority == expected.authority
+            && self.epoch == expected.epoch
+    }
+}
+
+/// Server-side answer for one absolute path: a directory the server user can
+/// list, with the server's canonical spelling, or why it is not one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DirectoryCheck {
+    Directory { path: RemotePath },
+    Missing,
+    Unreadable,
+    NotDirectory,
+}
+
+/// The closed browse surface: directory listing, directory check and the
+/// existing read-only Git reads. No content read, watch, write, terminal or
+/// upload verb exists here, and no tab verb is accepted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", content = "data", deny_unknown_fields)]
+pub enum BrowseOperation {
+    BrowseOpen,
+    /// The helper user's home, canonical and resolved on the server from the
+    /// helper process's own environment; `None` when it is unset or is not a
+    /// readable directory. The screen's start folder when the server record
+    /// names no initial directory.
+    BrowseOpened {
+        home: Option<RemotePath>,
+    },
+    BrowseClose,
+    BrowseClosed,
+    BrowseList {
+        path: RemotePath,
+    },
+    BrowseListed {
+        path: RemotePath,
+        entries: Vec<DirectoryEntry>,
+        truncated: bool,
+        done: bool,
+    },
+    BrowseCheck {
+        path: RemotePath,
+    },
+    BrowseChecked {
+        requested: RemotePath,
+        result: DirectoryCheck,
+    },
+    BrowseGitRead {
+        path: RemotePath,
+        command: GitRead,
+    },
+    BrowseGitResult {
+        path: RemotePath,
+        command: GitRead,
+        offset: u64,
+        data: Chunk,
+        done: bool,
+    },
+    Error {
+        code: ErrorCode,
+    },
+}
+impl fmt::Debug for BrowseOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BrowseOperation(<redacted>)")
+    }
+}
+impl BrowseOperation {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::BrowseListed { path, entries, .. } => {
+                if entries.len() > MAX_LIST_BATCH {
+                    return Err(ProtocolError::Limit);
+                }
+                let mut seen = std::collections::HashSet::new();
+                for entry in entries {
+                    if !entry.path.is_direct_child_of(path) || !seen.insert(&entry.path) {
+                        return Err(ProtocolError::Path);
+                    }
+                }
+            }
+            Self::BrowseGitResult { offset, data, .. }
+                if offset
+                    .checked_add(data.0.len() as u64)
+                    .is_none_or(|n| n > MAX_GIT_BYTES) =>
+            {
+                return Err(ProtocolError::Limit)
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn is_request(&self) -> bool {
+        matches!(
+            self,
+            Self::BrowseOpen
+                | Self::BrowseClose
+                | Self::BrowseList { .. }
+                | Self::BrowseCheck { .. }
+                | Self::BrowseGitRead { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowseEnvelope {
+    pub major: u16,
+    pub identity: BrowseIdentity,
+    pub request_id: u64,
+    pub operation: BrowseOperation,
+}
+impl BrowseEnvelope {
+    pub fn new(identity: BrowseIdentity, request_id: u64, operation: BrowseOperation) -> Self {
+        Self {
+            major: PROTOCOL_MAJOR,
+            identity,
+            request_id,
+            operation,
+        }
+    }
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.major != PROTOCOL_MAJOR {
+            return Err(ProtocolError::Version);
+        }
+        self.identity.validate()?;
+        if self.request_id == 0 {
+            return Err(ProtocolError::Identity);
+        }
+        self.operation.validate()
+    }
+    /// A browse request is a request verb on an absolute path. `RemotePath`
+    /// already refuses relative, empty, `.`/`..` and NUL-bearing paths; the
+    /// server still validates every path on its own filesystem.
+    pub fn validate_request(&self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        if self.operation.is_request() {
+            Ok(())
+        } else {
+            Err(ProtocolError::UnexpectedResponse)
+        }
+    }
+    /// Validate ONE reply frame's routing and shape against its request.
+    /// Streams use BrowseReplyProgress for aggregate bounds and completion.
+    pub fn validate_reply(&self, request: &Self) -> Result<(), ProtocolError> {
+        self.validate()?;
+        request.validate_request()?;
+        if !self.identity.matches(&request.identity) || self.request_id != request.request_id {
+            return Err(ProtocolError::Identity);
+        }
+        use BrowseOperation::*;
+        let valid = match (&request.operation, &self.operation) {
+            (_, Error { .. }) | (BrowseOpen, BrowseOpened { .. }) | (BrowseClose, BrowseClosed) => {
+                true
+            }
+            (BrowseList { path: a }, BrowseListed { path: b, .. })
+            | (BrowseCheck { path: a }, BrowseChecked { requested: b, .. }) => a == b,
+            (
+                BrowseGitRead {
+                    path: a,
+                    command: c,
+                },
+                BrowseGitResult {
+                    path: b,
+                    command: d,
+                    ..
+                },
+            ) => a == b && c == d,
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ProtocolError::UnexpectedResponse)
+        }
+    }
+}
+
+/// Same framing as `encode`, for the browse grant.
+pub fn encode_browse(frame: &BrowseEnvelope) -> Result<Vec<u8>, ProtocolError> {
+    frame.validate()?;
+    encode_payload(frame)
+}
+
+/// Same contract as `FrameDecoder`, for browse frames only. A tab frame never
+/// decodes here, and a browse frame never decodes in `FrameDecoder`.
+#[derive(Default)]
+pub struct BrowseFrameDecoder {
+    buffer: Vec<u8>,
+    length: Option<usize>,
+}
+impl fmt::Debug for BrowseFrameDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrowseFrameDecoder")
+            .field("buffered_bytes", &self.buffer.len())
+            .field("expected_bytes", &self.length)
+            .finish()
+    }
+}
+impl BrowseFrameDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(usize, Option<BrowseEnvelope>), ProtocolError> {
+        push_frame(
+            &mut self.buffer,
+            &mut self.length,
+            bytes,
+            BrowseEnvelope::validate,
+        )
+    }
+    pub fn finish(&self) -> Result<(), ProtocolError> {
+        if self.buffer.is_empty() && self.length.is_none() {
+            Ok(())
+        } else {
+            Err(ProtocolError::Malformed)
+        }
+    }
+}
+
+/// Bounded validation for one browse reply stream: at most
+/// MAX_BROWSE_ENTRIES unique listing paths, or a contiguous Git byte stream
+/// under MAX_GIT_BYTES. Any accept error poisons this instance.
+pub struct BrowseReplyProgress {
+    request: BrowseEnvelope,
+    entries: std::collections::HashSet<RemotePath>,
+    bytes: u64,
+    done: bool,
+    failed: bool,
+    truncated: bool,
+}
+impl fmt::Debug for BrowseReplyProgress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrowseReplyProgress")
+            .field("entries", &self.entries.len())
+            .field("bytes", &self.bytes)
+            .field("done", &self.done)
+            .field("failed", &self.failed)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+impl BrowseReplyProgress {
+    pub fn new(request: BrowseEnvelope) -> Result<Self, ProtocolError> {
+        request.validate_request()?;
+        Ok(Self {
+            request,
+            entries: std::collections::HashSet::new(),
+            bytes: 0,
+            done: false,
+            failed: false,
+            truncated: false,
+        })
+    }
+    pub fn accept(&mut self, reply: &BrowseEnvelope) -> Result<(), ProtocolError> {
+        if self.done || self.failed {
+            self.failed = true;
+            return Err(ProtocolError::Transfer);
+        }
+        let result = self.accept_inner(reply);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn accept_inner(&mut self, reply: &BrowseEnvelope) -> Result<(), ProtocolError> {
+        reply.validate_reply(&self.request)?;
+        match &reply.operation {
+            BrowseOperation::BrowseListed {
+                entries,
+                truncated,
+                done,
+                ..
+            } => {
+                if (!done && (entries.is_empty() || *truncated))
+                    || self
+                        .entries
+                        .len()
+                        .checked_add(entries.len())
+                        .is_none_or(|n| n > MAX_BROWSE_ENTRIES)
+                {
+                    return Err(ProtocolError::Limit);
+                }
+                for entry in entries {
+                    if !self.entries.insert(entry.path.clone()) {
+                        return Err(ProtocolError::Path);
+                    }
+                }
+                self.truncated = *truncated;
+                self.done = *done;
+            }
+            BrowseOperation::BrowseGitResult {
+                offset, data, done, ..
+            } => {
+                if *offset != self.bytes || (!done && data.as_bytes().is_empty()) {
+                    return Err(ProtocolError::Transfer);
+                }
+                self.bytes = self
+                    .bytes
+                    .checked_add(data.as_bytes().len() as u64)
+                    .filter(|n| *n <= MAX_GIT_BYTES)
+                    .ok_or(ProtocolError::Limit)?;
+                self.done = *done;
+            }
+            _ => self.done = true,
+        }
+        Ok(())
+    }
+    /// Call at end-of-response/EOF; absence of a final reply is not success.
+    pub fn finish(&self) -> Result<(), ProtocolError> {
+        if self.done && !self.failed {
+            Ok(())
+        } else {
+            Err(ProtocolError::Transfer)
+        }
+    }
+    pub fn is_done(&self) -> bool {
+        self.done && !self.failed
+    }
+    pub fn received_bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 }
 

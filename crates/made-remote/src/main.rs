@@ -5,7 +5,8 @@ use made_bridge::{config, config_guard::ConfigSnapshot, remote_rpc::RpcConnectio
 use made_platform::{Environment, PathsInputs, Platform, PlatformFamily, PtyRequest};
 use made_remote::{
     claude,
-    filesystem::native,
+    filesystem::{native, remote, Filesystem},
+    git::GitRunner,
     grok::{self, GrokFiles},
     integration::{resolve_config, Integration},
     protocol::*,
@@ -157,7 +158,14 @@ fn run() -> io::Result<()> {
 }
 fn frontend() -> io::Result<()> {
     let mut stdin = io::stdin().lock();
-    let first = read_envelope(&mut stdin)?;
+    // The first frame fixes the grant for this session. A screen-scoped
+    // browse grant is served here and never reaches the tab path below.
+    let payload = read_payload(&mut stdin)?.ok_or_else(fail)?;
+    if let Ok(open) = serde_json::from_slice::<BrowseEnvelope>(&payload) {
+        return browse(&open, &mut stdin, &mut io::stdout().lock());
+    }
+    let first: WireEnvelope = serde_json::from_slice(&payload).map_err(|_| fail())?;
+    first.validate().map_err(|_| fail())?;
     let paths = paths()?;
     let runtime = convert(supervisor::runtime_directory(
         &paths.data_dir,
@@ -248,6 +256,221 @@ fn relay(mut input: impl io::Read, mut output: impl io::Write) -> io::Result<()>
         output.flush()?;
     }
 }
+
+/// One bounded frame payload, or `None` on a clean end of input.
+fn read_payload(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0; 4];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        match reader.read(&mut prefix[filled..]) {
+            Ok(0) if filled == 0 => return Ok(None),
+            Ok(0) => return Err(fail()),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(fail());
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload)?;
+    Ok(Some(payload))
+}
+
+/// The screen-scoped, read-only browse grant (SSH-12). It lives only as long
+/// as this stdio session and ends on `BrowseClose` or end of input. No
+/// runtime directory, supervisor, socket or file is created, no file content
+/// is read, and nothing a tab owns is reachable from here.
+fn browse(
+    open: &BrowseEnvelope,
+    input: &mut impl Read,
+    output: &mut impl io::Write,
+) -> io::Result<()> {
+    open.validate_request().map_err(|_| fail())?;
+    if open.operation != BrowseOperation::BrowseOpen {
+        return Err(fail());
+    }
+    write_browse(
+        output,
+        open,
+        BrowseOperation::BrowseOpened {
+            home: browse_home(),
+        },
+    )?;
+    while let Some(payload) = read_payload(input)? {
+        // A tab frame, a reply, a malformed path or another grant, authority
+        // or epoch ends this grant unanswered.
+        let request: BrowseEnvelope = serde_json::from_slice(&payload).map_err(|_| fail())?;
+        if request.validate_request().is_err() || !request.identity.matches(&open.identity) {
+            return Err(fail());
+        }
+        let replies = match &request.operation {
+            BrowseOperation::BrowseClose => {
+                return write_browse(output, &request, BrowseOperation::BrowseClosed);
+            }
+            BrowseOperation::BrowseList { path } => browse_list(path),
+            BrowseOperation::BrowseCheck { path } => vec![BrowseOperation::BrowseChecked {
+                requested: path.clone(),
+                result: check_directory(path),
+            }],
+            BrowseOperation::BrowseGitRead { path, command } => browse_git(path, *command),
+            // A second open under a live grant.
+            _ => browse_error(ErrorCode::InvalidRequest),
+        };
+        for reply in replies {
+            write_browse(output, &request, reply)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_browse(
+    output: &mut impl io::Write,
+    request: &BrowseEnvelope,
+    operation: BrowseOperation,
+) -> io::Result<()> {
+    let reply = BrowseEnvelope::new(request.identity.clone(), request.request_id, operation);
+    output.write_all(&encode_browse(&reply).map_err(|_| fail())?)?;
+    output.flush()
+}
+
+/// This helper user's home, from its own environment as every other helper
+/// mode resolves it, never from client input: reported only when it is an
+/// absolute, readable directory, by its canonical server path.
+fn browse_home() -> Option<RemotePath> {
+    let home = PathsInputs::from_env(PlatformFamily::current()).home?;
+    match check_directory(&remote(&home).ok()?) {
+        DirectoryCheck::Directory { path } => Some(path),
+        _ => None,
+    }
+}
+
+fn browse_error(code: ErrorCode) -> Vec<BrowseOperation> {
+    vec![BrowseOperation::Error { code }]
+}
+
+/// Classify one absolute path on this server. `metadata` follows links but
+/// only stats, so a FIFO, socket or device is classified without being opened;
+/// a directory is opened only as a directory, to prove it can be listed.
+fn check_directory(path: &RemotePath) -> DirectoryCheck {
+    let Ok(directory) = native(path) else {
+        return DirectoryCheck::Unreadable;
+    };
+    match fs::metadata(&directory) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            DirectoryCheck::Missing
+        }
+        Err(_) => DirectoryCheck::Unreadable,
+        Ok(metadata) if !metadata.is_dir() => DirectoryCheck::NotDirectory,
+        Ok(_) => match (fs::read_dir(&directory), fs::canonicalize(&directory)) {
+            (Ok(_), Ok(canonical)) => remote(&canonical)
+                .map_or(DirectoryCheck::Unreadable, |path| {
+                    DirectoryCheck::Directory { path }
+                }),
+            _ => DirectoryCheck::Unreadable,
+        },
+    }
+}
+
+/// The tab listing code under a single-use guard rooted at this directory:
+/// kinds come from the entries themselves (links are reported, not
+/// followed), no entry is opened, and at most MAX_BROWSE_ENTRIES are sent,
+/// folders first.
+fn browse_list(path: &RemotePath) -> Vec<BrowseOperation> {
+    if !matches!(check_directory(path), DirectoryCheck::Directory { .. }) {
+        return browse_error(ErrorCode::Unavailable);
+    }
+    let listed = match Filesystem::new(path, 1).and_then(|filesystem| filesystem.list(path)) {
+        Ok(listed) => listed,
+        Err(code) => return browse_error(code),
+    };
+    let mut truncated = false;
+    let mut entries = Vec::new();
+    for operation in listed {
+        if let Operation::Listed {
+            entries: batch,
+            truncated: batch_truncated,
+            ..
+        } = operation
+        {
+            truncated |= batch_truncated;
+            entries.extend(batch);
+        }
+    }
+    if entries.len() > MAX_BROWSE_ENTRIES {
+        entries.truncate(MAX_BROWSE_ENTRIES);
+        truncated = true;
+    }
+    // Eight entries per frame, as for tabs: worst-case paths fit the frame cap.
+    // Truncation is reported once, on the final frame.
+    let batches: Vec<_> = entries.chunks(8).collect();
+    if batches.is_empty() {
+        return vec![BrowseOperation::BrowseListed {
+            path: path.clone(),
+            entries: Vec::new(),
+            truncated,
+            done: true,
+        }];
+    }
+    batches
+        .iter()
+        .enumerate()
+        .map(|(index, batch)| {
+            let done = index + 1 == batches.len();
+            BrowseOperation::BrowseListed {
+                path: path.clone(),
+                entries: batch.to_vec(),
+                truncated: truncated && done,
+                done,
+            }
+        })
+        .collect()
+}
+
+/// One of the fixed read-only Git reads in the server-resolved directory,
+/// passed only as the value of `-C`. The bounded runner rejects any other argv.
+fn browse_git(path: &RemotePath, command: GitRead) -> Vec<BrowseOperation> {
+    let DirectoryCheck::Directory { path: canonical } = check_directory(path) else {
+        return browse_error(ErrorCode::Unavailable);
+    };
+    let bytes = match native(&canonical).and_then(|directory| {
+        GitRunner::new()
+            .read_bytes(command.into(), &directory)
+            .map_err(|_| ErrorCode::Unavailable)
+    }) {
+        Ok(bytes) => bytes,
+        Err(code) => return browse_error(code),
+    };
+    let pieces: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[]]
+    } else {
+        bytes.chunks(MAX_CHUNK_BYTES).collect()
+    };
+    let mut replies = Vec::with_capacity(pieces.len());
+    let mut offset = 0;
+    for (index, piece) in pieces.iter().enumerate() {
+        let Ok(data) = Chunk::new(piece.to_vec()) else {
+            return browse_error(ErrorCode::Limit);
+        };
+        replies.push(BrowseOperation::BrowseGitResult {
+            path: path.clone(),
+            command,
+            offset,
+            data,
+            done: index + 1 == pieces.len(),
+        });
+        offset += piece.len() as u64;
+    }
+    replies
+}
+
 fn daemon() -> io::Result<()> {
     let first = read_envelope(&mut io::stdin().lock())?;
     let Operation::Open {
