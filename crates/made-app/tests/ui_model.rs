@@ -1769,7 +1769,7 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     let explorer_card =
         largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card must paint");
     assert!(
-        (explorer_card.height() - 748.0).abs() < 2.0,
+        (explorer_card.height() - 758.0).abs() < 2.0,
         "explorer must fill the main content height: {explorer_card:?}"
     );
 
@@ -2716,7 +2716,7 @@ fn explorer_rows_use_unified_metrics_and_open_folder_treatment() {
     let output = headless.render();
     let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
     let explorer_left = 1280.0 - layout.gutter - layout.right_card_width;
-    let body_top = layout.gap + layout.top_height + layout.gap + layout.card_header_height;
+    let body_top = layout.content_top() + layout.card_header_height;
     let selected = rects_with_fill(&output, made_app::theme::BG_SELECTED)
         .into_iter()
         .find(|rect| rect.left() > explorer_left && rect.top() > body_top)
@@ -3013,7 +3013,7 @@ fn explorer_rows_keep_text_offsets_and_vertical_centering() {
 
         let layout = made_app::theme::Layout::for_window(width, height);
         let explorer_left = width - layout.gutter - layout.right_card_width;
-        let body_top = layout.gap + layout.top_height + layout.gap + layout.card_header_height;
+        let body_top = layout.content_top() + layout.card_header_height;
         let folder_row = explorer_row_rect(&headless, id, 0);
         let file_row = explorer_row_rect(&headless, id, 1);
         assert!(
@@ -3353,7 +3353,7 @@ fn explorer_selection_and_tree_focus_paint_no_outline() {
     let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
     let explorer_left = 1280.0 - layout.gutter - layout.right_card_width;
     let explorer = egui::Rect::from_min_max(
-        egui::pos2(explorer_left, layout.gap + layout.top_height + layout.gap),
+        egui::pos2(explorer_left, layout.content_top()),
         egui::pos2(1280.0, 800.0),
     );
     let folder_rect = headless.response(folder_row).rect;
@@ -3805,8 +3805,8 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: tab height must be {tab_height}: {first_tab:?}"
         );
         assert!(
-            (first_tab.top() - layout.gap).abs() < 0.5,
-            "{width}px: header top must be one pane gap below the window edge: {first_tab:?}"
+            (first_tab.top() - layout.header_top()).abs() < 0.5,
+            "{width}px: the strip must be centered in the header band: {first_tab:?}"
         );
         assert!(
             (explorer.right() - content_right).abs() < 0.75,
@@ -3827,6 +3827,37 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             .expect("Explorer panel glyph");
         let left_padding = explorer_glyph.left() - explorer.left();
         let right_padding = explorer.right() - explorer_glyph.right();
+        // Every header object shares the strip's vertical center, the
+        // wordmark by its cap-height ink rather than its galley line box.
+        let strip_center = layout.header_top() + layout.top_height / 2.0;
+        let wordmark_ink = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == made_app::theme::WORDMARK => {
+                    Some(
+                        made_app::theme::wordmark_ink_rect(&text.galley)
+                            .translate(text.pos.to_vec2()),
+                    )
+                }
+                _ => None,
+            })
+            .expect("wordmark text");
+        for (name, rect) in [
+            ("first tab", first_tab),
+            ("last tab", last_tab),
+            ("plus", plus),
+            ("wordmark target", wordmark),
+            ("wordmark ink", wordmark_ink),
+            ("ssh", ssh),
+            ("explorer", explorer),
+            ("explorer glyph", explorer_glyph),
+        ] {
+            assert!(
+                (rect.center().y - strip_center).abs() <= 0.5,
+                "{width}px: {name} {rect:?} must share the strip center {strip_center}"
+            );
+        }
         assert!(
             (left_padding - right_padding).abs() < 0.75,
             "{width}px: the last glyph must be centered in its target: glyph {explorer_glyph:?}, target {explorer:?}, padding {left_padding}/{right_padding}"
@@ -3911,14 +3942,14 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             "{width}px: wordmark must sit before the icon group"
         );
         let card = largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card");
-        let panel_bottom = layout.gap + layout.top_height + layout.gap;
+        let panel_bottom = layout.content_top();
         assert!(
             (card.top() - panel_bottom).abs() < 1.0,
             "{width}px: compact header must move card top to {panel_bottom}px: {card:?}"
         );
         assert!(
-            (card.top() - first_tab.bottom() - layout.gap).abs() < 1.0,
-            "{width}px: the space above and below the strip must both equal the pane gap"
+            (card.top() - first_tab.bottom() - layout.header_top()).abs() < 1.0,
+            "{width}px: the space below the strip must equal the space above it"
         );
 
         let wordmark_hover = headless.hover_until_text(made_app::theme::wordmark_id(), "About");
@@ -4084,10 +4115,16 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
             .all(|tab| tab.right() <= plus.left() + 0.5),
         "no visible tab may overlap the plus: tabs {visible_tabs:?}, plus {plus:?}"
     );
+    let compact = made_app::theme::Layout::for_window(720.0, 480.0);
+    let strip_center = compact.header_top() + compact.top_height / 2.0;
     for (name, rect) in [("plus", plus), ("overflow", overflow), ("ssh", ssh)] {
         assert!(
             rect.width() >= 24.0 && rect.height() >= 24.0,
             "{name} target below 24px or clipped: {rect:?}"
+        );
+        assert!(
+            (rect.center().y - strip_center).abs() <= 0.5,
+            "{name} {rect:?} must share the strip center {strip_center}"
         );
     }
     for (name, rect) in [
@@ -7186,84 +7223,95 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
         "the resize splitter must not be a Tab stop"
     );
     assert!(
-        splitter_response.rect.width() >= 8.0,
-        "the resize splitter must keep an 8px pointer hit area"
+        splitter_response.rect.width() >= made_app::theme::SPLITTER_HIT_WIDTH,
+        "the resize splitter must keep its pointer hit area"
     );
     let position = splitter_response.rect.center();
     assert!(
         !shape_hits_point(&output, position),
-        "the splitter must paint no line or grip at rest"
+        "the splitter must paint nothing at rest"
     );
+    let capsule_at = |output: &egui::FullOutput, center: egui::Pos2| {
+        rect_shapes(output).into_iter().find(|shape| {
+            shape.rect.contains(center)
+                && (shape.rect.width() - 2.0).abs() < 0.01
+                && (shape.rect.height() - 32.0).abs() < 0.01
+        })
+    };
+    let rgb_matches = |actual: [u8; 4], expected: egui::Color32| {
+        let expected = expected.to_srgba_unmultiplied();
+        actual[..3]
+            .iter()
+            .zip(&expected[..3])
+            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1)
+    };
 
     let before_hover = headless.model.workspace(id).unwrap().explorer_width();
     let hover_start = headless.render_events_at(
         vec![egui::Event::PointerMoved(position)],
         headless.last_time + 1.0 / 60.0,
     );
-    let early_alpha = rect_shapes(&hover_start)
-        .into_iter()
-        .find(|shape| {
-            shape.rect.contains(position)
-                && (shape.rect.width() - 1.0).abs() < 0.01
-                && shape.rect.height() > 100.0
-        })
+    let early_alpha = capsule_at(&hover_start, position)
         .map(|shape| shape.fill.to_srgba_unmultiplied()[3])
         .unwrap_or(0);
     headless.advance(0.20);
     let hovered = headless.render();
-    let line = rect_shapes(&hovered)
-        .into_iter()
-        .find(|shape| {
-            shape.rect.contains(position)
-                && (shape.rect.width() - 1.0).abs() < 0.01
-                && shape.rect.height() > 100.0
-        })
-        .expect("hovered splitter must fade in a 1px line");
-    let line_rgba = line.fill.to_srgba_unmultiplied();
-    let border_rgba = made_app::theme::BORDER_CONTROL.to_srgba_unmultiplied();
+    let capsule =
+        capsule_at(&hovered, position).expect("hovered splitter must fade in a 2×32 capsule");
+    let capsule_rgba = capsule.fill.to_srgba_unmultiplied();
     assert!(
-        line_rgba[..3]
-            .iter()
-            .zip(&border_rgba[..3])
-            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
-        "hover line must use muted BORDER_CONTROL"
+        rgb_matches(capsule_rgba, made_app::theme::BORDER_CONTROL),
+        "hover capsule must use muted BORDER_CONTROL"
     );
     assert!(
-        line_rgba[3] > 0 && line_rgba[3] < 255,
-        "hover line must be partial opacity, not a bright permanent line: {line_rgba:?}"
+        capsule_rgba[3] > 0 && capsule_rgba[3] < 255,
+        "hover capsule must be partial opacity: {capsule_rgba:?}"
     );
     assert!(
-        line_rgba[3] > early_alpha,
+        capsule_rgba[3] > early_alpha,
         "splitter must fade in rather than snap: early {early_alpha}, settled {}",
-        line_rgba[3]
+        capsule_rgba[3]
     );
-    let grip = rect_shapes(&hovered)
-        .into_iter()
-        .find(|shape| {
+    assert_eq!(
+        capsule.stroke.width, 0.0,
+        "the capsule is filled, not stroked"
+    );
+    assert!(
+        capsule.corner_radius == egui::CornerRadius::same(1),
+        "the capsule must be fully rounded"
+    );
+    assert!(
+        !rect_shapes(&hovered).iter().any(|shape| {
             shape.rect.contains(position)
-                && (shape.rect.width() - 6.0).abs() < 0.01
-                && (shape.rect.height() - 32.0).abs() < 0.01
-        })
-        .expect("hovered splitter must fade in a 6×32 grip");
-    let grip_stroke = grip.stroke.color.to_srgba_unmultiplied();
+                && shape.rect.height() > 100.0
+                && shape.rect.width() <= 2.0
+        }),
+        "the splitter must not paint a full-height line"
+    );
+    // The capsule sits inside the 4px pane gap without touching either card.
+    let explorer_card =
+        largest_rect(&hovered, made_app::theme::BG_CARD_GLASS).expect("explorer card");
+    let left_card = rects_with_fill(&hovered, made_app::theme::BG_TERMINAL_GLASS)
+        .into_iter()
+        .chain(rects_with_fill(&hovered, made_app::theme::BG_TERMINAL))
+        .filter(|rect| rect.right() <= explorer_card.left() && rect.height() > 300.0)
+        .max_by(|a, b| a.area().total_cmp(&b.area()))
+        .expect("terminal card");
     assert!(
-        grip_stroke[..3]
-            .iter()
-            .zip(&border_rgba[..3])
-            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
-        "hover grip must use muted BORDER_CONTROL"
+        (explorer_card.left() - left_card.right() - 4.0).abs() < 0.5,
+        "pane gap must be 4px: {left_card:?} {explorer_card:?}"
     );
     assert!(
-        grip_stroke[3] > 0 && grip_stroke[3] < 255,
-        "hover grip must be partial opacity: {grip_stroke:?}"
+        !capsule.rect.intersects(left_card.shrink(0.01))
+            && !capsule.rect.intersects(explorer_card.shrink(0.01))
+            && capsule.rect.left() >= left_card.right()
+            && capsule.rect.right() <= explorer_card.left(),
+        "capsule {:?} must stay inside the gap {left_card:?} {explorer_card:?}",
+        capsule.rect
     );
     assert!(
         output_text(&hovered).contains("Drag to resize explorer"),
         "splitter tooltip missing"
-    );
-    assert!(
-        shape_hits_point(&hovered, position),
-        "hovered splitter must paint at the boundary"
     );
     assert_eq!(
         headless.model.workspace(id).unwrap().explorer_width(),
@@ -7279,21 +7327,12 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     headless.advance(0.20);
     let dragged = headless.render();
     let dragged_center = headless.response(splitter).rect.center();
-    let drag_line = rect_shapes(&dragged)
-        .into_iter()
-        .find(|shape| {
-            shape.rect.contains(dragged_center)
-                && (shape.rect.width() - 1.0).abs() < 0.01
-                && shape.rect.height() > 100.0
-        })
-        .expect("dragging splitter must keep the faded line");
-    let drag_rgba = drag_line.fill.to_srgba_unmultiplied();
-    let accent_rgba = made_app::theme::ACCENT.to_srgba_unmultiplied();
+    let drag_rgba = capsule_at(&dragged, dragged_center)
+        .expect("dragging splitter must keep the capsule")
+        .fill
+        .to_srgba_unmultiplied();
     assert!(
-        drag_rgba[..3]
-            .iter()
-            .zip(&accent_rgba[..3])
-            .all(|(actual, expected)| actual.abs_diff(*expected) <= 1),
+        rgb_matches(drag_rgba, made_app::theme::ACCENT),
         "dragging splitter must use the green accent"
     );
     assert!(
@@ -7314,7 +7353,7 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
     let leaving_center = headless.response(splitter).rect.center();
     let leaving = headless.render_events_at(Vec::new(), left_at + 2.0 / 60.0);
     assert!(
-        shape_hits_point(&leaving, leaving_center),
+        capsule_at(&leaving, leaving_center).is_some(),
         "leaving the splitter must fade out rather than vanish instantly"
     );
     headless.advance(0.20);
@@ -7325,18 +7364,8 @@ fn explorer_splitter_is_invisible_at_rest_and_reveals_on_hover_and_drag() {
         "the splitter paint must disappear after the fade-out"
     );
     assert!(
-        !has_stroke_color(&rest, made_app::theme::BORDER_CONTROL_HOVER),
-        "no permanent hover line may remain at rest"
-    );
-    assert!(
-        !rect_shapes(&rest).iter().any(|shape| {
-            shape.rect.contains(rested_center)
-                && ((shape.rect.width() - 1.0).abs() < 0.01
-                    || (shape.rect.width() - 6.0).abs() < 0.01)
-                && (shape.fill.to_srgba_unmultiplied()[3] > 0
-                    && shape.fill.to_srgba_unmultiplied()[3] < 255)
-        }),
-        "no faded splitter line or grip may remain at rest"
+        capsule_at(&rest, rested_center).is_none(),
+        "no faded splitter capsule may remain at rest"
     );
 }
 
@@ -7381,17 +7410,16 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
             layout.content_width(),
         );
         let (expected_explorer_width, expected_left_width) = if width >= 1100.0 {
-            (360.0, 892.0)
+            (360.0, 908.0)
         } else {
-            (288.0, 410.0)
+            (288.0, 420.0)
         };
         assert_eq!(layout.right_card_width, expected_explorer_width);
         assert_eq!(explorer_width, expected_explorer_width);
         assert!((layout.explorer_default_width() - expected_explorer_width).abs() < 0.01);
-        let expected_left = layout.content_width() - layout.gap - explorer_width;
+        let expected_left = layout.content_width() - layout.pane_gap - explorer_width;
         assert!((expected_left - expected_left_width).abs() < 2.0);
-        let expected_height =
-            height - (layout.gap + layout.top_height + layout.gap) - layout.gutter;
+        let expected_height = height - layout.content_top() - layout.gutter;
         let explorer_card =
             largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("explorer card");
         let expected_explorer_left = width - layout.gutter - expected_explorer_width;
@@ -7412,6 +7440,19 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
                 && (left_card.width() - expected_left).abs() < 2.0
                 && (left_card.height() - expected_height).abs() < 2.0,
             "{width}x{height} preview card {left_card:?} expected width {expected_left} height {expected_height}"
+        );
+        // Left, right and bottom window margins are 4px in both layouts; the
+        // header strip is centered in the 38/34 band above the cards.
+        let expected_card_top = if width >= 900.0 { 38.0 } else { 34.0 };
+        assert_eq!(layout.header_top(), if width >= 900.0 { 6.0 } else { 5.0 });
+        assert!(
+            (left_card.left() - 4.0).abs() < 1.0
+                && (explorer_card.right() - (width - 4.0)).abs() < 1.0
+                && (explorer_card.bottom() - (height - 4.0)).abs() < 1.0
+                && (left_card.bottom() - (height - 4.0)).abs() < 1.0
+                && (explorer_card.top() - expected_card_top).abs() < 1.0
+                && (left_card.top() - expected_card_top).abs() < 1.0,
+            "{width}x{height} cards {left_card:?} {explorer_card:?} must sit 4px from the window edges"
         );
         assert!(
             output_text(&output).contains("Terminal"),
@@ -8210,7 +8251,7 @@ fn file_control_sits_below_session_strip_and_path() {
         .response(left_surface_action_id(&pane_id, "file"))
         .rect;
     let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
-    let card_top = layout.gap + layout.top_height + layout.gap;
+    let card_top = layout.content_top();
     let path_line = 22.0;
     assert!(
         file_rect.top() >= card_top + layout.tab_strip_height + path_line - 1.0,
@@ -9111,7 +9152,7 @@ fn compact_layout_keeps_essential_controls_inside_the_window() {
     );
     let explorer_card = largest_rect(&output, made_app::theme::BG_CARD_GLASS).unwrap();
     assert!(
-        (explorer_card.height() - 436.0).abs() < 2.0,
+        (explorer_card.height() - 442.0).abs() < 2.0,
         "compact explorer must fill main height: {explorer_card:?}"
     );
     assert!(

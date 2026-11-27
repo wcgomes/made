@@ -2833,15 +2833,15 @@ impl Workbench {
             let width = layout
                 .explorer_width(self.explorer_width(), available)
                 .clamp(0.0, available);
-            let panel_width = ((width + layout.gap) * progress).clamp(0.0, available);
-            // The panel's inner left margin is the gap; keep the content
+            let panel_width = ((width + layout.pane_gap) * progress).clamp(0.0, available);
+            // The panel's inner left margin is the pane gap; keep the content
             // rectangle non-negative during the first/last animation frames.
-            if panel_width > layout.gap + 0.5 {
+            if panel_width > layout.pane_gap + 0.5 {
                 egui::Panel::right(egui::Id::unique(("made-explorer-panel", self.pane_id())))
                     .resizable(false)
                     .exact_size(panel_width)
                     .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                        left: layout.gap as i8,
+                        left: layout.pane_gap as i8,
                         right: 0,
                         top: 0,
                         bottom: 0,
@@ -2850,8 +2850,8 @@ impl Workbench {
                     .show(ui, |ui| {
                         let rect = ui.max_rect();
                         let splitter = egui::Rect::from_center_size(
-                            egui::pos2(rect.left() - layout.gap * 0.5, rect.center().y),
-                            egui::vec2(8.0, rect.height()),
+                            egui::pos2(rect.left() - layout.pane_gap * 0.5, rect.center().y),
+                            egui::vec2(theme::SPLITTER_HIT_WIDTH, rect.height()),
                         );
                         let response = ui.interact(
                             splitter,
@@ -2915,30 +2915,18 @@ impl Workbench {
                             );
                         }
 
-                        // Paint the divider after the card so the grip cannot
-                        // be covered by the sliding content.
+                        // Paint the capsule after the card so it cannot be
+                        // covered by the sliding content.
                         if splitter_fade > 0.0 {
                             let dragged = response.dragged();
                             let opacity = theme::splitter_opacity(splitter_fade, dragged);
                             if opacity > 0.001 {
-                                let tone = theme::splitter_line_color(splitter_fade, dragged);
                                 ui.painter().rect_filled(
-                                    egui::Rect::from_center_size(
-                                        splitter.center(),
-                                        egui::vec2(1.0, splitter.height()),
+                                    theme::splitter_capsule_rect(splitter.center()),
+                                    CornerRadius::same(
+                                        (theme::SPLITTER_CAPSULE_SIZE.x / 2.0) as u8,
                                     ),
-                                    0.0,
-                                    tone,
-                                );
-                                ui.painter().rect(
-                                    egui::Rect::from_center_size(
-                                        splitter.center(),
-                                        egui::vec2(6.0, 32.0),
-                                    ),
-                                    CornerRadius::same(2),
-                                    theme::splitter_grip_fill(splitter_fade, dragged),
-                                    Stroke::new(1.0, tone),
-                                    StrokeKind::Inside,
+                                    theme::splitter_capsule_color(splitter_fade, dragged),
                                 );
                             }
                         }
