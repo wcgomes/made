@@ -178,5 +178,6 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 - Root frame has margin but no fill, otherwise the translucent backdrop is hidden.
 - Terminal card border is overpainted after content so the inset body fill cannot cover it; the body is transparent on the primary screen and opaque `BG_TERMINAL` on the alternate screen.
 - `native_options.clipboard_shortcuts = false` so terminal copy/paste semantics are not consumed by egui-winit.
+- The app icon (dark window tile, mint `>_` prompt and agent spark, dark-green explorer sidebar) is sourced from `crates/made-app/assets/app-icon/made-icon.svg`; generation and per-platform wiring are in [Release and CI](../operations/release-ci.md#app-icon).
 
 Related: [Layout and controls](layout-and-controls.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [UI spec](../../specs/made-ui-ux.md), [Git view archive](../../specs/changes/archive/20261031-explorer-git-view/spec.md).
