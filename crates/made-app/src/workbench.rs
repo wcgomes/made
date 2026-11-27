@@ -6217,8 +6217,9 @@ mod tests {
             );
             let socket = env_value(&first, "MADE_URL_SOCKET").expect("socket");
             // A Windows endpoint is a named pipe, not a filesystem entry.
-            #[cfg(unix)]
-            assert!(Path::new(&socket).exists(), "{target:?} endpoint is bound");
+            if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
+                assert!(Path::new(&socket).exists(), "{target:?} endpoint is bound");
+            }
             // A relaunch (fallback retry or TUI replaced by its shell) gets a
             // fresh token on the same endpoint.
             let second = launch_env(&mut workbench);
@@ -6241,6 +6242,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn render_workbench(workbench: &mut Workbench, width: f32) -> egui::FullOutput {
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);

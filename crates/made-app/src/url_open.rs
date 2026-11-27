@@ -242,8 +242,11 @@ impl PaneUrlOpen {
             self.sink = paths.and_then(|paths| {
                 // Unix binds its socket under the temp directory; Windows
                 // serves a named pipe and needs no directory.
-                #[cfg(unix)]
-                made_platform::ensure_private_directory(&paths.temp_dir).ok()?;
+                if made_platform::PlatformFamily::current()
+                    != made_platform::PlatformFamily::Windows
+                {
+                    made_platform::ensure_private_directory(&paths.temp_dir).ok()?;
+                }
                 UrlRequestSink::new(&paths.temp_dir).ok()
             });
         }

@@ -404,7 +404,9 @@ pub(crate) mod windows_pipe {
         GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    };
     use windows_sys::Win32::Security::{
         EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
@@ -441,7 +443,8 @@ pub(crate) mod windows_pipe {
 
     pub(crate) fn create(name: &str) -> io::Result<OwnedHandle> {
         let wide = wide(std::ffi::OsStr::new(name));
-        let sddl = wide_literal("D:P(A;;GA;;;CU)");
+        // SDDL has no alias for the current user: name its SID explicitly.
+        let sddl = wide_literal(&format!("D:P(A;;GA;;;{})", current_user_sid()?));
         let mut descriptor = std::ptr::null_mut();
         // SAFETY: sddl is NUL-terminated. The API allocates the descriptor,
         // which is released with LocalFree after the pipe is created.
@@ -674,6 +677,32 @@ pub(crate) mod windows_pipe {
             windows_sys::Win32::Foundation::CloseHandle(token);
         }
         (ok != 0).then_some(bytes)
+    }
+
+    /// The current process user's SID in string form (`S-1-5-...`).
+    fn current_user_sid() -> io::Result<String> {
+        // SAFETY: GetCurrentProcess returns a pseudo handle that needs no close.
+        let user = token_user(unsafe { GetCurrentProcess() })
+            .filter(|bytes| bytes.len() >= std::mem::size_of::<TOKEN_USER>())
+            .ok_or_else(|| io::Error::other("current user SID unavailable"))?;
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: user was filled by GetTokenInformation as TOKEN_USER and is
+        // at least that large. The API allocates `text`, freed with LocalFree.
+        let converted = unsafe {
+            let user = &*(user.as_ptr() as *const TOKEN_USER);
+            ConvertSidToStringSidW(user.User.Sid, &mut text)
+        };
+        if converted == 0 || text.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `text` is a NUL-terminated wide string owned by this call.
+        let sid = unsafe {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            sid
+        };
+        Ok(sid)
     }
 
     fn sids_equal(left: &[u8], right: &[u8]) -> bool {
