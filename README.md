@@ -1,6 +1,10 @@
-# Made
+<p align="center">
+  <img src="crates/made-app/assets/app-icon/made-icon-512.png" alt="Made app icon" width="128" height="128">
+</p>
 
-**Minimal Agentic Development Environment**
+<h1 align="center">MADE</h1>
+
+<p align="center"><strong>Minimal Agentic Development Environment</strong></p>
 
 A native, terminal-first desktop workspace for developers: one window, independent live workspace tabs, and a real shell plus file explorer in every tab. Use it without an agent installed; when you run OpenCode v2 in a tab — yourself or from the `+` menu — Made follows the active session and worktree.
 
