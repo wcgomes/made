@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use made_platform::native_backdrop::NativeBackdropStatus;
-use made_platform::Platform;
+use made_platform::{Platform, PlatformFamily};
 
 use crate::cli::LaunchArgs;
 use crate::integrations::{
@@ -37,11 +37,13 @@ use crate::{APP_NAME, APP_VERSION};
 /// macOS gets the artwork inset to Apple's icon grid; other platforms get the
 /// full-bleed tile. An undecodable PNG yields eframe's "no icon" value.
 pub fn app_icon() -> egui::IconData {
-    #[cfg(target_os = "macos")]
-    const PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-macos-512.png");
-    #[cfg(not(target_os = "macos"))]
-    const PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-256.png");
-    eframe::icon_data::from_png_bytes(PNG).unwrap_or_default()
+    const MACOS_PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-macos-512.png");
+    const FULL_BLEED_PNG: &[u8] = include_bytes!("../assets/app-icon/made-icon-256.png");
+    let png = match PlatformFamily::current() {
+        PlatformFamily::MacOs => MACOS_PNG,
+        PlatformFamily::Linux | PlatformFamily::Windows => FULL_BLEED_PNG,
+    };
+    eframe::icon_data::from_png_bytes(png).unwrap_or_default()
 }
 
 /// Native window options shared by the binary and tests.

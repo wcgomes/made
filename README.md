@@ -165,7 +165,7 @@ The file preview is read-only: no editing, saving, LSP, or diff view. Releases a
 - `aarch64-apple-darwin` — macOS arm64
 - `x86_64-apple-darwin` — macOS x64
 - `x86_64-unknown-linux-gnu` — Linux x64 on X11 and Wayland
-- `x86_64-pc-windows-msvc` — Windows x64 (native ConPTY; WSL-hosted OpenCode is out of scope)
+- `x86_64-pc-windows-msvc` — Windows x64 with native OpenCode (ConPTY; WSL-hosted OpenCode is out of scope)
 
 ## Documentation
 
