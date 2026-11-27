@@ -166,6 +166,8 @@ pub const WORDMARK_ABOUT_TOOLTIP: &str = "About";
 pub const WORDMARK_ABOUT_UPDATE_TOOLTIP: &str = "About, update ready";
 /// Radius of the wordmark's update-ready accent dot.
 pub const UPDATE_DOT_RADIUS: f32 = 2.5;
+/// Clear space between the wordmark's last glyph ink and the update dot.
+pub const UPDATE_DOT_INK_GAP: f32 = 3.0;
 /// Wordmark font size.
 pub const WORDMARK_SIZE: f32 = 14.0;
 /// Wordmark tracking in points.
@@ -304,6 +306,35 @@ pub fn wordmark_brand(ui: &mut Ui) -> egui::Rect {
     rect
 }
 
+/// Union of the painted glyph bitmaps of `galley`, relative to its origin.
+///
+/// Unlike the galley size, this excludes the trailing letter spacing and the
+/// space above the cap height.
+pub fn wordmark_ink_rect(galley: &egui::Galley) -> egui::Rect {
+    let mut ink = egui::Rect::NOTHING;
+    for placed in &galley.rows {
+        for glyph in &placed.row.glyphs {
+            if glyph.uv_rect.is_nothing() {
+                continue;
+            }
+            let min = placed.pos + glyph.pos.to_vec2() + glyph.uv_rect.offset;
+            ink = ink.union(egui::Rect::from_min_size(min, glyph.uv_rect.size));
+        }
+    }
+    ink
+}
+
+/// Center of the update dot for the wordmark's painted `ink` rect: a
+/// superscript badge [`UPDATE_DOT_INK_GAP`] past the last glyph, centered on
+/// the cap-height top. It may extend into the wordmark-to-icon gap but never
+/// overlaps the letters.
+pub fn update_dot_center(ink: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        ink.right() + UPDATE_DOT_INK_GAP + UPDATE_DOT_RADIUS,
+        ink.top(),
+    )
+}
+
 /// Paint the two-tone wordmark as the header About trigger.
 ///
 /// The trigger keeps the cached two-tone paint, paints no fill, owns the icon
@@ -311,8 +342,8 @@ pub fn wordmark_brand(ui: &mut Ui) -> egui::Rect {
 /// its tooltip and accessibility name, and reports pointer or Enter/Space
 /// activation. The caller gates the toggle on an active workspace.
 ///
-/// With `update_ready`, one app-drawn accent dot is painted inside the
-/// target's top-right corner and the name becomes
+/// With `update_ready`, one app-drawn accent dot is painted as a superscript
+/// badge (see [`update_dot_center`]) and the name becomes
 /// [`WORDMARK_ABOUT_UPDATE_TOOLTIP`]; the target size is unchanged.
 pub fn wordmark_about_action(
     ui: &mut Ui,
@@ -330,15 +361,11 @@ pub fn wordmark_about_action(
         rect.center().x - galley.size().x / 2.0,
         rect.center().y - galley.size().y * 0.5,
     );
-    let galley_width = galley.size().x;
+    let ink = wordmark_ink_rect(&galley).translate(origin.to_vec2());
     ui.painter().galley(origin, galley, TEXT_PRIMARY);
     if update_ready {
-        let center = egui::pos2(
-            (origin.x + galley_width + UPDATE_DOT_RADIUS).min(rect.right() - UPDATE_DOT_RADIUS),
-            (origin.y + UPDATE_DOT_RADIUS).max(rect.top() + UPDATE_DOT_RADIUS),
-        );
         ui.painter()
-            .circle_filled(center, UPDATE_DOT_RADIUS, ACCENT);
+            .circle_filled(update_dot_center(ink), UPDATE_DOT_RADIUS, ACCENT);
     }
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2459,6 +2486,50 @@ mod tests {
             output.textures_delta.clear();
         }
         assert!(!std::sync::Arc::ptr_eq(&galleys[0], &galleys[1]));
+    }
+
+    #[test]
+    fn update_dot_clears_the_wordmark_ink_and_the_first_icon() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut target = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            target = wordmark_about_action(ui, 26.0, BG_CARD, true).response.rect;
+        });
+        output.textures_delta.clear();
+        let mut ink = None;
+        let mut dot = None;
+        for clipped in &output.shapes {
+            match &clipped.shape {
+                egui::Shape::Text(text) => {
+                    ink = Some(wordmark_ink_rect(&text.galley).translate(text.pos.to_vec2()));
+                }
+                egui::Shape::Circle(circle) if circle.fill == ACCENT => {
+                    dot = Some(egui::Rect::from_center_size(
+                        circle.center,
+                        egui::Vec2::splat(2.0 * circle.radius),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let (ink, dot) = (ink.expect("wordmark text"), dot.expect("update dot"));
+        assert!(
+            dot.left() >= ink.right() + UPDATE_DOT_INK_GAP - 0.01,
+            "dot {dot:?} must clear the letters {ink:?}"
+        );
+        assert!(
+            !dot.intersects(ink),
+            "dot {dot:?} overlaps the letters {ink:?}"
+        );
+        assert!((dot.center().y - ink.top()).abs() < 0.01);
+        // The first icon target starts one wordmark gap after the target; the
+        // compact gap is the tighter one.
+        let first_icon_left = target.right() + wordmark_gap(true);
+        assert!(
+            dot.right() + 6.0 <= first_icon_left,
+            "dot {dot:?} must stay well clear of the first icon at {first_icon_left}"
+        );
     }
 
     #[test]

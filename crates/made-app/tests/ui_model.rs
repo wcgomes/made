@@ -12722,6 +12722,13 @@ fn wordmark_rect(headless: &Headless) -> egui::Rect {
     headless.response(made_app::theme::wordmark_id()).rect
 }
 
+/// The wordmark target plus the part of the wordmark-to-icon gap the
+/// superscript update dot may use.
+fn wordmark_dot_area(headless: &Headless) -> egui::Rect {
+    let rect = wordmark_rect(headless);
+    egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() + 12.0, rect.bottom()))
+}
+
 #[test]
 fn update_indicator_appears_only_when_ready_on_the_active_header_wordmark() {
     if isolated("update_indicator_appears_only_when_ready_on_the_active_header_wordmark") {
@@ -12748,7 +12755,7 @@ fn update_indicator_appears_only_when_ready_on_the_active_header_wordmark() {
             let rect = wordmark_rect(&headless);
             rects.push(rect);
             assert_eq!(
-                accent_dots_in(&output, rect),
+                accent_dots_in(&output, wordmark_dot_area(&headless)),
                 usize::from(ready.is_some()),
                 "{width}x{height} ready={ready:?}"
             );
@@ -12779,7 +12786,7 @@ fn update_indicator_appears_only_when_ready_on_the_active_header_wordmark() {
     let mut headless = Headless::new(model, 1280.0, 800.0);
     wait_explorer_ready(&mut headless, id);
     let output = headless.render();
-    assert_eq!(accent_dots_in(&output, wordmark_rect(&headless)), 0);
+    assert_eq!(accent_dots_in(&output, wordmark_dot_area(&headless)), 0);
 
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     installed_updates(
@@ -12805,7 +12812,7 @@ fn update_indicator_appears_only_when_ready_on_the_active_header_wordmark() {
     headless.render();
     let output = headless.render();
     assert_eq!(
-        accent_dots_in(&output, wordmark_rect(&headless)),
+        accent_dots_in(&output, wordmark_dot_area(&headless)),
         1,
         "dots: {:?} wordmark: {:?}",
         circle_shapes(&output)
