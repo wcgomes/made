@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Event, Key, Rect, Sense, Ui, Vec2};
 use made_platform::{
     save_clipboard_image_png, ClipboardImage, ExitStatus, ImeComposition, ImeEvent, Platform,
-    PlatformFamily, PtySize,
+    PtySize,
 };
 use made_terminal::{
     InputEncoder, Key as TerminalKey, Modifiers as TerminalModifiers, MouseButton, MouseEvent,
@@ -189,7 +189,9 @@ pub struct TerminalPane {
     input_submitted: bool,
     pending_input: PendingInput,
     input_notice: Option<String>,
-    native_image_paste_hint_shown: bool,
+    /// OSC 52 store taken from a core replaced by a resnapshot before
+    /// [`TerminalPane::apply_clipboard_store`] ran.
+    carried_clipboard_store: Option<String>,
     focus_on_next_frame: bool,
     wrote_input: bool,
     palette: GridPalette,
@@ -258,7 +260,7 @@ impl TerminalPane {
             input_submitted: false,
             pending_input: PendingInput::default(),
             input_notice: None,
-            native_image_paste_hint_shown: false,
+            carried_clipboard_store: None,
             focus_on_next_frame: false,
             wrote_input: false,
             palette: crate::theme::terminal_palette(),
@@ -321,7 +323,7 @@ impl TerminalPane {
             input_submitted: false,
             pending_input: PendingInput::default(),
             input_notice: None,
-            native_image_paste_hint_shown: false,
+            carried_clipboard_store: None,
             focus_on_next_frame: false,
             wrote_input: false,
             palette: crate::theme::terminal_palette(),
@@ -359,6 +361,9 @@ impl TerminalPane {
     /// paused until [`Self::resume_input`].
     pub fn apply_resnapshot(&mut self, bytes: &[u8]) {
         let size = self.core.size();
+        if let Some(text) = self.core.take_clipboard_store() {
+            self.carried_clipboard_store = Some(text);
+        }
         self.core = TerminalCore::with_size(size, SCROLLBACK_LINES);
         if !bytes.is_empty() {
             self.core.feed(bytes);
@@ -390,10 +395,8 @@ impl TerminalPane {
         let wrote = self.write_paste(path, log);
         if wrote && !self.remote_image_hint_shown {
             self.remote_image_hint_shown = true;
-            self.input_notice = Some(
-                "Remote paste uses an uploaded PNG path for both chords. The remote process does not read the host clipboard."
-                    .to_owned(),
-            );
+            self.input_notice =
+                Some("Image uploaded to the server; its file path was pasted.".to_owned());
         }
         wrote
     }
@@ -969,6 +972,44 @@ impl TerminalPane {
         Some(text)
     }
 
+    /// Write the latest OSC 52 clipboard store from the child to the platform
+    /// clipboard.
+    ///
+    /// Uses the same egui fallback as [`Self::copy_selection`]. Logs record
+    /// only the text length, never the text.
+    pub fn apply_clipboard_store(
+        &mut self,
+        platform: &dyn Platform,
+        ctx: &egui::Context,
+        log: &mut DiagnosticLog,
+    ) {
+        // A store fed after a resnapshot is newer than one carried across it.
+        let carried = self.carried_clipboard_store.take();
+        let Some(text) = self.core.take_clipboard_store().or(carried) else {
+            return;
+        };
+        let len = text.len();
+        match platform.clipboard() {
+            Ok(mut clipboard) => match clipboard.set_text(&text) {
+                Ok(()) => {}
+                Err(error) => {
+                    log.record(
+                        LogLevel::Warn,
+                        format!("OSC 52 clipboard write of {len} bytes failed: {error}"),
+                    );
+                    ctx.copy_text(text);
+                }
+            },
+            Err(error) => {
+                log.record(
+                    LogLevel::Warn,
+                    format!("clipboard unavailable for OSC 52 write of {len} bytes: {error}"),
+                );
+                ctx.copy_text(text);
+            }
+        }
+    }
+
     /// Paste clipboard text, or forward Ctrl+V when the clipboard holds an
     /// image so the child TUI can read the clipboard natively.
     pub fn paste_clipboard(&mut self, platform: &dyn Platform, log: &mut DiagnosticLog) -> bool {
@@ -1008,7 +1049,7 @@ impl TerminalPane {
                 return self.queue_remote_image(&image);
             }
             return match mode {
-                PasteMode::Native => self.forward_native_image_paste(platform, log),
+                PasteMode::Native => self.forward_native_image_paste(log),
                 PasteMode::Path => self.paste_image_path(platform, &image, log),
             };
         }
@@ -1093,25 +1134,9 @@ impl TerminalPane {
         true
     }
 
-    fn forward_native_image_paste(
-        &mut self,
-        platform: &dyn Platform,
-        log: &mut DiagnosticLog,
-    ) -> bool {
+    fn forward_native_image_paste(&mut self, log: &mut DiagnosticLog) -> bool {
         self.clear_selection_for_input();
-        let wrote = self.write(&[0x16], log);
-        if wrote && !self.native_image_paste_hint_shown {
-            self.native_image_paste_hint_shown = true;
-            let shortcut = if platform.family() == PlatformFamily::MacOs {
-                "Cmd+Shift+V"
-            } else {
-                "Ctrl+Shift+V"
-            };
-            self.input_notice = Some(format!(
-                "Image paste sent to the terminal; use {shortcut} to paste its file path instead."
-            ));
-        }
-        wrote
+        self.write(&[0x16], log)
     }
 
     fn paste_image_path(
@@ -1268,7 +1293,7 @@ impl TerminalPane {
         self.ime_preedit.clear();
         self.pending_input.clear();
         self.input_notice = None;
-        self.native_image_paste_hint_shown = false;
+        self.carried_clipboard_store = None;
         self.wrote_input = false;
         self.input_echo = None;
         self.recent_typed_text.clear();
@@ -2247,8 +2272,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use made_platform::{
-        AppPaths, Clipboard, Environment, PlatformError, PluginDirSource, PtyRequest, PtySession,
-        ShellSpec, MAX_CLIPBOARD_IMAGE_SIDE,
+        AppPaths, Clipboard, Environment, PlatformError, PlatformFamily, PluginDirSource,
+        PtyRequest, PtySession, ShellSpec, MAX_CLIPBOARD_IMAGE_SIDE,
     };
     use made_terminal::InputModes;
 
@@ -3165,6 +3190,7 @@ mod tests {
 
     struct TestClipboard {
         state: Arc<Mutex<TestClipboardState>>,
+        fail_writes: bool,
     }
 
     impl Clipboard for TestClipboard {
@@ -3178,6 +3204,9 @@ mod tests {
         }
 
         fn set_text(&mut self, text: &str) -> Result<(), PlatformError> {
+            if self.fail_writes {
+                return Err(PlatformError::message("test clipboard write failed"));
+            }
             let mut state = self.state.lock().unwrap();
             state.text = Ok(text.to_owned());
             state.image = Ok(None);
@@ -3200,6 +3229,14 @@ mod tests {
         writes: Arc<Mutex<Vec<u8>>>,
         /// What each spawned child prints.
         output: fn() -> Box<dyn Read + Send>,
+        clipboard_fault: ClipboardFault,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ClipboardFault {
+        None,
+        Unavailable,
+        WriteFails,
     }
 
     impl Platform for TestPlatform {
@@ -3224,8 +3261,12 @@ mod tests {
         }
 
         fn clipboard(&self) -> Result<Box<dyn Clipboard>, PlatformError> {
+            if self.clipboard_fault == ClipboardFault::Unavailable {
+                return Err(PlatformError::message("test clipboard unavailable"));
+            }
             Ok(Box::new(TestClipboard {
                 state: self.clipboard.clone(),
+                fail_writes: self.clipboard_fault == ClipboardFault::WriteFails,
             }))
         }
 
@@ -3313,6 +3354,7 @@ mod tests {
             paths: test_app_paths(temp.path()),
             writes: Arc::new(Mutex::new(Vec::new())),
             output: || Box::new(io::empty()),
+            clipboard_fault: ClipboardFault::None,
         }
     }
 
@@ -3375,7 +3417,7 @@ mod tests {
     }
 
     #[test]
-    fn native_image_paste_forwards_ctrl_v_and_hints_once() {
+    fn native_image_paste_forwards_ctrl_v_without_a_notice() {
         let temp = tempfile::tempdir().unwrap();
         let platform = test_platform(
             &temp,
@@ -3387,33 +3429,48 @@ mod tests {
         let mut pane = spawn_test_pane(&platform);
         let mut log = DiagnosticLog::new();
 
-        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        let writes = wait_for_writes(&platform, |writes| !writes.is_empty());
-        assert_eq!(writes, vec![0x16]);
-        assert!(
-            !writes
-                .windows(b"must not be pasted".len())
-                .any(|window| window == b"must not be pasted"),
-            "image paste must not fall through to the text payload"
-        );
+        for count in 1..=2 {
+            assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
+            let writes = wait_for_writes(&platform, |writes| writes.len() >= count);
+            assert_eq!(writes, vec![0x16; count]);
+            assert!(
+                !writes
+                    .windows(b"must not be pasted".len())
+                    .any(|window| window == b"must not be pasted"),
+                "image paste must not fall through to the text payload"
+            );
+            assert!(
+                pane.input_notice.is_none(),
+                "native image paste must not show a notice"
+            );
+        }
+        pane.terminate(&mut log);
+    }
 
-        let notice = pane.input_notice.take().expect("native image paste hint");
-        let shortcut = if PlatformFamily::current() == PlatformFamily::MacOs {
-            "Cmd+Shift+V"
-        } else {
-            "Ctrl+Shift+V"
+    #[test]
+    fn local_osc52_copy_reaches_the_clipboard() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut platform = test_platform(&temp, TestClipboardState::default());
+        platform.output = || {
+            Box::new(io::Cursor::new(
+                b"\x1b]52;c;bG9jYWwgdHVpIGNvcHk=\x07".to_vec(),
+            ))
         };
-        assert!(
-            notice.contains(shortcut),
-            "the one-time hint must name the path fallback: {notice}"
-        );
-        assert!(!notice.to_lowercase().contains("failed"));
+        let mut pane = spawn_test_pane(&platform);
+        let ctx = egui::Context::default();
+        let mut log = DiagnosticLog::new();
+        let copied = || platform.clipboard.lock().unwrap().text.clone();
 
-        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        let _ = wait_for_writes(&platform, |writes| writes.len() >= 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while copied().as_deref() != Ok("local tui copy") && Instant::now() < deadline {
+            pane.pump(&mut log);
+            pane.apply_clipboard_store(&platform, &ctx, &mut log);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(copied().as_deref(), Ok("local tui copy"));
         assert!(
-            pane.input_notice.is_none(),
-            "the fallback hint must not repeat on every paste"
+            platform.writes.lock().unwrap().is_empty(),
+            "no OSC 52 reply"
         );
         pane.terminate(&mut log);
     }
@@ -3524,46 +3581,6 @@ mod tests {
             !platform.paths.temp_dir.join("clipboard-images").exists(),
             "an oversized image must not create the private image directory"
         );
-        pane.terminate(&mut log);
-    }
-
-    #[test]
-    fn relaunch_allows_the_native_image_paste_hint_again() {
-        let temp = tempfile::tempdir().unwrap();
-        let platform = test_platform(
-            &temp,
-            TestClipboardState {
-                text: Ok(String::new()),
-                image: Ok(Some(test_image(2, 2))),
-            },
-        );
-        let mut pane = spawn_test_pane(&platform);
-        let mut log = DiagnosticLog::new();
-        let shortcut = if PlatformFamily::current() == PlatformFamily::MacOs {
-            "Cmd+Shift+V"
-        } else {
-            "Ctrl+Shift+V"
-        };
-
-        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        assert!(pane
-            .input_notice
-            .take()
-            .expect("first hint")
-            .contains(shortcut));
-        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        assert!(
-            pane.input_notice.is_none(),
-            "the hint must not repeat before relaunch"
-        );
-
-        pane.relaunch(&platform, &mut log).expect("relaunch");
-        assert!(pane.paste_clipboard_with_mode(&platform, &mut log, PasteMode::Native));
-        assert!(pane
-            .input_notice
-            .take()
-            .expect("hint after relaunch")
-            .contains(shortcut));
         pane.terminate(&mut log);
     }
 
@@ -4180,6 +4197,139 @@ mod tests {
         let second = pane.take_pending_image().expect("path chord queues a PNG");
         assert!(second.starts_with(b"\x89PNG"));
         assert!(!writes.lock().unwrap().contains(&0x16));
+    }
+
+    #[test]
+    fn remote_osc52_copy_reaches_the_host_clipboard() {
+        let mut pane = TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([7; 16]),
+            },
+            24,
+            80,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(&temp, TestClipboardState::default());
+        let ctx = egui::Context::default();
+        let mut log = DiagnosticLog::new();
+
+        pane.feed_remote_output(b"\x1b]52;c;cmVtb3RlIHR1aSBjb3B5\x1b\\");
+        pane.apply_clipboard_store(&platform, &ctx, &mut log);
+        assert_eq!(
+            platform.clipboard.lock().unwrap().text.as_deref(),
+            Ok("remote tui copy")
+        );
+    }
+
+    fn remote_test_pane() -> TerminalPane {
+        TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([7; 16]),
+            },
+            24,
+            80,
+        )
+    }
+
+    #[test]
+    fn osc52_store_survives_a_following_resnapshot() {
+        let mut pane = remote_test_pane();
+        let temp = tempfile::tempdir().unwrap();
+        let platform = test_platform(&temp, TestClipboardState::default());
+        let ctx = egui::Context::default();
+        let mut log = DiagnosticLog::new();
+
+        pane.feed_remote_output(b"\x1b]52;c;cmVtb3RlIHR1aSBjb3B5\x07");
+        pane.apply_resnapshot(b"ready");
+        pane.apply_clipboard_store(&platform, &ctx, &mut log);
+        assert_eq!(
+            platform.clipboard.lock().unwrap().text.as_deref(),
+            Ok("remote tui copy")
+        );
+
+        // A store fed after the resnapshot is newer and wins.
+        pane.feed_remote_output(b"\x1b]52;c;Zmlyc3Q=\x07");
+        pane.apply_resnapshot(b"ready");
+        pane.feed_remote_output(b"\x1b]52;c;c2Vjb25k\x07");
+        pane.apply_clipboard_store(&platform, &ctx, &mut log);
+        assert_eq!(
+            platform.clipboard.lock().unwrap().text.as_deref(),
+            Ok("second")
+        );
+        pane.apply_clipboard_store(&platform, &ctx, &mut log);
+        assert_eq!(
+            platform.clipboard.lock().unwrap().text.as_deref(),
+            Ok("second"),
+            "a carried store must not be applied after a newer one"
+        );
+    }
+
+    #[test]
+    fn osc52_clipboard_failure_falls_back_to_egui_and_logs_only_the_length() {
+        for fault in [ClipboardFault::Unavailable, ClipboardFault::WriteFails] {
+            let mut pane = remote_test_pane();
+            let temp = tempfile::tempdir().unwrap();
+            let mut platform = test_platform(&temp, TestClipboardState::default());
+            platform.clipboard_fault = fault;
+            let ctx = egui::Context::default();
+            let mut log = DiagnosticLog::new();
+
+            pane.feed_remote_output(b"\x1b]52;c;cmVtb3RlIHR1aSBjb3B5\x07");
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                pane.apply_clipboard_store(&platform, ui.ctx(), &mut log);
+            });
+            output.textures_delta.clear();
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .contains(&egui::OutputCommand::CopyText("remote tui copy".to_owned())),
+                "the egui clipboard must receive the text"
+            );
+            assert_eq!(
+                platform.clipboard.lock().unwrap().text.as_deref(),
+                Ok(""),
+                "the failing native clipboard is unchanged"
+            );
+            let messages: Vec<&str> = log.entries().map(|entry| entry.message.as_str()).collect();
+            assert!(
+                messages.iter().any(|message| message.contains("15 bytes")),
+                "{messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| !message.contains("remote tui copy")),
+                "{messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_image_paste_hint_names_the_uploaded_path() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut pane = TerminalPane::open_remote(
+            crate::tui::TerminalTarget::RemoteShell {
+                authority: made_remote::protocol::AuthorityId([7; 16]),
+            },
+            24,
+            80,
+        );
+        pane.attach_remote_transport(Box::new(SharedTransport {
+            writes: writes.clone(),
+            resized: Arc::new(Mutex::new(None)),
+        }));
+        pane.apply_resnapshot(b"ready");
+        pane.resume_input();
+        let mut log = DiagnosticLog::new();
+
+        assert!(pane.finish_remote_image_paste("/tmp/made-upload.png", &mut log));
+        assert_eq!(
+            pane.input_notice.take().as_deref(),
+            Some("Image uploaded to the server; its file path was pasted.")
+        );
+        assert!(pane.finish_remote_image_paste("/tmp/made-upload.png", &mut log));
+        assert!(pane.input_notice.is_none(), "the hint is shown once");
     }
 
     struct QueuedTransport(std::collections::VecDeque<made_terminal::PtyEvent>);

@@ -232,6 +232,8 @@ impl VtState {
                 self.primary = PrimaryRetention::capture(&self.core);
             }
         }
+        // OSC 52 copies are applied by the client's own core; do not retain them.
+        let _ = self.core.take_clipboard_store();
     }
 
     pub fn resnapshot(&self) -> Vec<u8> {

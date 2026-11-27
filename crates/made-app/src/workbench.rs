@@ -2891,6 +2891,9 @@ impl Workbench {
         self.sync_remote_claude();
         // END remote-path
         let terminal_changed = self.pump_remote_terminal();
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.apply_clipboard_store(&self.platform, ctx, self.diag.log_mut());
+        }
         self.poll_integrations(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
@@ -4139,6 +4142,7 @@ impl Workbench {
                 active = true;
                 self.last_activity = now;
             }
+            terminal.apply_clipboard_store(&self.platform, ctx, self.diag.log_mut());
             if !terminal_visible {
                 hidden_output_bytes = terminal.output_bytes().saturating_sub(output_before);
             }

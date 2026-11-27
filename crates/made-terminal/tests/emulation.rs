@@ -1,5 +1,5 @@
 //! Terminal core behavior tests: truecolor, alternate screen, scrollback,
-//! title, OSC 7 cwd, Unicode width, damage, resize, and selection/copy.
+//! title, OSC 7 cwd, Unicode width, damage, resize, selection/copy, and OSC 52.
 
 use made_platform::{Clipboard, InMemoryClipboard};
 use made_terminal::{CellSnapshot, QueriedColor, TerminalColor, TerminalCore, TerminalSize};
@@ -645,4 +645,121 @@ fn osc7_ignores_raw_cmd_prompt_form_off_windows() {
     let mut core = made_terminal::TerminalCore::new();
     core.feed("\x1b]7;file://localhost/C:\\Users\\a b\x1b\\".as_bytes());
     assert!(core.cwd().is_none());
+}
+
+mod osc52 {
+    use super::terminal;
+
+    /// Standard padded base64, enough for test payloads.
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+                if i <= chunk.len() {
+                    out.push(char::from(TABLE[((n >> shift) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn store(selector: &str, text: &[u8], terminator: &str) -> Vec<u8> {
+        format!("\x1b]52;{selector};{}{terminator}", base64(text)).into_bytes()
+    }
+
+    #[test]
+    fn clipboard_store_with_bel_reaches_take_once() {
+        let mut core = terminal(4, 20);
+        core.feed(&store("c", "copied é".as_bytes(), "\x07"));
+        assert_eq!(core.take_clipboard_store().as_deref(), Some("copied é"));
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn clipboard_store_with_st_reaches_take_once() {
+        let mut core = terminal(4, 20);
+        core.feed(&store("c", b"st text", "\x1b\\"));
+        assert_eq!(core.take_clipboard_store().as_deref(), Some("st text"));
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn empty_selector_defaults_to_the_clipboard() {
+        let mut core = terminal(4, 20);
+        core.feed(&store("", b"default", "\x07"));
+        assert_eq!(core.take_clipboard_store().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn clipboard_store_split_across_feeds_is_taken_once() {
+        let mut core = terminal(4, 20);
+        let bytes = store("c", b"split payload", "\x1b\\");
+        for chunk in bytes.chunks(3) {
+            core.feed(chunk);
+        }
+        assert_eq!(
+            core.take_clipboard_store().as_deref(),
+            Some("split payload")
+        );
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn latest_clipboard_store_wins() {
+        let mut core = terminal(4, 20);
+        core.feed(&store("c", b"first", "\x07"));
+        core.feed(&store("c", b"second", "\x07"));
+        assert_eq!(core.take_clipboard_store().as_deref(), Some("second"));
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn clipboard_query_is_refused_without_a_reply() {
+        let mut core = terminal(4, 20);
+        core.feed(b"\x1b]52;c;?\x07");
+        core.feed(b"\x1b]52;c;?\x1b\\");
+        assert_eq!(core.take_clipboard_store(), None);
+        assert!(core.take_replies(|_| [0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn primary_and_selection_stores_are_ignored() {
+        let mut core = terminal(4, 20);
+        core.feed(&store("p", b"primary", "\x07"));
+        core.feed(&store("s", b"selection", "\x07"));
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn invalid_base64_and_invalid_utf8_are_ignored() {
+        let mut core = terminal(4, 20);
+        core.feed(b"\x1b]52;c;!!not-base64!!\x07");
+        assert_eq!(core.take_clipboard_store(), None);
+        core.feed(&store("c", &[0xff, 0xfe, 0x80], "\x07"));
+        assert_eq!(core.take_clipboard_store(), None);
+    }
+
+    #[test]
+    fn clipboard_store_is_capped_at_one_mebibyte() {
+        const CAP: usize = made_terminal::PASTE_BYTE_LIMIT;
+        let mut core = terminal(4, 20);
+        core.feed(&store("c", &vec![b'a'; CAP + 1], "\x07"));
+        assert_eq!(core.take_clipboard_store(), None);
+
+        core.feed(&store("c", &vec![b'b'; CAP], "\x07"));
+        assert_eq!(
+            core.take_clipboard_store().map(|text| text.len()),
+            Some(CAP)
+        );
+    }
 }

@@ -34,7 +34,9 @@ use alacritty_terminal::grid::{Dimensions as VtDimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::{Cell as VtCell, Flags as VtFlags};
-use alacritty_terminal::term::{Config as VtConfig, RenderableCursor, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{
+    ClipboardType, Config as VtConfig, Osc52, RenderableCursor, Term, TermDamage, TermMode,
+};
 use alacritty_terminal::vte::ansi::{
     Color as VtColor, CursorShape as VtCursorShape, NamedColor, Processor, Rgb,
 };
@@ -329,6 +331,9 @@ impl TerminalCore {
         let size = normalize_size(size);
         let config = VtConfig {
             scrolling_history: scrollback_lines,
+            // OSC 52 may write the clipboard; queries that would read it
+            // back to the child are refused.
+            osc52: Osc52::OnlyCopy,
             ..VtConfig::default()
         };
         let listener_state = Arc::new(Mutex::new(ListenerState::default()));
@@ -617,6 +622,15 @@ impl TerminalCore {
         std::mem::replace(&mut self.listener_state_mut().bell, false)
     }
 
+    /// Take the latest OSC 52 clipboard store received since the last call.
+    ///
+    /// Only the clipboard selection (`c`, or an empty selector) up to
+    /// [`crate::input::PASTE_BYTE_LIMIT`] bytes of text is kept; a later store
+    /// replaces an earlier one.
+    pub fn take_clipboard_store(&mut self) -> Option<String> {
+        self.listener_state_mut().clipboard_store.take()
+    }
+
     /// Terminal input modes for the encoder.
     pub fn input_modes(&self) -> crate::input::InputModes {
         let mode = *self.term.mode();
@@ -889,6 +903,8 @@ struct ListenerState {
     title: Option<String>,
     replies: Vec<Reply>,
     bell: bool,
+    /// Latest accepted OSC 52 clipboard store. Never logged or Debug-printed.
+    clipboard_store: Option<String>,
 }
 
 struct CoreListener {
@@ -905,6 +921,11 @@ impl EventListener for CoreListener {
             Event::PtyWrite(text) => state.replies.push(Reply::Bytes(text.into_bytes())),
             Event::ColorRequest(index, format) => {
                 state.replies.push(Reply::Color(index, format));
+            }
+            Event::ClipboardStore(ClipboardType::Clipboard, text)
+                if text.len() <= crate::input::PASTE_BYTE_LIMIT =>
+            {
+                state.clipboard_store = Some(text);
             }
             _ => {}
         }
