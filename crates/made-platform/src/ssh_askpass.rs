@@ -288,7 +288,7 @@ fn publish_socket(fd: std::os::fd::RawFd, path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn same_user_peer(fd: std::os::fd::RawFd) -> io::Result<()> {
+pub(crate) fn same_user_peer(fd: std::os::fd::RawFd) -> io::Result<()> {
     let peer = peer_uid(fd)?;
     if peer != current_euid() {
         return Err(io::Error::new(
@@ -389,7 +389,7 @@ pub fn run_helper(pipe: &Path, prompt: &str, output: &mut impl io::Write) -> io:
 }
 
 #[cfg(windows)]
-mod windows_pipe {
+pub(crate) mod windows_pipe {
     use super::{read_blob as decode_blob, write_blob as encode_blob, Reply};
     use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
@@ -404,12 +404,15 @@ mod windows_pipe {
         GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    };
     use windows_sys::Win32::Security::{
         EqualSid, GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -424,14 +427,14 @@ mod windows_pipe {
     /// `CancelIoEx` must use the same handle that issued `ConnectNamedPipe`. A
     /// duplicated handle would not wake that call, so this token stores the
     /// raw value without taking ownership or closing it.
-    pub(super) struct PipeInterrupt(RawHandle);
+    pub(crate) struct PipeInterrupt(RawHandle);
 
     // SAFETY: the token never closes or frees the handle. `CancelIoEx` on a
     // live named pipe is safe from any thread, and the broker uses this token
     // only while the serve thread still owns that pipe.
     unsafe impl Send for PipeInterrupt {}
 
-    pub(super) fn interrupt(pipe: &OwnedHandle) -> PipeInterrupt {
+    pub(crate) fn interrupt(pipe: &OwnedHandle) -> PipeInterrupt {
         PipeInterrupt(pipe.as_raw_handle())
     }
 
@@ -439,9 +442,10 @@ mod windows_pipe {
         pipe.as_raw_handle() as HANDLE
     }
 
-    pub fn create(name: &str) -> io::Result<OwnedHandle> {
+    pub(crate) fn create(name: &str) -> io::Result<OwnedHandle> {
         let wide = wide(std::ffi::OsStr::new(name));
-        let sddl = wide_literal("D:P(A;;GA;;;CU)");
+        // SDDL has no alias for the current user: name its SID explicitly.
+        let sddl = wide_literal(&format!("D:P(A;;GA;;;{})", current_user_sid()?));
         let mut descriptor = std::ptr::null_mut();
         // SAFETY: sddl is NUL-terminated. The API allocates the descriptor,
         // which is released with LocalFree after the pipe is created.
@@ -462,11 +466,14 @@ mod windows_pipe {
             bInheritHandle: 0,
         };
         // SAFETY: name and attributes are valid for the call. PIPE_REJECT_REMOTE_CLIENTS
-        // refuses a remote client. The returned handle is uniquely owned.
+        // refuses a remote client. FILE_FLAG_FIRST_PIPE_INSTANCE fails instead
+        // of joining a pipe someone else already created under this name (and
+        // its DACL). This is the only instance: the serve loops reuse it after
+        // DisconnectNamedPipe. The returned handle is uniquely owned.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 8192,
@@ -486,7 +493,7 @@ mod windows_pipe {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
     }
 
-    pub fn serve(
+    pub(super) fn serve(
         owner: OwnedHandle,
         stop: std::sync::Arc<AtomicBool>,
         timeout: Duration,
@@ -572,7 +579,7 @@ mod windows_pipe {
         // `owner` drops here and is the only closer of the server pipe.
     }
 
-    pub fn cancel(pipe: &PipeInterrupt) {
+    pub(crate) fn cancel(pipe: &PipeInterrupt) {
         let handle = pipe.0 as HANDLE;
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return;
@@ -585,7 +592,7 @@ mod windows_pipe {
         }
     }
 
-    pub fn connect(path: &Path) -> io::Result<HANDLE> {
+    pub(crate) fn connect(path: &Path) -> io::Result<HANDLE> {
         let wide = wide(path.as_os_str());
         // SAFETY: the path is NUL-terminated. OPEN_EXISTING refuses to create
         // a different file. The handle is uniquely owned by the helper.
@@ -606,15 +613,15 @@ mod windows_pipe {
         Ok(handle)
     }
 
-    pub fn read_blob(handle: HANDLE, cap: usize) -> io::Result<Vec<u8>> {
+    pub(crate) fn read_blob(handle: HANDLE, cap: usize) -> io::Result<Vec<u8>> {
         decode_blob(&mut PipeIo(handle), cap)
     }
 
-    pub fn write_blob(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_blob(handle: HANDLE, bytes: &[u8]) -> io::Result<()> {
         encode_blob(&mut PipeIo(handle), bytes)
     }
 
-    pub fn close(handle: HANDLE) {
+    pub(crate) fn close(handle: HANDLE) {
         if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle);
@@ -622,7 +629,7 @@ mod windows_pipe {
         }
     }
 
-    fn same_user(pipe: HANDLE) -> bool {
+    pub(crate) fn same_user(pipe: HANDLE) -> bool {
         let mut pid = 0u32;
         // SAFETY: pipe is a connected server handle. The pid is written only
         // on success. A failed query rejects the client.
@@ -674,6 +681,32 @@ mod windows_pipe {
             windows_sys::Win32::Foundation::CloseHandle(token);
         }
         (ok != 0).then_some(bytes)
+    }
+
+    /// The current process user's SID in string form (`S-1-5-...`).
+    fn current_user_sid() -> io::Result<String> {
+        // SAFETY: GetCurrentProcess returns a pseudo handle that needs no close.
+        let user = token_user(unsafe { GetCurrentProcess() })
+            .filter(|bytes| bytes.len() >= std::mem::size_of::<TOKEN_USER>())
+            .ok_or_else(|| io::Error::other("current user SID unavailable"))?;
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: user was filled by GetTokenInformation as TOKEN_USER and is
+        // at least that large. The API allocates `text`, freed with LocalFree.
+        let converted = unsafe {
+            let user = &*(user.as_ptr() as *const TOKEN_USER);
+            ConvertSidToStringSidW(user.User.Sid, &mut text)
+        };
+        if converted == 0 || text.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `text` is a NUL-terminated wide string owned by this call.
+        let sid = unsafe {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+            sid
+        };
+        Ok(sid)
     }
 
     fn sids_equal(left: &[u8], right: &[u8]) -> bool {
@@ -742,8 +775,55 @@ mod windows_pipe {
             }
         }
 
+        /// Wait until the peer has read everything written. The serve loops
+        /// disconnect right after a reply, and DisconnectNamedPipe discards
+        /// unread data, so the reply must be flushed first.
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            // SAFETY: the pipe handle is connected and owned by the caller.
+            if unsafe { FlushFileBuffers(self.0) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES;
+
+        #[test]
+        fn create_refuses_a_name_another_pipe_already_holds() {
+            let name = format!(r"\\.\pipe\made-squat-test-{}", std::process::id());
+            let wide = wide(std::ffi::OsStr::new(&name));
+            // A squatter's open pipe: default DACL, any number of instances.
+            // SAFETY: wide is NUL-terminated; null security attributes use the
+            // default descriptor. The handle is owned below.
+            let squatter = unsafe {
+                CreateNamedPipeW(
+                    wide.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                    PIPE_UNLIMITED_INSTANCES,
+                    8192,
+                    8192,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert!(squatter != INVALID_HANDLE_VALUE && !squatter.is_null());
+            // SAFETY: CreateNamedPipeW returned a unique live handle.
+            let squatter = unsafe { OwnedHandle::from_raw_handle(squatter as RawHandle) };
+
+            let joined = create(&name).expect_err("a taken name is not joined");
+            assert_eq!(joined.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+
+            drop(squatter);
+            let own = create(&name).expect("a free name is created");
+            assert!(create(&name).is_err(), "our own name is not joined either");
+            drop(own);
         }
     }
 }

@@ -102,9 +102,9 @@ Git metadata/status MUST be observed on the remote authority, off the UI thread,
 
 ### Requirement: Remote terminal and clipboard parity (SSH-05)
 
-The remote terminal MUST run the server's real shell or the explicitly selected server OpenCode TUI and preserve the existing terminal fidelity: truecolor, alternate screen, resize propagation to the remote PTY, mouse/focus reporting, bracketed text paste and limits/sanitization, Unicode/emoji fallback, IME commit-once, scrollback, selection/copy, and keyboard semantics. Detection/test MUST NOT launch OpenCode; only explicit launch or user execution may do so. Host clipboard text MUST NOT transfer without a paste action. Made MUST NOT paste a host-private image path as if it existed on the server or claim that forwarding Ctrl+V gives a remote program access to the host clipboard.
+The remote terminal MUST run the server's real shell or the explicitly selected server OpenCode TUI and preserve the existing terminal fidelity: truecolor, alternate screen, resize propagation to the remote PTY, mouse/focus reporting, bracketed text paste and limits/sanitization, Unicode/emoji fallback, IME commit-once, scrollback, selection/copy, and keyboard semantics. Detection/test MUST NOT launch OpenCode; only explicit launch or user execution may do so. Host clipboard text MUST NOT transfer without a paste action. A remote program's OSC 52 copy MUST reach the host clipboard under the same rules as a local terminal (OSC 52 clipboard copy in `specs/opencode-session-follow.md`); OSC 52 queries MUST remain refused, so a remote program cannot read the host clipboard. Made MUST NOT paste a host-private image path as if it existed on the server or claim that forwarding Ctrl+V gives a remote program access to the host clipboard.
 
-For a remote terminal only, both explicit image-paste chords MUST upload the clipboard image as a private PNG and paste the completed remote absolute UTF-8 path through existing text/bracketed-paste semantics; the default chord MUST NOT forward `0x16` and claim native remote clipboard retrieval. The first successful image paste per pane/launch MUST explain that remote paste uses an uploaded PNG path for both chords. Local default/native (`Cmd+V` / `Ctrl+V`) and fallback (`Cmd+Shift+V` / `Ctrl+Shift+V`) behavior MUST remain unchanged. Both remote chords MUST prefer image over coexisting text, preserve the 128 MiB RGBA/16384-pixel limits, reject a PNG exceeding 128 MiB encoded size, and transfer only upon that explicit paste; no clipboard polling/synchronization is permitted. Empty/unreadable/oversized clipboard, disconnected transport or failed upload MUST show that nothing was pasted, and MUST NOT paste text as a substitute, a host path or a partial remote path. An interrupted upload MUST NOT be retried or its path pasted automatically on reconnect; a new explicit paste is required.
+For a remote terminal only, both explicit image-paste chords MUST upload the clipboard image as a private PNG and paste the completed remote absolute UTF-8 path through existing text/bracketed-paste semantics; the default chord MUST NOT forward `0x16` and claim native remote clipboard retrieval. The first successful image paste per pane/launch MUST show the notice "Image uploaded to the server; its file path was pasted." Local default/native (`Cmd+V` / `Ctrl+V`) and fallback (`Cmd+Shift+V` / `Ctrl+Shift+V`) behavior MUST remain unchanged. Both remote chords MUST prefer image over coexisting text, preserve the 128 MiB RGBA/16384-pixel limits, reject a PNG exceeding 128 MiB encoded size, and transfer only upon that explicit paste; no clipboard polling/synchronization is permitted. Empty/unreadable/oversized clipboard, disconnected transport or failed upload MUST show that nothing was pasted, and MUST NOT paste text as a substitute, a host path or a partial remote path. An interrupted upload MUST NOT be retried or its path pasted automatically on reconnect; a new explicit paste is required.
 
 The remote private `clipboard-images` directory MUST be `0700`, PNGs `0600`, created without overwrite/symlink following and never in the workspace. Cleanup MUST run on helper start and after each successful upload, remove only app-generated regular `clipboard-*.png` files older than seven days and then oldest files until at most 64 remain, preserve the current image and ignore unrelated/symlink entries. Cleanup failures MUST NOT invalidate a successful paste or remove unrelated files; failed partial uploads MUST be removed when reachable and swept on the next helper start. Successful images MUST survive tab close for the retention policy rather than being deleted while a consumer may use the path. When no helper runs or the server is unreachable, immediate physical deletion is not guaranteed: the next helper start MUST reconcile cleanup, and no completed-deletion claim may be made without confirmation.
 
@@ -118,7 +118,7 @@ The remote private `clipboard-images` directory MUST be `0700`, PNGs `0600`, cre
 
 - Given the host clipboard contains an image and a remote TUI is active
 - When the user invokes the default chord (`Cmd+V` on macOS or `Ctrl+V` elsewhere), which locally forwards `0x16` for child-native clipboard reading
-- Then Made explicitly uses remote PNG upload plus completed server-path paste, explains the remote path behavior on the first success, sends no native image `0x16`, and makes no claim of native host clipboard access by the remote process; the local default chord remains native
+- Then Made explicitly uses remote PNG upload plus completed server-path paste, shows the uploaded-path notice on the first success, sends no native image `0x16`, and makes no claim of native host clipboard access by the remote process; the local default chord remains native
 
 #### Scenario: Fallback image paste requires a server-valid path and separate authorization
 
@@ -131,6 +131,12 @@ The remote private `clipboard-images` directory MUST be `0700`, PNGs `0600`, cre
 - Given image-plus-text, empty/oversized clipboard, an interrupted upload, and a private remote directory with old/excess app PNGs, a symlink, unrelated files and a deletion-denied variant
 - When each remote paste chord is exercised and helper startup/upload/close/reconnect cleanup occurs
 - Then image priority and size/private-file limits hold, failed/disconnected paste sends no payload or automatic retry, only eligible app PNGs are cleaned by seven-day/64-file policy, the current image survives close, cleanup failure leaves its path usable, and no image/text bytes enter logs
+
+#### Scenario: Remote browser open requires the same user confirmation as local
+
+- Given an attached remote shell or TUI tab whose child runs `$BROWSER <url>`, as Claude Code does for its login URL
+- When the remote child asks to open an absolute `http`/`https` URL
+- Then the tab shows the same inline URL confirmation card as a local pane, labeled `from <server>`, nothing opens on the host until the user chooses Open, and Copy and Dismiss behave as they do locally
 
 ### Requirement: Remote OpenCode session and cwd follow (SSH-06)
 
@@ -256,6 +262,8 @@ For Made-generated operations, the client MUST constrain requests to the authori
 
 Registration/authentication, provisioning, paste and lifecycle decisions are resolved by SSH-01/05/06/07; none authorizes removing the filesystem guards or the compromised-server limitation above.
 
+A remote child's request to open a URL in the host browser is untrusted server content and MUST NOT cause any host action by itself. The supervisor MUST set the remote child's `BROWSER` to an app-owned companion helper path in the tab's private runtime directory, preserving a pre-existing `BROWSER` as `MADE_ORIGINAL_BROWSER`, and MUST NOT change the remote user's shell or configuration files to do so. The helper MUST accept only one absolute `http`/`https` URL of at most 2048 bytes with a host and without user information, control, whitespace or bidirectional-formatting characters, and MUST exit non-zero, so the child prints the URL itself, when the tab's endpoint or token is absent or wrong, the URL is refused, or no acknowledgement arrives within 1 second. The acknowledgement means the request was queued to an attached client, not that a card is showing: the client may still coalesce it into its visible card or refuse it under its own rate limit. The supervisor MUST route a request only by the tab's own per-launch token, MUST forward it as one bounded `OpenUrlRequest` frame only to an attached client whose resnapshot completed, MUST coalesce a repeat and drop a different URL within about one second, counting only a request whose frame was actually queued (a request that could not be queued is refused and its retry is new), and, while no client is attached, MUST refuse and drop it: no request is queued for, or replayed on, a later attach or resnapshot. The client MUST validate the frame again, accept it only under the current attach request, and present it only through the user-confirmed URL card of `specs/made-ui-ux.md`; Made MUST open the URL only after that user action, using the host opener with the URL as a single argument, and MUST NOT log the URL. Known limitation: a `BROWSER` assigned by the remote user's shell startup files (for example `~/.bashrc` or `~/.zshrc`) overrides the supervisor's value for that shell's children, which then run the user's command on the server and show no card.
+
 #### Scenario: Unknown or changed host key
 
 - Given a never-trusted server and then a server whose trusted key has changed
@@ -291,6 +299,12 @@ Registration/authentication, provisioning, paste and lifecycle decisions are res
 - Given a remote user with Claude Code settings, installed plugins, hooks, sessions and an existing `CLAUDE_CODE_PLUGIN_DIRS`, plus a staged companion set with the Claude Code package
 - When remote Claude Code runs in remote shell and `Claude Code SSH` tabs, the listing runs, tabs close and the client reconnects
 - Then Made wrote only inside app-owned remote storage, read no file under the remote user's Claude Code home, ran no `claude` subcommand other than `claude agents --json`, persisted no change to the remote user's environment or shell startup files, and relayed no prompt, `msg`, tool or transcript content
+
+#### Scenario: Remote URL open is confirmed, bounded and never replayed
+
+- Given an attached remote tab whose child runs `$BROWSER` with a valid URL, with a `file:`, `javascript:` or custom-scheme URL, with a URL carrying user information or a bidirectional override, with a stale or foreign token, and after the client detached
+- When each request reaches the companion helper and the supervisor
+- Then only the valid request from the tab's own token is queued to the attached client as one bounded frame and its helper exits 0; every other helper exits non-zero without a frame; a request made while detached is dropped and is not delivered on reattach or resnapshot; malformed or non-normalized `OpenUrlRequest` frames are rejected; and the URL appears in no diagnostics
 
 ### Requirement: Local preservation and truthful parity evidence (SSH-09)
 
@@ -507,3 +521,9 @@ Revealed About diagnostics MUST show the single Claude Code row for a remote wor
 - Given remote workspaces where claude is undetected, not running, started less than about 10 seconds ago with no live owned session, running with `--bare` for longer than the grace period, running with a live owned session and no session-level emission for longer than the grace period, and running with a live owned session and observed emissions
 - When the user reveals About diagnostics and copies the report
 - Then each row is driven by that tab's remote state with `Claude Code is not on PATH.`, `Claude Code is not running.`, `Claude Code is starting.`, `Claude Code session-status hooks are unavailable.`, `Claude Code status protocol is unavailable.` and the ready pill with `Claude Code session follow is ready.` respectively, no row mentions an interpreter, the rows stay out of routine chrome, and the copied report includes them
+
+#### Scenario: Remote Claude Code login opens only after confirmation
+
+- Given a `Claude Code SSH` tab, or claude typed in a remote shell, that starts a login and runs `$BROWSER` with its sign-in URL
+- When the request reaches the attached client
+- Then the tab shows the URL card `from <server>` with the host emphasized, the host browser opens that URL only when the user chooses Open, Copy places the URL on the host clipboard, and when the client is detached the helper fails so claude prints the URL in the terminal instead

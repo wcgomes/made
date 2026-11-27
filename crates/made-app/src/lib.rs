@@ -34,6 +34,7 @@ pub mod theme;
 pub mod tui;
 pub mod ui;
 pub mod updates;
+pub mod url_open;
 pub mod workbench;
 pub mod workspace;
 pub mod workspace_picker;

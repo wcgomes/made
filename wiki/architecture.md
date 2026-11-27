@@ -38,7 +38,7 @@ Rules enforced across the workspace:
 7. Only `made-explorer` reads workspace file contents for display. Read-only git metadata and closed-allowlist status are resolved by [`made-app::worktree`](../crates/made-app/src/worktree.rs); bridge config code is the only reader of the user's OpenCode config. Git observation is read-only.
 8. Owned values and events cross crate boundaries; the app event loop owns UI state and no cross-crate mutable singleton exists.
 
-`made-remote` is the SSH server-side companion and `made-askpass` the SSH password helper; both ship in the release layout (`made-app`, `plugins/`, `remote/<target>/made-remote`, `made-askpass`, `LICENSE`). Release packaging and updates are described in [Release and CI](operations/release-ci.md) and [ADR 0007](decisions/0007-github-releases-velopack-unsigned.md).
+`made-remote` is the SSH server-side companion, `made-askpass` the SSH password helper, and `made-open` (a `made-platform` binary) the `BROWSER` helper that routes pane URL requests to the confirmation card ([URL open requests](runtime/terminal-first.md#url-open-requests)); all ship in the release layout (`made-app`, `plugins/`, `remote/<target>/made-remote`, `made-askpass`, `made-open`, `LICENSE`). On servers, `made-open` is a symlink to `made-remote`. Release packaging and updates are described in [Release and CI](operations/release-ci.md) and [ADR 0007](decisions/0007-github-releases-velopack-unsigned.md).
 
 Heavy UI/GPU dependencies are confined to `made-app`: eframe 0.37 brings egui, winit, and wgpu. Domain crates stay UI-free. `made-terminal` uses alacritty_terminal 0.26 behind `TerminalCore`; `made-explorer` uses notify and syntect; `made-bridge` uses tungstenite, serde, sha2, getrandom, and thiserror.
 

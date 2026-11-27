@@ -29,6 +29,7 @@ use crate::{
     protocol::*,
 };
 use made_bridge::remote_rpc::{RpcConnection, RpcListener};
+use made_platform::open_url::{RateDecision, UrlRateGate, UrlRequestSink, UrlToken};
 use made_platform::shell_integration::{CwdReportSink, ShellLaunchPlan};
 use made_platform::PtySize;
 use made_terminal::{
@@ -53,6 +54,63 @@ use std::{
 
 /// Scrollback bound shared with the local terminal. Not a replay log.
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// About one forwarded URL request per tab in this window; repeats of the
+/// last URL inside it are coalesced.
+pub const URL_REQUEST_WINDOW: Duration = Duration::from_secs(1);
+
+/// Whether a routed URL request is acknowledged: a repeat inside the window
+/// is coalesced, a different URL inside it is refused, and a fresh one is
+/// acknowledged only when `deliver` queued its frame. It is recorded only
+/// then, so an undelivered request's retry is fresh again rather than a
+/// duplicate acknowledged without delivery.
+fn url_request_acked(
+    gate: &mut UrlRateGate,
+    url: &made_platform::open_url::SafeUrl,
+    now: Instant,
+    deliver: impl FnOnce() -> bool,
+) -> bool {
+    match gate.check(url, now) {
+        RateDecision::Duplicate => true,
+        RateDecision::Limited => false,
+        RateDecision::Fresh => {
+            let delivered = deliver();
+            if delivered {
+                gate.record(url, now);
+            }
+            delivered
+        }
+    }
+}
+
+/// Point the child's `BROWSER` at the companion's URL helper mode: a
+/// `made-open` symlink to the companion in this tab's private runtime
+/// directory, since `BROWSER` cannot carry a mode argument. A user `BROWSER`
+/// is preserved as `MADE_ORIGINAL_BROWSER`. On any failure the child keeps
+/// its environment and no URL variables are set.
+fn url_open_launch(
+    runtime: &Path,
+    companion: &Path,
+    env: &mut Vec<(OsString, OsString)>,
+) -> Option<(UrlRequestSink, UrlToken)> {
+    use made_platform::open_url::{
+        browser_environment, link_remote_helper, BROWSER_ENV, REMOTE_HELPER_NAME, URL_SOCKET_ENV,
+        URL_TOKEN_ENV,
+    };
+    env.retain(|(key, _)| key != URL_SOCKET_ENV && key != URL_TOKEN_ENV);
+    let helper = runtime.join(REMOTE_HELPER_NAME);
+    link_remote_helper(companion, &helper).ok()?;
+    let sink = UrlRequestSink::new(runtime).ok()?;
+    let token = UrlToken::generate().ok()?;
+    let inherited = env
+        .iter()
+        .find(|(key, _)| key == BROWSER_ENV)
+        .map(|(_, value)| value.clone());
+    let set = browser_environment(&helper, sink.socket_path(), &token, inherited.as_deref());
+    env.retain(|(key, _)| set.iter().all(|(set_key, _)| set_key != key));
+    env.extend(set);
+    Some((sink, token))
+}
 
 #[derive(Debug)]
 pub struct Lease {
@@ -232,6 +290,8 @@ impl VtState {
                 self.primary = PrimaryRetention::capture(&self.core);
             }
         }
+        // OSC 52 copies are applied by the client's own core; do not retain them.
+        let _ = self.core.take_clipboard_store();
     }
 
     pub fn resnapshot(&self) -> Vec<u8> {
@@ -592,6 +652,11 @@ pub struct Supervisor {
     attachment: Option<Attachment>,
     attached_once: bool,
     cwd_sink: CwdReportSink,
+    /// The tab's URL request endpoint and the token its child presents. Absent
+    /// when the helper link or the endpoint could not be created; the child
+    /// then keeps its own `BROWSER`.
+    url_open: Option<(UrlRequestSink, UrlToken)>,
+    url_gate: UrlRateGate,
     shell_plan: Option<ShellLaunchPlan>,
     shell_cwd: Option<RemotePath>,
     /// A validated report has arrived, so a reattach must restore it: the
@@ -646,6 +711,7 @@ impl Supervisor {
         let uploads = Uploads::new(data.join("remote/clipboard-images"))?;
         let cwd_sink = CwdReportSink::new(&runtime).map_err(io_error)?;
         let mut launch = launch;
+        let url_open = url_open_launch(&runtime, companion, &mut launch.env);
         // Helper start: spools of supervisors that are gone are swept first;
         // every live supervisor's spool stays.
         if let Some(runtime_root) = runtime.parent() {
@@ -756,6 +822,8 @@ impl Supervisor {
             attachment: None,
             attached_once: false,
             cwd_sink,
+            url_open,
+            url_gate: UrlRateGate::new(URL_REQUEST_WINDOW),
             shell_plan,
             shell_cwd: Some(directory.clone()),
             cwd_reported: false,
@@ -1175,8 +1243,62 @@ impl Supervisor {
         }
     }
 
+    /// Forward this tab's URL requests to the attached client. A request is
+    /// acknowledged only once its frame is queued for an attachment whose
+    /// resnapshot completed; while detached it is refused and dropped, never
+    /// queued for a later attach, so nothing is replayed.
+    fn poll_url_requests(&mut self) {
+        let Some((sink, token)) = self.url_open.as_mut() else {
+            return;
+        };
+        let requests = sink.poll();
+        let token = token.clone();
+        for request in requests {
+            let attached = self
+                .attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.snapshot_closed);
+            if !token.matches(request.token()) || !attached {
+                request.reject();
+                continue;
+            }
+            let mut gate =
+                std::mem::replace(&mut self.url_gate, UrlRateGate::new(URL_REQUEST_WINDOW));
+            let url = request.url().clone();
+            let acked = url_request_acked(&mut gate, &url, Instant::now(), || {
+                self.forward_url(url.as_str().to_owned())
+            });
+            self.url_gate = gate;
+            if acked {
+                request.accept();
+            } else {
+                request.reject();
+            }
+        }
+    }
+
+    fn forward_url(&mut self, url: String) -> bool {
+        let Some(attachment) = self.attachment.as_mut() else {
+            return false;
+        };
+        let frame = WireEnvelope::new(
+            attachment.identity.clone(),
+            attachment.request,
+            Operation::OpenUrlRequest { url },
+        );
+        match attachment.output.try_send(frame) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.detach_frontend();
+                false
+            }
+        }
+    }
+
     fn poll_events(&mut self) {
         self.step_redraw_nudge();
+        self.poll_url_requests();
         let previous_cwd = self.shell_cwd.clone();
         if let Ok(Some(bytes)) = self.cwd_sink.poll() {
             if let Ok(path) = RemotePath::new(bytes) {
@@ -1534,4 +1656,44 @@ pub fn write_envelope(writer: &mut impl Write, frame: &WireEnvelope) -> io::Resu
         &encode(frame).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid frame"))?,
     )?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod url_request_tests {
+    use super::*;
+    use made_platform::open_url::validate_url;
+
+    #[test]
+    fn a_failed_delivery_is_not_acknowledged_on_retry() {
+        let mut gate = UrlRateGate::new(URL_REQUEST_WINDOW);
+        let url = validate_url("https://example.com/login").unwrap();
+        let start = Instant::now();
+        // The output queue was full: refused, and nothing recorded.
+        assert!(!url_request_acked(&mut gate, &url, start, || false));
+        // The retry inside the window must be delivered, not coalesced.
+        let mut delivered = false;
+        let retry = start + Duration::from_millis(200);
+        assert!(url_request_acked(&mut gate, &url, retry, || {
+            delivered = true;
+            true
+        }));
+        assert!(
+            delivered,
+            "the retry was delivered, not acked as a duplicate"
+        );
+        // A real repeat of a delivered request is coalesced without delivery.
+        assert!(url_request_acked(
+            &mut gate,
+            &url,
+            retry + Duration::from_millis(100),
+            || panic!("a duplicate is not delivered again")
+        ));
+        let other = validate_url("https://other.example/").unwrap();
+        assert!(!url_request_acked(
+            &mut gate,
+            &other,
+            retry + Duration::from_millis(100),
+            || panic!("a limited request is not delivered")
+        ));
+    }
 }

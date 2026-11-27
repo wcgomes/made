@@ -486,6 +486,30 @@ The embedded terminal MUST run the real OpenCode v2 TUI and MUST support the ter
 - When the change occurs
 - Then Made reflects the title and reports focus changes to OpenCode
 
+### Requirement: OSC 52 clipboard copy
+
+A program running in the terminal MUST be able to copy text to the system clipboard with OSC 52 (`ESC ] 52 ; <selector> ; <base64> BEL` or `ST`). Made MUST accept a store only for the clipboard selector `c` or an empty selector, which defaults to the clipboard; the `p` and `s` selectors MUST be ignored. The decoded payload MUST be valid UTF-8 of at most 1 MiB, matching the paste text limit; invalid base64, invalid UTF-8, and oversized payloads MUST be ignored without changing the clipboard. When several stores arrive before Made applies them, the latest one wins.
+
+Made MUST refuse OSC 52 queries (`52;<selector>;?`): it MUST NOT read the system clipboard for the program and MUST NOT write a reply. OSC 52 text MUST NOT appear in logs, notices, or `Debug` output; logs MAY record its byte length. When the native clipboard is unavailable, Made MAY fall back to the UI toolkit's clipboard, as it does for selection copy.
+
+#### Scenario: Program copies to the clipboard
+
+- Given a TUI running in the terminal emits an OSC 52 store for the clipboard selector, terminated by BEL or ST, possibly split across output chunks
+- When Made processes the output
+- Then the decoded text is placed on the system clipboard once
+
+#### Scenario: Oversized or non-clipboard store
+
+- Given a program emits an OSC 52 store larger than 1 MiB, for the `p` or `s` selector, or with invalid base64 or UTF-8
+- When Made processes the output
+- Then the system clipboard is unchanged
+
+#### Scenario: Clipboard query is refused
+
+- Given a program emits an OSC 52 query `52;c;?`
+- When Made processes the output
+- Then Made does not read the system clipboard and writes no reply to the program
+
 ### Requirement: Clipboard image paste
 
 When the system clipboard contains an image, Made MUST treat the image as the paste payload for both paste chords, even when the clipboard also contains text. The behavior MUST be available on macOS, Linux on X11 and Wayland, and Windows.
@@ -493,8 +517,6 @@ When the system clipboard contains an image, Made MUST treat the image as the pa
 The default paste chord — `Cmd+V` on macOS and `Ctrl+V` elsewhere — MUST forward the `Ctrl+V` control byte (`0x16`) to the child process and MUST NOT paste image bytes, clipboard text, or a file path. The child program is responsible for reading the image from the system clipboard. When the clipboard contains no image, the default chord MUST keep the existing text behavior: UTF-8 text is pasted as bracketed paste when the child enabled bracketed paste, subject to the existing 1 MiB text limit and sanitization.
 
 The fallback chord — `Cmd+Shift+V` on macOS and `Ctrl+Shift+V` elsewhere — MUST encode the clipboard image as PNG, save it in the app's private temporary directory under `clipboard-images/`, and paste the absolute file path as text through the existing bracketed-paste path. The fallback MUST NOT write the image into the workspace, overwrite an existing file, or follow a symlink. When the clipboard contains no image, the fallback chord MUST continue to paste text exactly like the default chord.
-
-The first successful native image paste in a terminal pane MUST show a notice that names the fallback chord and MUST NOT read as an error. Later native image pastes in the same pane MUST NOT repeat that notice. The notice requirement applies again after the terminal is relaunched in that pane.
 
 If the clipboard is empty or neither an image nor text can be read, Made MUST show a clear notice and MUST NOT paste text or write an image file. In native mode, when the image read fails and no text is readable, Made MAY forward Ctrl+V without an accompanying image payload; the same notice requirement applies. In path fallback mode, no payload is written.
 
@@ -508,11 +530,11 @@ Clipboard image bytes and clipboard text MUST NOT appear in logs or user-facing 
 - When the user presses Cmd+V on macOS or Ctrl+V elsewhere
 - Then Made forwards the Ctrl+V control byte to the TUI, does not paste text, image bytes, or a path, and the TUI can read the clipboard image
 
-#### Scenario: Native image paste hint
+#### Scenario: Native image paste shows no notice
 
-- Given the clipboard contains an image and the pane has not yet shown the native-paste hint
-- When the user performs a native image paste, then performs another native image paste
-- Then the first paste shows a notice naming the fallback chord, the second does not repeat it, and relaunching the terminal allows the notice once again
+- Given the clipboard contains an image
+- When the user performs a native image paste
+- Then Made forwards the Ctrl+V control byte and shows no notice
 
 #### Scenario: Path fallback
 

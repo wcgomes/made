@@ -123,6 +123,7 @@ def install(form: str, assets: Path, version: str) -> tuple[list[str], Path, Pat
 def check_layout(exe_dir: Path, install_root: Path) -> None:
     hook = "made-grok-status.exe" if os.name == "nt" else "made-grok-status"
     askpass = "made-askpass.exe" if os.name == "nt" else "made-askpass"
+    open_url = "made-open.exe" if os.name == "nt" else "made-open"
     check((install_root / "plugins/opencode-made/package.json").is_file(), "plugins/opencode-made/package.json is installed")
     check(not (install_root / "plugins/opencode-made/node_modules").exists(), "no node_modules is shipped")
     grok = install_root / "plugins/grok-made"
@@ -134,6 +135,7 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
         check((claude / relative).is_file(), f"plugins/claude-code-made/{relative} resolves from the install root")
     check((install_root / "LICENSE").is_file(), "LICENSE is installed")
     check((exe_dir / askpass).is_file(), "made-askpass sits beside made-app")
+    check((exe_dir / open_url).is_file(), "made-open sits beside made-app")
     manifest_path = exe_dir / "remote" / "manifest.json"
     check(manifest_path.is_file(), "remote/manifest.json is installed")
     if manifest_path.is_file():
@@ -145,7 +147,7 @@ def check_layout(exe_dir: Path, install_root: Path) -> None:
                 path = exe_dir / "remote" / target / record["name"]
                 check(path.is_file() and sha256(path) == record["sha256"], f"{target}/{record['name']} matches the manifest")
     if os.name != "nt":
-        executables = [exe_dir / "made-app", exe_dir / askpass, grok / "hooks/bin" / hook, claude / "bin" / claude_hook_name]
+        executables = [exe_dir / "made-app", exe_dir / askpass, exe_dir / open_url, grok / "hooks/bin" / hook, claude / "bin" / claude_hook_name]
         executables += [exe_dir / "remote" / t / "made-remote" for t in TARGETS]
         executables += [exe_dir / "remote" / t / "plugins/grok-made/hooks/bin/made-grok-status" for t in TARGETS]
         executables += [exe_dir / "remote" / t / "plugins/claude-code-made/bin/made-claude-status" for t in TARGETS]

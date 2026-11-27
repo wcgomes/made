@@ -384,6 +384,46 @@ Made MUST keep the UI usable at 1280×800 and 720×480 with the documented gutte
 - When motion is unavailable or reduced
 - Then no essential status, selection, action, or error is communicated only through animation
 
+### Requirement: URL Open Confirmation Card
+
+When a terminal child of a pane asks to open a URL in the browser (by running `$BROWSER <url>`), Made MUST show the request as a confirmation card: a dialog centered over that pane's terminal body (not the whole window), with a subtle scrim dimming that pane body, and MUST NOT open anything until the user acts on it. The dialog uses the floating-card treatment (`BG_CARD`, 1px `BORDER`, radius 10, `SHADOW_FLOAT`), is about `min(560 px, pane width − 32 px)` wide, and is only as tall as its content, up to the pane body. Showing or hiding it MUST NOT change the terminal grid size, so the child receives no resize. It MUST show the title `Open link in browser?` (followed by ` — from <server>` with the saved server's display name for a remote tab), then the host sanitized for display on its own emphasized line, then the full sanitized URL in a monospace block that wraps and, when it is taller than about 180 px or the room the pane leaves, scrolls vertically, then the actions right-aligned as Dismiss, Copy and the primary Open. No part of the host or the URL is ever elided or truncated: the host wraps onto as many rows as it needs, and every character of a URL up to 2048 bytes is reachable by scrolling. Open hands the URL to the host's default browser with the URL as a single argument (macOS `/usr/bin/open`, Linux `xdg-open`, Windows `ShellExecuteW`, never through a shell); Copy places the URL on the clipboard; Dismiss removes the card. Each action removes the card. While it is shown, the dialog and the scrim together cover the whole pane body, and pointer input anywhere over them (presses, releases, drags, scrolls and moves) MUST reach the dialog only, never the terminal: no mouse report, selection or scroll. If the whole host cannot be shown in the dialog (a short or very narrow pane), Open MUST stay disabled with the short reason `Widen the pane to review this link`, while Copy and Dismiss keep working. The dialog is pointer-driven and never takes keyboard input: typing, including Enter and Escape, keeps going to the terminal, and a click on the dialog or scrim MUST NOT take keyboard focus away from the terminal if it had it. This is an accepted exception to the Keyboard Focus and Accessibility requirement: the dialog never takes keyboard focus or keys while the terminal has them, has no keyboard shortcut, and is operated by pointer, because a key typed for the TUI must never act on the dialog (an Enter must not open a link), and Escape is a common TUI key that must keep reaching the program. Its actions are ordinary buttons: after the user moves focus out of the terminal (F6), Tab can still reach them, with the standard focus ring. Open and Copy MUST be disabled for about 400 ms after a card is first painted, or after it is replaced and painted again, so a click aimed at one URL cannot land on another (a replacement can change the dialog's height and move its buttons); Dismiss works at once. Open's delay MUST restart when the dialog goes from unable to show the whole host to able, so the host has been on screen for it; a card that arrived in a hidden tab or window MUST NOT be armed before it is seen. A pane MUST show at most one card; a repeat of the shown URL MUST be coalesced into it, and a different URL MUST be refused within about one second of the last card (half a second for a remote tab, whose companion already limits it), so its child prints the URL instead. Only absolute `http`/`https` URLs of at most 2048 bytes with a host and without user information, control, whitespace or bidirectional-formatting characters MUST reach the card. A request from an earlier launch of the pane or from another pane MUST be refused. A failure to start the browser MUST show a short notice. The host opener MUST run without the URL routing variables and with an inherited Made helper `BROWSER` replaced by `MADE_ORIGINAL_BROWSER` or removed, so it cannot route the URL back into a card. Known limitation: a `BROWSER` that the user's shell startup files (for example `~/.bashrc` or `~/.zshrc`) assign overrides Made's value, locally and on SSH servers; children of that shell then use the user's browser command directly and no card appears. Diagnostics MUST record only counts of shown and refused requests, never a URL. The dialog's actions MUST have accessible names, and the dialog MUST remain usable at 720×480.
+
+#### Scenario: A TUI login URL waits for the user
+
+- Given a local or remote pane whose TUI runs `$BROWSER https://example.com/login`
+- When the request arrives
+- Then the pane shows the dialog with `example.com` emphasized (titled `from <server>` for a remote tab), no browser opens, the terminal grid keeps its size, and the TUI's helper exits successfully
+
+#### Scenario: A spoofing host is shown whole in a narrow pane
+
+- Given a request for `https://paypal.com.evil-really-long-name.co.uk/login` or `https://github.com.login.session-verify.account-security.attacker.example/oauth` in a narrow pane
+- When the dialog is painted
+- Then the whole host is painted, wrapping across rows if needed, with no part elided, and the text does not overlap Open, Copy or Dismiss
+
+#### Scenario: A long OAuth URL is fully reachable
+
+- Given a request for an OAuth authorize URL of nearly 2 KB
+- When the dialog is painted
+- Then the whole URL is in its monospace block, which scrolls until the URL's last character is visible, and scrolling sends nothing to the terminal
+
+#### Scenario: Clicks on the dialog do not reach the terminal
+
+- Given a mouse-reporting TUI with the dialog shown over its pane
+- When the user clicks the scrim, the dialog background, a disabled Open, Copy or Dismiss
+- Then the TUI receives no mouse report, no selection starts, the terminal keeps keyboard focus, and Copy or Dismiss removes the dialog, after which clicks reach the TUI again
+
+#### Scenario: Open, Copy and Dismiss
+
+- Given a card is showing
+- When the user chooses Open after it is armed, Copy, or Dismiss
+- Then Open starts the default browser with that URL only, Copy puts the URL on the clipboard, Dismiss opens nothing, and each removes the card; Open or Copy before the card is armed does nothing
+
+#### Scenario: Refused and coalesced requests
+
+- Given a pane showing a card
+- When the same URL arrives again, a different URL arrives within the window, a request carries a stale or foreign token, or a `file:`, `javascript:` or custom-scheme URL is requested
+- Then the repeat is coalesced into the visible card, every other request is refused so its child prints the URL, no second card appears, and diagnostics record counts only
+
 ### Requirement: Keyboard Focus and Accessibility
 
 Made MUST make every persistent interactive control keyboard reachable with a visible focus state, never relying on fill change alone. Icon-only actions MUST expose matching tooltip and accessibility-name metadata; the MADE wordmark About trigger MUST expose the matching tooltip and accessibility name `About`, or `About, update ready` while the update indicator is shown, show a visible focus ring, and open or close the About card on Enter or Space while a workspace is active. Workspace and optional session tabs MUST support keyboard entry, Left/Right movement, and Enter/Space activation; the terminal MUST remain one focus stop; the explorer tree, preview actions/return, picker, and the About card's diagnostics detail MUST remain keyboard operable. Focusing the tree before any row is selected MUST select the first visible row (fill plus primary text only, no preview). The explorer tree row/container and picker rows are a deliberate focus-outline exception: while focus moves there, it MUST be conveyed by the inset `BG_SELECTED` fill plus `TEXT_PRIMARY` text (luminance and text, not hue alone) with no outline; every other persistent control, including the wordmark trigger, the About diagnostics toggle, the picker card, and picker buttons, MUST keep its visible focus ring. The wordmark's focus cue MUST be its visible focus ring, not a fill change. The pointer-only explorer divider MUST NOT be a keyboard stop; hide/restore remains the keyboard path. Interactive targets MUST be at least 24×24, text MUST not fall below 10px, and status MUST use shape plus text plus color. Platform screen-reader exposure MUST NOT be claimed while the accesskit integration is absent.

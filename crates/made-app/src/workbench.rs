@@ -651,6 +651,8 @@ pub struct Workbench {
     remote_preview: RemotePreviewView,
     remote_explorer_cache: crate::explorer_view::RemoteExplorerCache,
     pub(crate) remote_preview_focus_pending: bool,
+    /// The pane's URL request endpoint, launch token and confirmation card.
+    url_open: crate::url_open::PaneUrlOpen,
 }
 
 impl std::fmt::Debug for Workbench {
@@ -965,6 +967,7 @@ impl Workbench {
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
+            url_open: crate::url_open::PaneUrlOpen::default(),
         };
 
         if let Some(error) = path_error {
@@ -1204,6 +1207,22 @@ impl Workbench {
             };
             configured |= entry.configures_launch(&contribution);
             contributions.push(contribution);
+        }
+        // The core BROWSER contribution comes first, so it wins over any
+        // integration's. Remote targets never receive local variables.
+        if !target.is_remote() {
+            let helper = self.url_open.helper_path();
+            let inherited = std::env::var_os(made_platform::open_url::BROWSER_ENV);
+            let original = std::env::var_os(made_platform::open_url::ORIGINAL_BROWSER_ENV);
+            contributions.insert(
+                0,
+                self.url_open.launch_contribution(
+                    self.paths.as_ref(),
+                    helper.as_deref(),
+                    inherited.as_deref(),
+                    original.as_deref(),
+                ),
+            );
         }
         (contributions, configured)
     }
@@ -1952,6 +1971,53 @@ impl Workbench {
         self.follow
             .as_ref()
             .and_then(SessionFollowCoordinator::active_session)
+    }
+
+    /// The pane's URL confirmation card, if one is showing.
+    pub fn url_card(&self) -> Option<&crate::url_open::UrlCard> {
+        self.url_open.prompt().card()
+    }
+
+    /// The card about to be painted; its first paint arms Open.
+    pub(crate) fn url_card_painted(&mut self, now: Instant) -> Option<crate::url_open::UrlCard> {
+        self.url_open.prompt_mut().mark_painted(now).cloned()
+    }
+
+    /// Record whether this frame's card layout shows the whole host.
+    pub(crate) fn set_url_card_reviewable(&mut self, reviewable: bool) {
+        self.url_open
+            .prompt_mut()
+            .set_reviewable(reviewable, Instant::now());
+    }
+
+    /// Apply the user's card action. Open hands the URL to the host browser;
+    /// Copy returns the text for the UI to put on the clipboard. Nothing else
+    /// ever opens a URL.
+    pub fn act_on_url_card(&mut self, action: crate::url_open::UrlCardAction) -> Option<String> {
+        match self.url_open.prompt_mut().act(action, Instant::now())? {
+            crate::url_open::UrlEffect::Open(url) => {
+                if made_platform::open_url(&url).is_err() {
+                    self.diag
+                        .log_mut()
+                        .record(LogLevel::Warn, "default browser could not be started");
+                    self.set_notice("The default browser could not be started.");
+                }
+                None
+            }
+            crate::url_open::UrlEffect::Copy(text) => {
+                self.set_notice("Link copied.");
+                Some(text)
+            }
+        }
+    }
+
+    /// Counts only: a URL never reaches diagnostics.
+    fn note_url_card(&mut self) {
+        let (shown, refused) = self.url_open.counts();
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!("URL open request awaiting confirmation ({shown} shown, {refused} refused on this tab)"),
+        );
     }
 
     /// Current task notice, if one is still fresh.
@@ -2891,6 +2957,9 @@ impl Workbench {
         self.sync_remote_claude();
         // END remote-path
         let terminal_changed = self.pump_remote_terminal();
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.apply_clipboard_store(&self.platform, ctx, self.diag.log_mut());
+        }
         self.poll_integrations(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
@@ -3385,6 +3454,7 @@ impl Workbench {
     }
 
     fn pump_remote_client(&mut self) {
+        let mut remote_urls = Vec::new();
         let (attach_reply, upload_replies, disconnected) =
             {
                 let Some(remote) = self.remote.as_mut() else {
@@ -3418,6 +3488,17 @@ impl Workbench {
                                 let mut identity = reply.identity;
                                 identity.generation = remote.workspace.identity().generation;
                                 let _ = remote.workspace.report_shell_cwd(&identity, path);
+                            }
+                            continue;
+                        }
+                        // A remote child's URL request: shown on this tab's
+                        // card, never opened. The companion already routed it
+                        // by the tab's token; the URL is validated again here.
+                        if let made_remote::protocol::Operation::OpenUrlRequest { url } =
+                            &reply.operation
+                        {
+                            if let Ok(url) = made_platform::open_url::validate_url(url) {
+                                remote_urls.push(url);
                             }
                             continue;
                         }
@@ -3573,6 +3654,16 @@ impl Workbench {
                     (attach_reply, upload_replies, false)
                 }
             };
+        if !remote_urls.is_empty() {
+            let server = self.remote_label().unwrap_or_default();
+            let now = Instant::now();
+            for url in remote_urls {
+                let origin = crate::url_open::UrlOrigin::Remote(server.clone());
+                if self.url_open.offer(url, origin, now) {
+                    self.note_url_card();
+                }
+            }
+        }
         if disconnected {
             self.fail_remote_transport();
             return;
@@ -4139,6 +4230,7 @@ impl Workbench {
                 active = true;
                 self.last_activity = now;
             }
+            terminal.apply_clipboard_store(&self.platform, ctx, self.diag.log_mut());
             if !terminal_visible {
                 hidden_output_bytes = terminal.output_bytes().saturating_sub(output_before);
             }
@@ -4265,6 +4357,11 @@ impl Workbench {
             if update.outcome != FocusOutcome::Idle {
                 self.handle_focus_update(update);
             }
+        }
+        if self.url_open.poll(now) > 0 {
+            active = true;
+            self.last_activity = now;
+            self.note_url_card();
         }
 
         let explorer_ready = self
@@ -6069,6 +6166,487 @@ mod tests {
         }
     }
 
+    fn url_test_paths(root: &Path) -> AppPaths {
+        AppPaths {
+            install_root: root.join("install"),
+            resource_dir: root.join("install"),
+            data_dir: root.join("data"),
+            plugin_root: root.join("plugin"),
+            plugin_dir: root.join("plugin").join("opencode-made"),
+            shipped_plugins_dir: None,
+            plugin_source: made_platform::PluginDirSource::DevelopmentRepository,
+            opencode_config_path: root.join("config").join("cli.json"),
+            log_dir: root.join("log"),
+            temp_dir: root.join("temp"),
+        }
+    }
+
+    fn launch_env(workbench: &mut Workbench) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let options = apply_contributions(
+            &workbench.prepare_launches().0,
+            made_terminal::PtyOptions::new(std::env::temp_dir()),
+        );
+        options.env
+    }
+
+    fn env_value(env: &[(std::ffi::OsString, std::ffi::OsString)], key: &str) -> Option<String> {
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn prepare_launches_points_local_browser_at_a_present_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("made-open");
+        for target in [
+            TerminalTarget::Shell,
+            TerminalTarget::Tui(OPENCODE),
+            TerminalTarget::Tui(GROK),
+            TerminalTarget::Tui(crate::integrations::CLAUDE_CODE),
+        ] {
+            let mut workbench = idle_workbench(target, None);
+            workbench.paths = Some(url_test_paths(temp.path()));
+            workbench.url_open.helper_override = Some(helper.clone());
+            let first = launch_env(&mut workbench);
+            assert_eq!(
+                env_value(&first, "BROWSER").as_deref(),
+                helper.to_str(),
+                "{target:?}"
+            );
+            let socket = env_value(&first, "MADE_URL_SOCKET").expect("socket");
+            // A Windows endpoint is a named pipe, not a filesystem entry.
+            if made_platform::PlatformFamily::current() != made_platform::PlatformFamily::Windows {
+                assert!(Path::new(&socket).exists(), "{target:?} endpoint is bound");
+            }
+            // A relaunch (fallback retry or TUI replaced by its shell) gets a
+            // fresh token on the same endpoint.
+            let second = launch_env(&mut workbench);
+            assert_eq!(env_value(&second, "MADE_URL_SOCKET"), Some(socket));
+            assert_ne!(
+                env_value(&first, "MADE_URL_TOKEN"),
+                env_value(&second, "MADE_URL_TOKEN")
+            );
+        }
+        let authority = made_remote::protocol::AuthorityId([5; 16]);
+        let mut remote = idle_workbench(TerminalTarget::RemoteShell { authority }, None);
+        remote.paths = Some(url_test_paths(temp.path()));
+        remote.url_open.helper_override = Some(helper);
+        let env = launch_env(&mut remote);
+        for key in ["BROWSER", "MADE_URL_SOCKET", "MADE_URL_TOKEN"] {
+            assert!(
+                env_value(&env, key).is_none(),
+                "remote receives no host {key}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn render_workbench(workbench: &mut Workbench, width: f32) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        // Two passes: the first lays out, the second paints settled sizes.
+        workbench_frame(&ctx, workbench, width, Vec::new());
+        workbench_frame(&ctx, workbench, width, Vec::new())
+    }
+
+    fn workbench_frame(
+        ctx: &egui::Context,
+        workbench: &mut Workbench,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        workbench_frame_sized(ctx, workbench, egui::vec2(width, 480.0), events)
+    }
+
+    fn workbench_frame_sized(
+        ctx: &egui::Context,
+        workbench: &mut Workbench,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let mut updates = crate::updates::UpdatePanel::default();
+        let mut out = ctx.run_ui(raw, |ui| {
+            workbench.ui(ui, &mut false, &mut false, &mut updates, false);
+        });
+        out.textures_delta.clear();
+        out
+    }
+
+    /// Where the text shape whose job contains `needle` is painted.
+    fn text_rect(output: &egui::FullOutput, needle: &str) -> Option<(egui::Rect, bool)> {
+        fn visit(shape: &egui::Shape, needle: &str) -> Option<(egui::Rect, bool)> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains(needle) => Some((
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    text.galley.elided,
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| visit(shape, needle)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| visit(&clipped.shape, needle))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_url_card_overlays_the_terminal_without_resizing_it() {
+        let options = made_terminal::PtyOptions::new(std::env::temp_dir())
+            .with_shell("/bin/sh")
+            .with_args(["-c", "sleep 10"]);
+        let pane = TerminalPane::spawn(&host_platform(), options).expect("pane");
+        let mut workbench = idle_workbench(TerminalTarget::Shell, Some(pane));
+        workbench.visible = true;
+        render_workbench(&mut workbench, 1024.0);
+        let size = workbench.terminal.as_ref().unwrap().size();
+        let url = made_platform::open_url::validate_url("https://example.com/login").unwrap();
+        assert!(workbench
+            .url_open
+            .offer(url, crate::url_open::UrlOrigin::Local, Instant::now()));
+        let shown = render_workbench(&mut workbench, 1024.0);
+        assert!(
+            ui_text(&shown).contains("example.com"),
+            "the card is painted"
+        );
+        assert!(workbench.url_card().unwrap().painted_at.is_some());
+        assert_eq!(
+            workbench.terminal.as_ref().unwrap().size(),
+            size,
+            "showing the card must not resize the terminal grid"
+        );
+        workbench.act_on_url_card(crate::url_open::UrlCardAction::Dismiss);
+        let hidden = render_workbench(&mut workbench, 1024.0);
+        assert!(!ui_text(&hidden).contains("example.com"));
+        assert_eq!(workbench.terminal.as_ref().unwrap().size(), size);
+    }
+
+    #[test]
+    fn a_long_host_is_painted_whole_in_a_narrow_card() {
+        for (address, host) in [
+            (
+                "https://github.com.login.session-verify.account-security.attacker.example/oauth",
+                "github.com.login.session-verify.account-security.attacker.example",
+            ),
+            (
+                "https://paypal.com.evil-really-long-name.co.uk/login",
+                "paypal.com.evil-really-long-name.co.uk",
+            ),
+            (
+                "https://accounts.google.com.secure.evil.github.io/signin",
+                "accounts.google.com.secure.evil.github.io",
+            ),
+        ] {
+            let mut workbench = idle_workbench(TerminalTarget::Shell, None);
+            workbench.visible = true;
+            let url = made_platform::open_url::validate_url(address).unwrap();
+            workbench
+                .url_open
+                .offer(url, crate::url_open::UrlOrigin::Local, Instant::now());
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            workbench_frame(&ctx, &mut workbench, 420.0, Vec::new());
+            let output = workbench_frame(&ctx, &mut workbench, 420.0, Vec::new());
+            let (label, elided) = text_rect(&output, host)
+                .unwrap_or_else(|| panic!("the whole host is painted: {}", ui_text(&output)));
+            assert!(!elided, "{host}: no row is elided");
+            assert!(
+                !ui_text(&output).contains('\u{2026}'),
+                "{host}: nothing is cut from the host"
+            );
+            for action in ["open", "copy", "dismiss"] {
+                let button = ctx
+                    .read_response(crate::ui::url_card_action_id(&workbench.pane_id, action))
+                    .unwrap_or_else(|| panic!("{action} is laid out"))
+                    .rect;
+                assert!(
+                    !label.intersects(button),
+                    "{host}: the text {label:?} must not cover {action} {button:?}"
+                );
+            }
+        }
+    }
+
+    struct RecordingTransport {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl made_terminal::TerminalTransport for RecordingTransport {
+        fn poll(&mut self) -> Option<made_terminal::PtyEvent> {
+            None
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<(), made_terminal::PtyError> {
+            self.writes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn resize(&mut self, _rows: u16, _cols: u16) -> Result<(), made_terminal::PtyError> {
+            Ok(())
+        }
+        fn status(&self) -> made_terminal::TransportStatus {
+            made_terminal::TransportStatus::Connected
+        }
+        fn detach(&mut self) -> Result<(), made_terminal::PtyError> {
+            Ok(())
+        }
+    }
+
+    fn recording_workbench() -> (Workbench, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut pane = TerminalPane::open_remote(TerminalTarget::Shell, 24, 80);
+        pane.attach_remote_transport(Box::new(RecordingTransport {
+            writes: writes.clone(),
+        }));
+        pane.apply_resnapshot(b"\x1b[?1000hready");
+        pane.resume_input();
+        let mut workbench = idle_workbench(TerminalTarget::Shell, Some(pane));
+        workbench.visible = true;
+        (workbench, writes)
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    #[test]
+    fn clicks_on_the_url_card_never_reach_a_mouse_reporting_terminal() {
+        for last in ["dismiss", "copy"] {
+            let (mut workbench, writes) = recording_workbench();
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+            workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+            assert!(workbench.terminal.as_ref().unwrap().is_focused());
+            let url = made_platform::open_url::validate_url("https://example.com/login").unwrap();
+            assert!(workbench.url_open.offer(
+                url,
+                crate::url_open::UrlOrigin::Local,
+                Instant::now()
+            ));
+            workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+            workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+            // Open stays disarmed for the whole test, so no browser can start.
+            workbench
+                .url_open
+                .prompt_mut()
+                .card_mut()
+                .unwrap()
+                .painted_at = Some(Instant::now() + std::time::Duration::from_secs(3600));
+            let rect_of = |action: &str| {
+                ctx.read_response(crate::ui::url_card_action_id(&workbench.pane_id, action))
+                    .unwrap_or_else(|| panic!("{action} is laid out"))
+                    .rect
+            };
+            let card = rect_of("card");
+            let scrim = rect_of("scrim");
+            let open = rect_of("open");
+            let closing = rect_of(last);
+            assert!(scrim.contains_rect(card), "the dialog sits over the pane");
+            writes.lock().unwrap().clear();
+            // The scrim around the dialog, the dialog background, Open and Copy
+            // while they are disarmed, then Dismiss (immediate) or Copy once
+            // settled, which removes the dialog.
+            let outside = egui::pos2(card.center().x, card.bottom() + 20.0);
+            assert!(scrim.contains(outside));
+            let background = egui::pos2(card.center().x, card.top() + 4.0);
+            let copy = rect_of("copy");
+            for (step, pos) in [
+                outside,
+                background,
+                open.center(),
+                copy.center(),
+                closing.center(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if step == 4 && last == "copy" {
+                    // Settle Copy. Only Copy is clicked from here on, so no
+                    // browser can start.
+                    workbench
+                        .url_open
+                        .prompt_mut()
+                        .card_mut()
+                        .unwrap()
+                        .painted_at = Some(Instant::now() - std::time::Duration::from_secs(1));
+                }
+                if step < 4 {
+                    assert!(
+                        workbench.url_card().is_some(),
+                        "{last}: step {step} keeps it"
+                    );
+                }
+                workbench_frame(&ctx, &mut workbench, 1024.0, click_at(pos));
+                workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+                assert!(
+                    writes.lock().unwrap().is_empty(),
+                    "{last}: no mouse report for a click on the dialog: {:?}",
+                    writes.lock().unwrap()
+                );
+                let terminal = workbench.terminal.as_ref().unwrap();
+                assert!(!terminal.has_selection(), "no selection from the dialog");
+                assert!(terminal.is_focused(), "{last}: the terminal keeps focus");
+            }
+            assert!(workbench.url_card().is_none(), "{last} removes the dialog");
+            // Typing still reaches the child.
+            workbench_frame(
+                &ctx,
+                &mut workbench,
+                1024.0,
+                vec![egui::Event::Text("x".to_owned())],
+            );
+            assert_eq!(writes.lock().unwrap().as_slice(), b"x", "{last}");
+            // With the dialog gone, the same place reaches the terminal again.
+            writes.lock().unwrap().clear();
+            workbench_frame(&ctx, &mut workbench, 1024.0, click_at(outside));
+            assert!(
+                writes.lock().unwrap().starts_with(b"\x1b[M"),
+                "{last}: a click is reported once the dialog is gone: {:?}",
+                writes.lock().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_oauth_url_is_whole_and_reachable_by_scrolling() {
+        let query: String = (0..170).map(|i| format!("p{i}=v{i:04}&")).collect();
+        let address = format!("https://claude.com/cai/oauth/authorize?{query}end=TAIL");
+        assert!(address.len() > 1500 && address.len() <= 2048);
+        let (mut workbench, writes) = recording_workbench();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+        let url = made_platform::open_url::validate_url(&address).unwrap();
+        assert!(workbench
+            .url_open
+            .offer(url, crate::url_open::UrlOrigin::Local, Instant::now()));
+        workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new());
+        let find = |output: &egui::FullOutput| {
+            fn visit(
+                shape: &egui::Shape,
+                clip: egui::Rect,
+                needle: &str,
+            ) -> Option<(String, egui::Rect, egui::Rect, bool)> {
+                match shape {
+                    egui::Shape::Text(text) if text.galley.job.text.contains(needle) => Some((
+                        text.galley.job.text.clone(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        clip,
+                        text.galley.elided,
+                    )),
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().find_map(|shape| visit(shape, clip, needle))
+                    }
+                    _ => None,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| visit(&clipped.shape, clipped.clip_rect, "end=TAIL"))
+                .expect("the full URL is painted")
+        };
+        let (text, start, clip, elided) =
+            find(&workbench_frame(&ctx, &mut workbench, 1024.0, Vec::new()));
+        assert_eq!(text, address, "the URL is painted whole");
+        assert!(!elided);
+        assert!(start.bottom() > clip.bottom() + 1.0, "a long URL scrolls");
+        let over = egui::pos2(clip.center().x, clip.center().y);
+        let mut end = start;
+        for _ in 0..120 {
+            let output = workbench_frame(
+                &ctx,
+                &mut workbench,
+                1024.0,
+                vec![
+                    egui::Event::PointerMoved(over),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -400.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            end = find(&output).1;
+            if end.bottom() <= clip.bottom() + 1.0 {
+                break;
+            }
+        }
+        assert!(
+            end.bottom() <= clip.bottom() + 1.0,
+            "the URL's end is reachable: {end:?} in {clip:?}"
+        );
+        assert!(
+            writes.lock().unwrap().iter().all(|byte| *byte != 0x1b),
+            "scrolling the dialog sends nothing to the terminal"
+        );
+    }
+
+    #[test]
+    fn open_stays_disabled_while_a_long_host_cannot_be_shown_whole() {
+        let label = "a".repeat(63);
+        let host = format!("{label}.{label}.{label}.{}.example", "b".repeat(55));
+        assert_eq!(host.len(), 255);
+        let (mut workbench, _writes) = recording_workbench();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let short = |workbench: &mut Workbench, events| {
+            workbench_frame_sized(&ctx, workbench, egui::vec2(420.0, 100.0), events)
+        };
+        short(&mut workbench, Vec::new());
+        let url = made_platform::open_url::validate_url(&format!("https://{host}/")).unwrap();
+        assert!(workbench
+            .url_open
+            .offer(url, crate::url_open::UrlOrigin::Local, Instant::now()));
+        short(&mut workbench, Vec::new());
+        let output = short(&mut workbench, Vec::new());
+        assert!(
+            ui_text(&output).contains("Widen the pane to review this link"),
+            "{}",
+            ui_text(&output)
+        );
+        // Long past the arming delay, Open is still disabled.
+        workbench
+            .url_open
+            .prompt_mut()
+            .card_mut()
+            .unwrap()
+            .painted_at = Some(Instant::now() - std::time::Duration::from_secs(3600));
+        short(&mut workbench, Vec::new());
+        let card = workbench.url_card().unwrap();
+        assert!(!card.reviewable && !card.armed(Instant::now()));
+        let open = ctx
+            .read_response(crate::ui::url_card_action_id(&workbench.pane_id, "open"))
+            .expect("Open is laid out");
+        short(&mut workbench, click_at(open.rect.center()));
+        short(&mut workbench, Vec::new());
+        assert!(workbench.url_card().is_some(), "nothing was opened");
+        assert_eq!(
+            workbench
+                .url_open
+                .prompt_mut()
+                .act(crate::url_open::UrlCardAction::Open, Instant::now()),
+            None,
+            "the model refuses Open too"
+        );
+        assert!(workbench.url_card().is_some());
+    }
+
     fn idle_workbench(target: TerminalTarget, terminal: Option<TerminalPane>) -> Workbench {
         let cwd = std::env::temp_dir();
         let now = Instant::now();
@@ -6139,6 +6717,7 @@ mod tests {
             remote_preview: RemotePreviewView::default(),
             remote_explorer_cache: crate::explorer_view::RemoteExplorerCache::default(),
             remote_preview_focus_pending: false,
+            url_open: crate::url_open::PaneUrlOpen::default(),
         }
     }
 

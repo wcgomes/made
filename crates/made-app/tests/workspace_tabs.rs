@@ -5128,3 +5128,206 @@ mod tab_presentation_characterization {
         }
     }
 }
+
+/// Window-side IME state as egui-winit 0.37 drives it: `State` toggles
+/// `set_ime_allowed` only when `platform_output.ime.is_some()` changes, and a
+/// direct `ViewportCommand::IMEAllowed` sets the window regardless. winit on
+/// macOS composes dead keys (´ + a) only while the window allows IME.
+#[derive(Default)]
+struct WindowIme {
+    integration_allows: bool,
+    window_allows: bool,
+    ime_commands: usize,
+    purpose: Option<egui::IMEPurpose>,
+}
+
+impl WindowIme {
+    fn apply(&mut self, output: &egui::FullOutput) {
+        let wants = output.platform_output.ime.is_some();
+        self.purpose = output.platform_output.ime.as_ref().map(|ime| ime.purpose);
+        if self.integration_allows != wants {
+            self.integration_allows = wants;
+            self.window_allows = wants;
+        }
+        if let Some(viewport) = output.viewport_output.get(&egui::ViewportId::ROOT) {
+            for command in &viewport.commands {
+                match command {
+                    egui::ViewportCommand::IMEAllowed(allowed) => {
+                        self.window_allows = *allowed;
+                        self.ime_commands += 1;
+                    }
+                    egui::ViewportCommand::IMEPurpose(_) => self.ime_commands += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn ime_frame(
+    model: &mut AppModel,
+    ctx: &egui::Context,
+    window: &mut WindowIme,
+    window_focused: bool,
+    events: Vec<egui::Event>,
+) {
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    raw.viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .focused = Some(window_focused);
+    let mut output = ctx.run_ui(raw, |ui| {
+        model.logic(ui.ctx());
+        model.ui(ui);
+    });
+    output.textures_delta.clear();
+    window.apply(&output);
+}
+
+/// Hover, press and release the primary button at `pos`, one frame each.
+fn ime_click(model: &mut AppModel, ctx: &egui::Context, window: &mut WindowIme, pos: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    ime_frame(
+        model,
+        ctx,
+        window,
+        true,
+        vec![egui::Event::PointerMoved(pos)],
+    );
+    ime_frame(model, ctx, window, true, vec![button(true)]);
+    ime_frame(model, ctx, window, true, vec![button(false)]);
+}
+
+#[test]
+fn clicking_another_workspace_tab_keeps_terminal_ime_allowed() {
+    if isolated("clicking_another_workspace_tab_keeps_terminal_ime_allowed") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let ctx = egui::Context::default();
+    let mut ids = Vec::new();
+    for name in ["a", "b"] {
+        let path = root.join(name);
+        std::fs::create_dir(&path).unwrap();
+        open(&mut model, &path);
+        ids.push(model.active_workspace_id().unwrap());
+    }
+    let mut window = WindowIme::default();
+    for _ in 0..4 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    assert!(window.window_allows, "a focused terminal allows IME");
+
+    let pos = ctx
+        .read_response(made_app::ui::workspace_tab_id(ids[0]))
+        .expect("first workspace tab is painted")
+        .rect
+        .center();
+    ime_click(&mut model, &ctx, &mut window, pos);
+    assert_eq!(model.active_workspace_id(), Some(ids[0]));
+
+    for _ in 0..5 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    assert!(model.workbench().unwrap().terminal().unwrap().is_focused());
+    assert!(
+        window.window_allows,
+        "dead keys need IME allowed while the switched-to terminal is focused"
+    );
+
+    ime_frame(&mut model, &ctx, &mut window, false, Vec::new());
+    assert!(!window.window_allows, "window blur disallows IME");
+    assert_eq!(
+        window.ime_commands, 0,
+        "egui-winit owns IME on/off; no viewport command (and its repaint) per frame"
+    );
+}
+
+#[test]
+fn returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed() {
+    if isolated("returning_from_an_ssh_field_to_the_terminal_keeps_ime_allowed") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let ctx = egui::Context::default();
+    open(&mut model, &root);
+    let mut window = WindowIme::default();
+    for _ in 0..4 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    assert!(window.window_allows, "a focused terminal allows IME");
+    let terminal_focus = model
+        .workbench()
+        .unwrap()
+        .terminal()
+        .unwrap()
+        .focus_id()
+        .expect("terminal focus id");
+
+    let ssh = ctx
+        .read_response(made_app::ui::top_action_id("ssh-servers"))
+        .expect("SSH servers action is painted")
+        .rect
+        .center();
+    ime_click(&mut model, &ctx, &mut window, ssh);
+    for _ in 0..2 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    let field = made_app::ui::ssh_field_id("name");
+    let field_pos = ctx
+        .read_response(field)
+        .expect("SSH name field is painted")
+        .rect
+        .center();
+    ime_click(&mut model, &ctx, &mut window, field_pos);
+    for _ in 0..2 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(field));
+    assert!(!model.workbench().unwrap().terminal().unwrap().is_focused());
+    assert!(window.window_allows, "the focused text field allows IME");
+    assert_ne!(window.purpose, Some(egui::IMEPurpose::Terminal));
+
+    let dialog = ctx
+        .memory(|memory| memory.area_rect(made_app::ui::ssh_servers_window_id()))
+        .expect("SSH window rect");
+    let terminal = ctx
+        .read_response(terminal_focus)
+        .expect("terminal is painted")
+        .rect;
+    let back = [
+        terminal.left_bottom() + egui::vec2(24.0, -24.0),
+        terminal.right_bottom() + egui::vec2(-24.0, -24.0),
+        terminal.left_top() + egui::vec2(24.0, 24.0),
+    ]
+    .into_iter()
+    .find(|pos| !dialog.contains(*pos))
+    .expect("a terminal point outside the SSH window");
+    ime_click(&mut model, &ctx, &mut window, back);
+    for _ in 0..5 {
+        ime_frame(&mut model, &ctx, &mut window, true, Vec::new());
+    }
+    assert!(model.workbench().unwrap().terminal().unwrap().is_focused());
+    assert_eq!(window.purpose, Some(egui::IMEPurpose::Terminal));
+    assert!(
+        window.window_allows,
+        "dead keys need IME allowed once the terminal has focus again"
+    );
+    assert_eq!(window.ime_commands, 0);
+}

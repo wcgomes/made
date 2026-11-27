@@ -4,7 +4,7 @@
 Usage: compose-macos-bundle.py --stage DIR --bundle OUT/Made.app --version X.Y.Z
 
 Velopack packs a prebuilt `.app` as is. Mach-O executables (`made-app`,
-`made-askpass`) go to `Contents/MacOS`; everything else (plugins, LICENSE,
+`made-askpass`, `made-open`) go to `Contents/MacOS`; everything else (plugins, LICENSE,
 README, version.json, the companion tree) goes to `Contents/Resources`,
 because files that are not Mach-O lose their code signature in Velopack's
 update package when they live in `Contents/MacOS`. `Contents/MacOS/remote` is a
@@ -21,7 +21,7 @@ import stat
 import sys
 from pathlib import Path
 
-EXECUTABLES = ("made-app", "made-askpass")
+EXECUTABLES = ("made-app", "made-askpass", "made-open")
 BUNDLE_ID = "io.github.wcgomes.made"
 
 

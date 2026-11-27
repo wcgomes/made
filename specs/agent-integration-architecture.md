@@ -183,10 +183,17 @@ Per-integration follow semantics that differ today MUST be declared per integrat
 ### Requirement: Declared launch policy (AIA-07)
 Each integration MUST declare its direct-launch arguments and its launch-environment contribution: the variables it sets, the local targets that receive them (the shell target, its own direct target, or neither), and the variables removed from targets that do not bind them. The core MUST compose a tab's launch environment only from these declarations, for the first spawn and the fallback-directory retry alike. The result MUST equal today's for every target: a shell tab receives OpenCode's composed configuration and Made's Claude Code plugin entry and spool binding; a direct OpenCode tab receives the composed configuration and no Made Claude Code entry; a direct Grok tab runs `grok dashboard` with neither; a direct Claude Code tab receives the Claude Code entry and spool binding and no OpenCode configuration; `MADE_CLAUDE_SPOOL` is removed from every local target that does not bind a spool; remote targets receive no host integration environment and start no host process.
 
+Beside the integration declarations the core MUST add one launch contribution of its own, the `BROWSER` contribution, to every local shell and direct TUI launch, including the fallback retry; it is not an integration's and is applied after every integration contribution, so it wins. When the packaged `made-open` helper sits beside the application executable and the pane's private URL endpoint exists, it MUST set `BROWSER` to the helper's absolute path, `MADE_URL_SOCKET` to the pane's endpoint and `MADE_URL_TOKEN` to a fresh token for that launch, and MUST preserve a pre-existing user `BROWSER` as `MADE_ORIGINAL_BROWSER` unless that value is itself a Made helper; otherwise it MUST leave a user's `BROWSER` unchanged, remove `MADE_URL_SOCKET` and `MADE_URL_TOKEN`, and replace an inherited `BROWSER` that is itself a Made helper (a Made started from a Made pane) with `MADE_ORIGINAL_BROWSER`, or remove it when there is none, since it could only fail. Remote targets MUST NOT receive it: their `BROWSER` is set on the server by SSH-08 of `specs/ssh-remote-workspaces.md`.
+
 #### Scenario: Launch environment matrix
 - Given the shell, direct OpenCode, direct Grok, direct Claude Code and remote targets, with and without a shipped Claude Code plugin and a spool
 - When each target's launch is prepared, including the fallback retry
 - Then program, arguments, variables set and variables removed equal the values recorded before the change
+
+#### Scenario: BROWSER is a core launch contribution
+- Given local shell and direct TUI launches with and without the packaged `made-open` helper, with and without a user `BROWSER`, and remote targets
+- When each launch is prepared, including the fallback retry and a TUI replaced by its shell
+- Then with the helper `BROWSER` names it, `MADE_URL_SOCKET` and a launch-fresh `MADE_URL_TOKEN` are set and a user `BROWSER` is kept as `MADE_ORIGINAL_BROWSER`; without it the user's `BROWSER` is unchanged, an inherited Made helper `BROWSER` is restored to the original or removed, and the two URL variables are removed; remote targets receive none of these from the host
 
 #### Scenario: Grok arguments
 - Given Grok is on PATH
