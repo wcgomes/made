@@ -8,7 +8,8 @@
 //! - Detach is `made_platform::spawn_detached_command` (module `detach` is
 //!   private; that function is the re-export). It starts a new session, ignores
 //!   SIGHUP, closes inherited stdio, and uses a private directory. The frontend
-//!   calls it. This module does not reimplement OS detach.
+//!   calls it and passes `<data>/remote/detach` as that directory. This module
+//!   does not reimplement OS detach.
 //! - Endpoint publish uses the existing `write_private_metadata_atomic` /
 //!   `read_private_metadata`. The draft helpers `write_private` and
 //!   `read_private_file` are not the atomic API.

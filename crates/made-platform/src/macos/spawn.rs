@@ -171,6 +171,15 @@ impl FileActions {
         check(unsafe { libc::posix_spawn_file_actions_addchdir_np(&mut self.0, dir.as_ptr()) })
     }
 
+    /// `fchdir(fd)` in the child.
+    pub(super) fn fchdir(&mut self, fd: libc::c_int) -> io::Result<()> {
+        // The `_np` form is intentional, as for `chdir`: the release deployment
+        // target is macOS 12.0, posix_spawn_file_actions_addfchdir_np exists
+        // from macOS 10.15, and the unsuffixed form only from macOS 26.
+        // SAFETY: a plain descriptor number recorded for the child.
+        check(unsafe { libc::posix_spawn_file_actions_addfchdir_np(&mut self.0, fd) })
+    }
+
     pub(super) fn open(
         &mut self,
         fd: libc::c_int,
