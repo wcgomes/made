@@ -6,8 +6,8 @@
 //! one-time libSystem initialization at the fork. `posix_spawn` runs none.
 //!
 //! Keep this the only test in this binary: it changes process-wide state (an
-//! atfork handler, descriptor 77, `TMUX` in the environment) and counts every
-//! fork in the process.
+//! atfork handler, descriptor 77, `TMUX` and `TMPDIR` in the environment) and
+//! counts every fork in the process.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -45,7 +45,11 @@ fn detached_child_is_spawned_without_fork_and_keeps_its_detachment() {
     std::env::set_var("TMUX_PANE", "%1");
 
     let temp = tempfile::tempdir().unwrap();
-    let report = temp.path().canonicalize().unwrap().join("report");
+    let temp_root = temp.path().canonicalize().unwrap();
+    // The runtime directory goes under this test's temp directory, so the run
+    // leaves nothing behind.
+    std::env::set_var("TMPDIR", &temp_root);
+    let report = temp_root.join("report");
     let script = r#"
 read -r payload
 if [ /dev/fd/1 -ef /dev/null ] && [ /dev/fd/2 -ef /dev/null ]; then stdio=null; else stdio=other; fi
@@ -122,8 +126,4 @@ while [ ! -e "$1.release" ] && [ -e "$1" ]; do sleep 0.05; done
         "the child leads its own session"
     );
     std::fs::write(report.with_extension("release"), b"").unwrap();
-    // spawn_detached_command leaves the runtime directory on success; remove
-    // the one this spawn created. It stays empty, so rmdir succeeds even
-    // while the child still has it as its cwd.
-    std::fs::remove_dir(field("cwd")).unwrap();
 }

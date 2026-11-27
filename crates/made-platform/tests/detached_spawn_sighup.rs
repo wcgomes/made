@@ -3,7 +3,8 @@
 //! and mask) afterwards, on success and on failure.
 //!
 //! Keep this the only test in this binary: it installs a process-wide
-//! `SIGHUP` handler and reads the disposition back.
+//! `SIGHUP` handler and reads the disposition back, and points `TMPDIR` at its
+//! own temporary directory.
 #![cfg(target_os = "macos")]
 
 use std::ffi::OsString;
@@ -50,6 +51,9 @@ fn the_callers_sighup_action_is_restored_after_success_and_failure() {
     assert_ne!(installed.2, 0);
 
     let temp = tempfile::tempdir().unwrap();
+    // The runtime directory goes under this test's temp directory, so the run
+    // leaves nothing behind. No other test runs in this binary.
+    std::env::set_var("TMPDIR", temp.path());
     let report = temp.path().join("cwd");
     spawn_detached_command(
         Path::new("/bin/sh"),
@@ -72,18 +76,11 @@ fn the_callers_sighup_action_is_restored_after_success_and_failure() {
     );
     assert_eq!(sighup_action(), installed, "restored after a failed spawn");
 
-    // spawn_detached_command leaves the runtime directory of a successful
-    // spawn in place; remove the one the first spawn created.
+    // Let the child finish before the temp directory that holds its runtime
+    // directory is removed.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !report.exists() {
         assert!(Instant::now() < deadline, "detached child never reported");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let runtime = std::fs::read_to_string(&report).unwrap();
-    let runtime = Path::new(runtime.trim_end());
-    assert!(runtime
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("made-detach-")));
-    std::fs::remove_dir(runtime).unwrap();
 }
