@@ -201,6 +201,9 @@ pub struct TerminalPane {
     grid_paint_count: u64,
     last_grid_paint_visible: bool,
     output_bytes: u64,
+    /// Area drawn over the terminal (the URL dialog) whose pointer input the
+    /// terminal must not take.
+    pointer_exclusion: Option<Rect>,
 }
 
 impl std::fmt::Debug for TerminalPane {
@@ -270,6 +273,7 @@ impl TerminalPane {
             grid_paint_count: 0,
             last_grid_paint_visible: false,
             output_bytes: 0,
+            pointer_exclusion: None,
         };
         pane.encoder.set_modes(pane.core.input_modes());
         pane.core.clear_selection();
@@ -333,6 +337,7 @@ impl TerminalPane {
             grid_paint_count: 0,
             last_grid_paint_visible: false,
             output_bytes: 0,
+            pointer_exclusion: None,
         };
         pane.encoder.set_modes(pane.core.input_modes());
         pane
@@ -519,6 +524,13 @@ impl TerminalPane {
         self.focus_id
     }
     /// Whether the visible terminal currently owns keyboard/IME input.
+    /// Set, each frame before [`TerminalPane::ui`], the area overlaid on the
+    /// terminal whose pointer presses, releases, moves and scrolls the
+    /// terminal must ignore.
+    pub fn set_pointer_exclusion(&mut self, rect: Option<Rect>) {
+        self.pointer_exclusion = rect;
+    }
+
     pub fn is_focused(&self) -> bool {
         self.focused
     }
@@ -1301,6 +1313,12 @@ impl TerminalPane {
         self.renderer.invalidate_all();
     }
 
+    /// Whether any cells are selected or a selection is in progress.
+    #[cfg(test)]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selecting || self.selection.is_some() || self.core.has_selection()
+    }
+
     /// Visible screen text.
     #[cfg(test)]
     pub(crate) fn screen_text(&self) -> String {
@@ -1353,12 +1371,14 @@ impl TerminalPane {
             // when the Restart button held focus during the restart.
             response.request_focus();
         }
+        let exclusion = self.pointer_exclusion;
+        let excluded = |pos: egui::Pos2| exclusion.is_some_and(|rect| rect.contains(pos));
         let pointer_pressed = ctx.input(|input| {
             input.pointer.any_pressed()
                 && input
                     .pointer
                     .interact_pos()
-                    .is_some_and(|pos| pane_rect.contains(pos))
+                    .is_some_and(|pos| pane_rect.contains(pos) && !excluded(pos))
         });
         if response.clicked() || pointer_pressed {
             response.request_focus();
@@ -1654,8 +1674,9 @@ impl TerminalPane {
         let events = ctx.input(|input| input.events.clone());
         let mouse_mode = self.core.input_modes().mouse_mode;
         let core_size = self.core.size();
+        let exclusion = self.pointer_exclusion;
         let cell_at = |pos: egui::Pos2| -> Option<CellPoint> {
-            if !grid_rect.contains(pos) {
+            if !grid_rect.contains(pos) || exclusion.is_some_and(|rect| rect.contains(pos)) {
                 return None;
             }
             let col = ((pos.x - grid_rect.left()) / cell_metrics.width).floor();

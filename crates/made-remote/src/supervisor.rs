@@ -59,6 +59,30 @@ pub const SCROLLBACK_LINES: usize = 10_000;
 /// last URL inside it are coalesced.
 pub const URL_REQUEST_WINDOW: Duration = Duration::from_secs(1);
 
+/// Whether a routed URL request is acknowledged: a repeat inside the window
+/// is coalesced, a different URL inside it is refused, and a fresh one is
+/// acknowledged only when `deliver` queued its frame. It is recorded only
+/// then, so an undelivered request's retry is fresh again rather than a
+/// duplicate acknowledged without delivery.
+fn url_request_acked(
+    gate: &mut UrlRateGate,
+    url: &made_platform::open_url::SafeUrl,
+    now: Instant,
+    deliver: impl FnOnce() -> bool,
+) -> bool {
+    match gate.check(url, now) {
+        RateDecision::Duplicate => true,
+        RateDecision::Limited => false,
+        RateDecision::Fresh => {
+            let delivered = deliver();
+            if delivered {
+                gate.record(url, now);
+            }
+            delivered
+        }
+    }
+}
+
 /// Point the child's `BROWSER` at the companion's URL helper mode: a
 /// `made-open` symlink to the companion in this tab's private runtime
 /// directory, since `BROWSER` cannot carry a mode argument. A user `BROWSER`
@@ -1238,16 +1262,17 @@ impl Supervisor {
                 request.reject();
                 continue;
             }
-            match self.url_gate.admit(request.url(), Instant::now()) {
-                RateDecision::Duplicate => request.accept(),
-                RateDecision::Limited => request.reject(),
-                RateDecision::Fresh => {
-                    if self.forward_url(request.url().as_str().to_owned()) {
-                        request.accept();
-                    } else {
-                        request.reject();
-                    }
-                }
+            let mut gate =
+                std::mem::replace(&mut self.url_gate, UrlRateGate::new(URL_REQUEST_WINDOW));
+            let url = request.url().clone();
+            let acked = url_request_acked(&mut gate, &url, Instant::now(), || {
+                self.forward_url(url.as_str().to_owned())
+            });
+            self.url_gate = gate;
+            if acked {
+                request.accept();
+            } else {
+                request.reject();
             }
         }
     }
@@ -1631,4 +1656,44 @@ pub fn write_envelope(writer: &mut impl Write, frame: &WireEnvelope) -> io::Resu
         &encode(frame).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid frame"))?,
     )?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod url_request_tests {
+    use super::*;
+    use made_platform::open_url::validate_url;
+
+    #[test]
+    fn a_failed_delivery_is_not_acknowledged_on_retry() {
+        let mut gate = UrlRateGate::new(URL_REQUEST_WINDOW);
+        let url = validate_url("https://example.com/login").unwrap();
+        let start = Instant::now();
+        // The output queue was full: refused, and nothing recorded.
+        assert!(!url_request_acked(&mut gate, &url, start, || false));
+        // The retry inside the window must be delivered, not coalesced.
+        let mut delivered = false;
+        let retry = start + Duration::from_millis(200);
+        assert!(url_request_acked(&mut gate, &url, retry, || {
+            delivered = true;
+            true
+        }));
+        assert!(
+            delivered,
+            "the retry was delivered, not acked as a duplicate"
+        );
+        // A real repeat of a delivered request is coalesced without delivery.
+        assert!(url_request_acked(
+            &mut gate,
+            &url,
+            retry + Duration::from_millis(100),
+            || panic!("a duplicate is not delivered again")
+        ));
+        let other = validate_url("https://other.example/").unwrap();
+        assert!(!url_request_acked(
+            &mut gate,
+            &other,
+            retry + Duration::from_millis(100),
+            || panic!("a limited request is not delivered")
+        ));
+    }
 }

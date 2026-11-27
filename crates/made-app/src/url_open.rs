@@ -2,7 +2,7 @@
 //!
 //! A local child reaches the pane through `BROWSER` and the pane's private
 //! request sink; a remote child arrives as the companion's `OpenUrlRequest`
-//! push. Either way the pane shows one inline card with Open / Copy /
+//! push. Either way the pane shows one dialog over its terminal with Open / Copy /
 //! Dismiss. Nothing opens without the user's Open, and no URL is logged:
 //! diagnostics carry counts only.
 use std::ffi::OsStr;
@@ -36,13 +36,35 @@ pub enum UrlOrigin {
 pub struct UrlCard {
     pub url: SafeUrl,
     pub origin: UrlOrigin,
-    pub shown_at: Instant,
+    /// When the request was offered; it paces the rate window only.
+    pub offered_at: Instant,
+    /// When the card was first painted. Open arms from here, so a card that
+    /// arrived in a hidden tab or window is never armed before it is seen.
+    pub painted_at: Option<Instant>,
+    /// Whether the whole host fits on the card as laid out this frame. Open
+    /// stays disabled while it does not, so a link is never opened unseen.
+    pub reviewable: bool,
 }
 
 impl UrlCard {
-    /// Whether Open is enabled yet.
+    /// Whether the card has been seen for the arming delay. Copy needs it, so
+    /// a click aimed at one dialog cannot land on a replacement that moved
+    /// its buttons.
+    pub fn settled(&self, now: Instant) -> bool {
+        self.painted_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= OPEN_ARM_DELAY)
+    }
+
+    /// Whether Open is enabled yet: settled, with the whole host shown.
     pub fn armed(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.shown_at) >= OPEN_ARM_DELAY
+        self.reviewable && self.settled(now)
+    }
+
+    /// How long until Open arms, once painted.
+    pub fn arming_left(&self, now: Instant) -> Option<Duration> {
+        let at = self.painted_at?;
+        let left = OPEN_ARM_DELAY.saturating_sub(now.saturating_duration_since(at));
+        (!left.is_zero()).then_some(left)
     }
 }
 
@@ -109,9 +131,35 @@ impl UrlPrompt {
         self.card = Some(UrlCard {
             url,
             origin,
-            shown_at: now,
+            offered_at: now,
+            painted_at: None,
+            reviewable: true,
         });
         Offer::Shown
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_mut(&mut self) -> Option<&mut UrlCard> {
+        self.card.as_mut()
+    }
+
+    /// Record whether the card's layout shows the whole host.
+    /// When a card becomes reviewable again, the arming delay restarts, so
+    /// the host the user is about to open has been on screen for it.
+    pub fn set_reviewable(&mut self, reviewable: bool, now: Instant) {
+        if let Some(card) = self.card.as_mut() {
+            if reviewable && !card.reviewable && card.painted_at.is_some() {
+                card.painted_at = Some(now);
+            }
+            card.reviewable = reviewable;
+        }
+    }
+
+    /// Record that the card is being painted; the first call arms the delay.
+    pub fn mark_painted(&mut self, now: Instant) -> Option<&UrlCard> {
+        let card = self.card.as_mut()?;
+        card.painted_at.get_or_insert(now);
+        Some(card)
     }
 
     /// Apply the user's action. Open before the card is armed does nothing.
@@ -120,6 +168,7 @@ impl UrlPrompt {
         match action {
             UrlCardAction::Open if !card.armed(now) => None,
             UrlCardAction::Open => self.card.take().map(|card| UrlEffect::Open(card.url)),
+            UrlCardAction::Copy if !card.settled(now) => None,
             UrlCardAction::Copy => self
                 .card
                 .take()
@@ -145,6 +194,9 @@ pub fn packaged_url_helper() -> Option<PathBuf> {
 /// A local pane's endpoint, current launch token and card.
 #[derive(Debug, Default)]
 pub struct PaneUrlOpen {
+    /// Test-only stand-in for the packaged helper beside the executable.
+    #[cfg(test)]
+    pub(crate) helper_override: Option<PathBuf>,
     sink: Option<UrlRequestSink>,
     token: Option<UrlToken>,
     prompt: UrlPrompt,
@@ -161,6 +213,15 @@ impl PaneUrlOpen {
         &mut self.prompt
     }
 
+    /// The helper a launch points `BROWSER` at, if it is packaged.
+    pub fn helper_path(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Some(helper) = &self.helper_override {
+            return Some(helper.clone());
+        }
+        packaged_url_helper()
+    }
+
     /// Cards shown and requests refused on this pane, for diagnostics.
     pub fn counts(&self) -> (u64, u64) {
         (self.shown, self.refused)
@@ -174,6 +235,7 @@ impl PaneUrlOpen {
         paths: Option<&AppPaths>,
         helper: Option<&Path>,
         inherited_browser: Option<&OsStr>,
+        inherited_original: Option<&OsStr>,
     ) -> EnvContribution {
         self.token = UrlToken::generate().ok();
         if self.sink.is_none() {
@@ -183,10 +245,12 @@ impl PaneUrlOpen {
             });
         }
         match (helper, self.sink.as_ref(), self.token.as_ref()) {
-            (Some(helper), Some(sink), Some(token)) => {
-                browser_contribution(Some((helper, sink.socket_path(), token)), inherited_browser)
-            }
-            _ => browser_contribution(None, inherited_browser),
+            (Some(helper), Some(sink), Some(token)) => browser_contribution(
+                Some((helper, sink.socket_path(), token)),
+                inherited_browser,
+                inherited_original,
+            ),
+            _ => browser_contribution(None, inherited_browser, inherited_original),
         }
     }
 
@@ -257,6 +321,7 @@ mod tests {
         // Showing a card is not opening it, and an early Open is ignored.
         assert_eq!(prompt.act(UrlCardAction::Open, start), None);
         assert!(prompt.card().is_some());
+        prompt.mark_painted(start);
         let armed = start + OPEN_ARM_DELAY;
         assert_eq!(
             prompt.act(UrlCardAction::Open, armed),
@@ -267,6 +332,12 @@ mod tests {
 
         let later = start + Duration::from_secs(2);
         prompt.offer(url("https://b.example/x"), UrlOrigin::Local, later);
+        // Copy waits for the same delay from the first paint.
+        assert_eq!(prompt.act(UrlCardAction::Copy, later), None);
+        prompt.mark_painted(later);
+        assert_eq!(prompt.act(UrlCardAction::Copy, later), None);
+        assert!(prompt.card().is_some());
+        let later = later + OPEN_ARM_DELAY;
         assert_eq!(
             prompt.act(UrlCardAction::Copy, later),
             Some(UrlEffect::Copy("https://b.example/x".into()))
@@ -280,6 +351,33 @@ mod tests {
             None
         );
         assert!(prompt.card().is_none());
+    }
+
+    #[test]
+    fn arming_restarts_when_the_card_becomes_reviewable() {
+        let start = Instant::now();
+        let mut prompt = UrlPrompt::default();
+        prompt.offer(url("https://a.example/"), UrlOrigin::Local, start);
+        prompt.mark_painted(start);
+        prompt.set_reviewable(false, start);
+        let shown = start + Duration::from_secs(5);
+        assert!(
+            !prompt.card().unwrap().armed(shown),
+            "not while unreviewable"
+        );
+        assert!(prompt.card().unwrap().settled(shown), "Copy still works");
+        prompt.set_reviewable(true, shown);
+        let card = prompt.card().unwrap();
+        assert!(!card.armed(shown));
+        assert!(!card.armed(shown + OPEN_ARM_DELAY - Duration::from_millis(1)));
+        assert!(card.armed(shown + OPEN_ARM_DELAY));
+        assert_eq!(prompt.act(UrlCardAction::Open, shown), None);
+        // Staying reviewable does not restart it again.
+        prompt.set_reviewable(true, shown + OPEN_ARM_DELAY);
+        assert_eq!(
+            prompt.act(UrlCardAction::Open, shown + OPEN_ARM_DELAY),
+            Some(UrlEffect::Open(url("https://a.example/")))
+        );
     }
 
     #[test]
@@ -307,12 +405,34 @@ mod tests {
             prompt.offer(url("https://b.example/"), UrlOrigin::Local, later),
             Offer::Shown
         );
-        assert!(!prompt.card().unwrap().armed(later));
+        assert!(!prompt.card().unwrap().armed(later + OPEN_ARM_DELAY));
         // A remote card names its server and uses the remote window.
         let remote = UrlOrigin::Remote("build-box".into());
         let r = later + REMOTE_WINDOW;
         assert_eq!(prompt.offer(a.clone(), remote.clone(), r), Offer::Shown);
         assert_eq!(prompt.card().unwrap().origin, remote);
+    }
+
+    #[test]
+    fn open_arms_from_the_first_paint_not_from_the_offer() {
+        let start = Instant::now();
+        let mut prompt = UrlPrompt::default();
+        prompt.offer(url("https://a.example/"), UrlOrigin::Local, start);
+        // The card waited in a hidden tab: long after the offer it is still
+        // unarmed because nobody has seen it.
+        let seen = start + Duration::from_secs(30);
+        assert_eq!(prompt.act(UrlCardAction::Open, seen), None);
+        assert_eq!(prompt.card().unwrap().arming_left(seen), None);
+        prompt.mark_painted(seen);
+        // Later paints do not move the arming point.
+        prompt.mark_painted(seen + Duration::from_millis(300));
+        let early = seen + OPEN_ARM_DELAY - Duration::from_millis(1);
+        assert!(prompt.card().unwrap().arming_left(early).is_some());
+        assert_eq!(prompt.act(UrlCardAction::Open, early), None);
+        assert_eq!(
+            prompt.act(UrlCardAction::Open, seen + OPEN_ARM_DELAY),
+            Some(UrlEffect::Open(url("https://a.example/")))
+        );
     }
 
     #[test]
@@ -327,7 +447,7 @@ mod tests {
             start
         ));
         let helper = Path::new("/opt/made/made-open");
-        let _ = pane.launch_contribution(None, Some(helper), None);
+        let _ = pane.launch_contribution(None, Some(helper), None, None);
         let first = pane.token.clone().unwrap();
         let foreign = UrlToken::generate().unwrap();
         assert!(!pane.admit(
@@ -338,7 +458,7 @@ mod tests {
         ));
         assert!(pane.prompt().card().is_none());
         // A relaunch rotates the token: the earlier launch's children are stale.
-        let _ = pane.launch_contribution(None, Some(helper), None);
+        let _ = pane.launch_contribution(None, Some(helper), None, None);
         assert!(!pane.admit(
             first.as_str(),
             url("https://a.example/"),
@@ -379,7 +499,8 @@ mod tests {
                 .map(|(_, v)| v.to_string_lossy().into_owned())
         };
         let mut pane = PaneUrlOpen::default();
-        let set = pane.launch_contribution(Some(&paths), Some(&helper), Some(OsStr::new("lynx")));
+        let set =
+            pane.launch_contribution(Some(&paths), Some(&helper), Some(OsStr::new("lynx")), None);
         assert_eq!(
             get(&set, "BROWSER").as_deref(),
             Some(helper.to_str().unwrap())
@@ -389,9 +510,20 @@ mod tests {
         assert!(get(&set, "MADE_URL_TOKEN").is_some());
 
         let mut missing = PaneUrlOpen::default();
-        let unset = missing.launch_contribution(Some(&paths), None, Some(OsStr::new("lynx")));
+        let unset = missing.launch_contribution(Some(&paths), None, Some(OsStr::new("lynx")), None);
         assert!(unset.set.is_empty(), "the user's BROWSER stays untouched");
         assert!(unset.strip.contains(&"MADE_URL_SOCKET"));
         assert!(unset.strip.contains(&"MADE_URL_TOKEN"));
+        assert!(!unset.strip.contains(&"BROWSER"));
+
+        // Without a helper, an inherited Made helper BROWSER (Made started
+        // from a Made pane) would only fail: restore the original or drop it.
+        let outer = OsStr::new("/outer/made-open");
+        let restored =
+            missing.launch_contribution(Some(&paths), None, Some(outer), Some(OsStr::new("lynx")));
+        assert_eq!(get(&restored, "BROWSER").as_deref(), Some("lynx"));
+        let dropped = missing.launch_contribution(Some(&paths), None, Some(outer), None);
+        assert!(get(&dropped, "BROWSER").is_none());
+        assert!(dropped.strip.contains(&"BROWSER"));
     }
 }

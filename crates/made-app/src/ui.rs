@@ -3138,28 +3138,24 @@ impl Workbench {
             top += slot_height;
         }
 
-        if let Some(card) = self.url_card().cloned() {
-            let height = url_card_height(layout);
-            let card_strip = egui::Rect::from_min_size(
-                egui::pos2(card_rect.left(), top),
-                egui::vec2(card_rect.width(), height),
-            );
-            if let Some(action) = url_card_ui(ui, card_strip, layout, &card, self.pane_id()) {
-                if let Some(text) = self.act_on_url_card(action) {
-                    ui.ctx().copy_text(text);
-                }
-            }
-            top += height;
-        }
-
         let body_rect = egui::Rect::from_min_max(egui::pos2(card_rect.left(), top), card_rect.max);
         let mut body_ui = ui.new_child(
             UiBuilder::new()
                 .max_rect(body_rect)
                 .id_salt(("made-terminal-body", self.pane_id())),
         );
+        // Painting the URL dialog arms its Open from this frame. While it is
+        // shown the terminal leaves pointer input over the whole body alone.
+        let url_card = self.url_card_painted(std::time::Instant::now());
+        let terminal_had_focus = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.is_focused());
         let terminal_error = self.terminal_error.clone();
         let mut terminal = self.terminal.take();
+        if let Some(terminal) = terminal.as_mut() {
+            terminal.set_pointer_exclusion(url_card.as_ref().map(|_| body_rect));
+        }
         let mut output = TerminalUiOutput::default();
         if self.is_remote()
             && (self.remote_needs_consent()
@@ -3196,6 +3192,45 @@ impl Workbench {
             );
         }
         self.terminal = terminal;
+
+        // Drawn over the terminal body after it, so it is on top: showing or
+        // hiding it never changes the terminal grid, so the child gets no
+        // resize.
+        if let Some(card) = url_card {
+            let dialog = url_dialog_layout(ui, body_rect, layout, &card);
+            self.set_url_card_reviewable(dialog.reviewable);
+            // Read back: becoming reviewable restarts the arming delay.
+            let card = self.url_card().cloned().unwrap_or(card);
+            if let Some(action) =
+                url_dialog_ui(ui, body_rect, &dialog, layout, &card, self.pane_id())
+            {
+                if let Some(text) = self.act_on_url_card(action) {
+                    ui.ctx().copy_text(text);
+                }
+            }
+            // A click on the dialog or its scrim must not cost the terminal
+            // its keyboard focus: the dialog's controls take it only for the
+            // click, and typing keeps going to the terminal.
+            let dialog_pointer = ui.input(|input| {
+                (input.pointer.any_pressed()
+                    || input.pointer.any_released()
+                    || input.pointer.any_down())
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| body_rect.contains(pos))
+            });
+            if terminal_had_focus && dialog_pointer {
+                if let Some(terminal_id) = self
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.focus_id())
+                {
+                    ui.ctx()
+                        .memory_mut(|memory| memory.request_focus(terminal_id));
+                }
+            }
+        }
 
         if output.focus_exit_requested {
             let target = ui
@@ -4565,119 +4600,267 @@ pub fn url_card_action_id(pane_id: &str, action: &str) -> egui::Id {
     egui::Id::unique(("made-url-card", pane_id, action))
 }
 
-fn url_card_height(layout: &Layout) -> f32 {
-    layout.button_height + if layout.compact { 10.0 } else { 14.0 }
+/// Rows enough for the longest host (255 characters) even at one character
+/// per row, so wrapping never elides any of it.
+const URL_DIALOG_MAX_ROWS: usize = 255;
+/// Space kept between the dialog and the edges of the pane body.
+const URL_DIALOG_MARGIN: f32 = 16.0;
+const URL_DIALOG_MAX_WIDTH: f32 = 560.0;
+/// `theme::floating_frame`'s inner margin and corner radius.
+const URL_DIALOG_PADDING: f32 = 14.0;
+const URL_DIALOG_RADIUS: u8 = 10;
+/// Narrowest content column that still reviews a host; below it Open stays
+/// disabled.
+const URL_DIALOG_MIN_TEXT_WIDTH: f32 = 160.0;
+/// Tallest the full-URL block grows before it scrolls.
+const URL_DIALOG_URL_MAX_HEIGHT: f32 = 180.0;
+/// Inner padding of the full-URL block.
+const URL_DIALOG_URL_PADDING: f32 = 8.0;
+/// Dims the pane behind the dialog, like the floating shadows' black.
+const URL_DIALOG_SCRIM: Color32 = Color32::from_black_alpha(120);
+const URL_DIALOG_REASON: &str = "Widen the pane to review this link";
+
+/// The laid-out dialog for one frame.
+pub(crate) struct UrlDialogLayout {
+    /// The dialog, centered over the pane body.
+    pub rect: egui::Rect,
+    title: Arc<egui::Galley>,
+    host: Arc<egui::Galley>,
+    url: Arc<egui::Galley>,
+    /// Visible height of the full-URL block; longer URLs scroll in it.
+    url_height: f32,
+    /// Whether the whole host fits in the dialog; Open needs it.
+    pub reviewable: bool,
 }
 
-/// The URL a terminal child asked to open, with the host emphasized, and the
-/// only controls that act on it. Open is disabled until the card is armed.
-fn url_card_ui(
+fn url_dialog_job(text: &str, font: FontId, color: Color32, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width: width,
+            max_rows: URL_DIALOG_MAX_ROWS,
+            break_anywhere: true,
+            overflow_character: None,
+        },
+        ..Default::default()
+    };
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// Lays out the dialog for `body`. Nothing in it is ever shortened: the host
+/// wraps, and the full URL wraps inside a block that scrolls once it is
+/// taller than [`URL_DIALOG_URL_MAX_HEIGHT`] or the room the pane leaves.
+pub(crate) fn url_dialog_layout(
+    ui: &Ui,
+    body: egui::Rect,
+    layout: &Layout,
+    card: &crate::url_open::UrlCard,
+) -> UrlDialogLayout {
+    use crate::url_open::UrlOrigin;
+    let width = (body.width() - 2.0 * URL_DIALOG_MARGIN)
+        .clamp(2.0 * URL_DIALOG_PADDING + 1.0, URL_DIALOG_MAX_WIDTH);
+    let inner = width - 2.0 * URL_DIALOG_PADDING;
+    let title = match &card.origin {
+        UrlOrigin::Local => "Open link in browser?".to_owned(),
+        UrlOrigin::Remote(server) => format!(
+            "Open link in browser? \u{2014} from {}",
+            sanitize_display(server, 40)
+        ),
+    };
+    let galley = |text: &str, font: FontId, color: Color32, width: f32| {
+        ui.painter()
+            .layout_job(url_dialog_job(text, font, color, width))
+    };
+    let title = galley(
+        &title,
+        FontId::proportional(13.0),
+        theme::TEXT_SECONDARY,
+        inner,
+    );
+    let host = galley(
+        &sanitize_display(card.url.host(), 255),
+        FontId::proportional(16.0),
+        theme::TEXT_PRIMARY,
+        inner,
+    );
+    let url = galley(
+        &sanitize_display(card.url.as_str(), 2048),
+        FontId::monospace(11.5),
+        theme::TEXT_SECONDARY,
+        inner - 2.0 * URL_DIALOG_URL_PADDING,
+    );
+    let url_row = url.rows.first().map_or(url.size().y, |row| row.height());
+    let block = |height: f32| height + 2.0 * URL_DIALOG_URL_PADDING;
+    // Everything but the URL block's scrolling part.
+    let fixed = 2.0 * URL_DIALOG_PADDING
+        + title.size().y
+        + host.size().y
+        + layout.button_height.max(24.0)
+        + 3.0 * layout.gap;
+    let available = (body.height() - 2.0 * URL_DIALOG_MARGIN).max(0.0);
+    let reviewable = inner >= URL_DIALOG_MIN_TEXT_WIDTH && fixed + block(url_row) <= available;
+    let reason = if reviewable { 0.0 } else { layout.gap + 14.0 };
+    let url_height = url
+        .size()
+        .y
+        .min(URL_DIALOG_URL_MAX_HEIGHT)
+        .min(available - fixed - reason - block(0.0))
+        .max(url_row);
+    let height = fixed + reason + block(url_height);
+    let top = if height <= body.height() {
+        body.center().y - height / 2.0
+    } else {
+        body.top()
+    };
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(body.center().x - width / 2.0, top),
+        egui::vec2(width, height),
+    );
+    UrlDialogLayout {
+        rect,
+        title,
+        host,
+        url,
+        url_height,
+        reviewable,
+    }
+}
+
+/// The dialog over the pane that asked to open a URL: a scrim over the pane
+/// body that takes every pointer event, the title, the whole host, the full
+/// URL in a scrolling block, and the only controls that act on it. Open and
+/// Copy wait for the arming delay; Dismiss is immediate. It never takes
+/// keyboard input.
+fn url_dialog_ui(
     ui: &mut Ui,
-    rect: egui::Rect,
+    body: egui::Rect,
+    dialog: &UrlDialogLayout,
     layout: &Layout,
     card: &crate::url_open::UrlCard,
     pane_id: &str,
 ) -> Option<crate::url_open::UrlCardAction> {
-    use crate::url_open::{UrlCardAction, UrlOrigin, OPEN_ARM_DELAY};
-    ui.painter().rect_filled(rect, 0.0, theme::BG_ELEVATED);
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
-        CornerRadius::same(2),
-        theme::ACCENT,
+    use crate::url_open::UrlCardAction;
+    // The scrim claims pointer input over the whole pane body, so a click
+    // meant for the dialog never reaches the terminal or the program in it.
+    ui.interact(
+        body,
+        url_card_action_id(pane_id, "scrim"),
+        Sense::click_and_drag(),
     );
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left(), rect.bottom() - 0.5),
-            egui::pos2(rect.right(), rect.bottom() - 0.5),
-        ],
-        Stroke::new(1.0, theme::BORDER_HEADER),
+    let bottom = layout.card_radius;
+    ui.painter().rect_filled(
+        body,
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: bottom,
+            se: bottom,
+        },
+        URL_DIALOG_SCRIM,
+    );
+    let rect = dialog.rect;
+    ui.interact(
+        rect,
+        url_card_action_id(pane_id, "card"),
+        Sense::click_and_drag(),
+    );
+    let radius = CornerRadius::same(URL_DIALOG_RADIUS);
+    // A dialog taller than a short pane must not paint over the chrome.
+    let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(body));
+    painter.add(theme::SHADOW_FLOAT.as_shape(rect, radius));
+    painter.rect(
+        rect,
+        radius,
+        theme::BG_CARD,
+        Stroke::new(1.0, theme::BORDER),
+        StrokeKind::Inside,
     );
     let now = std::time::Instant::now();
     let armed = card.armed(now);
-    if !armed {
-        ui.ctx().request_repaint_after(
-            OPEN_ARM_DELAY.saturating_sub(now.saturating_duration_since(card.shown_at)),
-        );
+    let settled = card.settled(now);
+    if let Some(left) = card.arming_left(now) {
+        ui.ctx().request_repaint_after(left);
     }
-    let mut row = ui.new_child(
+    let inner = rect.shrink(URL_DIALOG_PADDING);
+    let mut content = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
-            .layout(egui::Layout::right_to_left(Align::Center)),
+            .id_salt(("made-url-dialog", pane_id))
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(Align::Min)),
     );
+    content.set_clip_rect(rect.intersect(body));
+    content.spacing_mut().item_spacing = egui::vec2(layout.gap, layout.gap);
+    content.add(egui::Label::new(dialog.title.clone()).selectable(false));
+    if !dialog.reviewable {
+        // First after the title, so it stays visible in a short pane.
+        content.add(egui::Label::new(theme::micro(URL_DIALOG_REASON)).truncate());
+    }
+    content.add(egui::Label::new(dialog.host.clone()));
+    egui::Frame::NONE
+        .fill(theme::BG_ELEVATED)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(URL_DIALOG_URL_PADDING as i8))
+        .show(&mut content, |ui| {
+            ui.set_width(inner.width() - 2.0 * URL_DIALOG_URL_PADDING);
+            egui::ScrollArea::vertical()
+                .id_salt(("made-url-dialog-url", pane_id))
+                .max_height(dialog.url_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(dialog.url.clone()));
+                });
+        });
     let mut action = None;
-    let dismiss = theme::ghost_action(
-        &mut row,
-        url_card_action_id(pane_id, "dismiss"),
-        "Dismiss",
-        false,
-        layout.button_height,
-        theme::BG_ELEVATED,
-    );
-    if dismiss.activated {
-        action = Some(UrlCardAction::Dismiss);
-    }
-    let copy = theme::secondary_action(
-        &mut row,
-        url_card_action_id(pane_id, "copy"),
-        "Copy",
-        layout.button_height,
-        true,
-        theme::BG_ELEVATED,
-    );
-    if copy.activated {
-        action = Some(UrlCardAction::Copy);
-    }
-    let open = theme::primary_action(
-        &mut row,
-        url_card_action_id(pane_id, "open"),
-        "Open",
-        layout.button_height,
-        armed,
-        theme::BG_ELEVATED,
-    );
-    open.response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::Role::Button, armed, "Open link in browser")
-    });
-    if open.activated && armed {
-        action = Some(UrlCardAction::Open);
-    }
-    let rest_chars = if layout.compact { 28 } else { 72 };
-    let host = sanitize_display(card.url.host(), 255);
-    let rest = truncate_end(&sanitize_display(card.url.rest(), 2048), rest_chars);
-    let origin = match &card.origin {
-        UrlOrigin::Local => String::new(),
-        UrlOrigin::Remote(server) => format!(" from {}", sanitize_display(server, 80)),
-    };
-    let font = FontId::proportional(10.5);
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_rows = 1;
-    job.wrap.break_anywhere = true;
-    job.wrap.max_width = row.available_width().max(40.0);
-    let part = |color: Color32| egui::TextFormat {
-        font_id: font.clone(),
-        color,
-        ..Default::default()
-    };
-    job.append(
-        &format!("Open link{origin}?  "),
-        0.0,
-        part(theme::TEXT_TERTIARY),
-    );
-    job.append(card.url.prefix(), 0.0, part(theme::TEXT_TERTIARY));
-    job.append(
-        &host,
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(11.5),
-            color: theme::TEXT_PRIMARY,
-            ..Default::default()
+    content.allocate_ui_with_layout(
+        egui::vec2(inner.width(), layout.button_height.max(24.0)),
+        egui::Layout::right_to_left(Align::Center),
+        |row| {
+            let open = theme::primary_action(
+                row,
+                url_card_action_id(pane_id, "open"),
+                "Open",
+                layout.button_height,
+                armed,
+                theme::BG_CARD,
+            );
+            open.response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Button, armed, "Open link in browser")
+            });
+            if open.activated && armed {
+                action = Some(UrlCardAction::Open);
+            }
+            let copy = theme::secondary_action(
+                row,
+                url_card_action_id(pane_id, "copy"),
+                "Copy",
+                layout.button_height,
+                settled,
+                theme::BG_CARD,
+            );
+            if copy.activated && settled {
+                action = Some(UrlCardAction::Copy);
+            }
+            let dismiss = theme::ghost_action(
+                row,
+                url_card_action_id(pane_id, "dismiss"),
+                "Dismiss",
+                false,
+                layout.button_height,
+                theme::BG_CARD,
+            );
+            if dismiss.activated {
+                action = Some(UrlCardAction::Dismiss);
+            }
         },
     );
-    job.append(&rest, 0.0, part(theme::TEXT_TERTIARY));
-    row.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
-        ui.label(job)
-            .on_hover_text(sanitize_display(card.url.as_str(), 2048));
-    });
     action
 }
 

@@ -403,22 +403,35 @@ pub fn apply_contributions(contributions: &[EnvContribution], options: PtyOption
 /// integration's: the launch applies it after every integration contribution,
 /// so it wins. With `(helper, socket, token)` the child's `BROWSER` names the
 /// URL helper, and a user `BROWSER` is kept as `MADE_ORIGINAL_BROWSER`.
-/// Without them nothing is set, the user's `BROWSER` stays, and URL routing
-/// variables inherited from an enclosing Made are removed.
+/// Without them the user's `BROWSER` stays, URL routing variables inherited
+/// from an enclosing Made are removed, and an inherited Made helper
+/// `BROWSER`, which could only fail, is restored to `inherited_original` or
+/// removed.
 pub fn browser_contribution(
     helper: Option<(&Path, &Path, &made_platform::open_url::UrlToken)>,
     inherited_browser: Option<&std::ffi::OsStr>,
+    inherited_original: Option<&std::ffi::OsStr>,
 ) -> EnvContribution {
-    use made_platform::open_url::{browser_environment, URL_SOCKET_ENV, URL_TOKEN_ENV};
+    use made_platform::open_url::{
+        browser_environment, restored_browser, BROWSER_ENV, URL_SOCKET_ENV, URL_TOKEN_ENV,
+    };
     match helper {
         Some((helper, socket, token)) => EnvContribution {
             set: browser_environment(helper, socket, token, inherited_browser),
             strip: Vec::new(),
         },
-        None => EnvContribution {
-            set: Vec::new(),
-            strip: vec![URL_SOCKET_ENV, URL_TOKEN_ENV],
-        },
+        None => {
+            let mut contribution = EnvContribution {
+                set: Vec::new(),
+                strip: vec![URL_SOCKET_ENV, URL_TOKEN_ENV],
+            };
+            match restored_browser(inherited_browser, inherited_original) {
+                Some(Some(value)) => contribution.set.push((BROWSER_ENV.into(), value)),
+                Some(None) => contribution.strip.push(BROWSER_ENV),
+                None => {}
+            }
+            contribution
+        }
     }
 }
 

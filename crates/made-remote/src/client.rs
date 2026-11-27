@@ -1087,4 +1087,55 @@ mod tests {
         assert!(state.receive(current).is_ok());
         assert_eq!(state.sessions.len(), 1);
     }
+
+    #[test]
+    fn url_requests_are_accepted_only_under_the_current_attach_id() {
+        let url = || Operation::OpenUrlRequest {
+            url: "https://example.com/login".into(),
+        };
+        let root = RemotePath::new(b"/project".to_vec()).unwrap();
+        let client = RemoteClient::new(NullStream, identity(), root).unwrap();
+        let first = client
+            .request(Operation::Attach { rows: 24, cols: 80 }, None)
+            .unwrap();
+        {
+            let mut state = client.state.lock().unwrap();
+            let identity = state.identity.clone();
+            // While the attach is still pending the push is dropped.
+            state
+                .receive(WireEnvelope::new(identity.clone(), first, url()))
+                .unwrap();
+            assert!(state.replies.is_empty());
+            state
+                .receive(WireEnvelope::new(identity, first, Operation::Attached))
+                .unwrap();
+        }
+        let second = client
+            .request(Operation::Attach { rows: 24, cols: 80 }, None)
+            .unwrap();
+        let mut state = client.state.lock().unwrap();
+        let identity = state.identity.clone();
+        state
+            .receive(WireEnvelope::new(
+                identity.clone(),
+                second,
+                Operation::Attached,
+            ))
+            .unwrap();
+        state.replies.clear();
+        // An earlier attach id and an unrelated id are not URL sources.
+        for id in [first, second + 100] {
+            state
+                .receive(WireEnvelope::new(identity.clone(), id, url()))
+                .unwrap();
+            assert!(state.replies.is_empty(), "request id {id} must be dropped");
+        }
+        state
+            .receive(WireEnvelope::new(identity, second, url()))
+            .unwrap();
+        assert!(matches!(
+            state.replies.pop_front().map(|frame| frame.operation),
+            Some(Operation::OpenUrlRequest { .. })
+        ));
+    }
 }

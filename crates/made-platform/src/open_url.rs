@@ -298,14 +298,54 @@ pub fn browser_environment(
         ),
     ];
     if let Some(original) = inherited_browser.filter(|value| !value.is_empty()) {
-        let made_helper = Path::new(original)
-            .file_name()
-            .is_some_and(|name| name == url_helper_file_name() || name == REMOTE_HELPER_NAME);
-        if !made_helper {
+        if !is_made_helper(original) {
             env.push((OsString::from(ORIGINAL_BROWSER_ENV), original.to_owned()));
         }
     }
     env
+}
+
+/// Whether a `BROWSER` value names a Made URL helper (local or remote).
+pub fn is_made_helper(browser: &OsStr) -> bool {
+    Path::new(browser)
+        .file_name()
+        .is_some_and(|name| name == url_helper_file_name() || name == REMOTE_HELPER_NAME)
+}
+
+/// What `BROWSER` must become for a process that cannot reach a Made helper
+/// endpoint: `None` leaves it as is; `Some(Some(value))` restores the user's
+/// original; `Some(None)` removes an inherited Made helper that would only
+/// fail. Only an inherited Made helper is ever changed.
+pub fn restored_browser(
+    browser: Option<&OsStr>,
+    original: Option<&OsStr>,
+) -> Option<Option<OsString>> {
+    if !browser.is_some_and(is_made_helper) {
+        return None;
+    }
+    Some(
+        original
+            .filter(|value| !value.is_empty() && !is_made_helper(value))
+            .map(OsStr::to_owned),
+    )
+}
+
+/// Environment changes for the host opener so it cannot route back into a
+/// card: the URL routing variables are removed and an inherited Made helper
+/// `BROWSER` is restored to the user's original or removed. Returns
+/// (variables to set, variables to remove).
+pub fn opener_environment(
+    browser: Option<&OsStr>,
+    original: Option<&OsStr>,
+) -> (Vec<(OsString, OsString)>, Vec<&'static str>) {
+    let mut set = Vec::new();
+    let mut remove = vec![URL_SOCKET_ENV, URL_TOKEN_ENV, ORIGINAL_BROWSER_ENV];
+    match restored_browser(browser, original) {
+        Some(Some(value)) => set.push((OsString::from(BROWSER_ENV), value)),
+        Some(None) => remove.push(BROWSER_ENV),
+        None => {}
+    }
+    (set, remove)
 }
 
 /// Create `link` as a symlink to the remote companion, so `BROWSER` can name
@@ -346,18 +386,35 @@ impl UrlRateGate {
         Self { window, last: None }
     }
 
+    /// Classify `url` and record it when it is fresh.
     pub fn admit(&mut self, url: &SafeUrl, now: Instant) -> RateDecision {
-        if let Some((last, at)) = &self.last {
-            if now.saturating_duration_since(*at) < self.window {
-                return if last == url.as_str() {
+        let decision = self.check(url, now);
+        if decision == RateDecision::Fresh {
+            self.record(url, now);
+        }
+        decision
+    }
+
+    /// Classify `url` without recording it. A caller that may fail to deliver
+    /// a fresh request records it with [`record`](Self::record) only after
+    /// delivery, so an undelivered request is never later coalesced as a
+    /// duplicate and acknowledged.
+    pub fn check(&self, url: &SafeUrl, now: Instant) -> RateDecision {
+        match &self.last {
+            Some((last, at)) if now.saturating_duration_since(*at) < self.window => {
+                if last == url.as_str() {
                     RateDecision::Duplicate
                 } else {
                     RateDecision::Limited
-                };
+                }
             }
+            _ => RateDecision::Fresh,
         }
+    }
+
+    /// Record a delivered request as the window's latest.
+    pub fn record(&mut self, url: &SafeUrl, now: Instant) {
         self.last = Some((url.as_str().to_owned(), now));
-        RateDecision::Fresh
     }
 }
 
@@ -863,6 +920,14 @@ pub fn open_url(url: &SafeUrl) -> io::Result<()> {
 #[cfg(unix)]
 fn spawn_opener(command: &mut std::process::Command) -> io::Result<()> {
     use std::process::Stdio;
+    let (set, remove) = opener_environment(
+        std::env::var_os(BROWSER_ENV).as_deref(),
+        std::env::var_os(ORIGINAL_BROWSER_ENV).as_deref(),
+    );
+    for key in remove {
+        command.env_remove(key);
+    }
+    command.envs(set);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1015,6 +1080,35 @@ mod tests {
     }
 
     #[test]
+    fn the_opener_never_routes_back_into_a_card() {
+        let helper = OsStr::new("/opt/made/made-open");
+        let has = |set: &[(OsString, OsString)], key: &str| {
+            set.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        // Made itself was started from a Made pane with a user browser.
+        let (set, remove) = opener_environment(Some(helper), Some(OsStr::new("firefox")));
+        assert_eq!(has(&set, BROWSER_ENV).as_deref(), Some("firefox"));
+        for key in [URL_SOCKET_ENV, URL_TOKEN_ENV, ORIGINAL_BROWSER_ENV] {
+            assert!(remove.contains(&key));
+        }
+        // No original: the dead helper is removed.
+        let (set, remove) = opener_environment(Some(helper), None);
+        assert!(set.is_empty());
+        assert!(remove.contains(&BROWSER_ENV));
+        // A user's own BROWSER is left alone.
+        let (set, remove) = opener_environment(Some(OsStr::new("lynx")), None);
+        assert!(set.is_empty());
+        assert!(!remove.contains(&BROWSER_ENV));
+        assert_eq!(restored_browser(None, Some(OsStr::new("x"))), None);
+        assert_eq!(
+            restored_browser(Some(helper), Some(OsStr::new("/a/made-open"))),
+            Some(None)
+        );
+    }
+
+    #[test]
     fn rate_gate_coalesces_duplicates_and_limits_distinct_urls() {
         let mut gate = UrlRateGate::new(Duration::from_secs(1));
         let a = validate_url("https://a.example/").unwrap();
@@ -1032,6 +1126,22 @@ mod tests {
         assert_eq!(
             gate.admit(&b, start + Duration::from_millis(1000)),
             RateDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_fresh_request_is_not_coalesced_later() {
+        let mut gate = UrlRateGate::new(Duration::from_secs(1));
+        let a = validate_url("https://a.example/").unwrap();
+        let start = Instant::now();
+        // Delivery failed: the caller checked but did not record.
+        assert_eq!(gate.check(&a, start), RateDecision::Fresh);
+        let retry = start + Duration::from_millis(100);
+        assert_eq!(gate.check(&a, retry), RateDecision::Fresh);
+        gate.record(&a, retry);
+        assert_eq!(
+            gate.check(&a, retry + Duration::from_millis(100)),
+            RateDecision::Duplicate
         );
     }
 }
