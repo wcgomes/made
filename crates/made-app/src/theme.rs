@@ -12,8 +12,8 @@
 use eframe::egui::style::{WidgetVisuals, Widgets};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Frame, Margin, RichText, Shadow, Stroke, StrokeKind,
-    TextFormat, TextStyle, Ui, UiBuilder, Visuals,
+    self, epaint::FontColorTransferFunction, Color32, CornerRadius, FontId, Frame, Margin,
+    RichText, Shadow, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, Visuals,
 };
 use egui_extras::loaders::svg_loader::SvgLoader;
 use std::collections::BTreeMap;
@@ -1806,6 +1806,47 @@ pub fn install(ctx: &egui::Context) {
     install_icon_loader(ctx);
 }
 
+/// Pixels per point at and above which text keeps egui's dark-mode coverage
+/// curve. Retina and 150 %+ scaled displays sit here; 1x and 125 % do not.
+pub const HIGH_DPI_PIXELS_PER_POINT: f32 = 1.5;
+
+/// Coverage curve for light-on-dark text below [`HIGH_DPI_PIXELS_PER_POINT`].
+///
+/// `Gamma(0.8)` lifts mid coverage to ~0.57 instead of the default's 0.75, so
+/// edge pixels stop thickening 1–2 px stems at 1x, while keeping enough lift
+/// that gamma-space blending does not wash thin strokes out as linear would.
+pub const LOW_DPI_TEXT_COLOR_TRANSFER: FontColorTransferFunction =
+    FontColorTransferFunction::Gamma(0.8);
+
+/// The text coverage curve for a display with `pixels_per_point`.
+pub fn text_color_transfer(pixels_per_point: f32) -> FontColorTransferFunction {
+    if pixels_per_point < HIGH_DPI_PIXELS_PER_POINT {
+        LOW_DPI_TEXT_COLOR_TRANSFER
+    } else {
+        FontColorTransferFunction::DARK_MODE_DEFAULT
+    }
+}
+
+/// Match the text coverage curve to the window's current pixels per point.
+/// Call every frame; the style is only written when the curve changes, which
+/// rebuilds the font atlas on the next pass.
+pub fn sync_text_color_transfer(ctx: &egui::Context) {
+    let wanted = text_color_transfer(ctx.pixels_per_point());
+    if ctx
+        .global_style()
+        .visuals
+        .text_options
+        .color_transfer_function
+        == wanted
+    {
+        return;
+    }
+    ctx.all_styles_mut(|style| {
+        style.visuals.text_options.color_transfer_function = wanted;
+    });
+    ctx.request_repaint();
+}
+
 /// Install the SVG loader that decodes the embedded Explorer icons, once per
 /// context.
 ///
@@ -2016,6 +2057,63 @@ mod tests {
         );
         assert_eq!(TERMINAL_BACKGROUND, [0x0B, 0x0D, 0x10]);
         assert_eq!(TERMINAL_BRIGHT_BLACK, [0x70, 0x7B, 0x8E]);
+    }
+
+    #[test]
+    fn text_color_transfer_lightens_only_below_high_dpi() {
+        for ppp in [1.0, 1.25, 1.49] {
+            assert_eq!(text_color_transfer(ppp), LOW_DPI_TEXT_COLOR_TRANSFER);
+        }
+        for ppp in [HIGH_DPI_PIXELS_PER_POINT, 1.75, 2.0, 3.0] {
+            assert_eq!(
+                text_color_transfer(ppp),
+                FontColorTransferFunction::DARK_MODE_DEFAULT
+            );
+        }
+        let default = FontColorTransferFunction::DARK_MODE_DEFAULT;
+        for coverage in [0.25, 0.5, 0.75] {
+            assert!(
+                LOW_DPI_TEXT_COLOR_TRANSFER.alpha_from_coverage(coverage)
+                    < default.alpha_from_coverage(coverage),
+                "low-DPI curve must be lighter at coverage {coverage}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_text_color_transfer_follows_pixels_per_point() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        for (ppp, wanted) in [
+            (1.0, LOW_DPI_TEXT_COLOR_TRANSFER),
+            (2.0, FontColorTransferFunction::DARK_MODE_DEFAULT),
+            (1.25, LOW_DPI_TEXT_COLOR_TRANSFER),
+        ] {
+            let input = egui::RawInput {
+                viewports: std::iter::once((
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        native_pixels_per_point: Some(ppp),
+                        ..Default::default()
+                    },
+                ))
+                .collect(),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| sync_text_color_transfer(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(
+                ctx.global_style()
+                    .visuals
+                    .text_options
+                    .color_transfer_function,
+                wanted
+            );
+            // Steady state: an unchanged curve leaves the style untouched.
+            let before = ctx.global_style();
+            sync_text_color_transfer(&ctx);
+            assert!(Arc::ptr_eq(&before, &ctx.global_style()));
+        }
     }
 
     #[test]

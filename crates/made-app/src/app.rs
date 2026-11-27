@@ -2417,6 +2417,7 @@ impl AppModel {
             theme::install(ui.ctx());
             self.theme_ready = true;
         }
+        theme::sync_text_color_transfer(ui.ctx());
         if self.is_picker() {
             ui::picker_ui(self, ui);
             return;
