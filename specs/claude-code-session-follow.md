@@ -30,25 +30,25 @@ Claude Code MUST be treated as present in a local tab while any of these holds: 
 
 ### Requirement: Claude Code launch
 
-Claude Code MUST be an integrated-TUI catalog entry after Grok. Detecting it MUST be the catalog's metadata-only PATH lookup for the executable `claude`, which never spawns it, never checks its version, never loads or installs a plugin, ignores empty and relative PATH segments, and does not delay shell or explorer startup. When `claude` is detected, the `+` menu MUST show a row labeled `Claude Code` after every other detected catalog row, whose 16px leading slot paints the Claude Code mark defined by `Claude Code tab presentation`. Choosing that row MUST start the detected `claude` absolute path with no arguments directly as the child of a new home-directory tab, with no shell first and no folder picker, and the current tab MUST keep running. That launch MUST carry the session-only plugin loading of `Session-only Claude Code plugin`, MUST NOT carry OpenCode's plugin environment, and MUST NOT add any command-line argument. Made MUST NOT launch Claude Code unless the user chooses its row; the read-only `claude agents --json` listing of `Claude Code explorer follow and precedence` starts no Claude Code session and is the only other way Made runs `claude`. Typing `claude` in a local shell tab MUST remain valid, MUST NOT be replaced by the menu, and MUST receive the same session-only plugin loading.
+Claude Code MUST be an integrated-TUI catalog entry after Grok. Detecting it MUST be the catalog's metadata-only PATH lookup for the executable `claude`, which never spawns it, never checks its version, never loads or installs a plugin, ignores empty and relative PATH segments, and does not delay shell or explorer startup. When `claude` is detected on the selected host, the Open workspace launch bar MUST show a button labeled `Claude Code` after every other detected catalog button, whose 16px leading slot paints the Claude Code mark defined by `Claude Code tab presentation`. Choosing that button for Local MUST start the detected `claude` absolute path with no arguments directly as the child of a new tab whose launch folder and explorer root are the effective launch path chosen on the screen, with no shell first and no further selection surface, and the current tab MUST keep running. That launch MUST carry the session-only plugin loading of `Session-only Claude Code plugin`, MUST NOT carry OpenCode's plugin environment, and MUST NOT add any command-line argument. Made MUST NOT launch Claude Code unless the user chooses its button; the read-only `claude agents --json` listing of `Claude Code explorer follow and precedence` starts no Claude Code session and is the only other way Made runs `claude`. Typing `claude` in a local shell tab MUST remain valid, MUST NOT be replaced by the launch bar, and MUST receive the same session-only plugin loading.
 
 #### Scenario: Catalog lists Claude Code last
 
-- Given OpenCode, grok and claude are all on PATH
+- Given OpenCode, grok and claude are all on PATH and Local is selected
 - When the user activates `+`
-- Then the menu is Terminal, OpenCode, Grok Build, Claude Code, and the `+` tooltip and accessible name stay Open folder
+- Then the launch bar is Terminal, OpenCode, Grok Build, Claude Code, and the `+` tooltip and accessible name are Open workspace
 
 #### Scenario: Only Claude Code is installed
 
-- Given claude is on PATH and neither OpenCode nor grok is
+- Given claude is on PATH and neither OpenCode nor grok is, and Local is selected
 - When the user activates `+`
-- Then the menu is Terminal, then Claude Code, and the Claude Code row paints the Claude Code mark in its 16px leading slot
+- Then the launch bar is Terminal, then Claude Code, and the Claude Code button paints the Claude Code mark in its 16px leading slot
 
-#### Scenario: Choosing Claude Code starts claude at home
+#### Scenario: Choosing Claude Code starts claude in the chosen folder
 
-- Given a tab is running and claude is on PATH
-- When the user chooses the Claude Code row
-- Then Made starts claude's absolute path with no arguments directly as the child of a new home-directory tab, with no shell first and no folder picker, the current tab keeps running, and the launched Claude Code loads Made's session-only plugin and no OpenCode plugin environment
+- Given a tab is running, claude is on PATH, and Local is selected with effective launch path `/work/api`
+- When the user chooses the Claude Code button
+- Then Made starts claude's absolute path with no arguments directly as the child of a new tab whose launch folder and explorer root are `/work/api`, with no shell first and no further selection surface, the current tab keeps running, and the launched Claude Code loads Made's session-only plugin and no OpenCode plugin environment
 
 #### Scenario: Detection does not run claude
 
@@ -59,7 +59,7 @@ Claude Code MUST be an integrated-TUI catalog entry after Grok. Detecting it MUS
 #### Scenario: Shell-typed claude stays valid
 
 - Given a local shell tab and claude on PATH
-- When the user types `claude` in that shell and does not choose the Claude Code row
+- When the user types `claude` in that shell and does not choose the Claude Code button
 - Then Made does not launch Claude Code on its own, the typed claude starts normally with Made's session-only plugin loaded, and the shell remains a valid way to start Claude Code
 
 ### Requirement: Program status protocol in the terminal
@@ -394,7 +394,7 @@ A background session opened from Claude Code's agent view runs under Claude Code
 
 ### Requirement: Claude Code tab presentation
 
-While OpenCode is not active in a tab and Claude Code is present there, the tab MUST use the label `Claude Code` and paint the Claude Code mark in its 16px leading icon slot, even before any session or status exists, and Grok Build presentation MUST yield to it. The Claude Code mark MUST be the official Claude Code mark, shipped as an app asset and painted at 16px in its official colors with the same treatment as the official Grok mark, without redrawing or tinting, and it MUST be the same asset the `+` menu row paints. The tab MUST paint one status dot per live owned Claude Code session, or exactly one dot when Claude Code is present with a protocol status and no live owned session, using the same size, placement, cap of eight, pulse, colors, tooltip summary and accessible-name summary as OpenCode session dots. A dot's status MUST be the tab's protocol status when one is set, applied to the tab's most recent live owned session, otherwise that session's hook-derived status, otherwise idle; busy is busy, attention and error are attention, and idle is idle. A finished turn MUST show idle. The tooltip MUST omit the workspace path and MUST be the session title, followed by ` — ` and the session summary when dots exist, where the session title is the first of these that is non-empty: the terminal's window title, which is the title the program in that tab sets for its own terminal and never the OS window title, read only while a Claude Code protocol status is live in that tab; the most recent session title carried by an owned record of the tab's most recent live owned session; `Claude Code`. The window title is untrusted and MUST be sanitized by replacing control characters and newlines with spaces and removing bidirectional and format control characters and truncated to at most 120 characters. The accessible name MUST be `Claude Code` followed by ` — ` and the session summary when dots exist. When Claude Code is no longer present and no Grok Build presentation applies, the label, tooltip and leading icon MUST return to the folder label, full-path tooltip and terminal glyph, and its dots MUST be removed. If OpenCode is active, the label, leading icon and dots MUST stay OpenCode's even while Claude Code is present. A terminal window title applies only to its own tab: the OS window title MUST always be `Made` and MUST NOT be derived from any tab's terminal title, any status or the workspace.
+While OpenCode is not active in a tab and Claude Code is present there, the tab MUST use the Claude Code program label of `Brand and Workspace Tabs` (the hook-derived sanitized session title, else `Claude Code`) and paint the Claude Code mark in its 16px leading icon slot, even before any session or status exists, and Grok Build presentation MUST yield to it. The Claude Code mark MUST be the official Claude Code mark, shipped as an app asset and painted at 16px in its official colors with the same treatment as the official Grok mark, without redrawing or tinting, and it MUST be the same asset the `+` menu row paints. The tab MUST paint one status dot per live owned Claude Code session, or exactly one dot when Claude Code is present with a protocol status and no live owned session, using the same size, placement, cap of eight, pulse, colors, tooltip summary and accessible-name summary as OpenCode session dots. A dot's status MUST be the tab's protocol status when one is set, applied to the tab's most recent live owned session, otherwise that session's hook-derived status, otherwise idle; busy is busy, attention and error are attention, and idle is idle. A finished turn MUST show idle. The tooltip MUST omit the workspace path and MUST be the session title, followed by ` — ` and the session summary when dots exist, where the session title is the first of these that is non-empty: the terminal's window title, which is the title the program in that tab sets for its own terminal and never the OS window title, read only while a Claude Code protocol status is live in that tab; the most recent session title carried by an owned record of the tab's most recent live owned session; `Claude Code`. The window title is untrusted and MUST be sanitized by replacing control characters and newlines with spaces and removing bidirectional and format control characters and truncated to at most 120 characters. The accessible name MUST be `Claude Code`, then ` — ` and the session title when the label shows one, then ` — ` and the session summary when dots exist. When Claude Code is no longer present and no Grok Build presentation applies, the label, tooltip and leading icon MUST return to the shell label, full-path tooltip and terminal glyph, and its dots MUST be removed. If OpenCode is active, the label, leading icon and dots MUST stay OpenCode's even while Claude Code is present. A terminal window title applies only to its own tab: the OS window title MUST always be `Made` and MUST NOT be derived from any tab's terminal title, any status or the workspace.
 
 #### Scenario: OS window title stays Made
 
@@ -406,7 +406,7 @@ While OpenCode is not active in a tab and Claude Code is present there, the tab 
 
 - Given the user chose the Claude Code row
 - When the new tab is shown before any status emission or hook record arrives
-- Then its label is `Claude Code`, its leading slot paints the Claude Code mark, it shows no dot, and its tooltip is `Claude Code` without the workspace path
+- Then its label is the catalog label `Claude Code` (no session title is known yet), its leading slot paints the Claude Code mark, it shows no dot, and its tooltip is `Claude Code` without the workspace path
 
 #### Scenario: Dots follow protocol status with a title
 
@@ -448,7 +448,7 @@ While OpenCode is not active in a tab and Claude Code is present there, the tab 
 
 - Given a shell tab branded `Claude Code` with no open Grok session
 - When Claude Code exits and the shell is back at its prompt
-- Then the tab returns to the folder label, full-path tooltip and terminal glyph, and its Claude Code dots are removed
+- Then the tab returns to the shell label, full-path tooltip and terminal glyph, and its Claude Code dots are removed
 
 #### Scenario: Claude Code outranks Grok presentation
 
@@ -458,7 +458,7 @@ While OpenCode is not active in a tab and Claude Code is present there, the tab 
 
 ### Requirement: Claude Code channel fallback
 
-The status protocol and the session hooks MUST each work without the other, and losing either MUST NOT break the terminal, shell, explorer, diagnostics or other tabs. With both channels, protocol status drives the dots, the window title read under `Claude Code tab presentation` supplies the tooltip title and selects an agent-view session under `Claude Code agent-view session follow`, hook records drive session identity, and hook records together with the `claude agents --json` listing drive the explorer. Without the status protocol, for example with a Claude Code version that does not emit it, inside tmux, in a background session, with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, when no probe reply reaches Claude Code, or whenever Claude Code does not enable the protocol for another reason, hook-derived status drives the dots, the session title comes from hook records or is `Claude Code`, and explorer follow is unchanged except that no agent-view session is selected. Without hooks, for example with `--bare`, safe mode, `disableAllHooks`, a managed-hooks-only policy, a missing shipped plugin, an unwritable spool, or Windows where the hook cannot run, protocol status and the window title drive the presentation, Claude Code does not move the explorer, and the explorer follows the next applicable source. With neither channel, the tab behaves as a plain terminal, except that a directly launched Claude Code tab keeps the `Claude Code` label and mark while its child runs. Made MUST NOT retry, relaunch, add arguments, change Claude Code configuration, drop, reorder or replace the user's `CLAUDE_CODE_PLUGIN_DIRS` entries, or prompt the user in order to restore a channel.
+The status protocol and the session hooks MUST each work without the other, and losing either MUST NOT break the terminal, shell, explorer, diagnostics or other tabs. With both channels, protocol status drives the dots, the window title read under `Claude Code tab presentation` supplies the tooltip title and selects an agent-view session under `Claude Code agent-view session follow`, hook records drive session identity, and hook records together with the `claude agents --json` listing drive the explorer. Without the status protocol, for example with a Claude Code version that does not emit it, inside tmux, in a background session, with `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`, when no probe reply reaches Claude Code, or whenever Claude Code does not enable the protocol for another reason, hook-derived status drives the dots, the session title comes from hook records or is `Claude Code`, and explorer follow is unchanged except that no agent-view session is selected. Without hooks, for example with `--bare`, safe mode, `disableAllHooks`, a managed-hooks-only policy, a missing shipped plugin, an unwritable spool, or Windows where the hook cannot run, protocol status and the window title drive the presentation, Claude Code does not move the explorer, and the explorer follows the next applicable source. With neither channel, the tab behaves as a plain terminal, except that a directly launched Claude Code tab keeps the Claude Code program label (the catalog label `Claude Code` while no session title is known) and mark while its child runs. Made MUST NOT retry, relaunch, add arguments, change Claude Code configuration, drop, reorder or replace the user's `CLAUDE_CODE_PLUGIN_DIRS` entries, or prompt the user in order to restore a channel.
 
 #### Scenario: No probe reply or tmux
 
@@ -488,7 +488,7 @@ The status protocol and the session hooks MUST each work without the other, and 
 
 - Given Claude Code runs with hooks disabled and the status protocol unavailable, once typed in a shell tab and once launched from the Claude Code row
 - When the user works in Claude Code
-- Then the shell-typed tab stays a plain terminal with its folder label, the directly launched tab keeps the `Claude Code` label and mark with no dot while its child runs, and neither tab's terminal, explorer or diagnostics breaks
+- Then the shell-typed tab stays a plain terminal with its shell label, the directly launched tab keeps the Claude Code program label and mark with no dot while its child runs, and neither tab's terminal, explorer or diagnostics breaks
 
 ### Requirement: Claude Code diagnostics row
 
