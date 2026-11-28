@@ -4577,8 +4577,8 @@ fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
     assert_eq!(summary.label, "project");
     assert_eq!(
         summary.tooltip.as_deref(),
-        Some("remote-opencode-parity: /project"),
-        "an SSH shell tab's tooltip names the server and the full remote path"
+        Some("SSH: remote-opencode-parity (remote-opencode-parity)\n/project"),
+        "an SSH shell tab's tooltip names the host, then the full remote path"
     );
     assert!(
         tab_session_dots(&initial_output, initial_tab).is_empty(),
@@ -12545,9 +12545,11 @@ fn address_bar_navigates_on_enter_and_reports_invalid_paths_inline() {
     headless.model.picker_select(0).unwrap();
     let selected = headless.model.open_workspace().unwrap().launch_target();
     assert_eq!(selected, Some(root.join("work")));
+    // An absolute path on every platform (a Windows path needs its drive).
+    let missing = root.join("definitely-not-here").display().to_string();
     let attempts = [
         ("work/api", "Path must be absolute"),
-        ("/definitely/not/here/made-test", "Folder not found"),
+        (missing.as_str(), "Folder not found"),
     ];
     let file = root.join("file.txt").display().to_string();
     for (text, reason) in attempts
@@ -12602,7 +12604,11 @@ fn address_bar_navigates_on_enter_and_reports_invalid_paths_inline() {
         repeat: false,
         modifiers: egui::Modifiers::COMMAND,
     }];
-    events.extend(typed_events(&format!(" {}/ ", root.join("work").display())));
+    events.extend(typed_events(&format!(
+        " {}{} ",
+        root.join("work").display(),
+        std::path::MAIN_SEPARATOR
+    )));
     headless.render_events(events);
     headless.press_key(egui::Key::Enter);
     headless.render();
@@ -14362,4 +14368,141 @@ fn long_tab_labels_clamp_to_the_new_maxima_and_overflow() {
             "{width}px: the overflow stays reachable"
         );
     }
+}
+
+/// Painted SSH badge discs inside a tab's leading icon slot.
+fn ssh_badge_discs(output: &egui::FullOutput, tab: egui::Rect) -> Vec<egui::epaint::CircleShape> {
+    let center = made_app::ui::ssh_tab_badge_center(egui::Rect::from_center_size(
+        egui::pos2(tab.left() + 10.0 + 8.0, tab.center().y),
+        egui::Vec2::splat(16.0),
+    ));
+    circle_shapes(output)
+        .into_iter()
+        .filter(|circle| {
+            (circle.radius - made_app::theme::SSH_TAB_BADGE_RADIUS).abs() < 0.01
+                && (circle.center - center).length() < 0.5
+        })
+        .collect()
+}
+
+#[test]
+fn ssh_tabs_show_a_host_badge_that_changes_shape_when_disconnected() {
+    if isolated("ssh_tabs_show_a_host_badge_that_changes_shape_when_disconnected") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_app::theme::HostStatusGlyph;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "local-alpha", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let local = open_workspace(&mut model, &root);
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "prod".into(),
+            host: "prod.example.org".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/srv/app".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("remote model attaches");
+    let remote = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, local);
+    headless.render();
+    let output = headless.render();
+    let summaries = made_app::ui::workspace_tab_summaries(&headless.model);
+    let summary = |id| summaries.iter().find(|tab| tab.id == id).unwrap().clone();
+    // The SSH shell tab: badge, tooltip line and accessible name.
+    let ssh = summary(remote);
+    assert_eq!(
+        ssh.ssh_badge,
+        Some(None),
+        "a connected SSH tab paints the server glyph"
+    );
+    assert_eq!(
+        ssh.tooltip.as_deref(),
+        Some("SSH: prod (deploy@prod.example.org:2222)\n/srv/app")
+    );
+    assert!(
+        ssh.accessible_name.contains("on SSH host prod"),
+        "{}",
+        ssh.accessible_name
+    );
+    let remote_tab = headless.response(workspace_tab_id(remote)).rect;
+    assert_eq!(
+        ssh_badge_discs(&output, remote_tab).len(),
+        1,
+        "one badge disc"
+    );
+    // The local tab: none of it.
+    let plain = summary(local);
+    assert_eq!(plain.ssh_badge, None);
+    assert!(!plain.tooltip.unwrap_or_default().contains("SSH:"));
+    assert!(!plain.accessible_name.contains("SSH host"));
+    let local_tab = headless.response(workspace_tab_id(local)).rect;
+    assert!(ssh_badge_discs(&output, local_tab).is_empty());
+    // The badge sits inside the icon slot: the label still starts after it.
+    let label = text_rects(&output, "app", 55.0)
+        .into_iter()
+        .find(|rect| remote_tab.contains_rect(*rect))
+        .expect("the remote cwd label");
+    assert!(
+        (label.left() - (remote_tab.left() + 10.0 + 22.0)).abs() < 1.0,
+        "the label area is unchanged: {label:?} in {remote_tab:?}"
+    );
+    let width_before = remote_tab.width();
+    // Disconnected: the hollow ring replaces the server glyph.
+    headless
+        .model
+        .workspace_mut(remote)
+        .unwrap()
+        .remote_workspace_mut()
+        .unwrap()
+        .disconnect();
+    headless.render();
+    let output = headless.render();
+    let summaries = made_app::ui::workspace_tab_summaries(&headless.model);
+    let ssh = summaries.iter().find(|tab| tab.id == remote).unwrap();
+    assert_eq!(ssh.ssh_badge, Some(Some(HostStatusGlyph::NotConnected)));
+    let remote_tab = headless.response(workspace_tab_id(remote)).rect;
+    assert_eq!(ssh_badge_discs(&output, remote_tab).len(), 1);
+    assert!(
+        circle_shapes(&output).iter().any(|circle| {
+            circle.fill == egui::Color32::TRANSPARENT
+                && circle.stroke.width > 0.0
+                && remote_tab.contains(circle.center)
+                && (circle.center
+                    - made_app::ui::ssh_tab_badge_center(egui::Rect::from_center_size(
+                        egui::pos2(remote_tab.left() + 18.0, remote_tab.center().y),
+                        egui::Vec2::splat(16.0),
+                    )))
+                .length()
+                    < 0.5
+        }),
+        "the disconnected badge is a hollow ring"
+    );
+    assert!(
+        (remote_tab.width() - width_before).abs() < 0.01,
+        "no width change"
+    );
 }

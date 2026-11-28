@@ -2600,6 +2600,10 @@ fn workspace_tab_name(tab: &WorkspaceTabInfo, summary: Option<&str>) -> String {
         },
         None => tab.label.clone(),
     };
+    let label = match &tab.ssh {
+        Some(host) => format!("{label} on SSH host {}", sanitize_display(&host.name, 128)),
+        None => label,
+    };
     workspace_tab_accessible_label(&label, summary)
 }
 
@@ -2662,11 +2666,27 @@ struct WorkspaceTabInfo {
     label: String,
     path: std::path::PathBuf,
     remote_path: Option<String>,
-    /// The SSH server's display name, for a remote tab.
-    remote_server: Option<String>,
+    /// The SSH host of a remote tab: its badge, tooltip line and accessible
+    /// name.
+    ssh: Option<TabHost>,
     /// The integration that brands the tab: its label, mark and dots.
     brand: Option<TabBrand>,
     sessions: Vec<SessionActivity>,
+}
+
+/// Center of the SSH host badge: the bottom-right of the leading icon slot.
+pub fn ssh_tab_badge_center(icon_rect: egui::Rect) -> egui::Pos2 {
+    icon_rect.max - egui::vec2(3.5, 3.5)
+}
+
+/// The SSH host a workspace tab is bound to.
+struct TabHost {
+    /// Saved display name.
+    name: String,
+    /// `[user@]host[:port]`.
+    address: String,
+    /// The host bar state shape while the transport is not connected.
+    state: Option<theme::HostStatusGlyph>,
 }
 
 /// The integration that brands a workspace tab.
@@ -2845,7 +2865,11 @@ fn workspace_tab_info(id: WorkspaceId, workbench: &Workbench) -> WorkspaceTabInf
         label,
         path,
         remote_path,
-        remote_server: workbench.remote_label(),
+        ssh: workbench.remote_host().map(|(name, address)| TabHost {
+            name,
+            address,
+            state: workbench.remote_transport_glyph(),
+        }),
         brand,
         sessions,
     }
@@ -2855,7 +2879,7 @@ fn workspace_tab_info(id: WorkspaceId, workbench: &Workbench) -> WorkspaceTabInf
 /// sessions' summary and never the path; an unbranded tab with sessions shows
 /// the summary, and one without shows its path.
 fn workspace_tab_tooltip(tab: &WorkspaceTabInfo, summary: Option<&str>) -> Option<String> {
-    match &tab.brand {
+    let content = match &tab.brand {
         Some(TabBrand {
             title: Some(title), ..
         }) => Some(match summary {
@@ -2864,15 +2888,25 @@ fn workspace_tab_tooltip(tab: &WorkspaceTabInfo, summary: Option<&str>) -> Optio
         }),
         Some(_) => summary.map(str::to_owned),
         None if !tab.sessions.is_empty() => summary.map(str::to_owned),
-        None => Some(match (&tab.remote_server, &tab.remote_path) {
-            (Some(server), Some(path)) => format!(
-                "{}: {}",
-                sanitize_display(server, 128),
-                sanitize_display(path, 900)
-            ),
-            (_, Some(path)) => sanitize_display(path, 900),
-            (_, None) => sanitize_display(&tab.path.display().to_string(), 900),
+        None => Some(match &tab.remote_path {
+            Some(path) => sanitize_display(path, 900),
+            None => sanitize_display(&tab.path.display().to_string(), 900),
         }),
+    };
+    // An SSH tab names its host first.
+    match &tab.ssh {
+        Some(host) => {
+            let line = format!(
+                "SSH: {} ({})",
+                sanitize_display(&host.name, 128),
+                sanitize_display(&host.address, 300)
+            );
+            Some(match content {
+                Some(content) => format!("{line}\n{content}"),
+                None => line,
+            })
+        }
+        None => content,
     }
 }
 
@@ -2892,6 +2926,9 @@ pub struct TabSummary {
     pub tooltip: Option<String>,
     /// Accessible name of the tab.
     pub accessible_name: String,
+    /// The SSH host badge: `None` on a local tab, else the host bar state
+    /// shape it paints (`None` inside while connected).
+    pub ssh_badge: Option<Option<theme::HostStatusGlyph>>,
 }
 
 /// The tabs of the open workspaces as they paint, in strip order.
@@ -2910,6 +2947,7 @@ pub fn workspace_tab_summaries(model: &AppModel) -> Vec<TabSummary> {
                     .map(|brand| brand.entry.descriptor().mark),
                 tooltip: workspace_tab_tooltip(&tab, summary.as_deref()),
                 accessible_name: workspace_tab_name(&tab, summary.as_deref()),
+                ssh_badge: tab.ssh.as_ref().map(|host| host.state),
                 dots: tab.sessions,
                 label: tab.label,
             })
@@ -3406,6 +3444,10 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
                                 .remote_path
                                 .clone()
                                 .unwrap_or_else(|| tab.path.display().to_string());
+                            let path_text = match &tab.ssh {
+                                Some(host) => format!("SSH: {} · {path_text}", host.name),
+                                None => path_text,
+                            };
                             ui.label(theme::mono(
                                 truncate_path(&sanitize_display(&path_text, 900), 72),
                                 10.0,
@@ -3586,6 +3628,23 @@ fn workspace_tab_ui(
         }
     } else {
         theme::paint_icon(ui.painter(), icon_rect, theme::IconGlyph::Terminal, color);
+    }
+    if let Some(host) = &tab.ssh {
+        // The cutout ring takes the tab's own fill; the idle fill is
+        // translucent, so its opaque backdrop stands in.
+        let cutout = if active {
+            theme::BG_TAB_SELECTED
+        } else if hovered {
+            theme::BG_TAB_HOVER
+        } else {
+            theme::BG_CLEAR_SOLID
+        };
+        ui.painter().extend(theme::ssh_tab_badge_shapes(
+            ssh_tab_badge_center(icon_rect),
+            host.state,
+            cutout,
+            color,
+        ));
     }
     let font = FontId::proportional(if active {
         theme::TAB_SELECTED_FONT_SIZE

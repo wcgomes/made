@@ -603,6 +603,46 @@ pub fn host_status_shapes(
     shapes
 }
 
+/// Radius of the cutout disc behind an SSH tab badge.
+pub const SSH_TAB_BADGE_RADIUS: f32 = 6.0;
+
+/// Shapes of the SSH host badge of a workspace tab: a 9px server glyph (the
+/// host bar's SSH icon shape) while the transport is connected, else the host
+/// bar's state shape, on a cutout disc of `cutout` so it reads over any icon.
+pub fn ssh_tab_badge_shapes(
+    center: egui::Pos2,
+    status: Option<HostStatusGlyph>,
+    cutout: Color32,
+    color: Color32,
+) -> Vec<egui::Shape> {
+    if let Some(status) = status {
+        let mut shapes = host_status_shapes(center, status, cutout);
+        if let Some(egui::Shape::Circle(disc)) = shapes.first_mut() {
+            disc.radius = SSH_TAB_BADGE_RADIUS;
+        }
+        return shapes;
+    }
+    let point = |x: f32, y: f32| center + egui::vec2(x, y);
+    let stroke = Stroke::new(1.0, color);
+    let mut shapes = vec![
+        egui::Shape::circle_filled(center, SSH_TAB_BADGE_RADIUS, cutout),
+        egui::Shape::rect_stroke(
+            egui::Rect::from_center_size(center, egui::vec2(9.0, 7.5)),
+            CornerRadius::same(1),
+            stroke,
+            StrokeKind::Middle,
+        ),
+    ];
+    for y in [-1.6, 1.6] {
+        shapes.push(egui::Shape::circle_filled(point(-2.4, y), 0.65, color));
+        shapes.push(egui::Shape::line_segment(
+            [point(-1.1, y), point(3.0, y)],
+            stroke,
+        ));
+    }
+    shapes
+}
+
 // ── Geometry ────────────────────────────────────────────────────────────────
 
 /// Narrowest usable full-height explorer card.

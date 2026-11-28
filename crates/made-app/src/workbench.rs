@@ -2156,6 +2156,36 @@ impl Workbench {
         self.remote.is_some()
     }
 
+    /// The SSH host of a remote tab from its own record snapshot: the saved
+    /// display name and `[user@]host[:port]`.
+    pub fn remote_host(&self) -> Option<(String, String)> {
+        let metadata = self.remote.as_ref()?.snapshot.server().metadata();
+        Some((
+            metadata.display_name.clone(),
+            crate::ssh_servers::host_address(metadata),
+        ))
+    }
+
+    /// The host-bar state shape of a remote tab's transport while it is not
+    /// connected: approval, reconnecting, disconnected or failed. `None` for a
+    /// connected or local tab.
+    pub fn remote_transport_glyph(&self) -> Option<crate::theme::HostStatusGlyph> {
+        use crate::theme::HostStatusGlyph as G;
+        let remote = self.remote.as_ref()?;
+        match remote.phase {
+            RemotePhase::Failed => Some(G::Failed),
+            RemotePhase::NeedsConsent
+            | RemotePhase::NeedsHostApproval
+            | RemotePhase::NeedsUpdate => Some(G::ApprovalNeeded),
+            RemotePhase::Connecting | RemotePhase::Staging | RemotePhase::AwaitingAttach => {
+                Some(G::Connecting)
+            }
+            RemotePhase::Ready => (remote.workspace.connection()
+                != crate::remote_workspace::ConnectionState::Connected)
+                .then_some(G::NotConnected),
+        }
+    }
+
     pub fn remote_label(&self) -> Option<String> {
         self.remote
             .as_ref()
@@ -11084,6 +11114,30 @@ mod tests {
                 },
                 claude: false,
             }
+        }
+
+        #[test]
+        fn the_tab_badge_state_follows_the_transport_phase() {
+            use crate::theme::HostStatusGlyph as G;
+            let (mut workbench, _script, _) = probing();
+            assert_eq!(workbench.remote_host().unwrap().0, "lab");
+            assert_eq!(workbench.remote_host().unwrap().1, "lab.invalid");
+            for (phase, glyph) in [
+                (RemotePhase::Connecting, Some(G::Connecting)),
+                (RemotePhase::AwaitingAttach, Some(G::Connecting)),
+                (RemotePhase::NeedsHostApproval, Some(G::ApprovalNeeded)),
+                (RemotePhase::Failed, Some(G::Failed)),
+            ] {
+                workbench.remote.as_mut().unwrap().phase = phase;
+                assert_eq!(workbench.remote_transport_glyph(), glyph);
+            }
+            // Ready but not attached: disconnected.
+            workbench.remote.as_mut().unwrap().phase = RemotePhase::Ready;
+            assert_eq!(workbench.remote_transport_glyph(), Some(G::NotConnected));
+            assert_eq!(
+                idle_workbench(TerminalTarget::Shell, None).remote_transport_glyph(),
+                None
+            );
         }
 
         #[test]

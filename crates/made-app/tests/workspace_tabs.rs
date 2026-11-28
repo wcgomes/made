@@ -23,6 +23,18 @@ fn isolated(name: &str) -> bool {
 /// Run `name` in an isolated child process with a fake `opencode` first on
 /// `PATH`, then assert the fake ran exactly `expected_opencode_launches` times.
 fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize) -> bool {
+    isolated_child(name, expected_opencode_launches, false)
+}
+
+/// Like [`isolated`], but the child runs from a copy of this test binary with
+/// a fake packaged `made-askpass` beside it, so an SSH attempt gets past the
+/// askpass preflight. The real test binary never gets a helper beside it.
+#[cfg(unix)]
+fn isolated_with_askpass(name: &str) -> bool {
+    isolated_child(name, 0, true)
+}
+
+fn isolated_child(name: &str, expected_opencode_launches: usize, askpass: bool) -> bool {
     if std::env::var_os("MADE_WORKSPACE_TEST_CHILD").is_some() {
         return false;
     }
@@ -44,7 +56,24 @@ fn isolated_with_opencode_launches(name: &str, expected_opencode_launches: usize
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    let mut exe = std::env::current_exe().unwrap();
+    #[cfg(unix)]
+    if askpass {
+        use std::os::unix::fs::PermissionsExt;
+        let app = home.path().join("app");
+        std::fs::create_dir(&app).unwrap();
+        let copy = app.join(exe.file_name().unwrap());
+        std::fs::copy(&exe, &copy).unwrap();
+        let helper = app.join(made_platform::askpass_file_name());
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        for file in [&copy, &helper] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        exe = copy;
+    }
+    #[cfg(not(unix))]
+    let _ = askpass;
+    let mut command = std::process::Command::new(exe);
     command
         .args(["--exact", name, "--nocapture"])
         .env("MADE_WORKSPACE_TEST_CHILD", "1")
@@ -5022,33 +5051,43 @@ mod tab_presentation_characterization {
         // SSH-11/AIA-05: a deliberate contract change, not a reorganization
         // step. The remote order equals the local order: OpenCode, then
         // Claude Code, then Grok Build, else the server name.
+        // Every SSH tab names its host first (7.10).
         let server = expect(
             "project",
             "none",
             &[],
-            "Tab: project",
-            &["×", "remote-server: /project"],
+            "Tab: project on SSH host remote-server",
+            &["×", "SSH: remote-server (remote-server)\n/project"],
         );
         let grok = expect(
             "Grok Build",
             "grok",
             &["busy"],
-            "Tab: Grok Build — Sessions: 1 running",
-            &["×", "Sessions: 1 running"],
+            "Tab: Grok Build on SSH host remote-server — Sessions: 1 running",
+            &[
+                "×",
+                "SSH: remote-server (remote-server)\nSessions: 1 running",
+            ],
         );
         let opencode = expect(
             "Remote",
             "opencode",
             &["busy"],
-            "Tab: OpenCode — Remote — Sessions: 1 running",
-            &["×", "Remote — Sessions: 1 running"],
+            "Tab: OpenCode — Remote on SSH host remote-server — Sessions: 1 running",
+            &[
+                "×",
+                "SSH: remote-server (remote-server)\nRemote — Sessions: 1 running",
+            ],
         );
         let claude = expect(
             "Remote session",
             "claude-code",
             &["busy"],
-            "Tab: Claude Code — Remote session — Sessions: 1 running",
-            &["×", "Remote session — Sessions: 1 running"],
+            "Tab: Claude Code — Remote session on SSH host remote-server — Sessions: 1 running",
+            &[
+                "×",
+                "SSH: remote-server (remote-server)\nRemote session — Sessions: 1 running",
+            ],
         );
         // (OpenCode active, Claude Code present, Grok open).
         let table: [((bool, bool, bool), &String); 8] = [
@@ -5362,8 +5401,9 @@ fn returning_from_an_open_workspace_field_to_the_terminal_keeps_ime_allowed() {
 #[cfg(unix)]
 #[test]
 fn a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_locally() {
-    if isolated("a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_locally")
-    {
+    if isolated_with_askpass(
+        "a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_locally",
+    ) {
         return;
     }
     use made_app::ssh_servers::ServerMetadata;
