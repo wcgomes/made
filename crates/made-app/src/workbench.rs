@@ -12494,11 +12494,13 @@ mod tests {
 
         /// The SSH stream of a client, here a loopback socket to the
         /// supervisor (the transport the SSH frontend relays).
+        #[cfg(unix)]
         struct LoopbackStream {
             stream: std::net::TcpStream,
             received: std::sync::mpsc::Receiver<Vec<u8>>,
         }
 
+        #[cfg(unix)]
         impl made_remote::client::ClientStream for LoopbackStream {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
                 use std::io::Write;
@@ -12512,6 +12514,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         struct RealBench {
             bench: RemoteBench,
             ctx: egui::Context,
@@ -12523,6 +12526,7 @@ mod tests {
         /// "claude") attached to a real supervisor over a loopback socket. The
         /// launch child runs `script`; the shell that takes its place is bash.
         /// A small script stands in for the companion's `--child` wrapper.
+        #[cfg(unix)]
         fn real_bench(kind: &str, script: &str) -> RealBench {
             use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
@@ -12654,6 +12658,7 @@ mod tests {
             real
         }
 
+        #[cfg(unix)]
         impl RealBench {
             fn tick(&mut self) {
                 self.bench.workbench.tick_remote(&self.ctx);
@@ -12747,6 +12752,7 @@ mod tests {
         /// through the real supervisor, client and tab: the shell that takes
         /// the TUI's place takes input and resizes, the tab stays open, and
         /// `exit` in it closes the tab.
+        #[cfg(unix)]
         #[test]
         fn a_real_tui_exit_gives_a_shell_that_works_and_whose_exit_closes_the_tab() {
             let mut real = real_bench(
@@ -12797,6 +12803,7 @@ mod tests {
 
         /// `Open shell` after an unclean end, and after a plain `Terminal SSH`
         /// shell ended, through the real supervisor: typing then works.
+        #[cfg(unix)]
         #[test]
         fn a_real_open_shell_after_an_unclean_end_takes_input() {
             for (kind, script) in [("claude", "exit 3"), ("shell", "")] {
@@ -13053,6 +13060,7 @@ mod tests {
         /// real client: the bench's fake stream is relayed to it and back.
         /// Nothing here reaches a remote host. The supervisor's launch child is
         /// an idle script, so no terminal program is needed.
+        #[cfg(unix)]
         struct LoopbackCompanion {
             stop: Arc<std::sync::atomic::AtomicBool>,
             relay: Option<thread::JoinHandle<()>>,
@@ -13060,6 +13068,7 @@ mod tests {
             _temp: tempfile::TempDir,
         }
 
+        #[cfg(unix)]
         impl Drop for LoopbackCompanion {
             fn drop(&mut self) {
                 self.stop.store(true, Ordering::Relaxed);
@@ -13072,6 +13081,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn loopback_companion(
             bench: &RemoteBench,
             workspace: &std::path::Path,
@@ -13166,6 +13176,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn git_in(directory: &std::path::Path, args: &[&str]) {
             let output = std::process::Command::new("git")
                 .arg("-C")
@@ -13187,6 +13198,7 @@ mod tests {
         }
 
         /// Pump the tab until `done`, at most `limit`.
+        #[cfg(unix)]
         fn pump_for(
             bench: &mut RemoteBench,
             limit: Duration,
@@ -13209,6 +13221,7 @@ mod tests {
         /// the real client, the workbench pump and the workspace: a write in a
         /// nested expanded folder and a `git add` reach the projection as a
         /// pushed notification and a reload, with no manual refresh.
+        #[cfg(unix)]
         #[test]
         fn a_nested_write_and_a_git_add_reach_the_projection_through_a_real_supervisor() {
             let temp = tempfile::tempdir().unwrap();

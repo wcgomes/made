@@ -292,10 +292,28 @@ impl Pane {
         if self.contains(needle) {
             return;
         }
-        frames_until(stream, |operation| {
-            self.feed(operation);
-            self.contains(needle).then_some(())
-        });
+        let limit = deadline();
+        loop {
+            assert!(
+                Instant::now() < limit,
+                "deadline waiting for {needle:?}; the pane received {:?}",
+                String::from_utf8_lossy(&self.raw)
+            );
+            match read_envelope(stream) {
+                Ok(frame) => {
+                    self.feed(&frame.operation);
+                    if self.contains(needle) {
+                        return;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("attachment socket failed: {error}"),
+            }
+        }
     }
 
     fn until_reply(&mut self, stream: &mut TcpStream, request: u64) -> Operation {
