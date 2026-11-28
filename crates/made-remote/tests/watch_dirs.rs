@@ -114,6 +114,10 @@ fn land(
         let wanted = base.join_name(&name);
         let until = Instant::now() + Duration::from_secs(3);
         while Instant::now() < until {
+            // The supervisor's loop drives registration results too: a
+            // watch armed again is only settled (and can be re-armed after
+            // the next replacement) once its result is polled.
+            service.poll_watch_results();
             seen.extend(service.poll_changes());
             if changed(&seen, request, &wanted) {
                 return seen;
