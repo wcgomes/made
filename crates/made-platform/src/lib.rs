@@ -207,6 +207,10 @@ pub fn hide_console_window(command: &mut std::process::Command) -> &mut std::pro
     command
 }
 
+/// Whether the file-watching backend restarts its platform stream for every
+/// watch it adds or drops, losing events in the gap (macOS FSEvents).
+pub const WATCH_BACKEND_RESTARTS_STREAM: bool = cfg!(target_os = "macos");
+
 /// Environment variable that overrides the app-owned plugin directory.
 ///
 /// Development builds may point this at any staged plugin package. Release

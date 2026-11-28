@@ -6260,18 +6260,29 @@ mod tests {
         assert!(document.lines.is_empty());
     }
 
+    /// A pane whose root is listed and that never installs a watcher. Landing
+    /// the watcher queues one more root reload, so a test that swaps the tree
+    /// worker while a load is in flight would depend on how fast the platform
+    /// starts its watch stream.
+    fn unwatched_pane(root: &Path, log: &mut DiagnosticLog) -> ExplorerPane {
+        let mut pane = ExplorerPane::new(root, RootGeneration::INITIAL);
+        // Dropping the installer discards the queued install and its result.
+        pane.watcher_installer = WatcherInstaller::blocked();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !pane.is_root_ready() {
+            pane.tick(log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pane.is_root_ready());
+        pane
+    }
+
     #[test]
     fn tree_queue_saturation_keeps_cached_rows_and_does_not_install_errors() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("keep.txt"), "keep").unwrap();
-        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
         let mut log = DiagnosticLog::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !pane.is_root_ready() {
-            pane.tick(&mut log);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(pane.is_root_ready());
+        let mut pane = unwatched_pane(temp.path(), &mut log);
         let rows_before = pane.visible_row_count();
         assert!(rows_before >= 1);
 
@@ -6290,14 +6301,8 @@ mod tests {
     fn a_reload_requested_during_a_load_runs_after_it_lands() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("first.txt"), "1").unwrap();
-        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
         let mut log = DiagnosticLog::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !pane.is_root_ready() {
-            pane.tick(&mut log);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(pane.is_root_ready());
+        let mut pane = unwatched_pane(temp.path(), &mut log);
         let root = pane.root.clone().expect("root");
 
         // A load is in flight (its worker is not running yet) when a change

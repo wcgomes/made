@@ -124,7 +124,7 @@ const GIT_STATE_FILES: [&str; 7] = [
 /// Backends that restart their platform stream for every watch they add or
 /// drop (macOS FSEvents) lose events in the gap; the server reports every live
 /// directory again after each such operation.
-const RESTARTS_STREAM: bool = cfg!(target_os = "macos");
+const RESTARTS_STREAM: bool = made_platform::WATCH_BACKEND_RESTARTS_STREAM;
 /// How often directories that were replaced are looked for again.
 const REARM_INTERVAL: Duration = Duration::from_millis(500);
 /// A re-arm that failed waits this long before it is tried again.

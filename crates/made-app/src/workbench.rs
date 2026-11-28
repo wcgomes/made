@@ -4305,6 +4305,7 @@ impl Workbench {
     /// that root is no longer usable on the server. A companion that cannot
     /// start it leaves the exit banner with the reason.
     fn poll_follow_up_shell(&mut self, now: Instant) {
+        // BEGIN remote-path (AIA-02)
         let clean_tui_exit = matches!(
             self.terminal_target,
             TerminalTarget::RemoteOpenCode { .. }
@@ -4314,6 +4315,7 @@ impl Workbench {
             .terminal
             .as_ref()
             .is_some_and(TerminalPane::exited_cleanly);
+        // END remote-path
         let Some(remote) = self.remote.as_mut() else {
             return;
         };
@@ -4493,9 +4495,11 @@ impl Workbench {
             if let Some(client) = remote.client.as_ref() {
                 client.child_replaced();
             }
+            // BEGIN remote-path (AIA-02)
             remote.opencode = false;
             remote.grok = false;
             remote.claude = false;
+            // END remote-path
             remote.shell_start = ShellStart::Idle;
             // The shell may have started in the launch folder instead.
             if let Some(path) = path.filter(|path| remote.workspace.shell_cwd() != Some(path)) {

@@ -5310,7 +5310,7 @@ mod tests {
     }
 
     /// Run test `name` again in a child process with a temporary home and
-    /// `TMPDIR`, since starting a workbench needs isolated app paths. Returns
+    /// temp directory, since starting a workbench needs isolated app paths. Returns
     /// `true` in the parent once the child passed.
     fn in_isolated_child(name: &str) -> bool {
         const CHILD: &str = "MADE_APP_MODEL_TEST_CHILD";
@@ -5327,6 +5327,12 @@ mod tests {
             .env("XDG_STATE_HOME", home.path().join("state"))
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("TMPDIR", home.path())
+            // Windows resolves app paths and the temp directory from these.
+            .env("USERPROFILE", home.path())
+            .env("APPDATA", home.path().join("roaming"))
+            .env("LOCALAPPDATA", home.path().join("local"))
+            .env("TEMP", home.path())
+            .env("TMP", home.path())
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
