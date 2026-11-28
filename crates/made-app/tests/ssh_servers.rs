@@ -516,3 +516,267 @@ fn grok_install_invocation_and_report_parsing_are_bounded_and_exact() {
     )
     .is_err());
 }
+
+// ---- Host bar of the Open workspace screen (open-workspace-redesign, 6.1) ----
+
+mod host_bar {
+    use super::{capabilities, Storage};
+    use made_app::open_workspace::{HostId, OpenWorkspace};
+    use made_app::ssh_servers::*;
+    use made_app::TerminalTarget;
+    use made_remote::protocol::{AuthorityId, RemotePath};
+
+    fn form(name: &str, host: &str) -> HostForm {
+        HostForm {
+            name: name.into(),
+            host: host.into(),
+            ..HostForm::default()
+        }
+    }
+
+    fn fields(form: &HostForm) -> Vec<HostField> {
+        form.validate()
+            .unwrap_err()
+            .into_iter()
+            .map(|(field, _)| field)
+            .collect()
+    }
+
+    #[test]
+    fn the_add_host_form_validates_each_field_before_saving() {
+        assert_eq!(
+            fields(&form("", "")),
+            vec![HostField::Name, HostField::Host]
+        );
+        assert_eq!(
+            fields(&form("Prod", "-oProxyCommand=x")),
+            vec![HostField::Host]
+        );
+        assert_eq!(fields(&form("Prod", "deploy@prod")), vec![HostField::Host]);
+        let mut bad = form("Prod", "prod.example.org");
+        bad.user = "bad user".into();
+        bad.port = "70000".into();
+        bad.key_file = "keys/\u{7}id".into();
+        bad.directory = "srv/app".into();
+        let errors = bad.validate().unwrap_err();
+        assert_eq!(
+            errors.iter().map(|(field, _)| *field).collect::<Vec<_>>(),
+            vec![
+                HostField::User,
+                HostField::Port,
+                HostField::KeyFile,
+                HostField::Directory
+            ]
+        );
+        assert!(errors.iter().all(|(_, message)| !message.is_empty()));
+        let mut zero = form("Prod", "prod");
+        zero.port = "0".into();
+        assert_eq!(fields(&zero), vec![HostField::Port]);
+
+        let mut good = form("  prod  ", " prod.example.org ");
+        good.user = "deploy".into();
+        good.port = "2222".into();
+        good.key_file = "/keys/id_ed25519".into();
+        good.directory = "/srv/app/".into();
+        let metadata = good.validate().unwrap();
+        assert_eq!(metadata.display_name, "prod");
+        assert_eq!(metadata.host, "prod.example.org");
+        assert_eq!(metadata.user.as_deref(), Some("deploy"));
+        assert_eq!(metadata.port, Some(2222));
+        assert_eq!(metadata.key_file.as_deref(), Some("/keys/id_ed25519"));
+        assert_eq!(
+            metadata.initial_directory,
+            Some(RemotePath::new(b"/srv/app".to_vec()).unwrap())
+        );
+        // Optional fields stay absent when empty.
+        let plain = form("lab", "lab").validate().unwrap();
+        assert_eq!((plain.user, plain.port, plain.key_file), (None, None, None));
+        assert!(plain.initial_directory.is_none());
+    }
+
+    #[test]
+    fn save_appends_and_selects_and_cancel_discards() {
+        let storage = Storage::default();
+        let mut registry = ServerRegistry::load(storage.clone()).unwrap();
+        let first = registry.add_host(&form("lab", "lab")).unwrap();
+        let mut screen = OpenWorkspace::new(
+            made_app::integrations::PRODUCT,
+            registry.screen_hosts(),
+            None,
+            std::env::temp_dir(),
+        );
+        // Cancel: the draft is dropped and nothing is written.
+        let writes = storage.0.borrow().writes;
+        drop(form("draft", "draft"));
+        assert_eq!(storage.0.borrow().writes, writes);
+        assert!(registry.add_host(&form("", "x")).is_err());
+        assert_eq!(
+            storage.0.borrow().writes,
+            writes,
+            "an invalid form writes nothing"
+        );
+
+        let second = registry.add_host(&form("prod", "prod")).unwrap();
+        let ids: Vec<_> = registry
+            .host_entries()
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, vec![first, second], "the new host is last");
+        screen.set_hosts(registry.screen_hosts());
+        assert!(screen.select_host(HostId::Ssh(second)));
+        assert_eq!(
+            screen.host_buttons().last(),
+            Some(&made_app::open_workspace::HostButton::AddHost)
+        );
+        assert_eq!(screen.host_buttons().len(), 4);
+    }
+
+    #[test]
+    fn host_entries_show_name_and_user_host_port_address() {
+        let mut registry = ServerRegistry::load(Storage::default()).unwrap();
+        let mut prod = form("prod", "prod.example.org");
+        prod.user = "deploy".into();
+        prod.port = "2222".into();
+        registry.add_host(&prod).unwrap();
+        registry.add_host(&form("lab", "lab")).unwrap();
+        let entries = registry.host_entries();
+        assert_eq!(entries[0].name, "prod");
+        assert_eq!(entries[0].address, "deploy@prod.example.org:2222");
+        assert_eq!(entries[1].address, "lab");
+    }
+
+    #[test]
+    fn the_form_accepts_every_key_file_reference_the_record_accepts() {
+        // SSH-01 records keep relative and `~` key-file references; the form
+        // must not refuse what a saved record already holds.
+        let mut registry = ServerRegistry::load(Storage::default()).unwrap();
+        for key in ["~/.ssh/id_ed25519", "keys/id", "id_rsa", "/keys/id"] {
+            let metadata = ServerMetadata {
+                display_name: "prod".into(),
+                host: "prod".into(),
+                user: None,
+                port: None,
+                key_file: Some(key.into()),
+                initial_directory: None,
+            };
+            assert!(metadata.validate().is_ok(), "{key}");
+            let mut draft = form("prod", "prod");
+            draft.key_file = key.into();
+            assert_eq!(
+                draft.validate().expect(key).key_file.as_deref(),
+                Some(key),
+                "the form accepts {key}"
+            );
+            let id = registry.add(metadata).unwrap();
+            let prefilled = registry.edit_form(id).unwrap();
+            assert!(
+                registry.edit_host(id, &prefilled).is_ok(),
+                "saving an unchanged Edit form keeps {key}"
+            );
+            registry.remove(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn edit_prefills_the_form_with_the_record() {
+        let mut registry = ServerRegistry::load(Storage::default()).unwrap();
+        let mut prod = form("prod", "prod.example.org");
+        prod.user = "deploy".into();
+        prod.port = "2222".into();
+        prod.key_file = "/keys/id".into();
+        prod.directory = "/srv/app".into();
+        let id = registry.add_host(&prod).unwrap();
+        let prefilled = registry.edit_form(id).unwrap();
+        assert_eq!(prefilled.name, "prod");
+        assert_eq!(prefilled.host, "prod.example.org");
+        assert_eq!(prefilled.user, "deploy");
+        assert_eq!(prefilled.port, "2222");
+        assert_eq!(prefilled.key_file, "/keys/id");
+        assert_eq!(prefilled.directory, "/srv/app");
+        let mut edited = prefilled;
+        edited.name = "production".into();
+        registry.edit_host(id, &edited).unwrap();
+        assert_eq!(registry.host_entries()[0].name, "production");
+        assert!(registry.edit_form(AuthorityId([9; 16])).is_none());
+    }
+
+    #[test]
+    fn remove_needs_confirmation_and_live_tabs_keep_their_authority() {
+        let storage = Storage::default();
+        let mut registry = ServerRegistry::load(storage.clone()).unwrap();
+        let id = registry.add_host(&form("prod", "prod")).unwrap();
+        let other = registry.add_host(&form("lab", "lab")).unwrap();
+        registry
+            .record_probe_result(id, Ok(capabilities()))
+            .unwrap();
+        // A live tab holds its own snapshot and target.
+        let live = registry.snapshot(id).unwrap();
+        let tab_target = TerminalTarget::RemoteShell { authority: id };
+
+        let prompt = registry.removal_prompt(id).unwrap();
+        assert!(prompt.message().contains("prod"), "{}", prompt.message());
+        assert!(prompt.message().contains("Open tabs stay open"));
+        assert_eq!(registry.host_entries().len(), 2, "asking removes nothing");
+        registry.remove_confirmed(prompt).unwrap();
+        let ids: Vec<_> = registry
+            .host_entries()
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, vec![other]);
+        assert_eq!(live.server().metadata().host, "prod");
+        assert_eq!(tab_target.authority(), Some(id));
+        assert!(
+            !registry.can_launch_target(tab_target),
+            "no new launch on a removed host"
+        );
+        assert!(registry.removal_prompt(id).is_none());
+        assert!(ServerRegistry::load(storage).unwrap().snapshot(id).is_err());
+
+        // The screen falls back to Local when its selected host is removed.
+        let mut screen = OpenWorkspace::new(
+            made_app::integrations::PRODUCT,
+            Vec::new(),
+            None,
+            std::env::temp_dir(),
+        );
+        screen.set_hosts(vec![made_app::open_workspace::SshHost {
+            id,
+            initial_directory: None,
+        }]);
+        screen.select_host(HostId::Ssh(id));
+        screen.set_hosts(registry.screen_hosts());
+        assert_eq!(screen.selected_host(), HostId::Local);
+    }
+
+    #[test]
+    fn local_exposes_no_host_actions() {
+        assert!(host_actions(HostId::Local).is_empty());
+        assert_eq!(
+            host_actions(HostId::Ssh(AuthorityId([1; 16]))),
+            &[
+                HostAction::Edit,
+                HostAction::TestConnection,
+                HostAction::Remove
+            ]
+        );
+        assert_eq!(HostAction::TestConnection.label(), "Test connection");
+    }
+
+    #[test]
+    fn launch_targets_follow_each_servers_own_detection() {
+        let mut registry = ServerRegistry::load(Storage::default()).unwrap();
+        let a = registry.add_host(&form("a", "a")).unwrap();
+        let b = registry.add_host(&form("b", "b")).unwrap();
+        registry.record_probe_result(a, Ok(capabilities())).unwrap();
+        assert!(registry.can_launch_target(TerminalTarget::RemoteShell { authority: b }));
+        assert_eq!(
+            registry.can_launch_target(TerminalTarget::RemoteOpenCode { authority: a }),
+            registry.can_launch_opencode(a)
+        );
+        assert!(!registry.can_launch_target(TerminalTarget::RemoteOpenCode { authority: b }));
+        assert!(!registry.can_launch_target(TerminalTarget::RemoteGrok { authority: b }));
+        assert!(!registry.can_launch_target(TerminalTarget::Shell));
+    }
+}

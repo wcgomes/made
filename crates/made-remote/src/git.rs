@@ -23,9 +23,77 @@ const STATUS_ARGS: &[&str] = &[
     "--porcelain=v1",
     "-z",
     "--untracked-files=all",
+    "--ignore-submodules=dirty",
     "--",
     ".",
 ];
+const FILTER_DRIVERS_UNSCOPED_ARGS: &[&str] = &[
+    "config",
+    "--name-only",
+    "--get-regexp",
+    r"^filter\..*\.(clean|process|smudge|required)$",
+];
+const FILTER_DRIVERS_ARGS: &[&str] = &[
+    "config",
+    "--show-scope",
+    "--name-only",
+    "--get-regexp",
+    r"^filter\..*\.(clean|process|smudge|required)$",
+];
+
+/// Configuration forced on every read so repository or inherited settings
+/// cannot make a read execute a program or leave this working tree.
+///
+/// - `core.fsmonitor=false`: no repository-chosen fsmonitor hook runs.
+/// - `log.showSignature=false`: the subject read never runs `gpg.program`.
+/// - `protocol.allow=never` and every `protocol.<name>.allow=never`: a
+///   partial clone's lazy fetch cannot start a transport, so neither
+///   `core.sshCommand` nor `remote.<name>.uploadpack` runs. Together with
+///   `GIT_NO_LAZY_FETCH=1` (git 2.45 and later) no fetch is attempted.
+///
+/// Command-line `-c` wins over every configuration file. Status also passes
+/// `--ignore-submodules=dirty`, which beats `submodule.<name>.ignore`, so it
+/// never enters a submodule worktree, and status disables every filter
+/// driver the repository's own configuration defines (see
+/// [`GitCommand::FilterDrivers`]).
+const HARDENED_CONFIG: &[&str] = &[
+    "core.fsmonitor=false",
+    "log.showSignature=false",
+    "protocol.allow=never",
+    "protocol.file.allow=never",
+    "protocol.git.allow=never",
+    "protocol.ssh.allow=never",
+    "protocol.http.allow=never",
+    "protocol.https.allow=never",
+    "protocol.ftp.allow=never",
+    "protocol.ftps.allow=never",
+    "protocol.ext.allow=never",
+    "protocol.fd.allow=never",
+];
+
+/// Inherited variables that would redirect a read to another repository,
+/// index or object store, or inject configuration or an external program.
+/// `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` are removed by prefix.
+const SCRUBBED_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_EXEC_PATH",
+    "GIT_ATTR_SOURCE",
+];
+const SCRUBBED_ENV_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
 
 /// Environment variable that overrides the git executable in Made's local app.
 ///
@@ -56,6 +124,8 @@ pub const READ_ONLY_GIT_ARGUMENTS: &[&[&str]] = &[
     COMMIT_ID_ARGS,
     COMMIT_SUBJECT_ARGS,
     STATUS_ARGS,
+    FILTER_DRIVERS_ARGS,
+    FILTER_DRIVERS_UNSCOPED_ARGS,
 ];
 
 /// Read-only git command surface.
@@ -78,17 +148,31 @@ pub enum GitCommand {
     CommitId,
     /// `log -1 --format=%s`
     CommitSubject,
-    /// `status --porcelain=v1 -z --untracked-files=all -- .`
+    /// `status --porcelain=v1 -z --untracked-files=all
+    /// --ignore-submodules=dirty -- .`
     ///
     /// `all` lists every untracked file. `normal` would collapse a new
     /// directory to one entry, so those files would never get a file dot.
-    /// Ignored paths stay omitted.
+    /// Ignored paths stay omitted. A submodule shows when its commit
+    /// changed; its worktree is never entered. The runner reads
+    /// [`Self::FilterDrivers`] first and disables every driver that any
+    /// repository-controlled scope defines.
     Status,
+    /// `config --show-scope --name-only --get-regexp
+    /// '^filter\..*\.(clean|process|smudge|required)$'`: the configured
+    /// filter driver keys with their scope (git 2.26 and later). Reading
+    /// configuration runs no program.
+    FilterDrivers,
+    /// `config --name-only --get-regexp
+    /// '^filter\..*\.(clean|process|smudge|required)$'`: the same keys
+    /// without scope, read only when git predates `--show-scope`. Every
+    /// driver it names is disabled.
+    FilterDriversUnscoped,
 }
 
 impl GitCommand {
     /// Every command the module can run.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::ShowToplevel,
         Self::Branch,
         Self::GitDir,
@@ -97,6 +181,8 @@ impl GitCommand {
         Self::CommitId,
         Self::CommitSubject,
         Self::Status,
+        Self::FilterDrivers,
+        Self::FilterDriversUnscoped,
     ];
 
     /// Fixed argument vector for this command.
@@ -110,6 +196,8 @@ impl GitCommand {
             Self::CommitId => COMMIT_ID_ARGS,
             Self::CommitSubject => COMMIT_SUBJECT_ARGS,
             Self::Status => STATUS_ARGS,
+            Self::FilterDrivers => FILTER_DRIVERS_ARGS,
+            Self::FilterDriversUnscoped => FILTER_DRIVERS_UNSCOPED_ARGS,
         }
     }
 
@@ -124,6 +212,8 @@ impl GitCommand {
             Self::CommitId => "commit-id",
             Self::CommitSubject => "commit-subject",
             Self::Status => "status",
+            Self::FilterDrivers => "filter-drivers",
+            Self::FilterDriversUnscoped => "filter-drivers-unscoped",
         }
     }
 }
@@ -190,6 +280,9 @@ pub enum GitRunError {
     Deadline,
     /// The command is not one of the fixed read-only commands.
     Rejected,
+    /// A configured filter driver could not be disabled, so status did not
+    /// run.
+    UnsafeFilter,
 }
 
 impl GitRunError {
@@ -197,7 +290,9 @@ impl GitRunError {
     pub fn kind(&self) -> io::ErrorKind {
         match self {
             Self::Spawn(error) | Self::Io(error) => error.kind(),
-            Self::Failed { .. } | Self::OutputLimit | Self::Rejected => io::ErrorKind::Other,
+            Self::Failed { .. } | Self::OutputLimit | Self::Rejected | Self::UnsafeFilter => {
+                io::ErrorKind::Other
+            }
             Self::Deadline => io::ErrorKind::TimedOut,
         }
     }
@@ -234,6 +329,9 @@ impl fmt::Display for GitRunError {
             Self::OutputLimit => formatter.write_str("git output limit"),
             Self::Deadline => formatter.write_str("git read deadline"),
             Self::Rejected => formatter.write_str("git arguments are not read-only"),
+            Self::UnsafeFilter => {
+                formatter.write_str("a configured git filter driver cannot be disabled")
+            }
         }
     }
 }
@@ -455,14 +553,124 @@ impl GitRunner {
         if !is_read_only_git_args(command.args()) {
             return Err(GitRunError::Rejected);
         }
-
         let deadline = self.limits.deadline.map(|limit| Instant::now() + limit);
+        let overrides = if command == GitCommand::Status {
+            self.filter_overrides(directory, use_current_dir, deadline)?
+        } else {
+            Vec::new()
+        };
+        self.spawn(command, &overrides, directory, use_current_dir, deadline)
+    }
+
+    /// `-c` settings that disable every filter driver with a key from a
+    /// scope the repository controls, read with [`GitCommand::FilterDrivers`]
+    /// under the same deadline. Drivers defined only in the user's global or
+    /// the system configuration (such as `git lfs install`) are trusted and
+    /// kept; any key from `local`, `worktree`, `command` or another scope,
+    /// includes pulled into those scopes too, disables the whole driver.
+    ///
+    /// A git before 2.26 rejects `--show-scope` as an unknown option; then
+    /// [`GitCommand::FilterDriversUnscoped`] is read and every driver is
+    /// disabled. Fails closed otherwise: any other failed read, an
+    /// unparseable line, or a disabled driver name that `-c` cannot express
+    /// exactly is an error and status does not run.
+    fn filter_overrides(
+        &self,
+        directory: &Path,
+        use_current_dir: bool,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>, GitRunError> {
+        let read = |command| {
+            match self.spawn(command, &[], directory, use_current_dir, deadline) {
+                Ok(output) => Ok(output.stdout),
+                // `git config --get-regexp` exits 1 when nothing matches.
+                Err(GitRunError::Failed {
+                    code: Some(1),
+                    stderr,
+                }) if stderr.is_empty() => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        };
+        let (scoped, keys) = match read(GitCommand::FilterDrivers) {
+            Ok(keys) => (true, keys),
+            Err(error) if rejects_show_scope(&error) => {
+                (false, read(GitCommand::FilterDriversUnscoped)?)
+            }
+            Err(error) => return Err(error),
+        };
+        let keys = String::from_utf8(keys).map_err(|_| GitRunError::UnsafeFilter)?;
+        let mut drivers = BTreeSet::new();
+        for line in keys.lines() {
+            let (scope, key) = if scoped {
+                line.split_once('\t').ok_or(GitRunError::UnsafeFilter)?
+            } else {
+                ("", line)
+            };
+            let name = key
+                .strip_prefix("filter.")
+                .and_then(|rest| rest.rsplit_once('.'))
+                .map(|(name, _)| name)
+                .ok_or(GitRunError::UnsafeFilter)?;
+            if scoped {
+                if scope.is_empty() || !scope.bytes().all(|byte| byte.is_ascii_lowercase()) {
+                    return Err(GitRunError::UnsafeFilter);
+                }
+                if matches!(scope, "system" | "global") {
+                    continue;
+                }
+            }
+            // `-c` splits at the first `=`; git config names hold no
+            // newline, and control characters are refused outright.
+            if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
+                return Err(GitRunError::UnsafeFilter);
+            }
+            drivers.insert(name);
+        }
+        Ok(drivers
+            .into_iter()
+            .flat_map(|name| {
+                [
+                    format!("filter.{name}.clean="),
+                    format!("filter.{name}.process="),
+                    format!("filter.{name}.required=false"),
+                ]
+            })
+            .collect())
+    }
+
+    fn spawn(
+        &self,
+        command: GitCommand,
+        overrides: &[String],
+        directory: &Path,
+        use_current_dir: bool,
+        deadline: Option<Instant>,
+    ) -> Result<GitOutput, GitRunError> {
         let mut process = Command::new(&self.program);
+        for setting in HARDENED_CONFIG {
+            process.arg("-c").arg(setting);
+        }
+        for setting in overrides {
+            process.arg("-c").arg(setting);
+        }
+        for name in SCRUBBED_ENV {
+            process.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| {
+                SCRUBBED_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+            }) {
+                process.env_remove(name);
+            }
+        }
         process
             .arg("-C")
             .arg(directory)
             .args(command.args())
             .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat")
             .env("LC_ALL", "C")
@@ -723,6 +931,17 @@ impl GitRunner {
     }
 }
 
+/// Whether `git config` refused `--show-scope` as an unknown option, as
+/// git before 2.26 does: a usage exit (129) naming that option. Every other
+/// failure keeps status failed closed.
+fn rejects_show_scope(error: &GitRunError) -> bool {
+    matches!(
+        error,
+        GitRunError::Failed { code: Some(129), stderr }
+            if stderr.contains("unknown option") && stderr.contains("show-scope")
+    )
+}
+
 struct GitOutput {
     stdout: Vec<u8>,
 }
@@ -750,37 +969,193 @@ struct PorcelainWorktree {
     branch: Option<String>,
 }
 
+/// Every record of the local metadata read, bare and empty paths included,
+/// with each path canonicalized for comparison with the top level.
 fn parse_worktree_list(text: &str) -> Vec<PorcelainWorktree> {
-    let mut entries = Vec::new();
-    let mut current: Option<PorcelainWorktree> = None;
+    parse_worktree_records(text)
+        .into_iter()
+        .map(|(entry, _)| PorcelainWorktree {
+            path: Some(fs::canonicalize(&entry.path).unwrap_or(entry.path)),
+            branch: entry.branch,
+        })
+        .collect()
+}
 
+/// One working tree from `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Working-tree path exactly as git reported it.
+    pub path: PathBuf,
+    /// Branch name without `refs/heads/`, when one is checked out.
+    pub branch: Option<String>,
+    /// Full `HEAD` commit id, when reported.
+    pub head: Option<String>,
+    /// Whether `HEAD` is detached.
+    pub detached: bool,
+    /// Whether git reports the directory as missing (`prunable`).
+    pub missing: bool,
+}
+
+impl WorktreeEntry {
+    /// Branch name, else the first 8 characters of a detached commit id.
+    pub fn head_label(&self) -> Option<String> {
+        self.branch.clone().or_else(|| {
+            self.head
+                .as_deref()
+                .filter(|head| !head.is_empty())
+                .map(|head| head.chars().take(8).collect())
+        })
+    }
+}
+
+/// Parse `git worktree list --porcelain` into working trees in repository
+/// order (git lists the main worktree first). Pure: no path is resolved,
+/// canonicalized or opened, so it is safe for remote output. Bare entries
+/// have no working tree and are skipped.
+pub fn parse_worktree_entries(text: &str) -> Vec<WorktreeEntry> {
+    parse_worktree_records(text)
+        .into_iter()
+        .filter(|(entry, bare)| !bare && !entry.path.as_os_str().is_empty())
+        .map(|(entry, _)| entry)
+        .collect()
+}
+
+/// Every `worktree` record in order, with whether it is bare. Pure.
+fn parse_worktree_records(text: &str) -> Vec<(WorktreeEntry, bool)> {
+    let mut entries = Vec::new();
+    let mut current: Option<(WorktreeEntry, bool)> = None;
     for line in text.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            if let Some(entry) = current.take() {
-                entries.push(entry);
-            }
-            let path = PathBuf::from(path);
-            current = Some(PorcelainWorktree {
-                path: Some(fs::canonicalize(&path).unwrap_or(path)),
-                branch: None,
-            });
-        } else if let Some(branch) = line.strip_prefix("branch ") {
-            if let Some(entry) = current.as_mut() {
-                entry.branch = Some(
-                    branch
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(branch)
-                        .to_owned(),
-                );
+            entries.extend(current.take());
+            current = Some((
+                WorktreeEntry {
+                    path: PathBuf::from(path),
+                    branch: None,
+                    head: None,
+                    detached: false,
+                    missing: false,
+                },
+                false,
+            ));
+            continue;
+        }
+        let Some((entry, bare)) = current.as_mut() else {
+            continue;
+        };
+        if let Some(branch) = line.strip_prefix("branch ") {
+            entry.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_owned(),
+            );
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            entry.head = Some(head.to_owned());
+        } else if line == "detached" {
+            entry.detached = true;
+        } else if line == "bare" {
+            *bare = true;
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            entry.missing = true;
+        }
+    }
+    entries.extend(current);
+    entries
+}
+
+/// One change pill kind, in pill order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PillKind {
+    /// Unmerged paths (`Merge Changes`).
+    Conflicted,
+    /// Index changes (`Staged Changes`).
+    Staged,
+    /// Unstaged changes to tracked paths (`Changes`).
+    Modified,
+    /// Untracked paths (`Untracked`).
+    Untracked,
+}
+
+impl PillKind {
+    /// Pill text after the count.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Conflicted => "conflicted",
+            Self::Staged => "staged",
+            Self::Modified => "modified",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+/// Whole-working-tree change counts with the `Grouped changes` classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChangeCounts {
+    /// Rows of `Merge Changes`.
+    pub conflicted: usize,
+    /// Rows of `Staged Changes`.
+    pub staged: usize,
+    /// Rows of `Changes`.
+    pub modified: usize,
+    /// Rows of `Untracked`.
+    pub untracked: usize,
+}
+
+impl ChangeCounts {
+    /// Count the rows of each group of `snapshot`. Group it at the working
+    /// tree's root to cover the whole working tree.
+    pub fn from_snapshot(snapshot: &GitStatusSnapshot) -> Self {
+        let mut counts = Self::default();
+        for group in &snapshot.groups {
+            let rows = group.rows.len();
+            match group.title {
+                GROUP_MERGE => counts.conflicted += rows,
+                GROUP_STAGED => counts.staged += rows,
+                GROUP_CHANGES => counts.modified += rows,
+                GROUP_UNTRACKED => counts.untracked += rows,
+                _ => {}
             }
         }
-        // `detached`, `bare`, `HEAD`, and `prunable` lines do not change the
-        // branch or path label used by the indicator.
+        counts
     }
-    if let Some(entry) = current {
-        entries.push(entry);
+
+    /// Count porcelain records over the whole working tree (no root filter).
+    pub fn from_records(records: &[PorcelainRecord]) -> Self {
+        let root = Path::new("/");
+        Self::from_snapshot(&group_status(records, root, Some(root)))
     }
-    entries
+
+    /// Whether every count is zero.
+    pub const fn is_clean(&self) -> bool {
+        self.conflicted == 0 && self.staged == 0 && self.modified == 0 && self.untracked == 0
+    }
+
+    /// Nonzero counts in pill order.
+    pub fn nonzero(&self) -> Vec<(PillKind, usize)> {
+        [
+            (PillKind::Conflicted, self.conflicted),
+            (PillKind::Staged, self.staged),
+            (PillKind::Modified, self.modified),
+            (PillKind::Untracked, self.untracked),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect()
+    }
+
+    /// Pill texts (`N staged`) of the nonzero counts, in pill order.
+    pub fn pill_labels(&self) -> Vec<String> {
+        self.nonzero()
+            .into_iter()
+            .map(|(kind, count)| format!("{count} {}", kind.label()))
+            .collect()
+    }
+
+    /// One tooltip and accessible name for the pills, `None` when clean.
+    pub fn summary(&self) -> Option<String> {
+        let labels = self.pill_labels();
+        (!labels.is_empty()).then(|| format!("Changes: {}", labels.join(" · ")))
+    }
 }
 
 /// Kind of change used by folder dots and row color.

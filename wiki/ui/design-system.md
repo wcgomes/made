@@ -7,7 +7,7 @@ Made uses the implemented **Calm Editor** visual system: quiet dark chrome, one 
 - Depth comes from layered tonal surfaces, 1px borders, 4px window gutters, and one soft painted shadow on the Explorer glass — not gradients or glows.
 - One accent (mint green) marks the wordmark initial, primary action, focus, spinner, and splitter drag. Semantic teal/amber/red/blue mark a single status; success is a cooler teal than the accent.
 - Terminal and preview are high-contrast reading surfaces. The terminal card is glass on the primary screen and opaque in alternate-screen TUI mode; preview stays fully opaque. The header paints no band. Workspace-tab fills follow the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md). Selected-tab stroke follows the same spec. Explorer and the primary terminal card are the in-app glass surfaces.
-- Hover and selection share one borderless fill language across header icons, session tabs, Explorer rows, and picker rows. Selected-tab stroke follows the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md); selection still changes fill and text opacity.
+- Hover and selection share one borderless fill language across header icons, session tabs, Explorer rows, and Open workspace rows. Selected-tab stroke follows the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md); selection still changes fill and text opacity.
 - Workspace tabs look editor-like: a shared 16px leading icon paints the terminal glyph on shell tabs and the vendored OpenCode SVG on active OpenCode tabs, per-session dots at the tab corner show busy (pulsing `ACCENT`), attention (`WARNING`), and idle (`TEXT_TERTIARY`), and the wordmark keeps its reserved 24px wide / 18px compact gaps before the right icon group with no divider ([UI spec](../../specs/made-ui-ux.md)). The header wordmark opens About, which reveals diagnostics on demand; OpenCode sessions themselves remain an optional, visually distinct map, not workspace tabs.
 - No routine status bar, degraded banner, shell-running pill, path row, version row, empty preview, or empty session strip.
 
@@ -74,7 +74,8 @@ Tints are opaque precomposited colors, not alpha fills. The persistent alpha sur
 | Explorer header, native applied | 32/255 (`BG_HEADER_GLASS_NATIVE`) |
 | Terminal card, primary screen | 160/255 (`BG_TERMINAL_GLASS`) |
 | Terminal card, alternate screen | 255 (`BG_TERMINAL`) |
-| Preview, picker, diagnostics, tooltip, toast | 255 |
+| Open workspace card | Explorer card pair (188 fallback, 24 native); inner fields, rows, pills and buttons opaque |
+| Preview, diagnostics, tooltip, toast | 255 |
 
 The Explorer card/header fills are conditional: `BG_CARD_GLASS` 188/255 and `BG_HEADER_GLASS` 194/255 when no native backdrop is applied (off, unsupported, or failed), or `BG_CARD_GLASS_NATIVE` 24/255 and `BG_HEADER_GLASS_NATIVE` 32/255 when the status reports a macOS HudWindow or Windows 11 Acrylic effect. Both pairs use the same RGB values and keep the border, shadow, and 1px top highlight unchanged; the native pair lets the material read through, while the fallback pair preserves legibility without blur.
 
@@ -82,7 +83,7 @@ macOS arm64 1280×800 native Explorer tint was visually approved by the user on 
 
 The primary-screen terminal card paints `BG_TERMINAL_GLASS` (160/255) as its sole glass layer. Workspace tabs do not use Explorer glass. Fills follow the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md). Selected-tab stroke follows the same spec. The workspace header paints no band fill, border, shadow, or highlight and floats directly over the clear/native backdrop. `BG_CLEAR` then renders as a solid `#0A0B0E` backdrop while the rest of the UI is unchanged. The no-native clear alpha is 215/255, while the native-effect clear stays 135/255; Xvfb without a compositor cannot visually validate blending over a light desktop, so the tokens are asserted by tests.
 
-Never stack the same translucent glass fill twice. On the primary screen the terminal card owns the only glass layer in the terminal surface: the body, path line, and file slot add no second translucent fill, and the optional session strip/header stays opaque `BG_HEADER`. A card+body double composite raises effective alpha from 160/255 to ~219/255 and creates a visible seam; overlays must be opaque or absent. In alternate-screen TUI mode (`ALT_SCREEN`, used by OpenCode/vim/less) the terminal card, body, and chrome switch to opaque `BG_TERMINAL` 255/255.
+Never stack the same translucent glass fill twice. On the primary screen the terminal card owns the only glass layer in the terminal surface: the body and path line add no second translucent fill, and the optional session strip/header stays opaque `BG_HEADER`. A card+body double composite raises effective alpha from 160/255 to ~219/255 and creates a visible seam; overlays must be opaque or absent. In alternate-screen TUI mode (`ALT_SCREEN`, used by OpenCode/vim/less) the terminal card, body, and chrome switch to opaque `BG_TERMINAL` 255/255.
 
 `made-platform::native_backdrop` optionally layers an OS material behind the window:
 
@@ -114,7 +115,6 @@ The terminal grid uses egui family `Name("terminal")` (`TERMINAL_FACES`, `instal
 | Brand `MADE` | 14 / 18, tracking 1.8 | Hack |
 | Workspace/session tab, selected | 13.0 / centered | Ubuntu-Light |
 | Workspace/session tab, inactive | 12.5 / centered | Ubuntu-Light |
-| Hero (picker) | 22 / 28 | Ubuntu-Light |
 | Body | 12.5 / 18 | Ubuntu-Light |
 | Button | 12 / 16 | Ubuntu-Light |
 | Section label | 10.5 / 14, uppercase, 0.6 tracking | Ubuntu-Light |
@@ -130,7 +130,7 @@ No text below 10px. `Style.text_styles`: Small 10.0, Body 12.5, Button 12.0, Hea
 ## Spacing, radii, and motion
 
 - Base rhythm 4pt, practical spacing 8pt. Spacing scale: 2, 4, 6, 8, 10, 12, 16, 20, 24, 32.
-- Window gutter 4; terminal↔Explorer pane gap 4 (`pane_gap`; `gap` 8/6 for other spacing); workspace strip and tabs 26/24, centered in a 38/34 header band (6/5 above and below); card content top 38/34; card header 34/30; card content padding 12/10; tree row 24; workspace-tab radius 6; picker path-chip radius 4; buttons 26–28; interactive targets at least 24×24.
+- Window gutter 4; terminal↔Explorer pane gap 4 (`pane_gap`; `gap` 8/6 for other spacing); workspace strip and tabs 26/24, centered in a 38/34 header band (6/5 above and below); card content top 38/34; card header 34/30; card content padding 12/10; tree row 24 (Explorer and Open workspace); workspace-tab radius 6; buttons 26–28; interactive targets at least 24×24.
 - Global spacing: `item_spacing(8,6)`, `button_padding(10,4)`, `interact_size(28,26)`, `window_margin 14`, `indent 14`, `tooltip_width 320`, `animation_time 0.12`.
 - Header geometry: the row spans gutter..width-gutter with no extra horizontal padding; tabs start at the card/window content left edge; the wordmark sits before the right icon group with a reserved 24/18 strip-side gap and an exact 24/18 icon-side gap; the last icon’s 26/24 target, selected/hover fill, and focus ring all end exactly at the card right (`content.right`) with no gutter overhang; the 14px glyph stays centered in its target with normal optical padding. Session-map strip/tabs remain 36/34 and 28/26.
 - Floating scrollbars are overlay-only: 8px expanded bar, 3px thin thumb, 24px minimum handle, and zero allocated width. They are hidden at rest, fade in on scroll-area hover, and expand with a faint track only on bar hover or drag.
@@ -146,22 +146,20 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 |---|---|---|---|
 | Workspace tab | `BG_TAB_IDLE`; `TEXT_SECONDARY` 12.5px at 0.72 | `BG_TAB_HOVER`; primary label | `BG_TAB_SELECTED`; `TEXT_PRIMARY` 13.0px; stroke in the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md); no underline or dot |
 | Workspace tab close | hidden; 24×24 target reserved | visible at fixed 14px; no fill; `ERROR` glyph on direct X hover; parent tab uses its hover fill (selected keeps `BG_TAB_SELECTED`); “Close workspace” suppresses the parent path tooltip | n/a |
-| Open-folder `+` | tab-strip icon; tertiary at 0.80; focus ring; Enter/Space | `BG_HOVER`; primary | n/a |
+| Open workspace `+` | tab-strip icon; tertiary at 0.80; focus ring; Enter/Space | `BG_HOVER`; primary | n/a |
 | Header icon | transparent; `TEXT_TERTIARY` at 0.80 | borderless radius-6 `BG_HOVER`; primary | `BG_SELECTED`; primary; no border or accent bar |
 | Session tab | transparent; secondary at 0.72 | borderless radius-6 `BG_HOVER`; primary | `BG_SELECTED`; primary; no underline or border |
 | Explorer row | transparent | borderless radius-6 `BG_HOVER` | inset radius-6 `BG_SELECTED`; primary text; no border, accent bar, or focus outline |
-| Picker tree row | transparent | borderless radius-6 `BG_HOVER` | inset radius-6 `BG_SELECTED`; primary text; app-drawn disclosure; no border, accent bar, or focus outline |
-| Picker path chip | inset `BG_SELECTED` radius 4; primary mono 10.5; no border | no fill change | selected tree-row path, or the root when nothing is selected |
+| Open workspace folder/worktree row | transparent | borderless radius-6 `BG_HOVER` | inset radius-6 `BG_SELECTED`; primary text; thin stroked chevron; no border, accent bar, or focus outline |
 | Explorer splitter | paints nothing; 6 px hit area centered on the 4 px gap | filled, fully rounded 2×32 capsule fades in at partial-opacity `BORDER_CONTROL` over 0.14 s | drag: same capsule in restrained `ACCENT` |
-| Picker secondary action | borderless `BG_ELEVATED` | borderless `BG_HOVER` | borderless `BG_SELECTED` |
+| Open workspace launch button | borderless `BG_SELECTED`; secondary label | `ACCENT_TINT`; primary label | pressed `BG_HOVER`; all buttons share this style, no accent fill |
 | Primary action | `ACCENT` | `ACCENT_HOVER` | `ACCENT_PRESSED` |
 
-- Focus is a 2px surface-colored gap plus 2px `FOCUS` outside ring; inside clipped scroll areas use a 1.5px inside ring. Never rely on fill change alone. Deliberate exception: Explorer tree rows/container and picker rows paint no focus ring; their focus/selection is the inset `BG_SELECTED` fill plus primary text. Picker card/buttons and all other controls keep their rings; the workspace-tab close uses an inside ring.
+- Focus is a 2px surface-colored gap plus 2px `FOCUS` outside ring; inside clipped scroll areas use a 1.5px inside ring. Never rely on fill change alone. Deliberate exception: Explorer tree rows/container and Open workspace folder/worktree rows paint no focus ring; their focus/selection is the inset `BG_SELECTED` fill plus primary text. All other controls keep their rings; the workspace-tab close uses an inside ring.
 - Keyboard focus entering the Explorer with no prior selection selects the first visible row without opening a preview.
 - Selected-tab stroke follows the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md). There is no underline, dot, or width animation. The selected tab is `BG_TAB_SELECTED` at 13px primary; hover is `BG_TAB_HOVER` at 12.5px primary; idle stays `BG_TAB_IDLE` with reduced-opacity secondary text.
 - Explorer file and directory rows show full-color Material Icon Theme icons in the existing 16px slot; folders use the theme's closed and expanded variants with a brighter expanded label, and file icons follow the theme mapping. Symlink, other/special, and error rows keep `@`, `?`, and `!`. Row height, inset, radius, text start at 28px plus 14px per depth, fills, label colors, and the icon/label optical center are unchanged, with no border, accent side bar, or extra expansion fill. The authoritative change is [`explorer-file-icons`](../../specs/explorer-file-icons.md).
-- The picker is an inline expandable tree rooted at the start directory. Root children are depth 0; expanding inserts children below the parent and keeps ancestors visible; collapsing removes only the subtree. There is one flattened selected row, 32px high with 4px inset, radius 6, 14px depth, and app-drawn disclosure triangles.
-- Picker keyboard: Up/Down selects visible rows; Right expands or selects the first child; Left collapses or selects the parent; Enter toggles expansion; Cmd/Ctrl+Enter confirms; Backspace or Up re-roots to the parent and clears expansion/selection. Refresh preserves valid expansion/selection, each directory keeps the 1000-entry cap, and an unreadable child stays collapsed with an error. Minimal scrolling reveals the selected row and its visible ancestors without centering.
+- The Open workspace folder tree keeps the former picker's tree and keyboard model (`Open Workspace Folder Navigation` in the [UI spec](../../specs/made-ui-ux.md)); layout is in [Layout and controls](layout-and-controls.md#open-workspace-screen).
 - Scrollbars are hidden at rest. The floating overlay fades in as a thumb over about 120–160 ms when the scroll area is hovered, expands and strengthens on bar hover/drag with a faint track only then, and fades out on leave. They allocate zero width and never shift layout. The custom terminal scrollback bar matches this behavior: full 8px hit area, thumb only on pane hover, and a track only on bar hover/drag.
 - Status uses shape + text + color: busy spinner, attention `!`, unread number, renaming `*`, tree error `!`, and shell state text. Success is a cooler teal than the mint accent, and no status relies on hue alone.
 - Git status colors reuse existing tokens. Letters and folder-dot colors are in the [UI spec](../../specs/made-ui-ux.md), painted by `change_kind_color` and `folder_mark_color` in [`explorer_view.rs`](../../crates/made-app/src/explorer_view.rs).
@@ -172,9 +170,9 @@ Key opaque-surface ratios: primary/card 14.21:1; secondary/card 9.73:1; tertiary
 
 - Theme install runs once per egui context behind `theme_ready`; headless UI tests use the same path.
 - `paint_glass_card` and `paint_glass_card_header` paint the Explorer alpha/shadow/highlight treatment. Workspace tabs paint `BG_TAB_IDLE`, `BG_TAB_HOVER`, or `BG_TAB_SELECTED`. Selected-tab stroke follows the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md). `wordmark_galley` lays out through egui's galley cache. Never cache a galley across frames outside egui: in egui 0.37 the font atlas is rebuilt when `text_options` change or the atlas passes ~80% full, and only egui's own galley cache is invalidated, so a manually cached galley keeps stale UVs and renders garbled glyphs.
-- `paint_disclosure` now serves only the picker; Explorer rows paint the resolved icon texture instead; `BG_TAB_IDLE` supplies the idle workspace-tab fill. close visibility is state-driven at a fixed glyph size (no scale), and `splitter_opacity` drives the supplementary splitter fade.
+- `paint_disclosure` (a thin stroked chevron) now serves only the Open workspace tree; Explorer rows paint the resolved icon texture instead; `BG_TAB_IDLE` supplies the idle workspace-tab fill. close visibility is state-driven at a fixed glyph size (no scale), and `splitter_opacity` drives the supplementary splitter fade.
 - Explorer icons are vendored from Material Icon Theme v5.40.0 under `crates/made-app/assets/material-icons/`, embedded at build time by `crates/made-app/build.rs`, and refreshed only by replacing the complete pinned set and updating the vendored README and counts.
-- `scroll_style` installs floating overlay scrollbars with dormant track/thumb opacity 0 and zero allocated width; the terminal paints its own matching scrollback bar. `wordmark_galley` and the brand-gap layout place the wordmark 24px (18 compact) before the right icon group without a divider; `wordmark_about_action` turns the header wordmark into the About trigger, `wordmark_brand` paints the non-interactive About brand, and the picker keeps the brand-only `wordmark`.
+- `scroll_style` installs floating overlay scrollbars with dormant track/thumb opacity 0 and zero allocated width; the terminal paints its own matching scrollback bar. `wordmark_galley` and the brand-gap layout place the wordmark 24px (18 compact) before the right icon group without a divider; `wordmark_about_action` turns the header wordmark into the About trigger, `wordmark_brand` paints the non-interactive About brand, and the Open workspace card keeps the brand-only `wordmark`.
 - Root frame has margin but no fill, otherwise the translucent backdrop is hidden.
 - Terminal card border is overpainted after content so the inset body fill cannot cover it; the body is transparent on the primary screen and opaque `BG_TERMINAL` on the alternate screen.
 - `native_options.clipboard_shortcuts = false` so terminal copy/paste semantics are not consumed by egui-winit.

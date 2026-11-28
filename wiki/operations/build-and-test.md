@@ -25,10 +25,10 @@ cargo run -p made-app -- /path/to/workspace
 # No argument: platform-resolved home workspace
 cargo run -p made-app
 
-# Explicit folder picker
+# Open workspace screen (--picker)
 cargo run -p made-app -- --picker
 
-# Pickers and explicit paths: explicit path wins
+# --picker with an explicit path: explicit path wins
 cargo run -p made-app -- --workspace /path/to/workspace --picker
 
 # CI-style smoke: create window, pump frames, print marker, exit
@@ -38,7 +38,7 @@ cargo run -p made-app -- --smoke-test
 cargo run -p made-app -- --smoke-test 2500 /path/to/workspace
 ```
 
-`--smoke-test` without a workspace stays on the picker surface and starts no workbench. With a workspace it starts the real workbench and can read real app paths/config; isolate user state for developer smoke:
+`--smoke-test` without a workspace stays on the Open workspace surface and starts no workbench. With a workspace it starts the real workbench and can read real app paths/config; isolate user state for developer smoke:
 
 ```bash
 root="$(mktemp -d)"
@@ -107,6 +107,19 @@ On Windows the binaries end in `.exe`. Run `dist/stage/made-app` from a normal t
 When an agent must launch the GUI from its Bash tool for a visual check, unset every `CLAUDE*`/`CLAUDECODE` variable and start the binary in its own session, for example `nohup env -u <each CLAUDE* var> /usr/bin/python3 -I -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' target/debug/made-app > <log> 2>&1 < /dev/null & disown`. Plain `nohup … & disown` leaves the app in the tool shell's process group, so it later exits; macOS has no `setsid` command.
 
 A terminal launch inherits the shell's `PATH` and does not reproduce a macOS Finder/Dock launch (see [macOS GUI launch PATH](../runtime/terminal-first.md#macos-gui-launch-path)). Reproduce one by opening the installed app, or with `env -i HOME="$HOME" SHELL="$SHELL" PATH=/usr/bin:/bin:/usr/sbin:/sbin <binary>`.
+
+## Test SSH locally with a CI-built companion
+
+A local release build has no `remote/` stage, so SSH browsing and launches fail with a missing companion. To test against a real server without building the Linux companion yourself:
+
+- Download the `ssh-companion-<triple>` artifact from a CI run ([`ci-artifacts.yml`](../../.github/workflows/ci-artifacts.yml)) and put its 14 files in `target/release/remote/<triple>/` (the lookup is `remote/<target>/` beside the executable, in [`ssh_servers.rs`](../../crates/made-app/src/ssh_servers.rs)).
+- Build the helpers next to `target/release/made-app`: `cargo build --release -p made-platform --bin made-askpass --bin made-open --no-default-features --locked`.
+- The client does not version-check the companion beyond `APP_VERSION`, so an artifact from a different commit of the same version is accepted; use one from the commit under test.
+- Avoid `cargo clean`: it deletes the staged companion and helpers.
+
+## Offscreen visual checks
+
+On macOS an agent session usually lacks screen-capture permission. Render a frame offscreen instead: run the egui frame, apply the output `textures_delta` to a CPU texture store, call `ctx.tessellate`, and rasterize the meshes on the CPU to a PNG. Without a native backdrop the fallback glass renders opaque, so such captures prove layout and tokens, not vibrancy; native-backdrop visuals still need a real window.
 
 ## Environment switches
 

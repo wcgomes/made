@@ -88,12 +88,6 @@ pub(crate) fn workspace_claude_branded(opencode: bool, present: bool) -> bool {
     !opencode && present
 }
 
-/// Official Claude mark from `assets/claude-code.svg`, outside the Material
-/// icon inventory. The Material `claude.svg` file icon is not this mark.
-pub(crate) fn mark() -> Mark {
-    DESCRIPTOR.mark
-}
-
 /// Claude Code state of a workbench's tab: presence, dots and title inputs.
 /// `None` for tabs that do not load Made's Claude Code plugin.
 #[doc(hidden)]

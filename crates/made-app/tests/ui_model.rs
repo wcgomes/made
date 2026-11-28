@@ -18,10 +18,9 @@ use made_app::integrations::grok::{self, GrokDiagnosticsHold, GrokRunningHold};
 use made_app::integrations::{IntegrationRef, CLAUDE_CODE, GROK, OPENCODE};
 use made_app::ui::{
     about_diagnostics_toggle_id, diagnostics_copy_id, diagnostics_previous_log_copy_id,
-    diagnostics_previous_log_path_id, explorer_splitter_id, left_surface_action_id,
-    new_tab_menu_item_id, picker_control_id, picker_current_target, picker_list_id, picker_path_id,
-    ssh_field_id, ssh_server_row_id, ssh_servers_window_id, top_action_id, top_workspace_action_id,
-    workspace_tab_close_id, workspace_tab_id,
+    diagnostics_previous_log_path_id, explorer_splitter_id, picker_control_id,
+    picker_current_target, picker_list_id, picker_path_id, ssh_field_id, top_action_id,
+    top_workspace_action_id, workspace_tab_close_id, workspace_tab_id,
 };
 use made_app::workbench::LeftSurface;
 use made_app::workspace::{
@@ -32,6 +31,23 @@ use made_app::{TerminalTarget, Workbench};
 use made_platform::native_backdrop::{NativeBackdropKind, NativeBackdropStatus};
 use serde_json::{json, Value};
 use tungstenite::{Message, WebSocket};
+
+/// The Open workspace launch button for `terminal` or a catalog TUI's menu
+/// item id.
+fn launch_item(key: &str) -> egui::Id {
+    use made_app::open_workspace::LaunchKind;
+    let kind = if key == "terminal" {
+        LaunchKind::Terminal
+    } else {
+        LaunchKind::Tui(
+            *made_app::integrations::PRODUCT
+                .iter()
+                .find(|tui| tui.descriptor().menu_item_id == key)
+                .expect("catalog entry"),
+        )
+    };
+    made_app::ui::launch_button_id(kind)
+}
 
 fn raw_input() -> egui::RawInput {
     egui::RawInput {
@@ -132,7 +148,6 @@ fn headless_ui_installs_the_calm_theme_and_transparency_request() {
         made_app::native_options().viewport.transparent,
         Some(made_app::theme::TRANSLUCENT_WINDOW)
     );
-    assert_eq!(made_app::ui::picker_primary_label(), "Use current folder");
     model.shutdown();
 }
 
@@ -207,7 +222,7 @@ fn picker_selection_transitions_to_workspace_surfaces_without_a_display() {
 }
 
 #[test]
-fn confirming_the_current_picker_folder_selects_both_surfaces() {
+fn launching_a_terminal_in_the_picker_folder_selects_both_surfaces() {
     let temp = tempfile::tempdir().unwrap();
     let picker = WorkspacePicker::new(temp.path()).unwrap();
     let launch = WorkspaceLaunch::Picker {
@@ -216,7 +231,9 @@ fn confirming_the_current_picker_folder_selects_both_surfaces() {
     };
     let mut model = AppModel::from_launch(launch, AppOptions::new());
 
-    model.confirm_picker().expect("confirm current folder");
+    model
+        .begin_terminal_workspace_in(temp.path())
+        .expect("terminal in the current folder");
     assert_eq!(model.surfaces(), Surfaces::full());
     assert!(model.start_pending());
     let expected = fs::canonicalize(temp.path()).unwrap();
@@ -1529,10 +1546,6 @@ fn fixture_workspace(temp: &Path, name: &str, file: &str) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
-fn authority_hex(id: made_remote::protocol::AuthorityId) -> String {
-    id.0.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn text_in_rect(output: &egui::FullOutput, rect: egui::Rect) -> String {
     fn visit(shape: &egui::Shape, rect: egui::Rect, text: &mut String) {
         match shape {
@@ -1597,18 +1610,6 @@ fn add_ssh_inventory(
         .collect()
 }
 
-fn wheel_over(headless: &mut Headless, position: egui::Pos2, delta: egui::Vec2) {
-    headless.render_events(vec![egui::Event::PointerMoved(position)]);
-    headless.render_events(vec![egui::Event::MouseWheel {
-        unit: egui::MouseWheelUnit::Point,
-        delta,
-        phase: egui::TouchPhase::Move,
-        source: egui::MouseWheelSource::Unknown,
-        modifiers: egui::Modifiers::NONE,
-    }]);
-    headless.advance(0.6);
-}
-
 #[test]
 fn quiet_workspace_chrome_has_no_default_technical_status() {
     if isolated("quiet_workspace_chrome_has_no_default_technical_status") {
@@ -1630,7 +1631,7 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
     }
     for forbidden in [
         "No active session",
-        "No open sessions",
+        "No OpenCode sessions",
         "waiting",
         "degraded",
         "running",
@@ -1640,6 +1641,8 @@ fn quiet_workspace_chrome_has_no_default_technical_status() {
         "Select a file",
         "TERMINAL",
         "Open folder",
+        "Open workspace",
+        "Servidores SSH",
         "Explorer",
         "Diagnostics",
         "Wider",
@@ -2149,6 +2152,20 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         tab_session_dots(&busy_output, beta_tab).is_empty(),
         "a plain shell workspace must stay free of OpenCode session dots"
     );
+    // The label, tooltip and accessible name carry the active session title.
+    let summary = made_app::ui::workspace_tab_summaries(&headless.model)
+        .into_iter()
+        .find(|tab| tab.id == alpha_id)
+        .unwrap();
+    assert_eq!(summary.label, "Session 0");
+    assert_eq!(
+        summary.tooltip.as_deref(),
+        Some("Session 0 — Sessions: 1 running, 1 idle")
+    );
+    assert_eq!(
+        summary.accessible_name,
+        "OpenCode — Session 0 — Sessions: 1 running, 1 idle"
+    );
 
     let opencode_icon = icon_named("opencode.svg");
     let icon_image = painted_images(&busy_output)
@@ -2169,10 +2186,10 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         egui::Color32::WHITE,
         "the tab icon keeps the shipped SVG colors"
     );
-    let alpha_label = text_rects(&busy_output, "OpenCode", 55.0)
+    let alpha_label = text_rects(&busy_output, "Session 0", 55.0)
         .into_iter()
         .find(|rect| alpha_tab.contains_rect(*rect))
-        .expect("the OpenCode label must be painted");
+        .expect("the active OpenCode session title must be the label");
     assert!(
         icon_image.rect.right() < alpha_label.left(),
         "the OpenCode icon must precede the label: {:?} vs {:?}",
@@ -2262,17 +2279,17 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the close target must stay centered at right - 13: target {close_target:?}, tab {alpha_tab:?}"
     );
     assert!(
-        (alpha_tab.width() - 135.6).abs() < 0.75,
-        "two dots on the OpenCode label must keep the base width: {alpha_tab:?}"
+        (alpha_tab.width() - 141.8).abs() < 0.75,
+        "two dots on the session-title label must keep the base width: {alpha_tab:?}"
     );
     assert!(
-        (initial_alpha_tab.width() - 238.0).abs() < 0.75,
+        (initial_alpha_tab.width() - 280.0).abs() < 0.75,
         "the disconnected folder tab must keep its long-label clamp: {initial_alpha_tab:?}"
     );
     // Usable label area ends 26px (close slot) + 14px (right-edge allowance) from the right.
     let label_area = alpha_tab.right() - 40.0 - alpha_label.left();
     assert!(
-        (label_area - 63.6).abs() < 0.75,
+        (label_area - 69.8).abs() < 0.75,
         "the OpenCode label must keep its base text area: {label_area} (tab {alpha_tab:?}, label {alpha_label:?})"
     );
     assert!(
@@ -2579,10 +2596,10 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the ninth attention session must stay out of the eight-dot row"
     );
     assert!(
-        (alpha_tab.width() - 166.6).abs() < 0.75,
-        "eight dots must grow the OpenCode tab to exactly 166.6px: {alpha_tab:?}"
+        (alpha_tab.width() - 172.8).abs() < 0.75,
+        "eight dots must grow the OpenCode tab to exactly 172.8px: {alpha_tab:?}"
     );
-    let many_label = text_rects(&many_output, "OpenCode", 55.0)
+    let many_label = text_rects(&many_output, "Session 0", 55.0)
         .into_iter()
         .find(|rect| alpha_tab.contains_rect(*rect))
         .expect("the capped-dot tab must keep its label");
@@ -2670,7 +2687,7 @@ fn workspace_tab_opencode_activity_updates_live_for_background_workspaces() {
         "the disconnected tab must revert to its folder label"
     );
     assert!(
-        (alpha_tab.width() - 238.0).abs() < 0.75,
+        (alpha_tab.width() - 280.0).abs() < 0.75,
         "the reverted folder label must restore the long-label width: {alpha_tab:?}"
     );
     headless.hover_until_text(workspace_tab_id(alpha_id), &alpha_path);
@@ -3520,11 +3537,11 @@ fn icon_only_header_actions_expose_tooltips_and_visible_focus() {
         "the header must not render a Diagnostics icon"
     );
     let open_folder_rect = headless.response(top_action_id("open-folder")).rect;
-    let hovered_output = headless.hover_until_text(top_action_id("open-folder"), "Open folder");
+    let hovered_output = headless.hover_until_text(top_action_id("open-folder"), "Open workspace");
     let hovered = output_text(&hovered_output);
     assert!(
-        hovered.contains("Open folder"),
-        "Open folder tooltip missing: {hovered}"
+        hovered.contains("Open workspace"),
+        "Open workspace tooltip missing: {hovered}"
     );
     assert!(
         rects_with_fill(&hovered_output, made_app::theme::BG_HOVER)
@@ -3789,7 +3806,13 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         let first_tab = headless.response(workspace_tab_id(alpha_id)).rect;
         let last_tab = headless.response(workspace_tab_id(beta_id)).rect;
         let plus = headless.response(top_action_id("open-folder")).rect;
-        let ssh = headless.response(top_action_id("ssh-servers")).rect;
+        assert!(
+            headless
+                .ctx
+                .read_response(top_action_id("ssh-servers"))
+                .is_none(),
+            "{width}px: no Servidores SSH header action"
+        );
         let explorer = headless
             .response(top_workspace_action_id(beta_id, "explorer"))
             .rect;
@@ -3863,7 +3886,6 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
             ("plus", plus),
             ("wordmark target", wordmark),
             ("wordmark ink", wordmark_ink),
-            ("ssh", ssh),
             ("explorer", explorer),
             ("explorer glyph", explorer_glyph),
         ] {
@@ -3903,28 +3925,23 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         );
         assert!(
             plus.left() >= last_tab.right() - 0.5 && plus.left() - last_tab.right() <= 8.0,
-            "{width}px: Open folder plus must sit immediately after the last tab: tab {last_tab:?}, plus {plus:?}"
+            "{width}px: Open workspace plus must sit immediately after the last tab: tab {last_tab:?}, plus {plus:?}"
         );
         assert!(
             wordmark.left() - plus.right() >= gap - 0.75,
             "{width}px: tab strip must leave a {gap}px gap before the wordmark: plus {plus:?}, wordmark {wordmark:?}"
         );
-        let control_gap = if layout.compact { 4.0 } else { 6.0 };
         assert!(
-            (ssh.left() - wordmark.right() - gap).abs() < 0.75,
-            "{width}px: wordmark-to-first-icon gap must be {gap}px: wordmark {wordmark:?}, ssh {ssh:?}"
+            (explorer.left() - wordmark.right() - gap).abs() < 0.75,
+            "{width}px: wordmark-to-first-icon gap must be {gap}px: wordmark {wordmark:?}, explorer {explorer:?}"
         );
         assert!(
-            (explorer.left() - ssh.right() - control_gap).abs() < 1.0,
-            "{width}px: Servidores SSH must sit immediately left of Explorer: ssh {ssh:?}, explorer {explorer:?}"
-        );
-        assert!(
-            explorer.right() > ssh.right() && explorer.right() > wordmark.right(),
-            "{width}px: Explorer toggle must be rightmost: wordmark {wordmark:?}, ssh {ssh:?}, explorer {explorer:?}"
+            explorer.right() > wordmark.right(),
+            "{width}px: Explorer toggle must be rightmost: wordmark {wordmark:?}, explorer {explorer:?}"
         );
         assert!(
             plus.width() >= 24.0 && plus.height() >= 24.0,
-            "{width}px: Open folder target below 24px: {plus:?}"
+            "{width}px: Open workspace target below 24px: {plus:?}"
         );
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
         for (name, rect) in [
@@ -4020,23 +4037,9 @@ fn header_places_tabs_left_and_wordmark_before_icons() {
         headless.focus(top_action_id("open-folder"));
         headless.press_key(egui::Key::Enter);
         headless.render();
-        // Enter already opened the picker when nothing else is offered. Do not
-        // send the menu chord into that picker: ArrowDown/Enter would navigate
-        // the folder list, not a terminal row that was never shown.
-        let menu_open = !headless.model.is_picker()
-            && headless
-                .ctx
-                .read_response(new_tab_menu_item_id("terminal"))
-                .is_some();
-        if menu_open {
-            headless.press_key(egui::Key::ArrowDown);
-            headless.render();
-            headless.press_key(egui::Key::Enter);
-            headless.render();
-        }
         assert!(
             headless.model.is_picker(),
-            "{width}px: + must open the picker directly when nothing else is offered, or via Terminal when a menu is open"
+            "{width}px: + must open the Open workspace screen directly"
         );
         let terminal = headless
             .model
@@ -4077,7 +4080,12 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
     let plus = headless.response(top_action_id("open-folder")).rect;
     let overflow = headless.response(top_action_id("workspace-overflow")).rect;
     let wordmark = headless.response(made_app::theme::wordmark_id()).rect;
-    let ssh = headless.response(top_action_id("ssh-servers")).rect;
+    let explorer = headless
+        .response(top_workspace_action_id(
+            headless.model.active_workspace_id().unwrap(),
+            "explorer",
+        ))
+        .rect;
     let layout = made_app::theme::Layout::for_window(720.0, 480.0);
     let gap = made_app::theme::wordmark_gap(true);
     let active = headless
@@ -4131,7 +4139,11 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
     );
     let compact = made_app::theme::Layout::for_window(720.0, 480.0);
     let strip_center = compact.header_top() + compact.top_height / 2.0;
-    for (name, rect) in [("plus", plus), ("overflow", overflow), ("ssh", ssh)] {
+    for (name, rect) in [
+        ("plus", plus),
+        ("overflow", overflow),
+        ("explorer", explorer),
+    ] {
         assert!(
             rect.width() >= 24.0 && rect.height() >= 24.0,
             "{name} target below 24px or clipped: {rect:?}"
@@ -4144,7 +4156,7 @@ fn header_plus_precedes_overflow_and_both_stay_reachable() {
     for (name, rect) in [
         ("plus", plus),
         ("overflow", overflow),
-        ("ssh", ssh),
+        ("explorer", explorer),
         ("wordmark", wordmark),
     ] {
         assert!(
@@ -4324,19 +4336,10 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
     assert_eq!(headless.model.active_workspace_id(), Some(alpha_id));
 
     headless.click(top_action_id("open-folder"));
-    // No local TUI and no saved server: + opens the picker and does not draw
-    // a Terminal item. When a menu is open, Terminal is still that choice.
-    if headless
-        .ctx
-        .read_response(new_tab_menu_item_id("terminal"))
-        .is_some()
-    {
-        headless.click(new_tab_menu_item_id("terminal"));
-    }
     assert!(headless.model.is_picker());
     assert_eq!(headless.model.workspace_count(), 1);
     let picker_text = output_text(&headless.render());
-    assert!(picker_text.contains("Open a workspace"));
+    assert!(picker_text.contains("Open workspace"));
 
     assert!(headless.model.cancel_picker());
     assert_eq!(headless.model.active_workspace_id(), Some(alpha_id));
@@ -4346,7 +4349,7 @@ fn workspace_strip_creates_switches_and_closes_tabs_to_picker() {
     assert_eq!(headless.model.workspace_count(), 0);
     assert!(headless.model.workbench().is_none());
     let final_text = output_text(&headless.render());
-    assert!(final_text.contains("Open a workspace"));
+    assert!(final_text.contains("Open workspace"));
 }
 
 #[cfg(unix)]
@@ -4381,48 +4384,6 @@ fn background_tui_detection_adopts_the_isolated_opencode() {
     assert!(
         detected == [OPENCODE] || detected == [OPENCODE, GROK],
         "the background worker must adopt catalog order from the isolated PATH: {detected:?}"
-    );
-}
-
-#[test]
-fn header_plus_without_a_detected_tui_opens_the_folder_picker() {
-    if isolated("header_plus_without_a_detected_tui_opens_the_folder_picker") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "fallback", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-    headless.pump_until(|model| {
-        model
-            .workspace(id)
-            .and_then(Workbench::terminal)
-            .is_some_and(made_app::TerminalPane::is_running)
-    });
-
-    headless.click(top_action_id("open-folder"));
-    assert!(
-        headless.model.is_picker(),
-        "without a local TUI and without a saved SSH server the + opens the picker"
-    );
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("terminal"))
-        .is_none());
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(headless.model.workspace(id).is_some());
-    assert!(
-        headless
-            .model
-            .workspace(id)
-            .and_then(Workbench::terminal)
-            .is_some_and(made_app::TerminalPane::is_running),
-        "opening the picker must leave the local terminal running"
     );
 }
 
@@ -4523,27 +4484,38 @@ fn ssh_header_registration_and_remote_tab_keep_local_work() {
     assert!(!text.contains("SSH connected"), "{text}");
     assert!(!text.contains("integration unknown"), "{text}");
     assert!(text.contains("readme.txt"), "{text}");
-    let ssh = headless.response(top_action_id("ssh-servers"));
-    assert!(ssh.rect.width() >= 24.0 && ssh.rect.height() >= 24.0);
-    let explorer = headless
-        .response(top_workspace_action_id(remote_id, "explorer"))
-        .rect;
     assert!(
-        ssh.rect.right() <= explorer.left() && explorer.right() > ssh.rect.right(),
-        "Servidores SSH must sit beside Explorer: {:?} {explorer:?}",
-        ssh.rect
+        headless
+            .ctx
+            .read_response(top_action_id("ssh-servers"))
+            .is_none(),
+        "no Servidores SSH header action"
     );
-    let hovered =
-        output_text(&headless.hover_until_text(top_action_id("ssh-servers"), "Servidores SSH"));
-    assert!(hovered.contains("Servidores SSH"), "{hovered}");
     headless.click(top_action_id("open-folder"));
-    let menu = output_text(&headless.render());
-    assert!(menu.contains("Terminal"), "{menu}");
-    assert!(menu.contains("Terminal SSH"), "{menu}");
     assert!(
-        !menu.contains("OpenCode SSH"),
-        "OpenCode SSH must wait for this server's detection: {menu}"
+        headless.model.is_picker(),
+        "+ opens the Open workspace screen"
     );
+    let screen = output_text(&headless.render());
+    assert!(screen.contains("Development"), "{screen}");
+    assert!(screen.contains("server-a:22"), "{screen}");
+    assert_eq!(
+        headless.model.open_workspace().unwrap().selected_host(),
+        made_app::open_workspace::HostId::Ssh(id),
+        "the screen opens on the active tab's host"
+    );
+    let buttons = headless.model.open_workspace().unwrap().launch_buttons();
+    assert_eq!(
+        buttons
+            .iter()
+            .map(|button| button.kind.label())
+            .collect::<Vec<_>>(),
+        vec!["Terminal"],
+        "OpenCode SSH must wait for this server's detection"
+    );
+    assert!(buttons.iter().all(|button| !button.enabled));
+    assert!(headless.model.workspace(local_id).is_some());
+    assert!(headless.model.workspace(remote_id).is_some());
 }
 
 #[test]
@@ -4593,10 +4565,20 @@ fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
     let initial_output = headless.render();
     let initial_tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&initial_output, name, 55.0)
+        text_rects(&initial_output, "project", 55.0)
             .iter()
             .any(|rect| initial_tab.contains_rect(*rect)),
-        "a remote shell tab without OpenCode keeps the server-name label"
+        "a remote shell tab without OpenCode is named after its remote cwd"
+    );
+    let summary = made_app::ui::workspace_tab_summaries(&headless.model)
+        .into_iter()
+        .find(|tab| tab.id == remote_id)
+        .unwrap();
+    assert_eq!(summary.label, "project");
+    assert_eq!(
+        summary.tooltip.as_deref(),
+        Some("SSH: remote-opencode-parity (remote-opencode-parity)\n/project"),
+        "an SSH shell tab's tooltip names the host, then the full remote path"
     );
     assert!(
         tab_session_dots(&initial_output, initial_tab).is_empty(),
@@ -4661,13 +4643,13 @@ fn remote_opencode_tab_shows_local_label_icon_and_session_dots() {
     let output = headless.render_events_at(Vec::new(), headless.last_time + 0.5);
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Busy", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "a connected remote OpenCode tab must be labeled OpenCode"
+        "a connected remote OpenCode tab is labeled with its active session title"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the tab label while the integration is connected"
@@ -4812,7 +4794,7 @@ fn remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "the tab returns to the server-name presentation after the remote OpenCode exits"
@@ -4864,7 +4846,7 @@ fn remote_opencode_direct_launch_keeps_branding_until_exit_or_disconnect() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "the tab returns to the server-name presentation after the transport disconnects"
@@ -4958,7 +4940,7 @@ fn remote_grok_tab_shows_grok_build_branding_and_dots() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "a remote shell tab stays on the server name until a Grok session opens"
@@ -4989,7 +4971,7 @@ fn remote_grok_tab_shows_grok_build_branding_and_dots() {
         "an owned remote Grok session must brand the shell tab Grok Build"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the label while a Grok session is open"
@@ -5156,7 +5138,7 @@ fn remote_grok_direct_launch_brands_before_a_session_and_exits() {
         "a directly launched remote grok must be labeled Grok Build before any session"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .all(|rect| !tab.contains_rect(*rect)),
         "the server name must not be the label while the remote grok process runs"
@@ -5208,7 +5190,7 @@ fn remote_grok_direct_launch_brands_before_a_session_and_exits() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "an exited remote grok with no sessions restores the server-name label"
@@ -5425,7 +5407,7 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
         "an exited remote grok with no open sessions restores the server-name label"
@@ -5480,10 +5462,10 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
         "stale-epoch Grok state must not repaint dots"
     );
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "discarded stale state keeps the server-name presentation"
+        "discarded stale state keeps the remote cwd presentation"
     );
 
     // A transport disconnect clears Grok activity without touching the
@@ -5514,10 +5496,10 @@ fn remote_grok_exit_disconnect_and_opencode_precedence() {
     let output = headless.render();
     let tab = headless.response(workspace_tab_id(remote_id)).rect;
     assert!(
-        text_rects(&output, name, 55.0)
+        text_rects(&output, "project", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "the disconnect restores the server-name presentation"
+        "the disconnect restores the remote cwd presentation"
     );
     assert!(
         tab_session_dots(&output, tab).is_empty(),
@@ -5769,61 +5751,6 @@ fn ssh_prompt_hidden_passes_repaint_regains_focus_and_dismissal_is_stable() {
         .unwrap()
         .submit_remote_auth(true);
     assert_terminal_takes_each_frame_input(&mut headless, local_id);
-}
-
-#[test]
-fn ssh_prompt_repaint_keeps_another_live_field_focused() {
-    if isolated("ssh_prompt_repaint_keeps_another_live_field_focused") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let (mut headless, local_id, remote_id) =
-        local_and_remote_headless(temp.path(), "ssh-hold-other-field");
-    let prompt = ssh_field_id("prompt");
-    let name = ssh_field_id("name");
-
-    assert!(headless
-        .model
-        .workspace_mut(remote_id)
-        .unwrap()
-        .present_remote_prompt("user@server's password:"));
-    for _ in 0..2 {
-        headless.render();
-    }
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(prompt),
-        "the first prompt paint must focus its secret field"
-    );
-
-    headless.click(workspace_tab_id(local_id));
-    for _ in 0..3 {
-        headless.render();
-    }
-    assert!(headless.ctx.read_response(prompt).is_none());
-
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.click(name);
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(name),
-        "the SSH servers field must own focus before the prompt repaints"
-    );
-
-    headless.click(workspace_tab_id(remote_id));
-    for _ in 0..3 {
-        headless.render();
-        assert_eq!(
-            headless.ctx.memory(|memory| memory.focused()),
-            Some(name),
-            "a repainted prompt must not steal focus from another live SSH field"
-        );
-    }
-    assert!(
-        headless.ctx.read_response(prompt).is_some(),
-        "the live prompt must actually repaint while the other field stays focused"
-    );
 }
 
 fn assert_terminal_takes_each_frame_input(headless: &mut Headless, id: WorkspaceId) {
@@ -6089,395 +6016,6 @@ fn same_version_update_card_is_actionable_and_explorer_is_bounded() {
 }
 
 #[test]
-fn header_plus_menu_lists_terminal_before_detected_tuis() {
-    if isolated("header_plus_menu_lists_terminal_before_detected_tuis") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "menu", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
-        style.interaction.tooltip_delay = 0.0
-    });
-    let hovered =
-        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
-    assert!(
-        hovered.contains("Open folder"),
-        "Open folder tooltip missing while a TUI is detected: {hovered}"
-    );
-
-    headless.click(top_action_id("open-folder"));
-    let output = headless.render();
-    let terminal = headless.response(new_tab_menu_item_id("terminal"));
-    let opencode = headless.response(new_tab_menu_item_id("opencode"));
-    assert!(
-        terminal.rect.top() < opencode.rect.top(),
-        "Terminal must be the first menu item"
-    );
-    assert!(
-        terminal.rect.width() >= 24.0 && terminal.rect.height() >= 24.0,
-        "menu targets must stay at least 24x24: {:?}",
-        terminal.rect
-    );
-    let text = output_text(&output);
-    assert!(text.contains("Terminal"), "missing Terminal item: {text}");
-    assert!(text.contains("OpenCode"), "missing OpenCode item: {text}");
-    assert!(!headless.model.is_picker());
-    assert_eq!(headless.model.workspace_count(), 1);
-}
-
-#[test]
-fn new_tab_menu_terminal_item_runs_the_add_workspace_flow() {
-    if isolated("new_tab_menu_terminal_item_runs_the_add_workspace_flow") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "terminal-menu", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("terminal"));
-    assert!(headless.model.is_picker());
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(headless.model.workspace(id).is_some());
-}
-
-#[test]
-fn new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one() {
-    if isolated("new_tab_menu_opencode_starts_a_home_tab_without_stopping_the_current_one") {
-        return;
-    }
-    use made_platform::Platform;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-    let home = made_platform::host_platform()
-        .home_dir()
-        .expect("test home")
-        .canonicalize()
-        .expect("canonical test home");
-
-    headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("opencode"));
-
-    assert_eq!(headless.model.active_workspace_id(), Some(id));
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(
-        headless.model.start_pending(),
-        "the new TUI tab must be scheduled for background preparation"
-    );
-    assert_eq!(
-        headless.model.terminal_target(),
-        TerminalTarget::Tui(OPENCODE)
-    );
-    assert_eq!(
-        headless.model.launch().source(),
-        WorkspaceSource::DefaultHome
-    );
-    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
-    assert!(headless
-        .model
-        .workspace(id)
-        .and_then(Workbench::terminal)
-        .is_some());
-}
-
-#[test]
-fn new_tab_menu_items_are_keyboard_reachable_with_visible_focus() {
-    if isolated("new_tab_menu_items_are_keyboard_reachable_with_visible_focus") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "keyboard-menu", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.render();
-    headless.focus(top_action_id("open-folder"));
-    headless.press_key(egui::Key::Enter);
-    headless.render();
-    headless.press_key(egui::Key::ArrowDown);
-    headless.render();
-    // The popup fades in over `animation_time`; let the open animation settle so
-    // the focus ring is painted at full opacity rather than mid-fade.
-    headless.settle_animation();
-    let terminal_id = new_tab_menu_item_id("terminal");
-    let terminal = headless.response(terminal_id);
-    assert!(
-        terminal.has_focus(),
-        "ArrowDown must focus the first menu item"
-    );
-    let focused = headless.render();
-    let terminal = headless.response(terminal_id);
-    assert!(
-        !focus_ring_rects(&focused, terminal.rect).is_empty(),
-        "the focused menu item must paint a visible focus ring"
-    );
-
-    headless.press_key(egui::Key::Enter);
-    assert!(headless.model.is_picker());
-}
-
-#[test]
-fn new_tab_menu_items_paint_leading_icons() {
-    if isolated("new_tab_menu_items_paint_leading_icons") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "menu-icons", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    // At 1× this font's ink center lands on the galley line box, so centering
-    // that box looks correct. 2× keeps the ink in the upper part of the box.
-    headless.ctx.set_pixels_per_point(2.0);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.click(top_action_id("open-folder"));
-    // The menu fades in; settle so glyph colors are the label tone, not a fade multiply.
-    headless.advance(0.3);
-    let output = headless.render();
-    let text = output_text(&output);
-    assert!(text.contains("Terminal"), "missing Terminal item: {text}");
-    assert!(text.contains("OpenCode"), "missing OpenCode item: {text}");
-
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    assert!(
-        terminal.top() < opencode.top(),
-        "Terminal must stay the first menu item"
-    );
-    assert!(
-        terminal.width() >= 24.0
-            && terminal.height() >= 24.0
-            && opencode.width() >= 24.0
-            && opencode.height() >= 24.0,
-        "menu targets must stay at least 24x24: {terminal:?} {opencode:?}"
-    );
-    assert!(
-        (terminal.left() - opencode.left()).abs() < 0.75
-            && (terminal.width() - opencode.width()).abs() < 0.75,
-        "both rows must fill the same menu width: {terminal:?} {opencode:?}"
-    );
-
-    let terminal_label = painted_menu_label(&output, "Terminal", terminal);
-    let opencode_label = painted_menu_label(&output, "OpenCode", opencode);
-    assert!(
-        (terminal_label.line.left() - opencode_label.line.left()).abs() < 1.0,
-        "labels must share the same left inset: {:?} {:?}",
-        terminal_label.line,
-        opencode_label.line
-    );
-    // 8px row inset + 14px slot + 8px gap.
-    assert!(
-        (terminal_label.line.left() - (terminal.left() + 30.0)).abs() < 1.0,
-        "the 14px slot keeps an 8px gap before the label: {:?} in {terminal:?}",
-        terminal_label.line
-    );
-    let terminal_baseline = terminal_label.baseline_y - terminal.center().y;
-    let opencode_baseline = opencode_label.baseline_y - opencode.center().y;
-    assert!(
-        (terminal_baseline - opencode_baseline).abs() < 0.2,
-        "Terminal and OpenCode must share one baseline: {terminal_baseline} vs {opencode_baseline}"
-    );
-    assert!(
-        opencode_label.ink.bottom() > terminal_label.ink.bottom() + 0.5,
-        "OpenCode keeps the p descender below Terminal's ink"
-    );
-    for (row, label) in [(terminal, &terminal_label), (opencode, &opencode_label)] {
-        assert!(
-            label.line.left() > row.left() + 16.0 && label.line.right() < row.right() - 4.0,
-            "label must be left-aligned inside the row with right padding: {:?} {row:?}",
-            label.line
-        );
-        let body_y = letterform_center_y(label);
-        assert!(
-            (body_y - row.center().y).abs() < 0.2,
-            "letterforms must sit on the icon, not in the upper part of the galley box: body {body_y} ink {:?} baseline {} row {row:?}",
-            label.ink,
-            label.baseline_y
-        );
-        assert!(
-            label.line.center().y > row.center().y + 0.15,
-            "centering the galley line box leaves the ink above the icon: line {:?} row {row:?}",
-            label.line
-        );
-    }
-
-    let window = rect_shapes(&output)
-        .into_iter()
-        .find(|shape| {
-            (shape.rect.width() - 14.0).abs() < 0.75
-                && (shape.rect.height() - 11.0).abs() < 0.75
-                && (shape.stroke.width - 1.5).abs() < 0.05
-                && shape.stroke.color == made_app::theme::TEXT_TERTIARY
-                && shape.corner_radius == egui::CornerRadius::same(2)
-                && terminal.contains_rect(shape.rect)
-                && shape.rect.right() <= terminal_label.line.left() - 2.0
-        })
-        .map(|shape| shape.rect)
-        .expect("terminal window glyph");
-    assert!(
-        (window.center().y - terminal.center().y).abs() < 1.0
-            && (window.left() - (terminal.left() + 8.0)).abs() < 1.0,
-        "terminal glyph must sit in the left slot: {window:?} {terminal:?}"
-    );
-    let terminal_paths: Vec<_> = path_shapes(&output)
-        .into_iter()
-        .filter(|path| {
-            let bounds = egui::Rect::from_points(&path.points);
-            terminal.contains_rect(bounds) && bounds.right() <= terminal_label.line.left() - 1.0
-        })
-        .collect();
-    assert_eq!(
-        terminal_paths.len(),
-        2,
-        "terminal glyph is a chevron plus cursor, not a sparkle: {terminal_paths:?}"
-    );
-    let chevron = terminal_paths
-        .iter()
-        .find(|path| path.points.len() == 3)
-        .expect("prompt chevron");
-    assert!(
-        chevron.points[1].x > chevron.points[0].x + 1.0
-            && chevron.points[1].x > chevron.points[2].x + 1.0
-            && (chevron.points[0].x - chevron.points[2].x).abs() < 0.5,
-        "chevron must point right: {:?}",
-        chevron.points
-    );
-    let cursor = terminal_paths
-        .iter()
-        .find(|path| path.points.len() == 2)
-        .expect("prompt cursor");
-    assert!(
-        (cursor.points[0].y - cursor.points[1].y).abs() < 0.5
-            && cursor.points[1].x > cursor.points[0].x + 1.0,
-        "cursor must be a short underscore: {:?}",
-        cursor.points
-    );
-    for path in [&chevron, &cursor] {
-        assert!(
-            window.contains_rect(egui::Rect::from_points(&path.points)),
-            "prompt strokes must sit inside the terminal window"
-        );
-        assert!(
-            (path.stroke.width - 1.5).abs() < 0.05
-                && matches!(
-                    path.stroke.color,
-                    egui::epaint::ColorMode::Solid(color)
-                        if color == made_app::theme::TEXT_TERTIARY
-                ),
-            "prompt strokes must use the 1.5px tertiary stroke"
-        );
-    }
-
-    let opencode_icon = explorer_icons::icon_by_file_name("opencode.svg")
-        .expect("opencode.svg is vendored with the explorer icons");
-    let opencode_image = painted_images(&output)
-        .into_iter()
-        .find(|image| {
-            (image.rect.width() - 16.0).abs() < 0.75
-                && (image.rect.height() - 16.0).abs() < 0.75
-                && opencode.contains_rect(image.rect)
-                && image.rect.right() <= opencode_label.line.left() - 1.0
-        })
-        .expect("OpenCode row must paint opencode.svg left of the label");
-    let image_px = (output.pixels_per_point * opencode_image.rect.size()).round();
-    assert!(
-        opencode_label.line.left() - opencode_image.rect.right() >= 6.0 - 0.75,
-        "the 16px image keeps at least 6px before the label: {:?} vs {:?}",
-        opencode_image.rect,
-        opencode_label.line
-    );
-    assert_eq!(
-        opencode_image.texture,
-        icon_texture_px(
-            &headless.ctx,
-            opencode_icon,
-            image_px.x as u32,
-            image_px.y as u32,
-        ),
-        "the menu must use the embedded opencode.svg bytes"
-    );
-    assert_eq!(
-        opencode_image.tint,
-        egui::Color32::WHITE,
-        "the SVG keeps its shipped colors"
-    );
-    assert!(
-        (opencode_image.rect.center().y - opencode.center().y).abs() < 1.0,
-        "the SVG must be vertically centered in the row: {:?}",
-        opencode_image.rect
-    );
-    for other in [
-        "opencode_light.svg",
-        "folder-opencode.svg",
-        "folder-opencode-open.svg",
-    ] {
-        assert_ne!(
-            opencode_image.texture,
-            icon_texture_px(
-                &headless.ctx,
-                icon_named(other),
-                image_px.x as u32,
-                image_px.y as u32,
-            ),
-            "the menu must not use {other}"
-        );
-    }
-
-    let hovered = headless.hover(new_tab_menu_item_id("terminal"));
-    let hovered_row = headless.response(new_tab_menu_item_id("terminal")).rect;
-    assert!(
-        rect_shapes(&hovered).iter().any(|shape| {
-            shape.fill == made_app::theme::BG_HOVER
-                && (shape.rect.left() - hovered_row.left()).abs() < 1.0
-                && (shape.rect.right() - hovered_row.right()).abs() < 1.0
-                && (shape.rect.top() - hovered_row.top()).abs() < 1.0
-                && (shape.rect.bottom() - hovered_row.bottom()).abs() < 1.0
-        }),
-        "hover fill must cover the full Terminal row: {hovered_row:?}"
-    );
-    assert!(
-        rect_shapes(&hovered).iter().any(|shape| {
-            (shape.rect.width() - 14.0).abs() < 0.75
-                && (shape.rect.height() - 11.0).abs() < 0.75
-                && shape.stroke.color == made_app::theme::TEXT_PRIMARY
-                && hovered_row.contains_rect(shape.rect)
-        }),
-        "hovered terminal glyph must use the primary label color"
-    );
-}
-
-#[test]
 fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     if isolated("file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input") {
         return;
@@ -6586,7 +6124,6 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         "preview keystrokes must never reach the hidden shell"
     );
 
-    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
     headless.click(top_workspace_action_id(id, "explorer"));
     assert!(!headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
@@ -6607,17 +6144,18 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     assert!(headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
     assert!(output_text(&headless.render()).contains("EXPLORER"));
-    let terminal_id = headless
+    let close_id = headless
         .model
         .workspace(id)
         .unwrap()
         .explorer()
         .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
+        .preview_action_id(PreviewAction::Close);
+    headless.click(close_id);
     assert_eq!(
         headless.model.workspace(id).unwrap().left_surface(),
-        LeftSurface::Terminal
+        LeftSurface::Terminal,
+        "Close must return to the live terminal"
     );
     for _ in 0..4 {
         headless.render();
@@ -6646,7 +6184,7 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         .explorer()
         .unwrap()
         .preview_path()
-        .is_some());
+        .is_none());
     assert_eq!(
         headless
             .model
@@ -6658,40 +6196,6 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
         pid
     );
 
-    headless.click(left_surface_action_id(&pane_id, "file"));
-    assert_eq!(
-        headless.model.workspace(id).unwrap().left_surface(),
-        LeftSurface::Preview
-    );
-    assert!(headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_document()
-        .is_some());
-    let preview_focus = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_focus_id();
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(preview_focus),
-        "File affordance must give the preview explicit focus"
-    );
-    let terminal_id = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
     let selected_file = headless
         .model
         .workspace(id)
@@ -6703,8 +6207,36 @@ fn file_preview_roundtrip_keeps_the_live_terminal_and_blocks_hidden_input() {
     assert_eq!(
         headless.model.workspace(id).unwrap().left_surface(),
         LeftSurface::Preview,
-        "clicking the selected file must reopen the loaded preview"
+        "clicking the file again must reopen the preview"
     );
+    headless.pump_until(|model| {
+        model
+            .workspace(id)
+            .and_then(Workbench::explorer)
+            .and_then(made_app::ExplorerPane::preview_document)
+            .is_some()
+    });
+    let preview_focus = headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .preview_focus_id();
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(preview_focus),
+        "reopening a file must give the preview explicit focus"
+    );
+    let text = output_text(&headless.render());
+    assert!(text.contains("Close"), "{text}");
+    for retired in ["updated", " ago"] {
+        assert!(
+            !text.contains(retired),
+            "preview header must not paint {retired:?}: {text}"
+        );
+    }
     let close_id = headless
         .model
         .workspace(id)
@@ -7468,9 +7000,14 @@ fn preview_fills_the_entire_left_pane_without_an_extra_row() {
                 && (left_card.top() - expected_card_top).abs() < 1.0,
             "{width}x{height} cards {left_card:?} {explorer_card:?} must sit 4px from the window edges"
         );
+        let text = output_text(&output);
         assert!(
-            output_text(&output).contains("Terminal"),
-            "preview header must provide the return-to-terminal action"
+            text.contains("Close"),
+            "preview header must provide the close action: {text}"
+        );
+        assert!(
+            !text.contains("updated"),
+            "preview header must not paint a refresh age: {text}"
         );
     }
 }
@@ -7526,22 +7063,10 @@ fn root_change_clears_a_loaded_preview_and_returns_terminal() {
     assert!(headless.model.workspace(id).unwrap().explorer_visible());
     headless.settle_animation();
     assert!(output_text(&headless.render()).contains("EXPLORER"));
-    let terminal_id = headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
-    assert!(headless
-        .model
-        .workspace(id)
-        .unwrap()
-        .explorer()
-        .unwrap()
-        .preview_path()
-        .is_some());
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
+    );
     type_terminal_command(
         headless.model.workspace_mut(id).unwrap(),
         &format!("cd '{}'", target.display()),
@@ -8187,8 +7712,8 @@ fn oversized_legacy_log_warns_with_previous_row_at_720_and_rotates_on_shutdown()
 }
 
 #[test]
-fn file_control_sits_below_session_strip_and_path() {
-    if isolated("file_control_sits_below_session_strip_and_path") {
+fn closing_the_preview_clears_it_and_reselecting_reopens_it() {
+    if isolated("closing_the_preview_clears_it_and_reselecting_reopens_it") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -8198,13 +7723,6 @@ fn file_control_sits_below_session_strip_and_path() {
     let mut headless = Headless::new(model, 1280.0, 800.0);
     wait_explorer_ready(&mut headless, id);
     headless.render();
-    assert!(
-        headless
-            .ctx
-            .read_response(top_workspace_action_id(id, "sessions"))
-            .is_none(),
-        "Sessions control must be absent without session data"
-    );
     let options = bridge_options(headless.model.workspace(id).unwrap()).expect("bridge options");
     let mut socket = connect(&options);
     send_state(&mut socket, 1, &root);
@@ -8223,30 +7741,61 @@ fn file_control_sits_below_session_strip_and_path() {
         .explorer()
         .unwrap()
         .row_widget_id(0);
-    headless.click(row);
-    headless.pump_until(|model| {
+    let loaded = |model: &AppModel| {
         model
             .workspace(id)
             .and_then(Workbench::explorer)
             .and_then(made_app::ExplorerPane::preview_document)
             .is_some()
-    });
-    let terminal_id = headless
+    };
+    headless.click(row);
+    headless.pump_until(loaded);
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
+    );
+    // Close: the terminal returns and the preview is cleared.
+    let close = headless
         .model
         .workspace(id)
         .unwrap()
         .explorer()
         .unwrap()
-        .preview_terminal_id();
-    headless.click(terminal_id);
+        .preview_action_id(PreviewAction::Close);
+    headless.click(close);
+    headless.render();
+    let workbench = headless.model.workspace(id).unwrap();
+    assert_eq!(workbench.left_surface(), LeftSurface::Terminal);
+    assert!(
+        workbench.explorer().unwrap().preview_path().is_none(),
+        "closing clears the preview"
+    );
+    // A programmatic return to the terminal clears it too.
+    headless.click(row);
+    headless.pump_until(loaded);
+    headless.model.workspace_mut(id).unwrap().close_preview();
+    assert!(headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .explorer()
+        .unwrap()
+        .preview_path()
+        .is_none());
+    // No File re-show control; the session strip and path line keep the
+    // single terminal glass layer.
     let output = headless.render();
     let text = output_text(&output);
     assert!(text.contains("Owned session"));
+    assert!(
+        !text.lines().any(|line| line == "File"),
+        "no File control: {text}"
+    );
     let glass = rects_with_fill(&output, made_app::theme::BG_TERMINAL_GLASS);
     assert_eq!(
         glass.len(),
         1,
-        "session/path/file-slot primary state must keep exactly one terminal glass layer: {glass:?}"
+        "session/path primary state must keep exactly one terminal glass layer: {glass:?}"
     );
     assert!(
         glass[0].width() > 500.0 && glass[0].height() > 300.0,
@@ -8254,28 +7803,20 @@ fn file_control_sits_below_session_strip_and_path() {
     );
     assert!(
         rects_with_fill(&output, made_app::theme::BG_TERMINAL).is_empty(),
-        "primary terminal body/path/file-slot chrome must not paint opaque BG_TERMINAL"
+        "primary terminal body and path chrome must not paint opaque BG_TERMINAL"
     );
-    assert!(
-        !rects_with_fill(&output, made_app::theme::BG_HEADER).is_empty(),
-        "the optional session strip/header must remain opaque BG_HEADER"
-    );
-    let pane_id = headless.model.workspace(id).unwrap().pane_id().to_owned();
-    let file_rect = headless
-        .response(left_surface_action_id(&pane_id, "file"))
-        .rect;
-    let layout = made_app::theme::Layout::for_window(1280.0, 800.0);
-    let card_top = layout.content_top();
-    let path_line = 22.0;
-    assert!(
-        file_rect.top() >= card_top + layout.tab_strip_height + path_line - 1.0,
-        "File control overlapped the session strip/path: {file_rect:?}"
+    // Reselecting the file in the Explorer reopens the preview.
+    headless.click(row);
+    headless.pump_until(loaded);
+    assert_eq!(
+        headless.model.workspace(id).unwrap().left_surface(),
+        LeftSurface::Preview
     );
 }
 
 #[test]
-fn add_workspace_picker_keeps_context_and_back_or_escape_returns() {
-    if isolated("add_workspace_picker_keeps_context_and_back_or_escape_returns") {
+fn add_workspace_picker_has_only_close_and_close_or_escape_returns() {
+    if isolated("add_workspace_picker_has_only_close_and_close_or_escape_returns") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -8284,15 +7825,20 @@ fn add_workspace_picker_keeps_context_and_back_or_escape_returns() {
     let id = open_workspace(&mut model, &root);
     model.begin_new_workspace();
     let mut headless = Headless::new(model, 1100.0, 700.0);
-    let text = output_text(&headless.render());
-    assert!(text.contains("Back to ctx"), "missing back context: {text}");
-    assert!(!text.contains("Return to workspace"));
-    headless.click(picker_control_id("back"));
-    assert!(!headless.model.is_picker());
-    assert_eq!(headless.model.active_workspace_id(), Some(id));
-
-    headless.model.begin_new_workspace();
     headless.render();
+    let text = output_text(&headless.render());
+    assert!(!text.contains("Back to"), "no Back action: {text}");
+    assert!(!text.contains("Return to workspace"));
+    assert!(
+        headless
+            .ctx
+            .read_response(picker_control_id("back"))
+            .is_none(),
+        "the header has no Back control"
+    );
+    let close = headless.response(picker_control_id("close")).rect;
+    assert!(close.width() >= 24.0 && close.height() >= 24.0);
+
     headless.press_key(egui::Key::Escape);
     assert!(!headless.model.is_picker());
     assert_eq!(headless.model.active_workspace_id(), Some(id));
@@ -8305,8 +7851,8 @@ fn add_workspace_picker_keeps_context_and_back_or_escape_returns() {
 }
 
 #[test]
-fn picker_rows_and_secondary_action_use_unified_states() {
-    if isolated("picker_rows_and_secondary_action_use_unified_states") {
+fn picker_rows_and_launch_buttons_use_unified_states() {
+    if isolated("picker_rows_and_launch_buttons_use_unified_states") {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
@@ -8315,12 +7861,12 @@ fn picker_rows_and_secondary_action_use_unified_states() {
     let mut picker = picker_headless(temp.path(), 900.0, 620.0);
     picker.model.picker_select(0).unwrap();
     let output = picker.render();
-    let secondary = picker.response(picker_control_id("selected")).rect;
+    let terminal = picker.response(launch_item("terminal")).rect;
     assert!(
-        rects_with_fill(&output, made_app::theme::BG_ELEVATED)
+        rects_with_fill(&output, made_app::theme::BG_SELECTED)
             .iter()
-            .any(|rect| rect.contains_rect(secondary)),
-        "secondary action rest fill must be BG_ELEVATED"
+            .any(|rect| rect.contains_rect(terminal)),
+        "launch button rest fill must be BG_SELECTED"
     );
 
     let row_id = egui::Id::unique(("made-picker-row", 1));
@@ -8333,21 +7879,21 @@ fn picker_rows_and_secondary_action_use_unified_states() {
         "hovered picker row must use BG_HOVER"
     );
 
-    let hovered = picker.hover(picker_control_id("selected"));
+    let hovered = picker.hover(launch_item("terminal"));
     assert!(
-        rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+        rects_with_fill(&hovered, made_app::theme::ACCENT_TINT)
             .iter()
-            .any(|rect| rect.contains_rect(secondary)),
-        "hovered secondary action must use BG_HOVER"
+            .any(|rect| rect.contains_rect(terminal)),
+        "hovered launch button must use ACCENT_TINT"
     );
-    let pressed = picker.press_hold(picker_control_id("selected"));
+    let pressed = picker.press_hold(launch_item("terminal"));
     assert!(
-        rects_with_fill(&pressed, made_app::theme::BG_SELECTED)
+        rects_with_fill(&pressed, made_app::theme::BG_HOVER)
             .iter()
-            .any(|rect| rect.contains_rect(secondary)),
-        "pressed secondary action must use BG_SELECTED"
+            .any(|rect| rect.contains_rect(terminal)),
+        "pressed launch button must use BG_HOVER"
     );
-    picker.release(picker_control_id("selected"));
+    picker.release(launch_item("terminal"));
 }
 
 #[test]
@@ -8397,9 +7943,15 @@ fn picker_rows_have_no_focus_outline_but_picker_controls_keep_focus_rings() {
     );
     let marker = path_shapes(&focused)
         .into_iter()
-        .filter(|path| path.points.len() == 3 && path.fill == made_app::theme::TEXT_PRIMARY)
+        .filter(|path| {
+            path.points.len() == 3
+                && !path.closed
+                && path.fill == egui::Color32::TRANSPARENT
+                && path.stroke.color
+                    == egui::epaint::ColorMode::Solid(made_app::theme::TEXT_SECONDARY)
+        })
         .find(|path| row_rect.contains(path_center(path)))
-        .expect("picker app-drawn disclosure triangle");
+        .expect("selected row paints the stroked TEXT_SECONDARY chevron");
     let marker_rect = egui::Rect::from_points(&marker.points);
     assert!(
         (marker_rect.center().x - (row_rect.left() + 12.0)).abs() < 1.5,
@@ -8407,11 +7959,11 @@ fn picker_rows_have_no_focus_outline_but_picker_controls_keep_focus_rings() {
     );
     assert!(
         (marker_rect.center().y - label.center().y).abs() < 0.75,
-        "picker triangle must share the label's optical center: {marker_rect:?} vs {label:?}"
+        "picker chevron must share the label's optical center: {marker_rect:?} vs {label:?}"
     );
 
-    let current = picker.response(picker_control_id("current")).rect;
-    picker.focus(picker_control_id("current"));
+    let current = picker.response(launch_item("terminal")).rect;
+    picker.focus(launch_item("terminal"));
     let button_focused = picker.render();
     assert!(
         !focus_ring_rects(&button_focused, current).is_empty(),
@@ -8465,14 +8017,6 @@ fn picker_click_expands_tree_keeps_ancestors_and_updates_target() {
 
     let output = picker.render();
     let text = output_text(&output);
-    assert!(
-        text.contains("Click a folder to expand or collapse it"),
-        "picker help must describe tree expansion: {text}"
-    );
-    assert!(
-        !text.contains("Click a folder to enter it"),
-        "stale enter-to-replace help must be removed: {text}"
-    );
     assert!(text.contains("nested"), "child rows must be listed: {text}");
     let nested_row = picker
         .response(egui::Id::unique(("made-picker-row", 1)))
@@ -8695,10 +8239,10 @@ fn picker_keyboard_tree_navigation_and_confirmation() {
         selected.model.launch().picker().unwrap().path_target(),
         root.join("alpha/nested")
     );
-    selected.click(picker_control_id("selected"));
+    selected.click(launch_item("terminal"));
     assert!(
         !selected.model.is_picker(),
-        "Open selected folder must open the selected row"
+        "Terminal must open the selected row"
     );
     assert_eq!(
         selected.model.launch().explorer_root(),
@@ -8823,15 +8367,24 @@ fn picker_current_path_chip_is_selected_and_fits() {
             chip.left() > refresh.right(),
             "path chip must not overlap Up/Refresh at {width}x{height}: {chip:?} vs {refresh:?}"
         );
-        let card = largest_rect(&output, made_app::theme::BG_CARD).expect("picker card");
+        let card = largest_rect(&output, made_app::theme::BG_CARD_GLASS).expect("picker card");
         assert!(
             card.contains_rect(chip),
             "path chip must stay inside the card at {width}x{height}: {chip:?} vs {card:?}"
         );
         let shape = rect_shapes(&output)
             .into_iter()
-            .find(|shape| shape.rect == chip && shape.fill == made_app::theme::BG_SELECTED)
-            .expect("path chip must use the inset BG_SELECTED fill");
+            .find(|shape| {
+                shape.rect.contains_rect(chip)
+                    && shape.rect.height() <= 26.0
+                    && shape.fill == made_app::theme::BG_SELECTED
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "address bar must use the inset BG_SELECTED fill: chip {chip:?} fills {:?}",
+                    rects_with_fill(&output, made_app::theme::BG_SELECTED)
+                )
+            });
         assert_eq!(shape.corner_radius, egui::CornerRadius::same(4));
         assert_eq!(
             shape.stroke,
@@ -8935,24 +8488,29 @@ fn picker_close_without_workspace_falls_back_to_home() {
         !rects_with_fill(&picker_output, made_app::theme::BG_SELECTED).is_empty(),
         "selected picker row must keep its rounded background"
     );
-    let secondary = closed.response(picker_control_id("selected")).rect;
+    let terminal = closed.response(launch_item("terminal")).rect;
     assert!(
-        rects_with_fill(&picker_output, made_app::theme::BG_ELEVATED)
+        !rect_shapes(&picker_output)
             .iter()
-            .any(|rect| rect.intersects(secondary)),
-        "quiet secondary action must use the elevated background"
+            .any(|rect| rect.rect == terminal && rect.stroke.width > 0.0),
+        "the Terminal launch button must be borderless"
     );
-    assert!(
-        !rect_shapes(&picker_output).iter().any(|rect| {
-            rect.rect.intersects(secondary) && rect.stroke.color == made_app::theme::BORDER_CONTROL
-        }),
-        "Open selected folder must be borderless"
-    );
+    let row = closed
+        .response(egui::Id::unique(("made-picker-row", 0)))
+        .rect;
     let selected_row = rects_with_fill(&picker_output, made_app::theme::BG_SELECTED)
         .into_iter()
-        .max_by(|left, right| left.area().total_cmp(&right.area()))
+        .find(|rect| row.contains_rect(*rect))
         .expect("selected picker row");
-    assert!((selected_row.height() - 30.0).abs() < 1.0);
+    assert!(
+        (row.height() - 24.0).abs() < 0.5,
+        "folder rows are 24px high: {row:?}"
+    );
+    assert!((selected_row.height() - 22.0).abs() < 1.0);
+    assert!(
+        (selected_row.left() - row.left() - 4.0).abs() < 0.5,
+        "4px inset"
+    );
     assert_eq!(
         rect_shapes(&picker_output)
             .into_iter()
@@ -8981,9 +8539,9 @@ fn picker_close_without_workspace_falls_back_to_home() {
         "picker close target below 24px: {:?}",
         close.rect
     );
-    let hovered = output_text(&closed.hover_until_text(picker_control_id("close"), "Close picker"));
+    let hovered = output_text(&closed.hover_until_text(picker_control_id("close"), "Close"));
     assert!(
-        hovered.contains("Close picker"),
+        hovered.contains("Close"),
         "picker close tooltip missing: {hovered}"
     );
     closed.click(picker_control_id("close"));
@@ -9051,7 +8609,6 @@ fn optional_session_map_appears_only_after_session_data() {
     let sessions = headless
         .response(top_workspace_action_id(id, "sessions"))
         .rect;
-    let ssh = headless.response(top_action_id("ssh-servers")).rect;
     let explorer = headless
         .response(top_workspace_action_id(id, "explorer"))
         .rect;
@@ -9067,28 +8624,33 @@ fn optional_session_map_appears_only_after_session_data() {
         "right icon order must be Sessions then Explorer (Explorer rightmost): sessions {sessions:?}, explorer {explorer:?}"
     );
     assert!(
-        sessions.right() <= ssh.left(),
-        "Sessions must not overlap the SSH control: sessions {sessions:?}, ssh {ssh:?}"
+        headless
+            .ctx
+            .read_response(top_action_id("ssh-servers"))
+            .is_none(),
+        "no Servidores SSH header action"
     );
+    let hovered = output_text(&headless.hover_until_text(
+        top_workspace_action_id(id, "sessions"),
+        "Show OpenCode sessions",
+    ));
     assert!(
-        ssh.right() <= explorer.left(),
-        "the SSH control must precede Explorer without overlap: ssh {ssh:?}, explorer {explorer:?}"
-    );
-    let hovered = output_text(
-        &headless.hover_until_text(top_workspace_action_id(id, "sessions"), "Show sessions"),
-    );
-    assert!(
-        hovered.contains("Show sessions"),
+        hovered.contains("Show OpenCode sessions"),
         "Sessions tooltip missing: {hovered}"
     );
     headless.click(top_workspace_action_id(id, "sessions"));
     assert!(headless.model.workspace(id).unwrap().sessions_visible());
+    let hovered = output_text(&headless.hover_until_text(
+        top_workspace_action_id(id, "sessions"),
+        "Hide OpenCode sessions",
+    ));
+    assert!(hovered.contains("Hide OpenCode sessions"), "{hovered}");
     let text = output_text(&headless.render());
     assert!(
         text.contains("Owned session"),
         "session title missing: {text}"
     );
-    assert!(!text.contains("No open sessions"));
+    assert!(!text.contains("No OpenCode sessions"));
 
     let beta = fixture_workspace(temp.path(), "sessions-beta", "beta.rs");
     let beta_id = open_workspace(&mut headless.model, &beta);
@@ -9108,7 +8670,8 @@ fn optional_session_map_appears_only_after_session_data() {
         "another workspace must not inherit session data or the map control"
     );
     let beta_text = output_text(&headless.render());
-    assert!(!beta_text.contains("Owned session"));
+    // Only the first tab's label names the session; no map shows it.
+    assert_eq!(beta_text.matches("Owned session").count(), 1, "{beta_text}");
     headless.click(workspace_tab_id(id));
     assert!(headless.model.workspace(id).unwrap().sessions_visible());
     let alpha_text = output_text(&headless.render());
@@ -9243,7 +8806,7 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
     let mut selected = picker_headless(&temp_root, 900.0, 620.0);
     selected.model.picker_select(0).unwrap();
     selected.render();
-    selected.focus(picker_control_id("selected"));
+    selected.focus(launch_item("terminal"));
     selected.press_key(egui::Key::Enter);
     assert!(!selected.model.is_picker());
     assert_eq!(
@@ -9253,7 +8816,7 @@ fn picker_focused_buttons_own_enter_and_list_keys_navigate_only_from_the_list() 
 
     let mut current = picker_headless(&temp_root, 900.0, 620.0);
     current.render();
-    current.focus(picker_control_id("current"));
+    current.focus(launch_item("terminal"));
     current.press_key(egui::Key::Enter);
     assert!(!current.model.is_picker());
     assert_eq!(
@@ -9316,56 +8879,46 @@ fn picker_virtualizes_thousands_of_entries() {
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
     let list_rect = headless.response(picker_list_id()).rect;
     assert!(
-        list_rect.height() <= 160.5,
-        "short-window picker list cap was {}",
+        list_rect.height() >= 4.0 * 24.0,
+        "the compact tree must keep at least four rows: {}",
         list_rect.height()
     );
-    for action in ["up", "refresh", "current", "selected"] {
-        let rect = headless.response(picker_control_id(action)).rect;
+    for id in [
+        picker_control_id("up"),
+        picker_control_id("refresh"),
+        launch_item("terminal"),
+    ] {
+        let rect = headless.response(id).rect;
         assert!(
             screen.contains_rect(rect),
-            "picker {action} control clipped: {rect:?}"
+            "{id:?} control clipped: {rect:?}"
         );
     }
 }
 
 #[test]
-fn picker_primary_names_the_current_target_and_empty_folders_confirm() {
+fn launch_bar_names_the_target_and_empty_folders_launch() {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir(temp.path().join("alpha")).unwrap();
     let mut picker = picker_headless(temp.path(), 720.0, 480.0);
     let output = picker.render();
     let text = output_text(&output);
-    assert!(text.contains("Use current folder"));
-    assert!(text.contains("Open selected folder"));
+    assert!(text.contains("Launch in"), "{text}");
+    assert!(text.contains("Terminal"), "{text}");
+    for retired in ["Use current folder", "Open selected folder"] {
+        assert!(!text.contains(retired), "{retired} is retired: {text}");
+    }
+    let root = temp.path().canonicalize().unwrap();
     assert_eq!(
         picker_current_target(&picker.model),
-        Some(temp.path().canonicalize().unwrap().display().to_string())
-    );
-    let secondary = picker.response(picker_control_id("selected")).rect;
-    assert!(
-        text_colors(&output, "Open selected folder", 400.0)
-            .contains(&made_app::theme::TEXT_DISABLED),
-        "Open selected folder must be disabled with no selected row"
-    );
-    picker.click(picker_control_id("selected"));
-    assert!(
-        picker.model.is_picker(),
-        "a disabled Open selected folder must not start a workspace"
+        Some(root.display().to_string())
     );
     picker.model.picker_select(0).unwrap();
-    picker.render_events(vec![egui::Event::PointerMoved(egui::pos2(4.0, 4.0))]);
-    let enabled = picker.render();
-    assert!(
-        rects_with_fill(&enabled, made_app::theme::BG_ELEVATED)
-            .iter()
-            .any(|rect| rect.contains_rect(secondary)),
-        "Open selected folder must use BG_ELEVATED once a row is selected"
-    );
-    assert!(
-        text_colors(&enabled, "Open selected folder", 400.0)
-            .contains(&made_app::theme::TEXT_SECONDARY),
-        "Open selected folder must leave the disabled tone when enabled"
+    picker.render();
+    assert_eq!(
+        picker_current_target(&picker.model),
+        Some(root.join("alpha").display().to_string()),
+        "the launch target follows the selected row"
     );
 
     let empty = tempfile::tempdir().unwrap();
@@ -9375,872 +8928,13 @@ fn picker_primary_names_the_current_target_and_empty_folders_confirm() {
         empty_picker.model.launch().picker().unwrap().selection(),
         None
     );
-    empty_picker.focus(picker_control_id("current"));
+    empty_picker.focus(launch_item("terminal"));
     empty_picker.press_key(egui::Key::Enter);
     assert!(!empty_picker.model.is_picker());
     assert_eq!(
         empty_picker.model.launch().explorer_root(),
         Some(empty.path().canonicalize().unwrap().as_path())
     );
-}
-
-#[test]
-fn ssh_servers_window_keeps_field_focus_and_has_no_collapse() {
-    if isolated("ssh_servers_window_keeps_field_focus_and_has_no_collapse") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-focus", "main.rs");
-    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1280.0, 800.0);
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    let opened = headless.render();
-    let text = output_text(&opened);
-    assert!(text.contains("Servidores SSH"), "{text}");
-    assert!(text.contains("Display name"), "{text}");
-    assert!(text.contains("Host or SSH alias"), "{text}");
-    let window = headless
-        .ctx
-        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
-        .expect("SSH window rect");
-    let title =
-        egui::Rect::from_min_max(window.min, egui::pos2(window.right(), window.top() + 36.0));
-    assert!(
-        triangles_in(&opened, title).is_empty(),
-        "Servidores SSH must not paint a collapse triangle"
-    );
-    let close = short_segments_in(&opened, title)
-        .into_iter()
-        .find(|segment| segment[0].x > window.center().x && segment[1].x > window.center().x)
-        .expect("close button still paints in the title bar");
-
-    let name = ssh_field_id("name");
-    let host = ssh_field_id("host");
-    let user = ssh_field_id("user");
-    let port = ssh_field_id("port");
-    let key = ssh_field_id("key");
-    let directory = ssh_field_id("directory");
-    let name_rect = headless.response(name).rect;
-    let host_rect = headless.response(host).rect;
-    let user_rect = headless.response(user).rect;
-    let port_rect = headless.response(port).rect;
-    let key_rect = headless.response(key).rect;
-    let directory_rect = headless.response(directory).rect;
-    for rect in [host_rect, user_rect, key_rect, directory_rect] {
-        assert!(
-            (rect.left() - name_rect.left()).abs() < 1.0,
-            "fields must share a left edge: {name_rect:?} vs {rect:?}"
-        );
-    }
-    assert!(
-        (port_rect.right() - name_rect.right()).abs() < 1.0,
-        "Port must align to the form's right edge: {port_rect:?} vs {name_rect:?}"
-    );
-    let pair_gap = host_rect.top() - name_rect.bottom();
-    let later_gap = directory_rect.top() - key_rect.bottom();
-    assert!(
-        pair_gap >= 8.0 && (pair_gap - later_gap).abs() < 2.0,
-        "field pairs must keep one Calm Editor rhythm: {pair_gap} vs {later_gap}"
-    );
-
-    headless.click(name);
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(name),
-        "clicking Display name must focus that field"
-    );
-    for _ in 0..3 {
-        headless.render();
-        assert_eq!(
-            headless.ctx.memory(|memory| memory.focused()),
-            Some(name),
-            "the terminal must not reclaim a focused SSH field"
-        );
-    }
-    let pane = headless.model.workspace(id).unwrap().pane_id().to_owned();
-    headless.ctx.data_mut(|data| {
-        data.insert_temp(
-            egui::Id::unique(("made-terminal-focus-boost", pane.as_str())),
-            4u8,
-        );
-    });
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(name),
-        "a terminal focus boost must not steal an active SSH field"
-    );
-    headless.click(top_workspace_action_id(id, "explorer"));
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(name),
-        "hiding the explorer must not hand focus back to the terminal"
-    );
-
-    headless.press_key(egui::Key::Tab);
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(host),
-        "Tab must move into the next SSH field and stay there"
-    );
-
-    let close_at = egui::pos2(
-        (close[0].x + close[1].x) * 0.5,
-        (close[0].y + close[1].y) * 0.5,
-    );
-    headless.render_events(vec![egui::Event::PointerMoved(close_at)]);
-    headless.render_events(vec![pointer_button(close_at, true)]);
-    headless.render_events(vec![pointer_button(close_at, false)]);
-    // The close click and the terminal focus handback can settle on different
-    // frames depending on the host. Render settling frames, bounded, until the
-    // handback has happened before checking.
-    headless.render();
-    let mut closed = headless.render();
-    for _ in 0..30 {
-        let handed_back = headless
-            .model
-            .workspace(id)
-            .and_then(|workbench| workbench.terminal())
-            .is_some_and(|terminal| terminal.is_focused());
-        if handed_back && !output_text(&closed).contains("Display name") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        closed = headless.render();
-    }
-    assert!(
-        !output_text(&closed).contains("Display name"),
-        "the window must still close: {}",
-        output_text(&closed)
-    );
-    assert!(
-        headless
-            .model
-            .workspace(id)
-            .unwrap()
-            .terminal()
-            .unwrap()
-            .is_focused(),
-        "closing the window must return focus to the terminal"
-    );
-}
-
-fn assert_large_ssh_window_scrolls(width: f32, height: f32) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-large", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let servers = add_ssh_inventory(&mut model, 80);
-    let last = *servers.last().expect("inventory");
-    let first = servers[0];
-    let mut headless = Headless::new(model, width, height);
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.render();
-
-    let screen = headless.ctx.content_rect();
-    let window = headless
-        .ctx
-        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
-        .expect("SSH window rect");
-    assert!(
-        screen.contains_rect(window),
-        "{width}x{height}: the SSH window must stay inside the viewport: {window:?} vs {screen:?}"
-    );
-
-    // The bottom actions are reachable by scrolling the bounded body.
-    wheel_over(&mut headless, window.center(), egui::vec2(0.0, -20_000.0));
-    for action in ["ssh-save", "ssh-test", "ssh-remove"] {
-        let rect = headless.response(top_action_id(action)).rect;
-        assert!(
-            window.contains_rect(rect) && screen.contains_rect(rect),
-            "{width}x{height}: {action} must be reachable inside the window: {rect:?} vs {window:?}"
-        );
-    }
-
-    // Keyboard focus on the last row scrolls it into the bounded body.
-    headless.focus(ssh_server_row_id(last));
-    headless.advance(0.6);
-    let last_rect = headless.response(ssh_server_row_id(last)).rect;
-    assert!(
-        window.contains_rect(last_rect),
-        "{width}x{height}: the last server row must scroll into the window: {last_rect:?} vs {window:?}"
-    );
-
-    // Shift+Tab from the first text field enters the inventory at the end;
-    // arrow keys then move between rows without the old focus hold stealing it
-    // back.
-    headless.focus(ssh_field_id("name"));
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(ssh_field_id("name")),
-        "{width}x{height}: the name field must own focus"
-    );
-    headless.press_key_with_modifiers(egui::Key::Tab, egui::Modifiers::SHIFT);
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(ssh_server_row_id(last)),
-        "{width}x{height}: Shift+Tab from the fields must enter the rows"
-    );
-    headless.press_key(egui::Key::ArrowUp);
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(ssh_server_row_id(servers[servers.len() - 2])),
-        "{width}x{height}: ArrowUp must move to the previous server row"
-    );
-
-    // Forward Tab from the action row enters the inventory instead of leaving
-    // the dialog.
-    headless.focus(top_action_id("ssh-remove"));
-    headless.press_key(egui::Key::Tab);
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(ssh_server_row_id(first)),
-        "{width}x{height}: Tab from the actions must enter the first server row"
-    );
-
-    // Escape closes the management window and returns focus to the terminal.
-    headless.press_key(egui::Key::Escape);
-    headless.render();
-    headless.render();
-    assert!(
-        !output_text(&headless.render()).contains("Display name"),
-        "{width}x{height}: Escape must close the SSH management window"
-    );
-    assert!(
-        headless
-            .model
-            .workspace(id)
-            .unwrap()
-            .terminal()
-            .unwrap()
-            .is_focused(),
-        "{width}x{height}: closing the window must return focus to the terminal"
-    );
-
-    // Reopen: the management window starts at the top, so the first server row
-    // is visible instead of inheriting the previous session's scroll offset.
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.render();
-    let reopened = headless
-        .ctx
-        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
-        .expect("reopened SSH window rect");
-    let first_rect = headless.response(ssh_server_row_id(first)).rect;
-    assert!(
-        reopened.contains_rect(first_rect) && first_rect.top() < reopened.top() + 96.0,
-        "{width}x{height}: reopening must show the first server row at the top: {first_rect:?} vs {reopened:?}"
-    );
-}
-
-fn ssh_window_rect(headless: &Headless) -> egui::Rect {
-    headless
-        .ctx
-        .memory(|memory| memory.area_rect(ssh_servers_window_id()))
-        .expect("SSH window rect")
-}
-
-/// Releasing a text-field hold into Save/Test/Remove or a server row must not
-/// forget the window rect, recenter it, or zero its measured body height.
-fn assert_ssh_window_stays_put_on_hold_release(width: f32, height: f32) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-hold-release", "main.rs");
-    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
-    let id = open_workspace(&mut model, &root);
-    let servers = add_ssh_inventory(&mut model, 6);
-    let first = servers[0];
-    let mut headless = Headless::new(model, width, height);
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.render();
-    let before = ssh_window_rect(&headless);
-    assert!(before.height() > 0.0, "{width}x{height}: {before:?}");
-
-    // Click a server row while its field owns focus.
-    let name = ssh_field_id("name");
-    headless.focus(name);
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(name),
-        "{width}x{height}: the name field must own focus"
-    );
-    headless.click(ssh_server_row_id(first));
-    let after_row_click = ssh_window_rect(&headless);
-    assert_eq!(
-        after_row_click, before,
-        "{width}x{height}: clicking a server row must not collapse or recenter the window"
-    );
-
-    // Tab from the field into Save, then Test, Remove, and the inventory row.
-    headless.focus(name);
-    headless.render();
-    let mut reached = Vec::new();
-    for _ in 0..16 {
-        headless.press_key(egui::Key::Tab);
-        headless.render();
-        let focused = headless.ctx.memory(|memory| memory.focused());
-        if let Some(focused) = focused {
-            if focused == top_action_id("ssh-save") {
-                reached.push("save");
-            } else if focused == top_action_id("ssh-test") {
-                reached.push("test");
-            } else if focused == top_action_id("ssh-remove") {
-                reached.push("remove");
-            }
-        }
-        if reached.len() == 3 {
-            break;
-        }
-        assert!(
-            headless
-                .ctx
-                .memory(|memory| memory.area_rect(ssh_servers_window_id()))
-                .is_some_and(|current| current == before),
-            "{width}x{height}: Tab release changed the window rect to {:?} from {before:?}",
-            ssh_window_rect(&headless)
-        );
-    }
-    assert_eq!(
-        reached,
-        vec!["save", "test", "remove"],
-        "{width}x{height}: Tab must reach each action without losing the window"
-    );
-    assert_eq!(
-        ssh_window_rect(&headless),
-        before,
-        "{width}x{height}: tabbing through actions must not collapse or recenter the window"
-    );
-
-    // The next Tab enters the inventory and keeps the same window rect.
-    headless.press_key(egui::Key::Tab);
-    headless.render();
-    assert_eq!(
-        headless.ctx.memory(|memory| memory.focused()),
-        Some(ssh_server_row_id(first)),
-        "{width}x{height}: Tab from Remove must enter the first server row"
-    );
-    assert_eq!(
-        ssh_window_rect(&headless),
-        before,
-        "{width}x{height}: entering a row must not collapse or recenter the window"
-    );
-}
-
-#[test]
-fn ssh_servers_window_keeps_rect_on_field_hold_release_at_1280x800() {
-    if isolated("ssh_servers_window_keeps_rect_on_field_hold_release_at_1280x800") {
-        return;
-    }
-    assert_ssh_window_stays_put_on_hold_release(1280.0, 800.0);
-}
-
-#[test]
-fn ssh_servers_window_keeps_rect_on_field_hold_release_at_720x480() {
-    if isolated("ssh_servers_window_keeps_rect_on_field_hold_release_at_720x480") {
-        return;
-    }
-    assert_ssh_window_stays_put_on_hold_release(720.0, 480.0);
-}
-
-#[test]
-fn ssh_server_rows_expose_accessible_button_label_and_selection() {
-    if isolated("ssh_server_rows_expose_accessible_button_label_and_selection") {
-        return;
-    }
-    use made_app::ssh_servers::ServerMetadata;
-
-    let format_controls = "\u{202e}\u{200b}\u{feff}\u{2066}";
-    let long = format!(
-        "Provisioning {format_controls}{}",
-        "long-server-name-".repeat(6)
-    );
-    assert!(long.chars().count() <= 128);
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-accessible", "main.rs");
-    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
-    let id = open_workspace(&mut model, &root);
-    let long_id = model
-        .add_ssh_metadata(ServerMetadata {
-            display_name: long.clone(),
-            host: "long-server.example".to_owned(),
-            user: None,
-            port: None,
-            key_file: None,
-            initial_directory: None,
-        })
-        .expect("long server saves");
-    let other_id = model
-        .add_ssh_metadata(ServerMetadata {
-            display_name: "Short server".to_owned(),
-            host: "short-server.example".to_owned(),
-            user: None,
-            port: None,
-            key_file: None,
-            initial_directory: None,
-        })
-        .expect("short server saves");
-    model.select_ssh_server(long_id);
-
-    let mut headless = Headless::new(model, 1280.0, 800.0);
-    headless.ctx.enable_accesskit();
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    let output = headless.render();
-
-    let row_id = ssh_server_row_id(long_id);
-    let row_rect = headless.response(row_id).rect;
-    let painted = text_in_rect(&output, row_rect);
-    let truncated = format!(
-        "{} · not tested",
-        made_app::sanitize::sanitize_display(&long, 48)
-    );
-    assert!(
-        painted.contains(&truncated) && painted.contains('…'),
-        "a long server name must ellipsize in the row: {painted:?}"
-    );
-    assert!(
-        !painted.contains(&long),
-        "the row must not paint the unbounded long name: {painted:?}"
-    );
-
-    let (role, label, selected) = accesskit_row_state(&output, row_id);
-    assert_eq!(
-        role,
-        egui::Role::Button,
-        "custom server rows must expose the Button role"
-    );
-    let expected_label = format!("{} · not tested", made_app::sanitize::sanitize_text(&long));
-    assert_eq!(
-        label.as_deref(),
-        Some(expected_label.as_str()),
-        "the accessible label carries the full untruncated name"
-    );
-    for (surface, text) in [
-        ("visible", painted.as_str()),
-        ("accessible", label.as_deref().expect("accessible label")),
-    ] {
-        // The painted-text collector joins rows with a trailing newline that is
-        // not part of the row's name; every other control is a real failure.
-        let checked = text.strip_suffix('\n').unwrap_or(text);
-        assert_eq!(
-            made_app::sanitize::sanitize_text(checked),
-            checked,
-            "the {surface} server name must not carry control or format characters"
-        );
-        for control in ['\u{202e}', '\u{200b}', '\u{feff}', '\u{2066}'] {
-            assert!(
-                !text.contains(control),
-                "the {surface} server name must not carry {control:?}: {text:?}"
-            );
-        }
-    }
-    use egui::accesskit::Toggled;
-
-    assert_eq!(
-        selected,
-        Some(Toggled::True),
-        "the selected server row must expose selected state"
-    );
-
-    let (_, _, other_selected) = accesskit_row_state(&output, ssh_server_row_id(other_id));
-    assert_eq!(
-        other_selected,
-        Some(Toggled::False),
-        "an unselected server row must expose selected = false"
-    );
-
-    headless.model.select_ssh_server(other_id);
-    let output = headless.render();
-    let (_, _, long_selected) = accesskit_row_state(&output, row_id);
-    let (_, _, other_selected) = accesskit_row_state(&output, ssh_server_row_id(other_id));
-    assert_eq!(
-        long_selected,
-        Some(Toggled::False),
-        "selection must move off the long row"
-    );
-    assert_eq!(
-        other_selected,
-        Some(Toggled::True),
-        "selection must move to the chosen row"
-    );
-}
-
-#[test]
-fn ssh_server_rows_activate_with_enter_and_space_and_load_metadata() {
-    if isolated("ssh_server_rows_activate_with_enter_and_space_and_load_metadata") {
-        return;
-    }
-    use made_app::ssh_servers::ServerMetadata;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-activation", "main.rs");
-    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
-    let id = open_workspace(&mut model, &root);
-    // Distinct host aliases prove which selected record loaded into the form.
-    let servers = (0..3)
-        .map(|index| {
-            model
-                .add_ssh_metadata(ServerMetadata {
-                    display_name: format!("Plant {index:03}"),
-                    host: format!("plant-{index:03}.example"),
-                    user: None,
-                    port: None,
-                    key_file: None,
-                    initial_directory: None,
-                })
-                .expect("server metadata saves")
-        })
-        .collect::<Vec<_>>();
-    let mut headless = Headless::new(model, 1280.0, 800.0);
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.render();
-
-    headless.focus(ssh_server_row_id(servers[1]));
-    headless.press_key(egui::Key::Enter);
-    headless.render();
-    let enter_text = output_text(&headless.render());
-    assert!(
-        enter_text.contains("plant-001.example"),
-        "Enter must load the selected server metadata into the form: {enter_text}"
-    );
-
-    headless.focus(ssh_server_row_id(servers[0]));
-    headless.press_key(egui::Key::Space);
-    headless.render();
-    let space_text = output_text(&headless.render());
-    assert!(
-        space_text.contains("plant-000.example"),
-        "Space must load the selected server metadata into the form: {space_text}"
-    );
-    assert!(
-        !space_text.contains("plant-001.example"),
-        "Space must replace the previous selection: {space_text}"
-    );
-}
-
-#[test]
-fn ssh_management_actions_save_test_remove_have_model_effects() {
-    if isolated("ssh_management_actions_save_test_remove_have_model_effects") {
-        return;
-    }
-    use made_remote::protocol::{Capabilities, RemoteTarget};
-
-    let capabilities = |opencode| Capabilities {
-        target: RemoteTarget::LinuxX64,
-        tmux: false,
-        opencode,
-        shell_cwd: false,
-        helper_version: "probe".to_owned(),
-        grok: false,
-        python3: false,
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "ssh-actions", "main.rs");
-    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
-    let id = open_workspace(&mut model, &root);
-    let servers = add_ssh_inventory(&mut model, 2);
-    let first = servers[0];
-    let selected = servers[1];
-    model
-        .hold_ssh_probe_result(first, Ok(capabilities(true)))
-        .expect("first probe result records");
-    model
-        .hold_ssh_probe_result(selected, Ok(capabilities(false)))
-        .expect("second probe result records");
-    let mut headless = Headless::new(model, 1280.0, 800.0);
-    wait_explorer_ready(&mut headless, id);
-    headless.click(top_action_id("ssh-servers"));
-    headless.render();
-    headless.render();
-
-    // Each server paints its own probe result instead of a global guess.
-    let probe_text = output_text(&headless.render());
-    assert!(
-        probe_text.contains("Plant 000 · OpenCode detected"),
-        "the first server keeps its own probe text: {probe_text}"
-    );
-    assert!(
-        probe_text.contains("Plant 001 · OpenCode not detected"),
-        "the second server keeps its own probe text: {probe_text}"
-    );
-
-    // Save persists the edited draft through the model, not just the widget.
-    headless.model.select_ssh_server(selected);
-    headless.render();
-    let name = ssh_field_id("name");
-    headless.click(name);
-    headless.press_key_with_modifiers(egui::Key::A, egui::Modifiers::COMMAND);
-    headless.render_events(vec![egui::Event::Text("Renamed Plant".to_owned())]);
-    headless.render();
-    headless.click(top_action_id("ssh-save"));
-    assert_eq!(
-        headless.model.ssh_notice(),
-        Some("Saved. Open workspaces keep their original server."),
-        "Save must report the model's edit"
-    );
-    let saved = output_text(&headless.render());
-    assert!(
-        saved.contains("Renamed Plant · not tested"),
-        "Save must persist the edited server record: {saved}"
-    );
-
-    // Test starts the bounded probe through the model and says so.
-    headless.click(top_action_id("ssh-test"));
-    assert_eq!(
-        headless.model.ssh_notice(),
-        Some("Testing the connection. OpenCode will not be started."),
-        "Test must start the selected server's probe"
-    );
-
-    // Remove deletes the selected record and resets the selection.
-    headless.click(top_action_id("ssh-remove"));
-    assert_eq!(
-        headless.model.ssh_notice(),
-        Some("Server removed. Open workspaces were not closed."),
-        "Remove must report the model's deletion"
-    );
-    let removed = output_text(&headless.render());
-    assert!(
-        !removed.contains("Renamed Plant"),
-        "Remove must delete the saved server row: {removed}"
-    );
-    assert!(
-        removed.contains("Plant 000"),
-        "Remove must keep the other server: {removed}"
-    );
-    assert!(
-        !removed.contains("plant-000.example"),
-        "Remove must clear the selected server's draft: {removed}"
-    );
-}
-
-#[test]
-fn ssh_servers_window_scrolls_large_inventory_at_1280x800() {
-    if isolated("ssh_servers_window_scrolls_large_inventory_at_1280x800") {
-        return;
-    }
-    assert_large_ssh_window_scrolls(1280.0, 800.0);
-}
-
-#[test]
-fn ssh_servers_window_scrolls_large_inventory_at_720x480() {
-    if isolated("ssh_servers_window_scrolls_large_inventory_at_720x480") {
-        return;
-    }
-    assert_large_ssh_window_scrolls(720.0, 480.0);
-}
-
-fn assert_large_new_tab_menu_scrolls(width: f32, height: f32) {
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "menu-large", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let servers = add_ssh_inventory(&mut model, 80);
-    let last = *servers.last().expect("inventory");
-    let last_menu = new_tab_menu_item_id(&format!("ssh-terminal-{}", authority_hex(last)));
-    let mut headless = Headless::new(model, width, height);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.click(top_action_id("open-folder"));
-    headless.settle_animation();
-    let screen = headless.ctx.content_rect();
-    let popup = headless
-        .ctx
-        .memory(|memory| memory.area_rect(top_action_id("open-folder").with("popup")))
-        .expect("menu area");
-    assert!(
-        screen.contains_rect(popup),
-        "{width}x{height}: the large menu must be capped inside the viewport: {popup:?} vs {screen:?}"
-    );
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    assert!(
-        terminal.top() < opencode.top(),
-        "{width}x{height}: Terminal must stay first"
-    );
-    assert!(
-        (terminal.height() - opencode.height()).abs() < 0.5
-            && (terminal.width() - opencode.width()).abs() < 0.75,
-        "{width}x{height}: Terminal and OpenCode rows must keep their geometry: {terminal:?} {opencode:?}"
-    );
-
-    // A wheel over the menu scrolls every remote row into view.
-    wheel_over(&mut headless, terminal.center(), egui::vec2(0.0, -20_000.0));
-    let last_rect = headless.response(last_menu).rect;
-    assert!(
-        screen.contains_rect(last_rect),
-        "{width}x{height}: the wheel must scroll the last remote row into view: {last_rect:?} vs {screen:?}"
-    );
-
-    // Reopen and walk the menu with the keyboard to the last remote row.
-    headless.press_key(egui::Key::Escape);
-    headless.render();
-    headless.focus(top_action_id("open-folder"));
-    headless.press_key(egui::Key::Enter);
-    headless.render();
-    let reopened_terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let reopened_opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    assert!(
-        screen.contains_rect(reopened_terminal) && screen.contains_rect(reopened_opencode),
-        "{width}x{height}: reopening must show Terminal and OpenCode at the top: {reopened_terminal:?} {reopened_opencode:?} vs {screen:?}"
-    );
-    assert!(
-        reopened_terminal.top() < reopened_opencode.top(),
-        "{width}x{height}: reopening must keep Terminal above OpenCode"
-    );
-    headless.press_key(egui::Key::ArrowDown);
-    headless.render();
-    let mut reached = false;
-    for _ in 0..servers.len() + 3 {
-        if headless.ctx.memory(|memory| memory.focused()) == Some(last_menu) {
-            reached = true;
-            break;
-        }
-        headless.press_key(egui::Key::ArrowDown);
-        headless.render();
-    }
-    assert!(
-        reached,
-        "{width}x{height}: arrow keys must reach the last remote row"
-    );
-    headless.advance(0.6);
-    let last_rect = headless.response(last_menu).rect;
-    assert!(
-        screen.contains_rect(last_rect),
-        "{width}x{height}: keyboard focus must scroll the last remote row into view: {last_rect:?} vs {screen:?}"
-    );
-}
-
-#[test]
-fn new_tab_menu_scrolls_large_inventory_at_1280x800() {
-    if isolated("new_tab_menu_scrolls_large_inventory_at_1280x800") {
-        return;
-    }
-    assert_large_new_tab_menu_scrolls(1280.0, 800.0);
-}
-
-#[test]
-fn new_tab_menu_scrolls_large_inventory_at_720x480() {
-    if isolated("new_tab_menu_scrolls_large_inventory_at_720x480") {
-        return;
-    }
-    assert_large_new_tab_menu_scrolls(720.0, 480.0);
-}
-
-#[test]
-fn new_tab_menu_scrolls_large_inventory_at_short_viewport() {
-    if isolated("new_tab_menu_scrolls_large_inventory_at_short_viewport") {
-        return;
-    }
-    // A shorter supported viewport must bound the menu to the space that is
-    // actually left instead of reserving three rows past the bottom edge.
-    assert_large_new_tab_menu_scrolls(720.0, 360.0);
-}
-
-#[test]
-fn new_tab_menu_short_inventory_stays_compact() {
-    if isolated("new_tab_menu_short_inventory_stays_compact") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "menu-short", "main.rs");
-    let mut model = AppModel::from_launch(
-        WorkspaceLaunch::waiting_for_picker(),
-        AppOptions::new().with_compatible_tuis([OPENCODE]),
-    );
-    let id = open_workspace(&mut model, &root);
-    let mut headless = Headless::new(model, 1100.0, 700.0);
-    wait_explorer_ready(&mut headless, id);
-
-    headless.click(top_action_id("open-folder"));
-    headless.settle_animation();
-    let screen = headless.ctx.content_rect();
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    let popup = headless
-        .ctx
-        .memory(|memory| memory.area_rect(top_action_id("open-folder").with("popup")))
-        .expect("menu area");
-    assert!(
-        (terminal.height() - opencode.height()).abs() < 0.5
-            && (terminal.width() - opencode.width()).abs() < 0.75,
-        "the short menu must keep its row geometry: {terminal:?} {opencode:?}"
-    );
-    assert!(
-        popup.height() < terminal.height() * 3.0 + 40.0,
-        "a short menu must not reserve an empty scroll viewport: {popup:?}"
-    );
-    assert!(
-        screen.contains_rect(popup),
-        "a short menu must stay compact inside the viewport: {popup:?} vs {screen:?}"
-    );
-}
-
-fn triangles_in(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<egui::Rect> {
-    fn visit(shape: &egui::Shape, bounds: egui::Rect, found: &mut Vec<egui::Rect>) {
-        match shape {
-            egui::Shape::Path(path) if path.points.len() == 3 => {
-                let rect = egui::Rect::from_points(&path.points);
-                if bounds.contains_rect(rect) {
-                    found.push(rect);
-                }
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    visit(shape, bounds, found);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut found = Vec::new();
-    for clipped in &output.shapes {
-        visit(&clipped.shape, bounds, &mut found);
-    }
-    found
-}
-
-fn short_segments_in(output: &egui::FullOutput, bounds: egui::Rect) -> Vec<[egui::Pos2; 2]> {
-    fn visit(shape: &egui::Shape, bounds: egui::Rect, found: &mut Vec<[egui::Pos2; 2]>) {
-        match shape {
-            egui::Shape::LineSegment { points, .. } => {
-                let rect = egui::Rect::from_two_pos(points[0], points[1]);
-                let length = (points[1] - points[0]).length();
-                if length < 20.0 && bounds.intersects(rect) {
-                    found.push(*points);
-                }
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    visit(shape, bounds, found);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut found = Vec::new();
-    for clipped in &output.shapes {
-        visit(&clipped.shape, bounds, &mut found);
-    }
-    found
 }
 
 fn grok_home_dir() -> PathBuf {
@@ -10589,7 +9283,12 @@ fn running_grok_tui_shows_grok_build_before_a_session_and_reverts_on_exit() {
         AppOptions::new().with_compatible_tuis([GROK]),
     );
     let shell_id = open_workspace(&mut model, &root);
-    model.begin_tui_workspace(GROK);
+    model
+        .begin_tui_workspace_in(
+            GROK,
+            &PathBuf::from(std::env::var_os("HOME").expect("isolated home")),
+        )
+        .expect("grok tab");
     model.ensure_workbench();
     let grok_id = model.active_workspace_id().expect("grok tab");
     assert_ne!(grok_id, shell_id);
@@ -10770,10 +9469,10 @@ fn an_opencode_tab_keeps_its_dots_and_root_when_grok_events_arrive() {
         "the OpenCode idle dot",
     );
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Session 0", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "the connected tab must stay labeled OpenCode"
+        "the connected tab stays labeled with its OpenCode session title"
     );
     assert!(
         text_rects(&output, "Grok Build", 55.0)
@@ -10814,225 +9513,6 @@ fn menu_model(root: &Path, tuis: &[IntegrationRef]) -> (Headless, WorkspaceId) {
         style.interaction.tooltip_delay = 0.0
     });
     (headless, id)
-}
-
-#[test]
-fn header_plus_without_a_detected_tui_shows_no_menu() {
-    if isolated("header_plus_without_a_detected_tui_shows_no_menu") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "no-tui", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[]);
-    headless.pump_until(|model| {
-        model
-            .workspace(id)
-            .and_then(Workbench::terminal)
-            .is_some_and(made_app::TerminalPane::is_running)
-    });
-    headless.click(top_action_id("open-folder"));
-    assert!(headless.model.is_picker());
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(headless.model.workspace(id).is_some());
-    assert!(
-        headless
-            .model
-            .workspace(id)
-            .and_then(Workbench::terminal)
-            .is_some_and(made_app::TerminalPane::is_running),
-        "opening the picker must leave the local terminal running"
-    );
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("terminal"))
-        .is_none());
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("opencode"))
-        .is_none());
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("grok"))
-        .is_none());
-}
-
-#[test]
-fn catalog_menu_lists_terminal_then_opencode_then_grok() {
-    if isolated("catalog_menu_lists_terminal_then_opencode_then_grok") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "both", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK]);
-    let hovered =
-        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
-    assert!(
-        hovered.contains("Open folder"),
-        "the + tooltip and accessible name stay Open folder: {hovered}"
-    );
-    headless.click(top_action_id("open-folder"));
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
-    assert!(
-        terminal.top() < opencode.top() && opencode.top() < grok.top(),
-        "menu order must be Terminal, OpenCode, Grok: {terminal:?} {opencode:?} {grok:?}"
-    );
-    assert!(!headless.model.is_picker());
-    assert_eq!(headless.model.workspace_count(), 1);
-}
-
-#[test]
-fn only_grok_omits_opencode_from_the_menu() {
-    if isolated("only_grok_omits_opencode_from_the_menu") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "grok-only", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[GROK]);
-    headless.click(top_action_id("open-folder"));
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
-    assert!(terminal.top() < grok.top());
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("opencode"))
-        .is_none());
-    let text = output_text(&headless.render());
-    assert!(text.contains("Terminal"));
-    assert!(
-        text.contains("Grok Build"),
-        "the Grok row must show the full product label: {text}"
-    );
-}
-
-#[test]
-fn choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one() {
-    if isolated("choosing_grok_starts_a_home_tab_without_a_picker_or_stopping_the_current_one") {
-        return;
-    }
-    use made_platform::Platform;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[GROK]);
-    let home = made_platform::host_platform()
-        .home_dir()
-        .expect("test home")
-        .canonicalize()
-        .expect("canonical test home");
-    headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("grok"));
-    assert!(!headless.model.is_picker());
-    assert_eq!(headless.model.active_workspace_id(), Some(id));
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(headless.model.start_pending());
-    assert_eq!(headless.model.terminal_target(), TerminalTarget::Tui(GROK));
-    assert_eq!(
-        headless.model.launch().source(),
-        WorkspaceSource::DefaultHome
-    );
-    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
-    assert!(headless
-        .model
-        .workspace(id)
-        .and_then(Workbench::terminal)
-        .is_some());
-}
-
-#[test]
-fn terminal_row_still_opens_the_folder_picker_when_grok_is_listed() {
-    if isolated("terminal_row_still_opens_the_folder_picker_when_grok_is_listed") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "terminal-row", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[OPENCODE, GROK]);
-    headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("terminal"));
-    assert!(headless.model.is_picker());
-    assert_eq!(headless.model.workspace_count(), 1);
-    assert!(headless
-        .model
-        .workspace(id)
-        .and_then(Workbench::terminal)
-        .is_some());
-    assert_eq!(headless.model.terminal_target(), TerminalTarget::Shell);
-}
-
-#[test]
-fn grok_row_paints_the_terminal_glyph_and_opencode_keeps_its_svg() {
-    if isolated("grok_row_paints_the_terminal_glyph_and_opencode_keeps_its_svg") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "glyphs", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK]);
-    headless.ctx.set_pixels_per_point(2.0);
-    headless.click(top_action_id("open-folder"));
-    headless.advance(0.3);
-    let output = headless.render();
-    let text = output_text(&output);
-    assert!(
-        text.contains("Grok Build"),
-        "missing Grok Build label: {text}"
-    );
-    assert!(text.contains("OpenCode"), "missing OpenCode label: {text}");
-    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    let grok_label = painted_menu_label(&output, "Grok Build", grok);
-    let grok_image = painted_images(&output)
-        .into_iter()
-        .find(|image| {
-            (image.rect.width() - 16.0).abs() < 0.75
-                && (image.rect.height() - 16.0).abs() < 0.75
-                && grok.contains_rect(image.rect)
-                && image.rect.right() <= grok_label.line.left() - 1.0
-        })
-        .expect("Grok row must paint the 16px official mark");
-    let grok_px = (output.pixels_per_point * grok_image.rect.size()).round();
-    assert_eq!(
-        grok_image.texture,
-        embedded_svg_texture(
-            &headless.ctx,
-            "bytes://grok.svg",
-            include_bytes!("../assets/grok.svg"),
-            grok_px.x as u32,
-            grok_px.y as u32,
-        ),
-        "the Grok row's 16px image must match grok.svg bytes"
-    );
-    assert!(
-        !rect_shapes(&output).into_iter().any(|shape| {
-            (shape.rect.width() - 14.0).abs() < 0.75
-                && (shape.rect.height() - 11.0).abs() < 0.75
-                && (shape.stroke.width - 1.5).abs() < 0.05
-                && shape.corner_radius == egui::CornerRadius::same(2)
-                && grok.contains_rect(shape.rect)
-                && shape.rect.right() <= grok_label.line.left() - 2.0
-        }),
-        "the terminal-window glyph is not the Grok mark"
-    );
-    let opencode_icon =
-        explorer_icons::icon_by_file_name("opencode.svg").expect("opencode.svg is vendored");
-    let opencode_image = painted_images(&output)
-        .into_iter()
-        .find(|image| {
-            (image.rect.width() - 16.0).abs() < 0.75
-                && (image.rect.height() - 16.0).abs() < 0.75
-                && opencode.contains_rect(image.rect)
-        })
-        .expect("OpenCode row must keep the 16px opencode.svg");
-    let image_px = (output.pixels_per_point * opencode_image.rect.size()).round();
-    assert_eq!(
-        opencode_image.texture,
-        icon_texture_px(
-            &headless.ctx,
-            opencode_icon,
-            image_px.x as u32,
-            image_px.y as u32,
-        )
-    );
 }
 
 #[cfg(unix)]
@@ -11128,10 +9608,8 @@ fn explicit_grok_catalog_does_not_install_the_plugin() {
     let root = fixture_workspace(temp.path(), "catalog", "main.rs");
     let (mut headless, _) = menu_model(&root, &[GROK]);
     headless.click(top_action_id("open-folder"));
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("grok"))
-        .is_some());
+    headless.render();
+    assert!(headless.ctx.read_response(launch_item("grok")).is_some());
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         headless.model.logic(&headless.ctx);
@@ -11577,8 +10055,9 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
         "a Grok catalog must not block the shell or install before the menu opens"
     );
     menu.click(top_action_id("open-folder"));
+    menu.render();
     let menu_output = menu.render();
-    let grok_row = menu.response(new_tab_menu_item_id("grok")).rect;
+    let grok_row = menu.response(launch_item("grok")).rect;
     let menu_labels: Vec<String> = hit_texts(&menu_output, "Grok")
         .into_iter()
         .filter(|hit| grok_row.intersects(hit.rect))
@@ -11594,6 +10073,8 @@ fn grok_build_diagnostics_row_follows_detection_and_install() {
             .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
         "the menu row shows a diagnostics sentence: {menu_labels:?}"
     );
+    menu.press_key(egui::Key::Escape);
+    menu.render();
 
     menu.click(made_app::theme::wordmark_id());
     let menu_pane = menu.model.workspace(menu_id).unwrap().pane_id().to_owned();
@@ -11820,8 +10301,9 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
         "a running mark must not block the shell or install"
     );
     menu.click(top_action_id("open-folder"));
+    menu.render();
     let menu_output = menu.render();
-    let grok_row = menu.response(new_tab_menu_item_id("grok")).rect;
+    let grok_row = menu.response(launch_item("grok")).rect;
     let menu_labels: Vec<String> = hit_texts(&menu_output, "Grok")
         .into_iter()
         .filter(|hit| grok_row.intersects(hit.rect))
@@ -11837,6 +10319,8 @@ fn grok_build_diagnostics_row_is_ready_only_while_grok_is_running_in_that_worksp
             .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
         "the menu row shows a diagnostics sentence: {menu_labels:?}"
     );
+    menu.press_key(egui::Key::Escape);
+    menu.render();
 
     open_about_diagnostics(&mut menu, menu_id);
     for running in [GrokRunningHold::LivingTarget, GrokRunningHold::NotRunning] {
@@ -11857,13 +10341,14 @@ const GROK_EXPLICIT_CATALOG_SENTENCE: &str = "Grok Build plugin was not installe
 
 fn assert_catalog_menu_unchanged(headless: &mut Headless) {
     headless.click(top_action_id("open-folder"));
+    headless.render();
     let output = headless.render();
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
+    let terminal = headless.response(launch_item("terminal")).rect;
+    let opencode = headless.response(launch_item("opencode")).rect;
+    let grok = headless.response(launch_item("grok")).rect;
     assert!(
-        terminal.top() < opencode.top() && opencode.top() < grok.top(),
-        "menu order changed"
+        terminal.left() < opencode.left() && opencode.left() < grok.left(),
+        "launch bar order changed"
     );
     let opencode_labels: Vec<String> = hit_texts(&output, "OpenCode")
         .into_iter()
@@ -11899,7 +10384,10 @@ fn assert_catalog_menu_unchanged(headless: &mut Headless) {
             .iter()
             .all(|label| !GROK_DIAGNOSTIC_SENTENCES.contains(&label.as_str())),
         "the menu row shows a diagnostics sentence: {grok_labels:?}"
-    );
+    ); // Back to the workspace: the screen leaves the live tab untouched.
+    headless.press_key(egui::Key::Escape);
+    headless.render();
+    assert!(!headless.model.is_picker());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12552,7 +11040,7 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
             initial_directory: None,
         })
         .expect("server metadata saves");
-    let _without_grok = model
+    let without_grok = model
         .add_ssh_metadata(ServerMetadata {
             display_name: "Plain server".into(),
             host: "plain-server".into(),
@@ -12577,42 +11065,37 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
     wait_explorer_ready(&mut headless, menu_host);
     headless.render();
 
-    // The `+` menu offers `Grok SSH` only for the server whose own probe
-    // detected grok; the other server's choices omit it.
+    // The launch bar offers `Grok SSH` only on the server whose own probe
+    // detected grok; the other server keeps its terminal button.
     headless.click(top_action_id("open-folder"));
-    let menu = output_text(&headless.render());
-    assert!(
-        menu.contains("Grok SSH — Grok server"),
-        "the detected server must offer Grok SSH: {menu}"
-    );
-    assert!(
-        !menu.contains("Grok SSH — Plain server"),
-        "an undetected server must not offer Grok SSH: {menu}"
-    );
-    assert!(
-        menu.contains("Terminal SSH — Plain server"),
-        "the undetected server keeps its terminal choice: {menu}"
-    );
-    headless.press_key(egui::Key::Escape);
+    assert!(headless.model.is_picker());
     headless.render();
-
-    // The consent card lives in the server window for the selected server.
-    headless.click(top_action_id("ssh-servers"));
-    let window = output_text(&headless.render());
+    let labels = |headless: &Headless| {
+        headless
+            .model
+            .open_workspace()
+            .unwrap()
+            .launch_buttons()
+            .iter()
+            .map(|button| button.kind.label())
+            .collect::<Vec<_>>()
+    };
+    headless.click(made_app::ui::open_workspace_host_id(
+        made_app::open_workspace::HostId::Ssh(without_grok),
+    ));
+    assert_eq!(labels(&headless), vec!["Terminal"]);
+    let plain = output_text(&headless.render());
     assert!(
-        window.contains("Servidores SSH"),
-        "the SSH window opens: {window}"
+        !plain.contains("Grok Build plugin install"),
+        "a server whose probe did not detect grok shows no Grok consent card: {plain}"
     );
-    assert!(
-        !window.contains("Grok Build plugin install"),
-        "a server whose probe did not detect grok shows no Grok consent card: {window}"
-    );
+    headless.click(made_app::ui::open_workspace_host_id(
+        made_app::open_workspace::HostId::Ssh(with_grok),
+    ));
+    assert_eq!(labels(&headless), vec!["Terminal", "Grok Build"]);
 
     // Select the grok-capable server: the card offers approve and refuse with
     // the honest new-sessions-only disclosure, and nothing has been installed.
-    headless.model.select_ssh_server(with_grok);
-    // The bounded body measures the card, then the window grows to fit it.
-    headless.render();
     headless.render();
     let card = output_text(&headless.render());
     assert!(
@@ -12719,9 +11202,1423 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
     );
     headless.render();
     let withdrawn = output_text(&headless.render());
+    // A success adds no notice text; the card itself shows the offer again.
     assert!(
-        withdrawn.contains("Consent withdrawn"),
-        "withdrawal is disclosed: {withdrawn}"
+        withdrawn.contains("Approve") && !withdrawn.contains("Consent withdrawn"),
+        "withdrawal returns the card to its offer: {withdrawn}"
+    );
+}
+
+// ── Open workspace screen (open-workspace-redesign task 7.2) ────────────────
+
+use made_app::open_workspace::{HostId, LaunchKind};
+
+fn launch_id(kind: LaunchKind) -> egui::Id {
+    made_app::ui::launch_button_id(kind)
+}
+
+/// Run `git` in `dir` with an isolated identity and no user configuration.
+fn git(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Made Test",
+            "-c",
+            "user.email=test@made.invalid",
+        ])
+        .args([
+            "-c",
+            "init.defaultBranch=main",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `work/made` with linked worktrees `work/made-wt/feature-a` (branch) and
+/// `work/made-wt/fix` (detached); `None` when git is unavailable.
+fn repo_with_worktrees(temp: &Path) -> Option<PathBuf> {
+    let work = temp.join("work");
+    let repo = work.join("made");
+    fs::create_dir_all(repo.join("crates")).unwrap();
+    fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+    if !git(&repo, &["init", "-q"]) || !git(&repo, &["add", "."]) {
+        return None;
+    }
+    if !git(&repo, &["commit", "-q", "-m", "base"]) {
+        return None;
+    }
+    fs::create_dir_all(work.join("made-wt")).unwrap();
+    assert!(git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature-a",
+            "../made-wt/feature-a"
+        ]
+    ));
+    assert!(git(
+        &repo,
+        &["worktree", "add", "-q", "--detach", "../made-wt/fix"]
+    ));
+    // Two staged and one modified on the root, one untracked on feature-a.
+    fs::write(repo.join("staged-1.txt"), "s1").unwrap();
+    fs::write(repo.join("staged-2.txt"), "s2").unwrap();
+    assert!(git(&repo, &["add", "staged-1.txt", "staged-2.txt"]));
+    fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+    fs::write(work.join("made-wt/feature-a/new.txt"), "n").unwrap();
+    Some(fs::canonicalize(&repo).unwrap())
+}
+
+/// A repository without linked worktrees whose working tree has one
+/// conflicted, one staged, one modified and one untracked path.
+fn repo_with_four_kinds(root: &Path) -> bool {
+    fs::create_dir_all(root).unwrap();
+    fs::write(root.join("conflict.txt"), "base\n").unwrap();
+    fs::write(root.join("tracked.txt"), "base\n").unwrap();
+    if !git(root, &["init", "-q"]) || !git(root, &["add", "."]) {
+        return false;
+    }
+    if !git(root, &["commit", "-q", "-m", "base"]) {
+        return false;
+    }
+    assert!(git(root, &["checkout", "-q", "-b", "other"]));
+    fs::write(root.join("conflict.txt"), "other\n").unwrap();
+    assert!(git(root, &["commit", "-q", "-am", "other"]));
+    assert!(git(root, &["checkout", "-q", "main"]));
+    fs::write(root.join("conflict.txt"), "main\n").unwrap();
+    assert!(git(root, &["commit", "-q", "-am", "main"]));
+    // The merge stops on the conflict; that is the state under test.
+    git(root, &["merge", "-q", "other"]);
+    fs::write(root.join("staged.txt"), "s").unwrap();
+    assert!(git(root, &["add", "staged.txt"]));
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+    fs::write(root.join("untracked.txt"), "u").unwrap();
+    true
+}
+
+fn screen_headless(start: &Path, width: f32, height: f32, tuis: &[IntegrationRef]) -> Headless {
+    let picker = WorkspacePicker::new(start).unwrap();
+    let launch = WorkspaceLaunch::Picker {
+        picker,
+        error: None,
+    };
+    let headless = Headless::new(
+        AppModel::from_launch(
+            launch,
+            AppOptions::new().with_compatible_tuis(tuis.iter().copied()),
+        ),
+        width,
+        height,
+    );
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless
+}
+
+/// Render until the screen's git reads for the current target settle.
+fn until_git(
+    headless: &mut Headless,
+    mut done: impl FnMut(&made_app::open_workspace::OpenWorkspace) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        headless.render();
+        if headless.model.open_workspace().is_some_and(&mut done) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "git reads did not settle");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    headless.render();
+}
+
+fn counts_ready(open: &made_app::open_workspace::OpenWorkspace) -> bool {
+    use made_app::open_workspace::{CountsState, GitState};
+    match open.git_state() {
+        Some(GitState::Repository {
+            worktrees, counts, ..
+        }) => {
+            if open.worktrees_shown() {
+                worktrees
+                    .iter()
+                    .all(|item| item.missing || matches!(item.counts, CountsState::Ready(_)))
+            } else {
+                matches!(counts, CountsState::Ready(_))
+            }
+        }
+        Some(GitState::NoRepository) => true,
+        None => false,
+    }
+}
+
+fn all_text_sizes(output: &egui::FullOutput) -> Vec<(String, f32)> {
+    fn visit(shape: &egui::Shape, sizes: &mut Vec<(String, f32)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                if !text.galley.job.text.trim().is_empty() {
+                    for section in &text.galley.job.sections {
+                        sizes.push((text.galley.job.text.clone(), section.format.font_id.size));
+                    }
+                }
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| visit(shape, sizes)),
+            _ => {}
+        }
+    }
+    let mut sizes = Vec::new();
+    for clipped in &output.shapes {
+        visit(&clipped.shape, &mut sizes);
+    }
+    sizes
+}
+
+#[test]
+fn plus_opens_the_screen_directly_in_every_detection_and_server_combination() {
+    if isolated("plus_opens_the_screen_directly_in_every_detection_and_server_combination") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    // No TUI and no server first: saved servers persist in the isolated
+    // app data for the rest of the test.
+    for (tuis, servers) in [(Vec::new(), 0), (vec![OPENCODE, GROK, CLAUDE_CODE], 2)] {
+        for keyboard in [None, Some(egui::Key::Enter), Some(egui::Key::Space)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fixture_workspace(temp.path(), "plus", "main.rs");
+            let mut model = AppModel::from_launch(
+                WorkspaceLaunch::waiting_for_picker(),
+                AppOptions::new().with_compatible_tuis(tuis.iter().copied()),
+            );
+            let existing = made_app::ssh_servers::ServerRegistry::load(
+                made_app::ssh_servers::PrivateMetadataStorage::from_app_paths().unwrap(),
+            )
+            .map(|registry| registry.servers().len())
+            .unwrap_or(0);
+            for index in existing..servers {
+                model
+                    .add_ssh_metadata(ServerMetadata {
+                        display_name: format!("server-{index}"),
+                        host: format!("host-{index}"),
+                        user: None,
+                        port: None,
+                        key_file: None,
+                        initial_directory: None,
+                    })
+                    .unwrap();
+            }
+            let id = open_workspace(&mut model, &root);
+            let mut headless = Headless::new(model, 1100.0, 700.0);
+            headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+                style.interaction.tooltip_delay = 0.0
+            });
+            wait_explorer_ready(&mut headless, id);
+            let hovered = output_text(
+                &headless.hover_until_text(top_action_id("open-folder"), "Open workspace"),
+            );
+            assert!(hovered.contains("Open workspace"), "{hovered}");
+            match keyboard {
+                None => {
+                    headless.click(top_action_id("open-folder"));
+                }
+                Some(key) => {
+                    headless.focus(top_action_id("open-folder"));
+                    headless.press_key(key);
+                }
+            }
+            assert!(
+                headless.model.is_picker(),
+                "+ must open the screen directly ({tuis:?}, {servers} servers, {keyboard:?})"
+            );
+            let output = headless.render();
+            let text = output_text(&output);
+            assert!(text.contains("Open workspace"), "{text}");
+            assert!(text.contains("Launch in"), "{text}");
+            assert!(!text.contains("Terminal SSH"), "no menu rows: {text}");
+            assert!(
+                !egui::Popup::is_any_open(&headless.ctx),
+                "+ must not open a menu"
+            );
+            assert!(
+                headless
+                    .model
+                    .workspace(id)
+                    .and_then(Workbench::terminal)
+                    .is_some(),
+                "the live workspace keeps running"
+            );
+            let labels: Vec<&str> = headless
+                .model
+                .open_workspace()
+                .unwrap()
+                .launch_buttons()
+                .iter()
+                .map(|button| button.kind.label())
+                .collect();
+            let expected: Vec<&str> = std::iter::once("Terminal")
+                .chain(tuis.iter().map(|tui| tui.descriptor().label))
+                .collect();
+            assert_eq!(labels, expected);
+            assert_eq!(
+                headless.model.screen_hosts().len(),
+                1 + servers,
+                "Local first, then every saved server"
+            );
+            headless.press_key(egui::Key::Escape);
+            assert!(!headless.model.is_picker());
+            assert_eq!(headless.model.active_workspace_id(), Some(id));
+        }
+    }
+}
+
+#[test]
+fn backspace_reroots_only_from_folder_navigation() {
+    let temp = tempfile::tempdir().unwrap();
+    let child = temp.path().join("child");
+    fs::create_dir(&child).unwrap();
+    let child = child.canonicalize().unwrap();
+    let mut headless = screen_headless(&child, 1280.0, 800.0, &[]);
+    headless.render();
+    let current = |headless: &Headless| {
+        headless
+            .model
+            .launch()
+            .picker()
+            .unwrap()
+            .current_dir()
+            .to_path_buf()
+    };
+    for id in [
+        made_app::ui::open_workspace_host_id(HostId::Local),
+        launch_id(LaunchKind::Terminal),
+        picker_control_id("close"),
+    ] {
+        headless.focus(id);
+        headless.press_key(egui::Key::Backspace);
+        assert_eq!(
+            current(&headless),
+            child,
+            "Backspace on {id:?} must not re-root"
+        );
+    }
+    headless.focus(picker_list_id());
+    headless.press_key(egui::Key::Backspace);
+    assert_eq!(current(&headless), child.parent().unwrap());
+}
+
+#[test]
+fn command_enter_does_not_launch_while_a_text_field_is_edited() {
+    use made_app::ssh_servers::HostField;
+    let temp = tempfile::tempdir().unwrap();
+    let mut headless = screen_headless(temp.path(), 1280.0, 800.0, &[]);
+    headless.render();
+    headless.model.screen_add_host();
+    headless.render();
+    for field in [
+        picker_path_id(),
+        made_app::ui::host_form_field_id(HostField::Name),
+    ] {
+        headless.focus(field);
+        headless.press_key_with_modifiers(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(
+            headless.model.is_picker() && !headless.model.start_pending(),
+            "Cmd/Ctrl+Enter in {field:?} must not launch"
+        );
+    }
+    // In the folder tree it still opens Terminal.
+    headless.model.screen_cancel_form();
+    headless.focus(picker_list_id());
+    headless.press_key_with_modifiers(egui::Key::Enter, egui::Modifiers::COMMAND);
+    assert!(headless.model.start_pending() || !headless.model.is_picker());
+}
+
+#[test]
+fn a_disabled_launch_button_is_a_tab_stop_that_says_why() {
+    let temp = tempfile::tempdir().unwrap();
+    let start = temp.path().join("gone");
+    fs::create_dir(&start).unwrap();
+    let picker = WorkspacePicker::new(&start).unwrap();
+    fs::remove_dir(&start).unwrap();
+    let mut headless = Headless::new(
+        AppModel::from_launch(
+            WorkspaceLaunch::Picker {
+                picker,
+                error: None,
+            },
+            AppOptions::new(),
+        ),
+        1280.0,
+        800.0,
+    );
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    headless.render();
+    let button = headless.model.open_workspace().unwrap().launch_buttons()[0];
+    assert!(!button.enabled);
+    let reason = button.disabled_reason.expect("a reason");
+    let id = launch_id(LaunchKind::Terminal);
+    // Tab reaches the disabled button.
+    headless.focus(made_app::ui::open_workspace_host_id(HostId::Local));
+    let mut reached = false;
+    for _ in 0..30 {
+        headless.press_key(egui::Key::Tab);
+        headless.render();
+        if headless.ctx.memory(|memory| memory.focused()) == Some(id) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "the disabled launch button is a Tab stop");
+    let output = headless.render();
+    assert_eq!(headless.ctx.memory(|memory| memory.focused()), Some(id));
+    assert!(
+        all_text_sizes(&output)
+            .iter()
+            .any(|(text, _)| text.contains(reason)),
+        "the focused disabled button shows why: {reason}"
+    );
+    // It still does not activate.
+    headless.press_key(egui::Key::Enter);
+    headless.press_key(egui::Key::Space);
+    assert!(headless.model.is_picker() && !headless.model.start_pending());
+}
+
+#[test]
+fn screen_tab_order_runs_host_bar_address_tree_worktrees_launch_then_close() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(repo) = repo_with_worktrees(temp.path()) else {
+        return;
+    };
+    let mut headless = screen_headless(&repo, 1280.0, 800.0, &[]);
+    until_git(&mut headless, counts_ready);
+    assert!(headless.model.open_workspace().unwrap().worktrees_shown());
+    headless.focus(made_app::ui::open_workspace_host_id(HostId::Local));
+    let mut order = vec![headless.ctx.memory(|memory| memory.focused()).unwrap()];
+    for _ in 0..60 {
+        headless.press_key(egui::Key::Tab);
+        headless.render();
+        let Some(focused) = headless.ctx.memory(|memory| memory.focused()) else {
+            break;
+        };
+        if order.contains(&focused) {
+            break;
+        }
+        order.push(focused);
+    }
+    let position = |id: egui::Id| {
+        order
+            .iter()
+            .position(|focused| *focused == id)
+            .unwrap_or_else(|| panic!("{id:?} is not a Tab stop: {order:?}"))
+    };
+    let sequence = [
+        made_app::ui::open_workspace_host_id(HostId::Local),
+        made_app::ui::open_workspace_add_host_id(),
+        picker_path_id(),
+        picker_list_id(),
+        made_app::ui::worktree_list_id(),
+        launch_id(LaunchKind::Terminal),
+        picker_control_id("close"),
+    ];
+    let positions: Vec<usize> = sequence.iter().map(|id| position(*id)).collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "Tab order must be host bar, address bar, tree, worktrees, launch bar, Close: {positions:?}"
+    );
+}
+
+#[test]
+fn host_bar_moves_with_left_right_and_scrolls_the_focused_host_into_view() {
+    if isolated("host_bar_moves_with_left_right_and_scrolls_the_focused_host_into_view") {
+        return;
+    }
+    use made_app::ssh_servers::ServerMetadata;
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::Picker {
+            picker: WorkspacePicker::new(temp.path()).unwrap(),
+            error: None,
+        },
+        AppOptions::new(),
+    );
+    for index in 0..12 {
+        model
+            .add_ssh_metadata(ServerMetadata {
+                display_name: format!("server-number-{index:02}"),
+                host: format!("host-{index:02}.example.org"),
+                user: Some("deploy".into()),
+                port: Some(2200 + index),
+                key_file: None,
+                initial_directory: None,
+            })
+            .unwrap();
+    }
+    let mut headless = Headless::new(model, 720.0, 480.0);
+    let output = headless.render();
+    let local = headless
+        .response(made_app::ui::open_workspace_host_id(HostId::Local))
+        .rect;
+    let add = headless.response(made_app::ui::open_workspace_add_host_id());
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+    assert!(
+        !screen.contains_rect(add.rect),
+        "twelve hosts overflow the compact row: {:?}",
+        add.rect
+    );
+    let hosts: Vec<egui::Rect> = headless
+        .model
+        .screen_hosts()
+        .iter()
+        .map(|host| {
+            headless
+                .response(made_app::ui::open_workspace_host_id(host.id))
+                .rect
+        })
+        .collect();
+    assert!(
+        hosts
+            .iter()
+            .all(|rect| (rect.center().y - local.center().y).abs() < 0.5),
+        "the host row never wraps"
+    );
+    assert!(
+        rects_with_fill(&output, made_app::theme::SCROLL_THUMB).is_empty(),
+        "no scrollbar is painted at rest"
+    );
+    headless.focus(made_app::ui::open_workspace_host_id(HostId::Local));
+    for _ in 0..13 {
+        headless.press_key(egui::Key::ArrowRight);
+        headless.render();
+    }
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(made_app::ui::open_workspace_add_host_id()),
+        "Right reaches + Add host"
+    );
+    let add = headless
+        .response(made_app::ui::open_workspace_add_host_id())
+        .rect;
+    assert!(
+        screen.contains_rect(add),
+        "the focused + Add host scrolls into view: {add:?}"
+    );
+    for _ in 0..13 {
+        headless.press_key(egui::Key::ArrowLeft);
+        headless.render();
+    }
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(made_app::ui::open_workspace_host_id(HostId::Local))
+    );
+    let local = headless
+        .response(made_app::ui::open_workspace_host_id(HostId::Local))
+        .rect;
+    assert!(screen.contains_rect(local), "Local scrolls back into view");
+}
+
+#[test]
+fn host_actions_button_and_context_menu_offer_edit_test_and_remove() {
+    if isolated("host_actions_button_and_context_menu_offer_edit_test_and_remove") {
+        return;
+    }
+    use made_app::ssh_servers::{HostAction, ServerMetadata};
+    let temp = tempfile::tempdir().unwrap();
+    let mut model = AppModel::from_launch(
+        WorkspaceLaunch::Picker {
+            picker: WorkspacePicker::new(temp.path()).unwrap(),
+            error: None,
+        },
+        AppOptions::new(),
+    );
+    let prod = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "prod".into(),
+            host: "prod.example.org".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            key_file: None,
+            initial_directory: Some(
+                made_remote::protocol::RemotePath::new(b"/srv/app".to_vec()).unwrap(),
+            ),
+        })
+        .unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.ctx.style_mut_of(egui::Theme::Dark, |style| {
+        style.interaction.tooltip_delay = 0.0
+    });
+    let text = output_text(&headless.render());
+    assert!(text.contains("deploy@prod.example.org:2222"), "{text}");
+    let host = made_app::ui::open_workspace_host_id(HostId::Ssh(prod));
+    let actions = made_app::ui::host_actions_id(prod);
+    assert!(
+        headless
+            .ctx
+            .read_response(made_app::ui::host_actions_id(prod))
+            .is_some(),
+        "SSH hosts expose Host actions"
+    );
+    let hovered = output_text(&headless.hover_until_text(actions, "Host actions"));
+    assert!(hovered.contains("Host actions"), "{hovered}");
+    let rect = headless.response(actions).rect;
+    assert!(rect.width() >= 24.0 && rect.height() >= 24.0, "{rect:?}");
+    let host_tooltip = output_text(&headless.hover_until_text(host, "SSH host"));
+    assert!(
+        host_tooltip.contains("SSH host: prod, deploy@prod.example.org:2222"),
+        "{host_tooltip}"
+    );
+
+    // Keyboard: Tab from the host reaches the ⋯ button; Enter opens the menu.
+    headless.focus(host);
+    headless.press_key(egui::Key::Tab);
+    headless.render();
+    assert_eq!(
+        headless.ctx.memory(|memory| memory.focused()),
+        Some(actions)
+    );
+    let focused = headless.render();
+    assert!(
+        !focus_ring_rects(&focused, rect).is_empty(),
+        "⋯ shows its focus ring"
+    );
+    headless.press_key(egui::Key::Enter);
+    let menu = output_text(&headless.render());
+    for label in ["Edit…", "Test connection", "Remove…"] {
+        assert!(menu.contains(label), "{label} missing: {menu}");
+    }
+    headless.click(made_app::ui::host_action_item_id(prod, HostAction::Edit));
+    let form = headless.model.screen_form().expect("Edit opens the form");
+    assert_eq!(form.editing, Some(prod));
+    assert_eq!(form.form.host, "prod.example.org");
+    assert_eq!(form.form.directory, "/srv/app");
+    headless.model.screen_cancel_form();
+
+    // Shift+F10 on the focused host opens the same menu.
+    headless.focus(host);
+    headless.press_key_with_modifiers(egui::Key::F10, egui::Modifiers::SHIFT);
+    let menu = output_text(&headless.render());
+    assert!(
+        menu.contains("Remove…"),
+        "Shift+F10 opens Host actions: {menu}"
+    );
+    headless.click(made_app::ui::host_action_item_id(prod, HostAction::Remove));
+    let prompt = headless.model.screen_removal().expect("Remove asks first");
+    assert!(prompt.contains("prod"), "{prompt}");
+    assert!(prompt.contains("Open tabs stay open"), "{prompt}");
+    let text = output_text(&headless.render());
+    assert!(text.contains("Remove prod?"), "{text}");
+    headless.click(picker_control_id("remove-cancel"));
+    assert!(headless.model.screen_removal().is_none());
+    assert_eq!(
+        headless.model.screen_hosts().len(),
+        2,
+        "Cancel keeps the host"
+    );
+
+    // Secondary click opens the context menu.
+    headless.render();
+    let center = headless.response(host).rect.center();
+    headless.render_events(vec![egui::Event::PointerMoved(center)]);
+    headless.render_events(vec![egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Secondary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    headless.render_events(vec![egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Secondary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    let context = output_text(&headless.render());
+    assert!(
+        context.contains("Test connection"),
+        "the context menu offers the host actions: {context}"
+    );
+
+    // Local offers no host actions.
+    assert!(made_app::ssh_servers::host_actions(HostId::Local).is_empty());
+}
+
+#[test]
+fn add_host_form_validates_saves_last_and_selects() {
+    if isolated("add_host_form_validates_saves_last_and_selects") {
+        return;
+    }
+    use made_app::ssh_servers::HostField;
+    let temp = tempfile::tempdir().unwrap();
+    let model = AppModel::from_launch(
+        WorkspaceLaunch::Picker {
+            picker: WorkspacePicker::new(temp.path()).unwrap(),
+            error: None,
+        },
+        AppOptions::new(),
+    );
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    headless.render();
+    headless.click(made_app::ui::open_workspace_add_host_id());
+    let text = output_text(&headless.render());
+    for label in [
+        "ADD SSH HOST",
+        "Display name",
+        "Host or SSH alias",
+        "Save host",
+        "Cancel",
+    ] {
+        assert!(text.contains(label), "{label} missing: {text}");
+    }
+    {
+        let form = headless.model.screen_form_mut().unwrap();
+        form.host = "bad host".into();
+        form.port = "99999".into();
+    }
+    headless.click(picker_control_id("form-save"));
+    let errors: Vec<HostField> = headless
+        .model
+        .screen_form()
+        .unwrap()
+        .errors
+        .iter()
+        .map(|(field, _)| *field)
+        .collect();
+    assert_eq!(
+        errors,
+        vec![HostField::Name, HostField::Host, HostField::Port]
+    );
+    let text = output_text(&headless.render());
+    assert!(text.contains("Port must be a number"), "{text}");
+    {
+        let form = headless.model.screen_form_mut().unwrap();
+        form.name = "staging".into();
+        form.host = "staging.example.org".into();
+        form.port = "2201".into();
+    }
+    headless.click(picker_control_id("form-save"));
+    assert!(
+        headless.model.screen_form().is_none(),
+        "Save closes the form"
+    );
+    let hosts = headless.model.screen_hosts();
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[1].name, "staging", "a new host is added last");
+    assert_eq!(hosts[1].address, "staging.example.org:2201");
+    assert_eq!(
+        headless.model.open_workspace().unwrap().selected_host(),
+        hosts[1].id,
+        "a new host is selected"
+    );
+    // Cancel discards the draft.
+    headless.click(made_app::ui::open_workspace_add_host_id());
+    headless.model.screen_form_mut().unwrap().name = "draft".into();
+    headless.click(picker_control_id("form-cancel"));
+    assert!(headless.model.screen_form().is_none());
+    assert_eq!(headless.model.screen_hosts().len(), 2);
+}
+
+#[test]
+fn rows_are_24px_with_inset_fills_and_the_chevron_follows_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(repo) = repo_with_worktrees(temp.path()) else {
+        return;
+    };
+    let mut headless = screen_headless(&repo, 1280.0, 800.0, &[]);
+    until_git(&mut headless, counts_ready);
+    let output = headless.render();
+    let row0 = headless
+        .response(egui::Id::unique(("made-picker-row", 0)))
+        .rect;
+    assert!((row0.height() - 24.0).abs() < 0.5, "folder row {row0:?}");
+    assert!(
+        !headless.model.screen_rows()[0].expanded,
+        "rows start collapsed: {:?}",
+        headless.model.screen_rows()
+    );
+
+    let chevron_color = |output: &egui::FullOutput, row: egui::Rect| {
+        path_shapes(output)
+            .into_iter()
+            .filter(|path| {
+                path.points.len() == 3 && !path.closed && row.contains(path_center(path))
+            })
+            .map(|path| {
+                assert_eq!(path.fill, egui::Color32::TRANSPARENT, "no filled shape");
+                assert!((path.stroke.width - 1.25).abs() < 0.01, "1.25px stroke");
+                let rect = egui::Rect::from_points(&path.points);
+                let (long, deep) = (
+                    rect.width().max(rect.height()),
+                    rect.width().min(rect.height()),
+                );
+                assert!(
+                    (long - 8.0).abs() < 0.01 && (deep - 4.0).abs() < 0.01,
+                    "8px tall, 4px deep: {rect:?}"
+                );
+                path.stroke.color
+            })
+            .next()
+            .expect("folder row chevron")
+    };
+    assert_eq!(
+        chevron_color(&output, row0),
+        egui::epaint::ColorMode::Solid(made_app::theme::TEXT_TERTIARY),
+        "rest chevron is TEXT_TERTIARY"
+    );
+    let rest = path_shapes(&output)
+        .into_iter()
+        .find(|path| path.points.len() == 3 && !path.closed && row0.contains(path_center(path)))
+        .unwrap();
+    assert!(
+        rest.points[1].x > rest.points[0].x,
+        "a collapsed chevron points right"
+    );
+    let hovered = headless.hover(egui::Id::unique(("made-picker-row", 0)));
+    assert_eq!(
+        chevron_color(&hovered, row0),
+        egui::epaint::ColorMode::Solid(made_app::theme::TEXT_SECONDARY),
+        "hovered chevron is TEXT_SECONDARY"
+    );
+    assert!(
+        rects_with_fill(&hovered, made_app::theme::BG_HOVER)
+            .iter()
+            .any(|rect| (rect.left() - row0.left() - 4.0).abs() < 0.5 && row0.contains_rect(*rect)),
+        "hover fill is inset 4px"
+    );
+
+    // Worktrees rows: 24px, inset BG_SELECTED radius-6 fill on the root.
+    let worktree = headless
+        .response(egui::Id::unique(("made-worktree-row", 0)))
+        .rect;
+    assert!(
+        (worktree.height() - 24.0).abs() < 0.5,
+        "worktree row {worktree:?}"
+    );
+    let fill = rect_shapes(&output)
+        .into_iter()
+        .find(|shape| {
+            shape.fill == made_app::theme::BG_SELECTED && worktree.contains_rect(shape.rect)
+        })
+        .expect("selected worktree fill");
+    assert_eq!(fill.corner_radius, egui::CornerRadius::same(6));
+    assert!(
+        (fill.rect.left() - worktree.left() - 4.0).abs() < 0.5,
+        "4px inset"
+    );
+    assert_eq!(fill.stroke, egui::Stroke::NONE, "no outline on rows");
+
+    // A nested row indents 14px.
+    headless.model.screen_toggle(0);
+    let output = headless.render();
+    let nested = headless
+        .response(egui::Id::unique(("made-picker-row", 1)))
+        .rect;
+    let nested_chevron = path_shapes(&output)
+        .into_iter()
+        .find(|path| path.points.len() == 3 && !path.closed && nested.contains(path_center(path)));
+    if let Some(chevron) = nested_chevron {
+        assert!(
+            (path_center(&chevron).x - (nested.left() + 12.0 + 14.0)).abs() < 1.5,
+            "depth 1 indents 14px"
+        );
+    }
+    let selected_color = chevron_color(&output, row0);
+    assert_eq!(
+        selected_color,
+        egui::epaint::ColorMode::Solid(made_app::theme::TEXT_SECONDARY),
+        "selected chevron is TEXT_SECONDARY"
+    );
+    let down = path_shapes(&output)
+        .into_iter()
+        .find(|path| path.points.len() == 3 && !path.closed && row0.contains(path_center(path)))
+        .unwrap();
+    assert!(
+        down.points[1].y > down.points[0].y,
+        "expanded chevron points down"
+    );
+}
+
+#[test]
+fn launch_buttons_share_one_quiet_style() {
+    for (width, height, button_height) in [(1280.0, 800.0, 26.0), (720.0, 480.0, 24.0)] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut headless =
+            screen_headless(temp.path(), width, height, &[OPENCODE, GROK, CLAUDE_CODE]);
+        let output = headless.render();
+        let kinds = [
+            LaunchKind::Terminal,
+            LaunchKind::Tui(OPENCODE),
+            LaunchKind::Tui(GROK),
+            LaunchKind::Tui(CLAUDE_CODE),
+        ];
+        let rects: Vec<egui::Rect> = kinds
+            .iter()
+            .map(|kind| headless.response(launch_id(*kind)).rect)
+            .collect();
+        assert!(
+            rects
+                .windows(2)
+                .all(|pair| pair[0].right() < pair[1].left()),
+            "Terminal first, then catalog order: {rects:?}"
+        );
+        assert!(
+            ((rects[0].left() + rects[3].right()) / 2.0 - width / 2.0).abs() <= 1.0,
+            "{width}px: buttons are centered in the footer: {rects:?}"
+        );
+        for (kind, rect) in kinds.iter().zip(&rects) {
+            assert!(
+                (rect.height() - button_height).abs() < 0.5,
+                "{kind:?} {rect:?}"
+            );
+            let shape = rect_shapes(&output)
+                .into_iter()
+                .find(|shape| shape.rect == *rect)
+                .unwrap_or_else(|| panic!("{kind:?} fill"));
+            assert_eq!(
+                shape.fill,
+                made_app::theme::BG_SELECTED,
+                "{kind:?} rest fill"
+            );
+            assert_eq!(shape.corner_radius, egui::CornerRadius::same(6));
+            assert_eq!(shape.stroke, egui::Stroke::NONE, "{kind:?} has no stroke");
+            let label = kind.label();
+            let colors = text_colors(&output, label, height);
+            assert!(
+                colors.contains(&made_app::theme::TEXT_SECONDARY),
+                "{kind:?} rest label is TEXT_SECONDARY: {colors:?}"
+            );
+            let painted = painted_menu_label(&output, label, *rect);
+            assert!(
+                (letterform_center_y(&painted) - rect.center().y).abs() < 1.0,
+                "{kind:?} label is centered: {:?}",
+                painted.line
+            );
+        }
+        assert!(
+            !rects_with_fill(&output, made_app::theme::ACCENT)
+                .iter()
+                .any(|fill| rects.iter().any(|rect| rect.intersects(*fill))),
+            "no launch button uses an ACCENT fill"
+        );
+        for kind in kinds {
+            let id = launch_id(kind);
+            let rect = headless.response(id).rect;
+            let hovered = headless.hover(id);
+            let fill = rect_shapes(&hovered)
+                .into_iter()
+                .find(|shape| shape.rect == rect)
+                .unwrap();
+            assert_eq!(
+                fill.fill,
+                made_app::theme::ACCENT_TINT,
+                "{kind:?} hover fill"
+            );
+            assert!(
+                text_colors(&hovered, kind.label(), height)
+                    .contains(&made_app::theme::TEXT_PRIMARY),
+                "{kind:?} hover label is TEXT_PRIMARY"
+            );
+            let pressed = headless.press_hold(id);
+            let fill = rect_shapes(&pressed)
+                .into_iter()
+                .find(|shape| shape.rect == rect)
+                .unwrap();
+            assert_eq!(
+                fill.fill,
+                made_app::theme::BG_HOVER,
+                "{kind:?} pressed fill"
+            );
+            assert!(
+                text_colors(&pressed, kind.label(), height)
+                    .contains(&made_app::theme::TEXT_PRIMARY),
+                "{kind:?} pressed label is TEXT_PRIMARY"
+            );
+            assert!(
+                !text_colors(&pressed, kind.label(), height).contains(&made_app::theme::ACCENT),
+                "no accent text"
+            );
+            // Release away from the button so nothing launches.
+            let away = egui::pos2(2.0, 2.0);
+            headless.render_events(vec![egui::Event::PointerMoved(away)]);
+            headless.render_events(vec![pointer_button(away, false)]);
+        }
+        // Keyboard focus: the 2px gap and 2px FOCUS ring.
+        let terminal = headless.response(launch_id(LaunchKind::Terminal)).rect;
+        headless.focus(launch_id(LaunchKind::Terminal));
+        let focused = headless.render();
+        let rings = rect_shapes(&focused)
+            .into_iter()
+            .filter(|shape| {
+                shape.stroke.color == made_app::theme::FOCUS && shape.rect.contains_rect(terminal)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rings
+                .iter()
+                .any(|ring| (ring.stroke.width - 2.0).abs() < 0.01
+                    && (ring.rect.left() - (terminal.left() - 3.0)).abs() < 0.5),
+            "2px gap and 2px FOCUS ring: {rings:?}"
+        );
+        // Left/Right move between launch buttons.
+        headless.press_key(egui::Key::ArrowRight);
+        headless.render();
+        assert_eq!(
+            headless.ctx.memory(|memory| memory.focused()),
+            Some(launch_id(LaunchKind::Tui(OPENCODE)))
+        );
+        // Cmd/Ctrl+Enter activates Terminal for the effective launch path.
+        headless.press_key_with_modifiers(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert!(
+            !headless.model.is_picker(),
+            "Cmd/Ctrl+Enter launches Terminal"
+        );
+        assert_eq!(
+            headless.model.terminal_target(),
+            made_app::TerminalTarget::Shell
+        );
+        assert_eq!(
+            headless.model.launch().explorer_root(),
+            Some(temp.path().canonicalize().unwrap().as_path())
+        );
+    }
+}
+
+#[test]
+fn launch_target_row_is_left_aligned_and_buttons_stay_centered() {
+    for (width, height) in [(1280.0, 800.0), (720.0, 480.0)] {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+        let compact = width < 900.0;
+        let (margin_x, _) = made_app::ui::open_workspace_card_margins(compact);
+        let inset = margin_x + 1.0 + if compact { 10.0 } else { 12.0 };
+        let temp = tempfile::tempdir().unwrap();
+        // A plain short folder: the buttons' reference position.
+        let short = temp.path().join("short");
+        fs::create_dir_all(&short).unwrap();
+        let mut reference = screen_headless(&short, width, height, &[OPENCODE, GROK, CLAUDE_CODE]);
+        reference.render();
+        reference.render();
+        let reference_rects: Vec<egui::Rect> = reference
+            .model
+            .open_workspace()
+            .unwrap()
+            .launch_buttons()
+            .iter()
+            .map(|button| reference.response(launch_id(button.kind)).rect)
+            .collect();
+        // A 200-character path in a repository with all four change kinds.
+        let mut long = temp.path().to_path_buf();
+        while long.display().to_string().len() < 200 {
+            long.push("a-rather-long-folder-name");
+        }
+        if !repo_with_four_kinds(&long) {
+            return;
+        }
+        let long = fs::canonicalize(&long).unwrap();
+        let mut headless = screen_headless(&long, width, height, &[OPENCODE, GROK, CLAUDE_CODE]);
+        until_git(&mut headless, counts_ready);
+        headless.render();
+        let output = headless.render();
+        let rects: Vec<egui::Rect> = headless
+            .model
+            .open_workspace()
+            .unwrap()
+            .launch_buttons()
+            .iter()
+            .map(|button| headless.response(launch_id(button.kind)).rect)
+            .collect();
+        assert_eq!(rects.len(), 4, "Terminal and three TUIs");
+        assert_eq!(
+            rects, reference_rects,
+            "{width}px: the path and pills never move the buttons"
+        );
+        assert!(
+            rects
+                .windows(2)
+                .all(|pair| pair[0].right() < pair[1].left()),
+            "{width}px: Terminal first, then the TUIs, left to right"
+        );
+        assert!(
+            rects
+                .iter()
+                .all(|rect| (rect.center().y - rects[0].center().y).abs() < 0.5),
+            "{width}px: buttons never wrap"
+        );
+        assert!(
+            ((rects[0].left() + rects[3].right()) / 2.0 - width / 2.0).abs() <= 1.0,
+            "{width}px: buttons are centered in the footer: {rects:?}"
+        );
+        let label = text_rects(&output, "Launch in", height)
+            .into_iter()
+            .next()
+            .expect("Launch in label");
+        assert!(
+            (label.left() - inset).abs() < 0.5,
+            "{width}px: the target row starts at the content inset: {label:?}"
+        );
+        let indicator = headless.response(picker_control_id("git-indicator")).rect;
+        let path = headless.response(picker_control_id("launch-path")).rect;
+        assert!(label.right() < indicator.left() && indicator.right() < path.left());
+        assert!((label.center().y - path.center().y).abs() < 2.0);
+        let top = rects.iter().map(|rect| rect.top()).fold(f32::MAX, f32::min);
+        assert!(
+            path.bottom() <= top,
+            "{width}px: the target row sits above the buttons"
+        );
+        let full = long.display().to_string();
+        let shown_path = text_in_rect(&output, path);
+        assert!(
+            !shown_path.contains(&full) && shown_path.contains('…'),
+            "{width}px: the 200-character path is middle-ellipsized: {shown_path}"
+        );
+        let text = output_text(&output);
+        let shown: Vec<&str> = ["1 conflicted", "1 staged", "1 modified", "1 untracked"]
+            .into_iter()
+            .filter(|pill| text.contains(pill))
+            .collect();
+        assert!(
+            !shown.is_empty() || width < 900.0,
+            "{width}px: pills beside the path: {text}"
+        );
+        let mut row = vec![label, indicator, path];
+        if !shown.is_empty() {
+            row.push(headless.response(picker_control_id("launch-pills")).rect);
+        }
+        for (index, item) in row.iter().enumerate() {
+            assert!(screen.contains_rect(*item), "{width}px: {item:?} visible");
+            assert!(
+                item.right() <= width - inset + 0.5,
+                "{width}px: {item:?} past the inset"
+            );
+            for other in &row[index + 1..] {
+                assert!(!item.intersects(*other), "{width}px: target row overlap");
+            }
+            for rect in &rects {
+                assert!(
+                    !item.intersects(*rect),
+                    "{width}px: {item:?} overlaps {rect:?}"
+                );
+            }
+        }
+        for rect in &rects {
+            assert!(screen.contains_rect(*rect), "{width}px: {rect:?} visible");
+        }
+        if compact {
+            let tree = headless.response(picker_list_id()).rect;
+            assert!(tree.height() >= 4.0 * 24.0, "four tree rows: {tree:?}");
+        }
+        let hovered =
+            output_text(&headless.hover_until_text(picker_control_id("launch-path"), &full));
+        assert!(hovered.contains(&full), "full path tooltip: {hovered}");
+        let tooltip = output_text(
+            &headless.hover_until_text(picker_control_id("git-indicator"), "Git repository"),
+        );
+        assert!(tooltip.contains("Git repository"), "{tooltip}");
+        if shown.len() < 4 {
+            assert!(
+                tooltip.contains("untracked"),
+                "hidden pills are listed on the indicator: {tooltip}"
+            );
+        } else {
+            let pills = output_text(
+                &headless.hover_until_text(picker_control_id("launch-pills"), "Changes:"),
+            );
+            assert!(
+                pills.contains("Changes: 1 conflicted · 1 staged · 1 modified · 1 untracked"),
+                "{pills}"
+            );
+        }
+    }
+}
+
+#[test]
+fn open_workspace_card_grows_with_the_window_as_conditional_glass() {
+    if isolated("open_workspace_card_grows_with_the_window_as_conditional_glass") {
+        return;
+    }
+    for (width, height) in [(1280.0, 800.0), (1920.0, 1080.0), (720.0, 480.0)] {
+        let (margin_x, margin_y) = made_app::ui::open_workspace_card_margins(width < 900.0);
+        let expected = egui::Rect::from_min_max(
+            egui::pos2(margin_x, margin_y),
+            egui::pos2(width - margin_x, height - margin_y),
+        );
+        // Backdrop only, then opened over a live workspace.
+        for over_workspace in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fixture_workspace(temp.path(), "ctx", "main.rs");
+            let mut model =
+                AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+            if over_workspace {
+                open_workspace(&mut model, &root);
+                model.begin_new_workspace();
+            }
+            let mut headless = Headless::new(model, width, height);
+            headless.render();
+            let output = headless.render();
+            assert!(headless.model.is_picker());
+            let card = largest_rect(&output, made_app::theme::BG_CARD_GLASS)
+                .unwrap_or_else(|| panic!("{width}x{height}: fallback glass card"));
+            assert!(
+                (card.min - expected.min).length() < 0.5
+                    && (card.max - expected.max).length() < 0.5,
+                "{width}x{height} ({over_workspace}): card {card:?} expected {expected:?}"
+            );
+            assert!(
+                rects_with_fill(&output, made_app::theme::GLASS_SHADOW)
+                    .iter()
+                    .any(|shadow| shadow.contains_rect(card.shrink(1.0))),
+                "a soft shadow under the card"
+            );
+            assert!(
+                rects_with_fill(&output, made_app::theme::GLASS_HIGHLIGHT)
+                    .iter()
+                    .any(|line| line.height() <= 1.0 && (line.top() - card.top() - 1.0).abs() < 0.5),
+                "a 1px top highlight"
+            );
+            assert!(
+                rects_with_fill(&output, made_app::theme::BG_HEADER_GLASS)
+                    .iter()
+                    .any(|header| (header.top() - card.top()).abs() < 0.5),
+                "the brand row uses the header glass"
+            );
+            assert!(
+                largest_rect(&output, made_app::theme::BG_CARD)
+                    .is_none_or(|opaque| opaque.area() < card.area() / 4.0),
+                "no opaque full card"
+            );
+            // Native backdrop applied: the native tint pair.
+            headless.model.set_native_backdrop(NativeBackdropStatus {
+                kind: NativeBackdropKind::MacosVibrancy,
+                applied: true,
+                reason: "test".to_owned(),
+            });
+            let output = headless.render();
+            let native = largest_rect(&output, made_app::theme::BG_CARD_GLASS_NATIVE)
+                .expect("native card tint");
+            assert!((native.min - expected.min).length() < 0.5);
+            assert!(
+                !rects_with_fill(&output, made_app::theme::BG_HEADER_GLASS_NATIVE).is_empty(),
+                "native header tint"
+            );
+            // Controls stay legible and inside the card.
+            for id in [
+                picker_path_id(),
+                picker_control_id("close"),
+                launch_item("terminal"),
+            ] {
+                let rect = headless.response(id).rect;
+                assert!(card.contains_rect(rect), "{id:?} inside the card");
+            }
+        }
+    }
+}
+
+#[test]
+fn worktree_pills_and_compact_layout_keep_launch_bar_and_four_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some(repo) = repo_with_worktrees(temp.path()) else {
+        return;
+    };
+    let work = repo.parent().unwrap().to_path_buf();
+    for name in ["three", "four", "five"] {
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &format!("../made-wt/{name}")
+            ]
+        ));
+    }
+    let mut headless = screen_headless(&repo, 720.0, 480.0, &[OPENCODE, GROK, CLAUDE_CODE]);
+    until_git(&mut headless, counts_ready);
+    let output = headless.render();
+    let open = headless.model.open_workspace().unwrap();
+    assert!(open.worktrees_shown());
+    assert_eq!(
+        open.worktree_selection(),
+        Some(0),
+        "the root is preselected"
+    );
+    let paths: Vec<PathBuf> = open
+        .worktrees()
+        .iter()
+        .map(|item| item.path.clone())
+        .collect();
+    assert_eq!(paths[0], repo);
+    assert_eq!(
+        paths[1],
+        fs::canonicalize(work.join("made-wt/feature-a")).unwrap()
+    );
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+    let tree = headless.response(picker_list_id()).rect;
+    assert!(tree.height() >= 4.0 * 24.0, "four tree rows: {tree:?}");
+    let list = headless.response(made_app::ui::worktree_list_id()).rect;
+    assert!(list.height() >= 2.0 * 24.0, "two worktree rows: {list:?}");
+    assert!(tree.bottom() <= list.top() + 0.5, "tree above worktrees");
+    for button in open.launch_buttons() {
+        let rect = headless.response(launch_id(button.kind)).rect;
+        assert!(screen.contains_rect(rect), "{button:?} visible at 720×480");
+        assert!(
+            rect.top() >= list.bottom(),
+            "launch bar below the worktrees"
+        );
+    }
+    let text = output_text(&output);
+    for pill in ["2 staged", "1 modified", "1 untracked"] {
+        assert!(text.contains(pill), "{pill}: {text}");
+    }
+    assert!(!text.contains("0 "), "no zero pill: {text}");
+    assert!(text.contains("feature-a"), "branch label: {text}");
+    let hovered = output_text(
+        &headless.hover_until_text(egui::Id::unique(("made-worktree-row", 0)), "Changes:"),
+    );
+    assert!(
+        hovered.contains("Changes: 2 staged · 1 modified"),
+        "{hovered}"
+    );
+
+    // Selecting a worktree retargets the launch path; Up/Down move.
+    headless.focus(made_app::ui::worktree_list_id());
+    headless.press_key(egui::Key::ArrowDown);
+    headless.render();
+    assert_eq!(
+        headless
+            .model
+            .open_workspace()
+            .unwrap()
+            .effective_launch_path(),
+        Some(fs::canonicalize(work.join("made-wt/feature-a")).unwrap())
+    );
+    // No text below 10px and every control target at least 24×24.
+    let output = headless.render();
+    for (text, size) in all_text_sizes(&output) {
+        assert!(size >= 10.0, "{text:?} is {size}px");
+    }
+    let mut targets = vec![
+        picker_control_id("up"),
+        picker_control_id("refresh"),
+        picker_control_id("close"),
+        made_app::ui::open_workspace_add_host_id(),
+        made_app::ui::open_workspace_host_id(HostId::Local),
+    ];
+    targets.extend(open_ids(&headless));
+    for id in targets {
+        let rect = headless.response(id).rect;
+        assert!(
+            rect.width() >= 24.0 && rect.height() >= 24.0,
+            "{id:?} {rect:?}"
+        );
+    }
+}
+
+fn open_ids(headless: &Headless) -> Vec<egui::Id> {
+    headless
+        .model
+        .open_workspace()
+        .unwrap()
+        .launch_buttons()
+        .iter()
+        .map(|button| launch_id(button.kind))
+        .collect()
+}
+
+#[test]
+fn address_bar_navigates_on_enter_and_reports_invalid_paths_inline() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::create_dir_all(root.join("work/api")).unwrap();
+    fs::write(root.join("file.txt"), "x").unwrap();
+    let mut headless = screen_headless(&root, 1280.0, 800.0, &[]);
+    headless.render();
+    headless.model.picker_select(0).unwrap();
+    let selected = headless.model.open_workspace().unwrap().launch_target();
+    assert_eq!(selected, Some(root.join("work")));
+    // An absolute path on every platform (a Windows path needs its drive).
+    let missing = root.join("definitely-not-here").display().to_string();
+    let attempts = [
+        ("work/api", "Path must be absolute"),
+        (missing.as_str(), "Folder not found"),
+    ];
+    let file = root.join("file.txt").display().to_string();
+    for (text, reason) in attempts
+        .iter()
+        .copied()
+        .chain([(file.as_str(), "Not a folder")])
+    {
+        headless.click(picker_path_id());
+        let mut events = vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }];
+        events.extend(typed_events(text));
+        headless.render_events(events);
+        headless.press_key(egui::Key::Enter);
+        let output = headless.render();
+        assert!(
+            output_text(&output).contains(reason),
+            "{reason}: {}",
+            output_text(&output)
+        );
+        assert!(
+            headless.model.is_picker(),
+            "an invalid path never closes the screen"
+        );
+        assert_eq!(
+            headless.model.open_workspace().unwrap().launch_target(),
+            selected
+        );
+        assert_eq!(
+            headless.ctx.memory(|memory| memory.focused()),
+            Some(picker_path_id()),
+            "the typed text stays editable"
+        );
+        headless.press_key(egui::Key::Escape);
+        headless.render();
+        assert!(
+            headless.model.is_picker(),
+            "Escape while editing keeps the screen"
+        );
+        assert!(headless.model.screen_address_error().is_none());
+    }
+    // A valid absolute path with whitespace and a trailing separator.
+    headless.click(picker_path_id());
+    let mut events = vec![egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    }];
+    events.extend(typed_events(&format!(
+        " {}{} ",
+        root.join("work").display(),
+        std::path::MAIN_SEPARATOR
+    )));
+    headless.render_events(events);
+    headless.press_key(egui::Key::Enter);
+    headless.render();
+    let open = headless.model.open_workspace().unwrap();
+    assert_eq!(open.launch_target(), Some(root.join("work")));
+    assert_eq!(headless.model.screen_selection(), None);
+    assert_eq!(
+        headless.model.launch().picker().unwrap().current_dir(),
+        root.join("work"),
+        "Enter re-roots at the pasted folder"
     );
 }
 
@@ -13026,13 +12923,17 @@ fn restart_confirmation_lives_inside_about_and_not_now_touches_nothing() {
     let text = output_text(&headless.render());
     for expected in [
         "0.3.0",
-        "OpenCode, Grok and SSH sessions",
+        "running programs and SSH sessions",
         "will not be restored",
         "Restart now",
         "Not now",
     ] {
         assert!(text.contains(expected), "missing {expected:?}: {text}");
     }
+    assert!(
+        !confirmation.contains("OpenCode") && !confirmation.contains("Grok"),
+        "{confirmation}"
+    );
     let pane = headless.model.workspace(two).unwrap().pane_id().to_owned();
     let window = headless
         .ctx
@@ -13150,103 +13051,6 @@ fn has_leading_image(output: &egui::FullOutput, area: egui::Rect, left_of: f32) 
             && area.contains_rect(image.rect)
             && image.rect.right() <= left_of - 1.0
     })
-}
-
-#[test]
-fn catalog_menu_lists_claude_code_after_grok() {
-    if isolated("catalog_menu_lists_claude_code_after_grok") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "all-three", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[OPENCODE, GROK, CLAUDE_CODE]);
-    let hovered =
-        output_text(&headless.hover_until_text(top_action_id("open-folder"), "Open folder"));
-    assert!(
-        hovered.contains("Open folder"),
-        "the + tooltip stays Open folder: {hovered}"
-    );
-    headless.click(top_action_id("open-folder"));
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let opencode = headless.response(new_tab_menu_item_id("opencode")).rect;
-    let grok = headless.response(new_tab_menu_item_id("grok")).rect;
-    let claude = headless.response(new_tab_menu_item_id("claude")).rect;
-    assert!(
-        terminal.top() < opencode.top() && opencode.top() < grok.top() && grok.top() < claude.top(),
-        "menu order must be Terminal, OpenCode, Grok Build, Claude Code"
-    );
-    assert!(!headless.model.is_picker());
-    assert!(headless
-        .ctx
-        .read_response(new_tab_menu_item_id("codex"))
-        .is_none());
-}
-
-#[test]
-fn only_claude_code_shows_terminal_then_claude_code_with_its_mark() {
-    if isolated("only_claude_code_shows_terminal_then_claude_code_with_its_mark") {
-        return;
-    }
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "claude-only", "main.rs");
-    let (mut headless, _) = menu_model(&root, &[CLAUDE_CODE]);
-    headless.ctx.set_pixels_per_point(2.0);
-    headless.click(top_action_id("open-folder"));
-    headless.advance(0.3);
-    let output = headless.render();
-    let terminal = headless.response(new_tab_menu_item_id("terminal")).rect;
-    let claude = headless.response(new_tab_menu_item_id("claude")).rect;
-    assert!(terminal.top() < claude.top());
-    for absent in ["opencode", "grok"] {
-        assert!(headless
-            .ctx
-            .read_response(new_tab_menu_item_id(absent))
-            .is_none());
-    }
-    let label = painted_menu_label(&output, "Claude Code", claude);
-    assert_claude_mark(
-        &headless,
-        &output,
-        claude,
-        label.line.left(),
-        "the Claude Code menu row",
-    );
-}
-
-#[test]
-fn choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker() {
-    if isolated("choosing_claude_code_starts_a_home_tab_and_terminal_still_opens_the_picker") {
-        return;
-    }
-    use made_platform::Platform;
-
-    let temp = tempfile::tempdir().unwrap();
-    let root = fixture_workspace(temp.path(), "current", "main.rs");
-    let (mut headless, id) = menu_model(&root, &[CLAUDE_CODE]);
-    let home = made_platform::host_platform()
-        .home_dir()
-        .expect("test home")
-        .canonicalize()
-        .expect("canonical test home");
-    headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("claude"));
-    assert!(!headless.model.is_picker());
-    assert_eq!(headless.model.active_workspace_id(), Some(id));
-    assert!(headless.model.start_pending());
-    assert_eq!(
-        headless.model.terminal_target(),
-        TerminalTarget::Tui(CLAUDE_CODE)
-    );
-    assert_eq!(
-        headless.model.launch().source(),
-        WorkspaceSource::DefaultHome
-    );
-    assert_eq!(headless.model.launch().terminal_cwd(), Some(home.as_path()));
-    assert!(headless
-        .model
-        .workspace(id)
-        .and_then(Workbench::terminal)
-        .is_some_and(made_app::TerminalPane::is_running));
 }
 
 /// Stage the shipped Claude Code plugin beside the test executable: its
@@ -13440,7 +13244,8 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
     // Protocol only: no hook record, so no live owned session.
     fixture.emit(b"\x1b]0;Refactor parser\x07");
     fixture.emit(CLAUDE_ESC_WORKING);
-    let output = fixture.labeled("Claude Code");
+    // The tab is labeled with the session title.
+    let output = fixture.labeled("Refactor parser");
     let tab = fixture.tab();
     let dots = tab_session_dots(&output, tab);
     assert_eq!(
@@ -13449,7 +13254,7 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
         "one protocol-only dot without a live session"
     );
     assert_session_dot_color(&dots[0], made_app::theme::ACCENT, "the busy dot");
-    let label = text_rects(&output, "Claude Code", 55.0)
+    let label = text_rects(&output, "Refactor parser", 55.0)
         .into_iter()
         .find(|rect| tab.contains_rect(*rect))
         .unwrap();
@@ -13472,7 +13277,10 @@ fn protocol_status_paints_one_busy_dot_with_the_window_title_tooltip() {
     let output = fixture.headless.render();
     let (role, name, _) = accesskit_row_state(&output, workspace_tab_id(fixture.id));
     assert_eq!(role, egui::Role::Tab);
-    assert_eq!(name.as_deref(), Some("Claude Code — Sessions: 1 running"));
+    assert_eq!(
+        name.as_deref(),
+        Some("Claude Code — Refactor parser — Sessions: 1 running")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -13487,14 +13295,28 @@ fn the_window_title_never_reaches_the_copied_report_or_the_log() {
     let id = fixture.id;
     fixture.emit(format!("\u{1b}]0;{MARKER}\u{7}").as_bytes());
     fixture.emit(CLAUDE_ESC_WORKING);
-    fixture.labeled("Claude Code");
+    fixture.labeled(MARKER);
     // The title is read, for the tooltip only.
     let hovered = fixture.hover_tab(MARKER);
     assert!(hovered.contains(MARKER), "{hovered}");
 
     // Open the diagnostics with the title live so every report path runs.
     open_about_diagnostics(&mut fixture.headless, id);
-    let shown = output_text(&fixture.headless.render());
+    // The tab label may show the title; the About card never does.
+    let output = fixture.headless.render();
+    let pane = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .pane_id()
+        .to_owned();
+    let about = fixture
+        .headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str()))))
+        .expect("about window");
+    let shown = text_in_rect(&output, about);
     assert!(!shown.contains(MARKER), "the About panel: {shown}");
     let workbench = fixture.headless.model.workspace(id).unwrap();
     let report = workbench.sanitized_diagnostics_text();
@@ -13692,7 +13514,7 @@ fn a_direct_claude_code_tab_is_branded_before_any_status() {
     let (mut headless, first) = menu_model(&root, &[CLAUDE_CODE]);
     headless.ctx.enable_accesskit();
     headless.click(top_action_id("open-folder"));
-    headless.click(new_tab_menu_item_id("claude"));
+    headless.click(launch_item("claude"));
     let mut direct = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while direct.is_none() && Instant::now() < deadline {
@@ -13736,6 +13558,29 @@ fn a_direct_claude_code_tab_is_branded_before_any_status() {
     let output = headless.render();
     let (_, name, _) = accesskit_row_state(&output, id);
     assert_eq!(name.as_deref(), Some("Claude Code"));
+
+    // The OpenCode session map yields to Claude Code: no action, no strip,
+    // even when it was toggled open.
+    headless
+        .model
+        .workspace_mut(direct)
+        .unwrap()
+        .set_sessions_visible(true);
+    headless.render();
+    let text = output_text(&headless.render());
+    assert!(
+        headless
+            .ctx
+            .read_response(top_workspace_action_id(direct, "sessions"))
+            .is_none(),
+        "no Sessions action while Claude Code runs"
+    );
+    assert!(!text.contains("No OpenCode sessions"), "{text}");
+    assert!(!text.contains("Open OpenCode in the terminal."), "{text}");
+    // The About headline never falls back to OpenCode's inactive sentence:
+    // it is Claude Code's row unless another row is actionable.
+    let headline = made_app::ui::about_headline(headless.model.workspace(direct).unwrap());
+    assert_ne!(headline, "OpenCode is not running.");
 }
 
 #[test]
@@ -13842,13 +13687,14 @@ fn claude_code_row_walks_not_running_starting_and_ready() {
 /// `opencode.svg`, one busy and one idle dot, no Claude Code branding.
 #[cfg(target_os = "linux")]
 fn assert_connected_opencode_tab(fixture: &mut ClaudeFixture, phase: &str) {
-    let output = fixture.labeled("OpenCode");
+    // The OpenCode tab is labeled with its active session's title.
+    let output = fixture.labeled("Session 0");
     let tab = fixture.tab();
     assert!(
-        text_rects(&output, "OpenCode", 55.0)
+        text_rects(&output, "Session 0", 55.0)
             .iter()
             .any(|rect| tab.contains_rect(*rect)),
-        "{phase}: the tab stays labeled OpenCode"
+        "{phase}: the tab stays labeled with the OpenCode session title"
     );
     assert!(
         text_rects(&output, "Claude Code", 55.0)
@@ -13999,7 +13845,13 @@ fn a_menu_launched_opencode_tab_keeps_its_injection_and_gets_no_claude_entry() {
     let temp = tempfile::tempdir().unwrap();
     let root = fixture_workspace(temp.path(), "current", "main.rs");
     let (mut headless, first) = menu_model(&root, &[OPENCODE, CLAUDE_CODE]);
-    headless.model.begin_tui_workspace(OPENCODE);
+    headless
+        .model
+        .begin_tui_workspace_in(
+            OPENCODE,
+            &PathBuf::from(std::env::var_os("HOME").expect("isolated home")),
+        )
+        .expect("OpenCode tab");
     let mut opened = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while opened.is_none() && Instant::now() < deadline {
@@ -14189,16 +14041,31 @@ fn claude_content_markers_never_reach_the_tooltip_diagnostics_report_or_log() {
     // still no content marker appears.
     fixture.emit(CLAUDE_ESC_WORKING);
     fixture.emit(format!("\x1b]0;{TITLE_MARKER} title\x07").as_bytes());
-    fixture.labeled("Claude Code");
+    fixture.labeled(TITLE_MARKER);
     let hovered = fixture.hover_tab(TITLE_MARKER);
     assert!(hovered.contains(TITLE_MARKER), "{hovered}");
     assert_clean(&hovered, "the protocol tooltip");
 
     // About diagnostics, the copied report and the log.
     open_about_diagnostics(&mut fixture.headless, id);
-    let about = output_text(&fixture.headless.render());
+    let output = fixture.headless.render();
+    let about = output_text(&output);
     assert_clean(&about, "the About diagnostics");
-    assert!(!about.contains(TITLE_MARKER), "{about}");
+    // The tab label may show the title; the About card never does.
+    let pane = fixture
+        .headless
+        .model
+        .workspace(id)
+        .unwrap()
+        .pane_id()
+        .to_owned();
+    let window = fixture
+        .headless
+        .ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique(("made-about-window", pane.as_str()))))
+        .expect("about window");
+    let card = text_in_rect(&output, window);
+    assert!(!card.contains(TITLE_MARKER), "{card}");
     let report = fixture
         .headless
         .model
@@ -14246,7 +14113,12 @@ fn opencode_tab(root: &Path) -> (Headless, WorkspaceId) {
         AppOptions::new().with_compatible_tuis([OPENCODE]),
     );
     let shell_id = open_workspace(&mut model, root);
-    model.begin_tui_workspace(OPENCODE);
+    model
+        .begin_tui_workspace_in(
+            OPENCODE,
+            &PathBuf::from(std::env::var_os("HOME").expect("isolated home")),
+        )
+        .expect("OpenCode tab");
     model.ensure_workbench();
     let id = model.active_workspace_id().expect("OpenCode tab");
     assert_ne!(id, shell_id);
@@ -14403,4 +14275,234 @@ fn a_shell_that_exits_non_zero_keeps_the_restart_banner() {
     assert!(text.contains("Shell exited (exit code 3)."), "{text}");
     assert!(text.contains("Restart shell"), "{text}");
     assert_eq!(headless.model.workspace_count(), 1);
+}
+
+#[test]
+fn about_diagnostics_names_the_opencode_only_sections() {
+    if isolated("about_diagnostics_names_the_opencode_only_sections") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "sections", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let id = open_workspace(&mut model, &root);
+    // Tall enough for every diagnostics section to render unscrolled.
+    let mut headless = Headless::new(model, 1280.0, 2400.0);
+    wait_explorer_ready(&mut headless, id);
+    headless.render();
+    open_about_diagnostics(&mut headless, id);
+    let text = output_text(&headless.render());
+    for expected in ["OPENCODE CONNECTION", "OPENCODE SESSION", "OpenCode plugin"] {
+        assert!(text.contains(expected), "missing {expected:?}: {text}");
+    }
+    // OpenCode is an ordinary row: its sentence is listed in the card.
+    assert!(text.contains("OpenCode is"), "{text}");
+}
+
+#[test]
+fn an_empty_open_session_map_names_opencode() {
+    if isolated("an_empty_open_session_map_names_opencode") {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "empty-map", "main.rs");
+    let (mut headless, id) = menu_model(&root, &[OPENCODE]);
+    headless
+        .model
+        .workspace_mut(id)
+        .unwrap()
+        .set_sessions_visible(true);
+    headless.render();
+    let text = output_text(&headless.render());
+    assert!(text.contains("No OpenCode sessions"), "{text}");
+    assert!(!text.contains("No open sessions"), "{text}");
+}
+
+#[test]
+fn long_tab_labels_clamp_to_the_new_maxima_and_overflow() {
+    if isolated("long_tab_labels_clamp_to_the_new_maxima_and_overflow") {
+        return;
+    }
+    for (width, height, max) in [(1280.0, 800.0, 280.0), (720.0, 480.0, 230.0)] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut model =
+            AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            let root = fixture_workspace(
+                temp.path(),
+                &format!("{index}-a-very-long-folder-name-that-exceeds-every-tab-maximum"),
+                "main.rs",
+            );
+            ids.push(open_workspace(&mut model, &root));
+        }
+        let mut headless = Headless::new(model, width, height);
+        for id in &ids {
+            wait_explorer_ready(&mut headless, *id);
+        }
+        headless.render();
+        let output = headless.render();
+        let shown: Vec<egui::Rect> = ids
+            .iter()
+            .filter_map(|id| headless.ctx.read_response(workspace_tab_id(*id)))
+            .map(|response| response.rect)
+            .collect();
+        assert!(!shown.is_empty());
+        assert!(shown.len() < ids.len(), "{width}px: some tabs overflow");
+        for rect in &shown {
+            assert!(
+                (rect.width() - max).abs() < 0.75,
+                "{width}px: a long label clamps at {max}: {rect:?}"
+            );
+        }
+        let text = output_text(&output);
+        assert!(
+            text.contains('…'),
+            "{width}px: the label ellipsizes: {text}"
+        );
+        assert!(
+            headless
+                .ctx
+                .read_response(top_action_id("workspace-overflow"))
+                .is_some(),
+            "{width}px: the overflow stays reachable"
+        );
+    }
+}
+
+/// Painted SSH badge discs inside a tab's leading icon slot.
+fn ssh_badge_discs(output: &egui::FullOutput, tab: egui::Rect) -> Vec<egui::epaint::CircleShape> {
+    let center = made_app::ui::ssh_tab_badge_center(egui::Rect::from_center_size(
+        egui::pos2(tab.left() + 10.0 + 8.0, tab.center().y),
+        egui::Vec2::splat(16.0),
+    ));
+    circle_shapes(output)
+        .into_iter()
+        .filter(|circle| {
+            (circle.radius - made_app::theme::SSH_TAB_BADGE_RADIUS).abs() < 0.01
+                && (circle.center - center).length() < 0.5
+        })
+        .collect()
+}
+
+#[test]
+fn ssh_tabs_show_a_host_badge_that_changes_shape_when_disconnected() {
+    if isolated("ssh_tabs_show_a_host_badge_that_changes_shape_when_disconnected") {
+        return;
+    }
+    use made_app::remote_workspace::RemoteWorkspace;
+    use made_app::ssh_servers::ServerMetadata;
+    use made_app::theme::HostStatusGlyph;
+    use made_remote::protocol::{Identity, RemotePath, TabCapability};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_workspace(temp.path(), "local-alpha", "main.rs");
+    let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
+    let local = open_workspace(&mut model, &root);
+    let authority = model
+        .add_ssh_metadata(ServerMetadata {
+            display_name: "prod".into(),
+            host: "prod.example.org".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            key_file: None,
+            initial_directory: None,
+        })
+        .expect("server metadata saves");
+    model
+        .attach_remote_model(
+            authority,
+            RemoteWorkspace::new(
+                Identity {
+                    authority,
+                    tab: TabCapability::random().unwrap(),
+                    epoch: 1,
+                    generation: 1,
+                },
+                RemotePath::new(b"/srv/app".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("remote model attaches");
+    let remote = model.active_workspace_id().unwrap();
+    let mut headless = Headless::new(model, 1280.0, 800.0);
+    wait_explorer_ready(&mut headless, local);
+    headless.render();
+    let output = headless.render();
+    let summaries = made_app::ui::workspace_tab_summaries(&headless.model);
+    let summary = |id| summaries.iter().find(|tab| tab.id == id).unwrap().clone();
+    // The SSH shell tab: badge, tooltip line and accessible name.
+    let ssh = summary(remote);
+    assert_eq!(
+        ssh.ssh_badge,
+        Some(None),
+        "a connected SSH tab paints the server glyph"
+    );
+    assert_eq!(
+        ssh.tooltip.as_deref(),
+        Some("SSH: prod (deploy@prod.example.org:2222)\n/srv/app")
+    );
+    assert!(
+        ssh.accessible_name.contains("on SSH host prod"),
+        "{}",
+        ssh.accessible_name
+    );
+    let remote_tab = headless.response(workspace_tab_id(remote)).rect;
+    assert_eq!(
+        ssh_badge_discs(&output, remote_tab).len(),
+        1,
+        "one badge disc"
+    );
+    // The local tab: none of it.
+    let plain = summary(local);
+    assert_eq!(plain.ssh_badge, None);
+    assert!(!plain.tooltip.unwrap_or_default().contains("SSH:"));
+    assert!(!plain.accessible_name.contains("SSH host"));
+    let local_tab = headless.response(workspace_tab_id(local)).rect;
+    assert!(ssh_badge_discs(&output, local_tab).is_empty());
+    // The badge sits inside the icon slot: the label still starts after it.
+    let label = text_rects(&output, "app", 55.0)
+        .into_iter()
+        .find(|rect| remote_tab.contains_rect(*rect))
+        .expect("the remote cwd label");
+    assert!(
+        (label.left() - (remote_tab.left() + 10.0 + 22.0)).abs() < 1.0,
+        "the label area is unchanged: {label:?} in {remote_tab:?}"
+    );
+    let width_before = remote_tab.width();
+    // Disconnected: the hollow ring replaces the server glyph.
+    headless
+        .model
+        .workspace_mut(remote)
+        .unwrap()
+        .remote_workspace_mut()
+        .unwrap()
+        .disconnect();
+    headless.render();
+    let output = headless.render();
+    let summaries = made_app::ui::workspace_tab_summaries(&headless.model);
+    let ssh = summaries.iter().find(|tab| tab.id == remote).unwrap();
+    assert_eq!(ssh.ssh_badge, Some(Some(HostStatusGlyph::NotConnected)));
+    let remote_tab = headless.response(workspace_tab_id(remote)).rect;
+    assert_eq!(ssh_badge_discs(&output, remote_tab).len(), 1);
+    assert!(
+        circle_shapes(&output).iter().any(|circle| {
+            circle.fill == egui::Color32::TRANSPARENT
+                && circle.stroke.width > 0.0
+                && remote_tab.contains(circle.center)
+                && (circle.center
+                    - made_app::ui::ssh_tab_badge_center(egui::Rect::from_center_size(
+                        egui::pos2(remote_tab.left() + 18.0, remote_tab.center().y),
+                        egui::Vec2::splat(16.0),
+                    )))
+                .length()
+                    < 0.5
+        }),
+        "the disconnected badge is a hollow ring"
+    );
+    assert!(
+        (remote_tab.width() - width_before).abs() < 0.01,
+        "no width change"
+    );
 }

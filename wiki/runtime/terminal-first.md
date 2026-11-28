@@ -1,20 +1,20 @@
 # Terminal-First Runtime
 
-A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly chooses it from the `+` menu. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), [`integrations/`](../../crates/made-app/src/integrations/mod.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`specs/opencode-session-follow.md`](../../specs/opencode-session-follow.md) with the historical v1 design at [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) for rationale.
+A Made workspace starts as a real shell and explorer in a folder. OpenCode is optional and starts only when the user runs `opencode` in that terminal or explicitly launches it from the Open workspace screen. This page records the runtime behavior implemented in [`app.rs`](../../crates/made-app/src/app.rs), [`workbench.rs`](../../crates/made-app/src/workbench.rs), [`session_follow.rs`](../../crates/made-app/src/session_follow.rs), [`integrations/`](../../crates/made-app/src/integrations/mod.rs), and [`made-platform`](../../crates/made-platform/src/lib.rs). Normative behavior is owned by [`specs/opencode-session-follow.md`](../../specs/opencode-session-follow.md) with the historical v1 design at [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md) for rationale.
 
 ## Launch and default workspace
 
 | Launch input | Result |
 |---|---|
 | `--workspace <path>` or positional folder | Explicit folder wins over `--picker`; opens a normal workspace. |
-| `--picker` | Picker surface only; no shell or explorer until a folder is confirmed. |
+| `--picker` | Open workspace screen only; no shell or explorer until a launch button is activated. |
 | No workspace argument | Platform-resolved home opens as a normal workspace. |
-| Missing/unreadable/unresolvable home | Visible non-blocking error, terminal-only fallback in a usable directory, no blocking picker, no crash. |
-| `--smoke-test` without a folder | Test-only picker surface; never starts a real home shell. |
+| Missing/unreadable/unresolvable home | Visible non-blocking error, terminal-only fallback in a usable directory, no blocking screen, no crash. |
+| `--smoke-test` without a folder | Test-only Open workspace surface; never starts a real home shell. |
 
-An explicit workspace does not require OpenCode installation, detection, a version wait, plugin readiness, a probe, or automatic launch. The folder picker is also the add-workspace surface and the state after the final tab closes.
+An explicit workspace does not require OpenCode installation, detection, a version wait, plugin readiness, a probe, or automatic launch. The [Open workspace screen](../ui/layout-and-controls.md#open-workspace-screen) is also the add-workspace (`+`) surface and the state after the final tab closes.
 
-The `+` new-tab control follows the integrated-TUI catalog in [Grok](../integration/grok.md). Catalog order is the order of the static `PRODUCT` list in [`integrations/mod.rs`](../../crates/made-app/src/integrations/mod.rs): OpenCode, Grok, then Claude Code. Undetected programs are omitted, and root precedence is separate (see Root precedence). With no detected TUI and no saved SSH server, `+` opens the folder picker and shows no menu. Otherwise `Terminal` is first and runs the existing folder-picker flow, then one row per detected catalog program, then each saved server's SSH launch rows. Choosing OpenCode, Grok or Claude Code starts that program's absolute path, never the bare name, as the PTY child of a new home-directory tab: no shell first, no picker, and the current tab keeps running. OpenCode keeps its launch injection; Grok does not inject plugin config or write the user's Grok config; Claude Code gets no arguments and no config edit, and its session-only plugin is composed into the environment (see [Claude Code](../integration/claude-code.md)). Detection is a metadata-only `PATH` lookup on a background thread started at launch; it never spawns the program, never verifies its version, and never delays shell or explorer startup. On macOS a Finder/Dock launch first corrects `PATH` (see macOS GUI launch PATH).
+Launch buttons follow the integrated-TUI catalog: Terminal first, then detected programs in the order of the static `PRODUCT` list in [`integrations/mod.rs`](../../crates/made-app/src/integrations/mod.rs) (OpenCode, Grok, Claude Code); root precedence is separate (see Root precedence). A TUI starts from its absolute path, never the bare name, as the PTY child of a new tab in the chosen folder or worktree (the effective launch path): no shell first, and the current tab keeps running. OpenCode keeps its launch injection; Grok gets no plugin config or Grok config write; Claude Code gets no arguments and no config edit, and its session-only plugin is composed into the environment (see [Claude Code](../integration/claude-code.md)). Launch contracts: `Open Workspace Launch Bar` in [`made-ui-ux.md`](../../specs/made-ui-ux.md) and AIA-07 in [`agent-integration-architecture.md`](../../specs/agent-integration-architecture.md). Detection is a metadata-only `PATH` lookup on a background thread started at launch; it never spawns the program, never verifies its version, and never delays shell or explorer startup. On macOS a Finder/Dock launch first corrects `PATH` (see macOS GUI launch PATH).
 
 The home/`--picker`/explicit-path policy is an accepted product decision; see [ADR 0005](../decisions/0005-home-default-startup.md). Implementation lives in [`workspace.rs`](../../crates/made-app/src/workspace.rs) and [`cli.rs`](../../crates/made-app/src/cli.rs).
 
@@ -48,6 +48,8 @@ Status: shipped in v0.1.2 (PR #20). v0.1.1 lacks it: a Finder/Dock launch shows 
 
 Contracts live in [`specs/ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md); this section records implementation facts that are not visible from one file.
 
+- Selecting an SSH host on the Open workspace screen opens a screen-scoped browse grant (SSH-12), separate from every tab's root grant; trust boundary in [Security](../security.md#remote-browse-grant). [`remote_workspace.rs`](../../crates/made-app/src/remote_workspace.rs) must never touch the host filesystem: `tests/remote_workspace.rs` fails on `PathBuf::from(`, `std::fs`, `.canonicalize(` or `GitRunner` in that file, so remote path keys go through `open_workspace::remote_key`.
+
 - Remote shell cwd arrives as companion `ShellCwd` frames, not OSC 7. The workbench `pump_remote_client` routes them before the `waiting_attach` match, and the supervisor re-emits the cwd on reattach.
 - `tick_remote` returns before the local idle repaint cadence, so any new remote event source needs an explicit wake through `RemoteClient::set_wake`.
 - Remote PTY locale: the supervisor ensures a UTF-8 `LC_CTYPE` chosen from the server's `locale -a`; it never invents one and leaves `LC_ALL` untouched. It prefers `C.UTF-8` and checks an existing UTF-8 locale against `locale -a`.
@@ -65,7 +67,7 @@ Precedence is each integration's declared rank (OpenCode 100, Claude Code 200, G
 3. Otherwise, while OpenCode is not connected, the directory of this tab's most recent live owned Claude Code session (or its agent-view selection) wins, local or remote ([Claude Code SSH](../integration/claude-code.md#ssh)).
 4. Otherwise, the directory of this tab's newest open Grok session wins, local or remote; a prompt in an older Grok session keeps the explorer there.
 5. Otherwise, the latest validated shell cwd wins.
-6. Otherwise, the launch/picker folder or platform-resolved home.
+6. Otherwise, the launch folder (from the CLI or the Open workspace screen) or platform-resolved home.
 7. A stale OpenCode root is never retained ahead of a newer shell cwd.
 
 While OpenCode is authoritative, shell cwd reports continue to be recorded. A connected view directory applies only while tabs are enabled and no session is active; an absent view directory leaves the latest shell cwd or launch folder in effect, while an invalid, missing, or unreadable one falls back to the latest shell cwd, then the launch folder, and is reported in Diagnostics. The view directory is cleared when OpenCode disconnects or exits, when integration is unsupported, when session tabs become unavailable, or on a new connection epoch. On OpenCode disconnect or normal exit, the root returns to this tab's live Claude Code session, then its newest open Grok session, if one exists, otherwise the latest shell cwd; if no shell cwd exists, it returns to the launch folder. Shell-owned roots that are deleted or become unreadable are revalidated by a low-frequency background worker, marked unavailable once, and recover when the path returns. Agent-owned roots are unaffected by bad shell reports.
@@ -84,7 +86,7 @@ The root model distinguishes effective path, display name, source, git/worktree 
 
 Switching tabs marks the previous workbench invisible and the target visible, resets terminal focus/composition state, and never stops either process. Hidden workspaces continue bounded polling/output consumption and bridge liveness, but they do not paint grids. Preview input is isolated from its hidden terminal.
 
-Closing a tab terminates/reaps only that workbench's process group, stops its listener/watchers, cancels pending loads, and releases its token/bootstrap state. Late callbacks are rejected by workspace id and generation. Closing the last tab returns to the picker and starts no shell or OpenCode. Window close shuts down all workbenches. There is no tab persistence across restart.
+Closing a tab terminates/reaps only that workbench's process group, stops its listener/watchers, cancels pending loads, and releases its token/bootstrap state. Late callbacks are rejected by workspace id and generation. Closing the last tab shows the Open workspace screen and starts no shell or TUI. Window close shuts down all workbenches. There is no tab persistence across restart.
 
 Process cleanup lives in `made-platform`:
 

@@ -1,6 +1,6 @@
 # Security
 
-Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, untrusted text and clipboard content arriving from OpenCode or the terminal, and URL open requests from pane children. This page records the implemented model and accepted v1 residuals. Normative requirements are in [OpenCode Session Follow](../specs/opencode-session-follow.md).
+Made is a local-first desktop application, not a multi-user service. Its main trust boundaries are the loopback OpenCode bridge, the user's read-only OpenCode config, the workspace filesystem, untrusted text and clipboard content arriving from OpenCode or the terminal, URL open requests from pane children, repository configuration read by git, and SSH servers browsed from the Open workspace screen. This page records the implemented model and accepted v1 residuals. Normative requirements are in [OpenCode Session Follow](../specs/opencode-session-follow.md).
 
 ## Local bridge
 
@@ -27,7 +27,34 @@ The token is passed to the plugin through launch configuration/child environment
 
 [`made-explorer::paths`](../crates/made-explorer/src/paths.rs) canonicalizes the root and every requested target, resolves symlinks, and compares component-wise against allowed roots. Lexical `..` is rejected even if it would resolve back inside the root. Symlink escapes and traversal are rejected. A future explicit user grant can add another canonical root; v1 exposes no “open outside root” UI.
 
-Only `made-explorer` reads workspace file contents for display. Read-only git metadata goes through a bounded allowlist in [`made-app::worktree`](../crates/made-app/src/worktree.rs). The bridge config code is the only reader of the user's OpenCode config.
+Only `made-explorer` reads workspace file contents for display. Read-only git metadata goes through a bounded allowlist in [`made-app::worktree`](../crates/made-app/src/worktree.rs), which wraps the shared runner in [`made-remote::git`](../crates/made-remote/src/git.rs) (also used by the server companion); see [Hardened git reads](#hardened-git-reads). The bridge config code is the only reader of the user's OpenCode config.
+
+## Hardened git reads
+
+Selecting a folder on the Open workspace screen, or opening a tab's git view, runs `git status` and metadata reads on a repository the user may not trust (a clone, a server checkout). Repository configuration can make those reads execute programs: a `core.fsmonitor` hook, a filter driver's `clean`/`process` command, a partial clone's lazy fetch that starts a transport through `core.sshCommand` or `remote.<name>.uploadpack`, and `submodule.*.ignore=none`, which walks into submodule worktrees. Every read therefore forces overrides on the command line (which beats every config file), scrubs inherited `GIT_*` redirection variables, and neutralizes repository-scoped filter drivers after a scope query. The flags, variables and fail-closed rules are the `Hardened read-only git reads` requirement in [`made-ui-ux.md`](../specs/made-ui-ux.md); the single implementation is `HARDENED_CONFIG`, `SCRUBBED_ENV` and the filter-driver query in [`made-remote::git`](../crates/made-remote/src/git.rs), so local and remote reads behave the same.
+
+Accepted residuals:
+
+- **Scope-read gap:** the driver-scope query and the status read are two git runs; a same-user process that rewrites the repository config between them is not caught.
+- **Old git, lazy fetch:** git before 2.45 ignores `GIT_NO_LAZY_FETCH`; the `protocol.*.allow=never` overrides still stop every transport, so no fetch command runs.
+- **Old git, drivers:** git before 2.26 has no `--show-scope`, so every configured driver is neutralized, including a trusted global git-lfs; LFS files can then show as modified.
+- **Repo-local LFS:** `git lfs install --local` or any repository-scoped `filter.lfs.*` key is treated as untrusted, so LFS-tracked files with dirty stat info can show as spurious modifications.
+- **Locale-dependent detection:** recognizing an old git relies on its English "unknown option" usage text; the runner sets `LC_ALL=C` for that reason, and any other failure fails closed.
+- **Not enumerated:** Made overrides the known execution vectors instead of enumerating the whole repository config; a future git setting that runs a program during status is not covered until it is added.
+
+## Remote browse grant
+
+Selecting an SSH host on the Open workspace screen opens a browse grant through the server's companion (SSH-12 in [`ssh-remote-workspaces.md`](../specs/ssh-remote-workspaces.md)). It is scoped to one screen instance and one server user, separate from every tab's root grant, and ends on screen close, host change or record removal without touching tabs. It lists folders, checks a directory and runs the hardened git reads; it never reads file contents, writes, or starts a session. Paths are validated on the server and never resolved on the host (guarded by `tests/remote_workspace.rs`, see [Terminal-first runtime](runtime/terminal-first.md#ssh-remote-runtime)); symlinks are reported as entries but never followed. Replies from a previous host, epoch or target are discarded, and one git read per grant is in flight at a time.
+
+## SSH password cache
+
+SSH authentication stays with the host's OpenSSH and the `made-askpass` helper (SSH-01, SSH-08). To avoid re-prompting the same server, [`credential_cache.rs`](../crates/made-app/src/credential_cache.rs) keeps a typed server password in process memory only, never on disk, in logs, argv or environment:
+
+- It is cached only after the attempt that used it authenticates (tab connect, browse grant open, staging, probe).
+- The key is the saved record plus its exact `[user@]host[:port]`, so an edited record or another server never receives it.
+- A cached value is sent at most once per attempt; a rejection forgets it and the user is prompted, and a failed or cancelled attempt forgets the value it sent. A stale rejection cannot evict another tab's fresh password.
+- Prompt cards belong to the attempt that raised them, and an expired prompt is never answered.
+- Only password prompts participate; key passphrases and host-key approvals keep their one-shot flows.
 
 ## Read-only preview
 
@@ -92,6 +119,7 @@ Installed builds (not `cargo run` or development artifacts) check GitHub Release
 | Lock timeout during shutdown | A stuck current-version peer causes the append to be refused after at most one second instead of hanging shutdown; the record is not written. |
 | Windows Job Object cleanup | Implemented/cross-compiled, native runtime evidence pending; immediate-child-only is not claimed as full descendant cleanup. |
 | Native macOS/Windows backdrop | Compile-checked only; no runtime effect/contrast claim. |
+| Hardened git read gaps | Scope-read timing, git before 2.45/2.26, repo-local LFS, C-locale detection, non-enumerated config; see [Hardened git reads](#hardened-git-reads). |
 | Same-user hostile session title | Sanitized when it reaches the plugin; a real control+newline title blocked before hello in one probe, exact blocker not isolated. |
 
 The bridge is not defended against a same-user attacker who can inspect process memory or ptrace the process. It does defend against accidental connections, other local users on a multi-user machine, and non-loopback access.

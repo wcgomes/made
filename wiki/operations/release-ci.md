@@ -38,7 +38,7 @@ The development artifact stages the plugin at `<artifact_root>/plugins/opencode-
 
 ## Deterministic/headless runs
 
-Use `MADE_NATIVE_BACKDROP=off` to skip the native material attempt and keep in-app glass with an honest disabled reason. Use `--smoke-test` with an isolated `HOME`/`XDG_*`/`TMPDIR`; the folder-less smoke keeps the picker surface and starts no workbench. On Linux X11 under Xvfb, unset `WAYLAND_DISPLAY` and use a software backend.
+Use `MADE_NATIVE_BACKDROP=off` to skip the native material attempt and keep in-app glass with an honest disabled reason. Use `--smoke-test` with an isolated `HOME`/`XDG_*`/`TMPDIR`; the folder-less smoke keeps the Open workspace surface and starts no workbench. On Linux X11 under Xvfb, unset `WAYLAND_DISPLAY` and use a software backend.
 
 ```bash
 MADE_NATIVE_BACKDROP=off \

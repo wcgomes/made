@@ -794,8 +794,8 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         companion: Some(true),
     };
 
-    // Before the SSH session attaches, the remote integration has not been
-    // observed; no host sentence may stand in for it.
+    // Before the SSH session attaches, only the neutral session state is
+    // reported; no host sentence may stand in for it.
     let report = remote_opencode_report(
         false,
         None,
@@ -805,12 +805,8 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         signals,
     );
     assert_eq!(report.status, IntegrationStatus::Inactive);
-    assert_eq!(report.code, "inactive");
-    assert!(
-        report.reason.contains("remote"),
-        "the reason names the remote integration: {}",
-        report.reason
-    );
+    assert_eq!(report.code, "ssh_not_attached");
+    assert_eq!(report.reason, "The SSH session is not attached.");
 
     // A healthy transport with a connected remote integration.
     let report = remote_opencode_report(
@@ -856,10 +852,10 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         signals,
     );
     assert_eq!(report.status, IntegrationStatus::Degraded);
-    assert!(
-        report.reason.contains("SSH transport"),
-        "the transport reason stays honest: {}",
-        report.reason
+    assert_eq!(report.code, "ssh_disconnected");
+    assert_eq!(
+        report.reason,
+        "The SSH connection was lost; the remote session state is unknown until it reconnects."
     );
 
     // A failed tab reports its own failure sentence.
@@ -872,6 +868,7 @@ fn remote_opencode_diagnostics_use_the_owning_remote_state_honestly() {
         signals,
     );
     assert_eq!(report.status, IntegrationStatus::Degraded);
+    assert_eq!(report.code, "ssh_session_failed", "an SSH session state");
     assert_eq!(
         report.reason,
         "SSH disconnected. Queued input was discarded and will not be replayed."
@@ -1734,8 +1731,8 @@ active session: none\n\
 active title: none\n\
 effective root: none\n\
 worktree: none\n\
-plugin version: none\n\
-protocol version: none\n\
+opencode plugin version: none\n\
+opencode protocol version: none\n\
 opencode version: none\n\
 app version: 9.9.9\n\
 last command-line apply: none\n\
@@ -2143,7 +2140,7 @@ fn remote_opencode_unavailable_maps_to_the_tab_signals() {
     };
 
     // Grok and Claude Code launches intentionally carry no OpenCode
-    // integration: not running, never degraded.
+    // integration: a neutral session state, never degraded.
     for detected in [true, false] {
         let report = row(
             Some(ErrorCode::Unavailable),
@@ -2155,10 +2152,11 @@ fn remote_opencode_unavailable_maps_to_the_tab_signals() {
         );
         assert_eq!(report.status, IntegrationStatus::Inactive);
         assert_eq!(report.code, ReasonCode::Inactive.code());
-        assert_eq!(report.reason, ReasonCode::Inactive.message());
+        assert_eq!(report.reason, "The SSH session is connected.");
     }
 
-    // OpenCode was not detected on this server.
+    // A Terminal tab on a server without OpenCode carries no OpenCode
+    // integration either.
     let report = row(
         Some(ErrorCode::Unavailable),
         RemoteOpenCodeSignals {
@@ -2168,7 +2166,32 @@ fn remote_opencode_unavailable_maps_to_the_tab_signals() {
         },
     );
     assert_eq!(report.status, IntegrationStatus::Inactive);
-    assert_eq!(report.reason, "OpenCode is not detected on this server.");
+    assert_eq!(report.reason, "The SSH session is connected.");
+
+    // The companion reports OpenCode the launch probe missed: never "not
+    // detected" while the companion says it is present.
+    for error in [Some(ErrorCode::Io), Some(ErrorCode::Unavailable)] {
+        let report = row(
+            error,
+            RemoteOpenCodeSignals {
+                detected: false,
+                ..ready
+            },
+        );
+        assert!(!report.reason.contains("not detected"), "{report:?}");
+    }
+
+    // A Terminal SSH tab carrying OpenCode before OpenCode is observed.
+    let report = remote_opencode_report(
+        true,
+        None,
+        ConnectionState::Connected,
+        RemoteIntegration::Unknown,
+        None,
+        ready,
+    );
+    assert_eq!(report.status, IntegrationStatus::Inactive);
+    assert_eq!(report.reason, "The SSH session is connected.");
 
     // Companion integration present, no plugin hello yet.
     let report = row(Some(ErrorCode::Unavailable), ready);
@@ -2198,4 +2221,206 @@ fn remote_opencode_unavailable_maps_to_the_tab_signals() {
             report.reason
         );
     }
+}
+
+/// Grok, Claude Code and Terminal-only SSH tabs carry no OpenCode
+/// integration: every transport and session state they report, and the
+/// snapshot headline built from it, is neutral SSH wording.
+#[test]
+fn remote_tabs_without_opencode_never_mention_opencode() {
+    use made_app::diagnostics::{remote_opencode_report, RemoteOpenCodeSignals};
+    use made_app::remote_workspace::{ConnectionState, IntegrationState as RemoteIntegration};
+    use made_remote::protocol::ErrorCode;
+
+    let targets = [
+        // Grok / Claude Code launch.
+        RemoteOpenCodeSignals {
+            integration_target: false,
+            detected: true,
+            companion: Some(true),
+        },
+        // Terminal on a server without OpenCode.
+        RemoteOpenCodeSignals {
+            integration_target: true,
+            detected: false,
+            companion: Some(false),
+        },
+        RemoteOpenCodeSignals {
+            integration_target: true,
+            detected: false,
+            companion: None,
+        },
+    ];
+    let transports = [ConnectionState::Connected, ConnectionState::Disconnected];
+    let integrations = [RemoteIntegration::Unknown, RemoteIntegration::Unavailable];
+    let errors = [None, Some(ErrorCode::Unavailable), Some(ErrorCode::Io)];
+    for signals in targets {
+        for attached in [false, true] {
+            for failed in [None, Some("SSH disconnected.")] {
+                for transport in transports {
+                    for integration in integrations {
+                        for error in errors {
+                            let report = remote_opencode_report(
+                                attached,
+                                failed,
+                                transport,
+                                integration,
+                                error,
+                                signals,
+                            );
+                            assert!(
+                                !report.reason.contains("OpenCode")
+                                    && !report.code.contains("bridge")
+                                    && !report.code.contains("opencode"),
+                                "{signals:?} {attached} {failed:?} {transport:?} {integration:?} {error:?}: {report:?}"
+                            );
+                            let diagnostics = Diagnostics::new("/tmp/made.log");
+                            let mut view = diagnostics.snapshot(
+                                &IntegrationState::new(None, PathBuf::from("/workspace")),
+                                None,
+                                None,
+                                None,
+                            );
+                            view.set_remote_opencode(report);
+                            assert!(!view.reason.contains("OpenCode"), "{}", view.reason);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The About headline summarizes every integration row: the most severe
+/// actionable row (catalog order breaks ties), else the active program's
+/// row, else the neutral inactive sentence. OpenCode is an ordinary row.
+#[test]
+fn about_headline_summarizes_every_integration_row() {
+    use made_app::diagnostics::DiagnosticsPill;
+    use made_app::integrations::RowReport;
+    use made_app::integrations::{CLAUDE_CODE, GROK, OPENCODE, PRODUCT};
+    use made_app::ui::{about_integrations, AboutPill, NO_PROGRAM_INTEGRATION};
+
+    let diagnostics = Diagnostics::new("/tmp/made.log");
+    let mut view = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    // A plain shell: nothing active, nothing actionable.
+    let about = about_integrations(&view, PRODUCT, None);
+    assert_eq!(about.headline.sentence, NO_PROGRAM_INTEGRATION);
+    assert_eq!(
+        about.headline.pill,
+        AboutPill::Row(DiagnosticsPill::Inactive)
+    );
+    assert_eq!(about.headline.entry, None);
+    let entries: Vec<_> = about.rows.iter().filter_map(|row| row.entry).collect();
+    assert_eq!(
+        entries.len(),
+        3,
+        "OpenCode, Grok Build and Claude Code rows"
+    );
+    assert_eq!(entries[0].descriptor().key, OPENCODE.descriptor().key);
+    assert_eq!(about.rows[0].sentence, "OpenCode is not running.");
+
+    // A local Claude Code tab: its row heads the card, never OpenCode's.
+    view.set_row(
+        "claude status",
+        RowReport::new(
+            DiagnosticsPill::Ready,
+            "Claude Code session follow is ready.",
+        ),
+    );
+    let about = about_integrations(&view, PRODUCT, Some(CLAUDE_CODE));
+    assert_eq!(
+        about.headline.sentence,
+        "Claude Code session follow is ready."
+    );
+    assert_ne!(about.headline.sentence, "OpenCode is not running.");
+    // Not ready yet: still the active program's current sentence.
+    view.set_row(
+        "claude status",
+        RowReport::new(DiagnosticsPill::Inactive, "Checking for Claude Code."),
+    );
+    let about = about_integrations(&view, PRODUCT, Some(CLAUDE_CODE));
+    assert_eq!(about.headline.sentence, "Checking for Claude Code.");
+
+    // Degraded rows win over the active program; catalog order breaks ties.
+    view.set_row(
+        "grok status",
+        RowReport::new(DiagnosticsPill::Degraded, "Grok Build hooks failed."),
+    );
+    view.set_row(
+        "claude status",
+        RowReport::new(DiagnosticsPill::Degraded, "Claude Code hooks failed."),
+    );
+    let about = about_integrations(&view, PRODUCT, Some(CLAUDE_CODE));
+    assert_eq!(about.headline.sentence, "Grok Build hooks failed.");
+    assert_eq!(about.headline.entry, Some(GROK));
+
+    // A program that is merely absent is not actionable unless it is the
+    // tab's active program; it stays in the list.
+    let mut absent = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    absent.status = IntegrationStatus::Unsupported;
+    absent.reason_code = "opencode_missing";
+    absent.reason = "OpenCode is not on PATH.".to_owned();
+    absent.set_row(
+        "claude status",
+        RowReport::new(
+            DiagnosticsPill::Ready,
+            "Claude Code session follow is ready.",
+        ),
+    );
+    let about = about_integrations(&absent, PRODUCT, Some(CLAUDE_CODE));
+    assert_eq!(
+        about.headline.sentence,
+        "Claude Code session follow is ready."
+    );
+    assert!(about
+        .rows
+        .iter()
+        .any(|row| row.sentence == "OpenCode is not on PATH."));
+    let about = about_integrations(&absent, PRODUCT, Some(OPENCODE));
+    assert_eq!(about.headline.sentence, "OpenCode is not on PATH.");
+    let about = about_integrations(&absent, PRODUCT, None);
+    assert_eq!(about.headline.sentence, NO_PROGRAM_INTEGRATION);
+
+    // An unsupported OpenCode outranks every degraded row.
+    view.status = IntegrationStatus::Unsupported;
+    view.reason = "The Made plugin protocol is incompatible with this app.".to_owned();
+    let about = about_integrations(&view, PRODUCT, Some(CLAUDE_CODE));
+    assert_eq!(
+        about.headline.sentence,
+        "The Made plugin protocol is incompatible with this app."
+    );
+    assert_eq!(
+        about.headline.pill,
+        AboutPill::Status(IntegrationStatus::Unsupported)
+    );
+}
+
+/// The OpenCode-only copy keys name OpenCode.
+#[test]
+fn copied_report_names_the_opencode_plugin_and_protocol() {
+    let diagnostics = Diagnostics::new("/tmp/made.log");
+    let view = diagnostics.snapshot(
+        &IntegrationState::new(None, PathBuf::from("/workspace")),
+        None,
+        None,
+        None,
+    );
+    let text = view.to_text();
+    assert!(text.contains("\nopencode plugin version: none\n"), "{text}");
+    assert!(
+        text.contains("\nopencode protocol version: none\n"),
+        "{text}"
+    );
+    assert!(!text.contains("\nplugin version:"), "{text}");
 }

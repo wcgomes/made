@@ -6,7 +6,7 @@ Made is a native Rust desktop application built on eframe/egui with one window a
 
 | Crate | Targets | Responsibility | Workspace dependencies |
 |---|---|---|---|
-| [`made-app`](../crates/made-app/src/lib.rs) | library + binary | Composition root: window, workspace collection, terminals, explorer/preview composition, picker, diagnostics, metrics, CLI. | all domain crates |
+| [`made-app`](../crates/made-app/src/lib.rs) | library + binary | Composition root: window, workspace collection, terminals, explorer/preview composition, Open workspace screen, diagnostics, metrics, CLI. | all domain crates |
 | [`made-terminal`](../crates/made-terminal/src/lib.rs) | library | `TerminalCore` boundary, VT screen state, PTY adapter, input encoding, render model. | `made-platform` |
 | [`made-platform`](../crates/made-platform/src/lib.rs) | library | Only OS-specific crate: PTY/ConPTY, shell launch and cwd hooks, process lifecycle, app paths, clipboard, IME, native backdrop, home resolution. | none |
 | [`made-explorer`](../crates/made-explorer/src/lib.rs) | library | Lazy tree, watcher, canonical path guard, read-only preview, highlighting, root generations. | none |
@@ -56,14 +56,14 @@ Made uses one source tree and one UI workflow for **macOS arm64/x64**, **Linux x
 - session-follow precedence, session map/focus state, worktree metadata, diagnostics, and metrics;
 - left-surface state (`Terminal` or `Preview`) and focus transfer.
 
-Opening another folder creates a new workbench without disturbing siblings. Closing a workspace shuts down only its own PTY/process group, bridge, queues, watcher, bootstrap, and pending work; late results are generation- or id-gated. Closing the final workspace returns to the picker and starts no process. There is no restart persistence.
+Opening another folder creates a new workbench without disturbing siblings. Closing a workspace shuts down only its own PTY/process group, bridge, queues, watcher, bootstrap, and pending work; late results are generation- or id-gated. Closing the final workspace shows the Open workspace screen and starts no process. There is no restart persistence.
 
 Module boundaries in `made-app`:
 
 | Module | Responsibility |
 |---|---|
-| [`app.rs`](../crates/made-app/src/app.rs) | Workspace collection, active id, picker transitions, per-tab ticking, shutdown. |
-| [`ui.rs`](../crates/made-app/src/ui.rs) | Calm Editor composition, header/tabs, explorer and preview surfaces, diagnostics, picker. |
+| [`app.rs`](../crates/made-app/src/app.rs) | Workspace collection, active id, Open workspace transitions, per-tab ticking, shutdown. |
+| [`ui.rs`](../crates/made-app/src/ui.rs) | Calm Editor composition, header/tabs, explorer and preview surfaces, diagnostics, Open workspace screen. |
 | [`theme.rs`](../crates/made-app/src/theme.rs) | Tokens, style installation, glass painting, clear color and transparency switch. |
 | [`workbench.rs`](../crates/made-app/src/workbench.rs) | One workspace runtime: shell/PTY, root follow, bridge, optional OpenCode, diagnostics, metrics. |
 | [`terminal_view.rs`](../crates/made-app/src/terminal_view.rs), [`render.rs`](../crates/made-app/src/render.rs) | Terminal input/visibility, selection/copy/IME, damage-driven grid rendering. |
@@ -80,7 +80,7 @@ Module boundaries in `made-app`:
 ### Shell workspace
 
 ```text
-launch / picker / home folder
+launch / Open workspace / home folder
   -> platform shell launch plan (user profile + launch-local OSC 7 emitter)
   -> PTY shell in workspace folder
   -> terminal input/output + VT state

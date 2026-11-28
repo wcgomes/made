@@ -567,7 +567,6 @@ struct PreviewState {
     pending_request: Option<u64>,
     last_applied: u64,
     next_request: u64,
-    refreshed_at: Option<Instant>,
 }
 
 impl PreviewState {
@@ -575,7 +574,6 @@ impl PreviewState {
         if self.path.as_deref() != Some(path) {
             // A new selection must never display the previous file's content.
             self.document = None;
-            self.refreshed_at = None;
         }
         self.path = Some(path.to_path_buf());
         self.loading = true;
@@ -586,7 +584,6 @@ impl PreviewState {
     fn begin_error(&mut self, path: PathBuf, error: impl Into<String>) {
         if self.path.as_deref() != Some(path.as_path()) {
             self.document = None;
-            self.refreshed_at = None;
         }
         self.path = Some(path);
         self.loading = false;
@@ -603,8 +600,6 @@ pub enum PreviewUiAction {
     None,
     /// Close the preview and return to the terminal.
     Close,
-    /// Keep the loaded preview and return to the live terminal.
-    ShowTerminal,
 }
 
 /// Display state for the shared full-left preview card.
@@ -614,7 +609,6 @@ pub(crate) struct PreviewCardState<'a> {
     pub(crate) document: Option<&'a PreviewDocument>,
     pub(crate) loading: bool,
     pub(crate) error: Option<&'a str>,
-    pub(crate) refreshed_at: Option<Instant>,
     pub(crate) focus_pending: bool,
 }
 
@@ -629,7 +623,6 @@ pub(crate) struct PreviewCardResult {
 pub(crate) struct PreviewCardIds {
     pub(crate) focus: egui::Id,
     pub(crate) close: egui::Id,
-    pub(crate) terminal: egui::Id,
     pub(crate) refresh: egui::Id,
     pub(crate) copy: egui::Id,
 }
@@ -929,11 +922,6 @@ impl ExplorerPane {
     /// Stable widget id for a preview header action.
     pub fn preview_action_id(&self, action: PreviewAction) -> egui::Id {
         self.ui_scope.with(("preview-action", action.label()))
-    }
-
-    /// Stable widget id for the preview's return-to-terminal action.
-    pub fn preview_terminal_id(&self) -> egui::Id {
-        self.ui_scope.with(("preview-action", "Terminal"))
     }
 
     /// The preview card's focus id.
@@ -1514,7 +1502,6 @@ impl ExplorerPane {
                 .pending_request
                 .is_some_and(|pending| pending > result.request);
             self.preview.error = None;
-            self.preview.refreshed_at = Some(Instant::now());
         }
     }
 
@@ -1762,13 +1749,11 @@ impl ExplorerPane {
                 document: self.preview.document.as_ref(),
                 loading: self.preview.loading,
                 error: self.preview.error.as_deref(),
-                refreshed_at: self.preview.refreshed_at,
                 focus_pending,
             },
             PreviewCardIds {
                 focus: self.preview_focus_id(),
                 close: self.preview_action_id(PreviewAction::Close),
-                terminal: self.preview_terminal_id(),
                 refresh: self.preview_action_id(PreviewAction::Refresh),
                 copy: self.preview_action_id(PreviewAction::CopyPath),
             },
@@ -2669,20 +2654,6 @@ pub(crate) fn preview_card_ui(
     if close_action.activated {
         result.surface = PreviewUiAction::Close;
     }
-    let terminal_action = theme::ghost_action(
-        &mut right,
-        ids.terminal,
-        "Terminal",
-        false,
-        layout.button_height,
-        theme::BG_HEADER,
-    );
-    terminal_action
-        .response
-        .on_hover_text("Return to the live terminal; the preview stays loaded");
-    if terminal_action.activated {
-        result.surface = PreviewUiAction::ShowTerminal;
-    }
     if layout.compact {
         let more = theme::ghost_action(
             &mut right,
@@ -2788,7 +2759,7 @@ pub(crate) fn preview_card_ui(
         ui.new_child(UiBuilder::new().max_rect(body_rect.shrink2(egui::vec2(10.0, 6.0))));
     if !layout.hide_preview_meta {
         if let Some(document) = state.document {
-            let meta = preview_meta(document, state.refreshed_at, layout.compact);
+            let meta = preview_meta(document, layout.compact);
             let mut meta_ui = ui.new_child(
                 UiBuilder::new()
                     .max_rect(meta_rect.shrink2(egui::vec2(layout.header_padding_x, 0.0)))
@@ -3236,11 +3207,7 @@ fn tone_strip(
     response.on_hover_text(tooltip);
 }
 
-fn preview_meta(
-    document: &PreviewDocument,
-    refreshed_at: Option<Instant>,
-    compact: bool,
-) -> String {
+fn preview_meta(document: &PreviewDocument, compact: bool) -> String {
     let size = document
         .size
         .map(theme::format_bytes)
@@ -3265,10 +3232,7 @@ fn preview_meta(
             }
         })
         .unwrap_or_else(|| "Plain text".to_owned());
-    let updated = refreshed_at
-        .map(|instant| format!(" · updated {:.1}s ago", instant.elapsed().as_secs_f32()))
-        .unwrap_or_default();
-    format!("{size} · {syntax} · {lines}{updated}")
+    format!("{size} · {syntax} · {lines}")
 }
 
 fn preview_state_card(ui: &mut Ui, document: &PreviewDocument, layout: &theme::Layout) {
@@ -7209,13 +7173,11 @@ mod tests {
                     document: Some(&document),
                     loading: false,
                     error: None,
-                    refreshed_at: None,
                     focus_pending: false,
                 },
                 PreviewCardIds {
                     focus: egui::Id::unique("remote-preview-focus"),
                     close: egui::Id::unique("remote-preview-close"),
-                    terminal: egui::Id::unique("remote-preview-terminal"),
                     refresh: egui::Id::unique("remote-preview-refresh"),
                     copy: egui::Id::unique("remote-preview-copy"),
                 },
@@ -7231,11 +7193,16 @@ mod tests {
             "Copy path",
             "Refresh",
             "Close",
-            "Terminal",
             "1",
             "PlantSuite",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+        for retired in ["Terminal", "updated", "ago"] {
+            assert!(
+                !text.contains(retired),
+                "preview header must not paint {retired:?}: {text:?}"
+            );
         }
         assert!(
             !text.contains("SSH"),

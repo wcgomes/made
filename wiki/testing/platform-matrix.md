@@ -32,7 +32,7 @@ The shell matrix is a release-blocking gap for v1: the spec names all four suppo
 |---|---|---|---|---|
 | In-app glass fallback (Explorer) | Verified | Pending compositor | **Rendered on arm64**; x64 compile-only | Compile-only |
 | Native backdrop | N/A (honest fallback log) | N/A | **Verified on arm64**; x64 compile-only | **Compile-only** (Acrylic on 22H2+; native unverified) |
-| Mint header, 26/24 card-edge header, 215 fallback alpha, tab/close scale per the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md), splitter fade, scrollbars, picker tree/path chip | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
+| Mint header, 26/24 card-edge header, 215 fallback alpha, tab/close scale per the [UI spec](../../specs/changes/archive/20261029-made-ui-ux-v1/spec.md), splitter fade, scrollbars, picker tree/path chip (picker since replaced by the Open workspace screen) | Headless + temporary Xvfb checks | Pointer/compositor pending | Pointer pending | Pointer pending |
 | Preview roundtrip | Native Xvfb | Pending | Pending | Pending |
 | Diagnostics log rotation, `.1` retention, 0600/0700, bounded lock/refusal, final-exit stderr visibility gap | Verified Linux automated | Pending native lock/reparse check | Pending native lock/reparse check | Pending native lock/reparse check |
 | Native IME/clipboard/mouse/paste | Not native (Xvfb) | Not yet tested | **Clipboard image paste user-confirmed 2026-11-01**; IME/mouse/full clipboard not yet tested | Not yet tested |
@@ -50,6 +50,15 @@ At the 2026-10-28 snapshot, all five workflows were observed green for the CI-st
 
 The v0.1.0 field-issue fixes (Windows GUI subsystem, DX12 visual swapchain/Acrylic backdrop, cmd.exe cwd, SSH cwd/locale/reattach) are Linux-tested and cross-compiled only. Native Windows, macOS, and live-SSH validation is pending. Details: [Terminal-first runtime](../runtime/terminal-first.md), [ADR 0003](../decisions/0003-in-app-glass-native-backdrop.md), [CI platform quirks](ci-platform-quirks.md).
 
+## Open workspace redesign (2026-11-27)
+
+Archived as a scoped archive under SSH-09 with two requester-accepted `UNVERIFIED` items, recorded in the archived [`tasks.md`](../../specs/changes/archive/20261127-open-workspace-redesign/tasks.md):
+
+- Task 8.2: manual check against a real SSH server (host-key approval, password/MFA prompt, remote browse, remote worktree pills, remote TUI launch in a worktree). Automated coverage uses loopback `sshd` fixtures only.
+- Native-backdrop visuals: the Open workspace card glass under macOS vibrancy and the SSH tab host badge on a native backdrop. The visual gate used offscreen fallback captures ([Build and test](../operations/build-and-test.md#offscreen-visual-checks)).
+
+Full release acceptance stays blocked until both run and results are recorded.
+
 ## Release-blocking gaps
 
 - Native Linux X11/Wayland with real desktop input.
@@ -61,6 +70,7 @@ The v0.1.0 field-issue fixes (Windows GUI subsystem, DX12 visual swapchain/Acryl
 - Hardware-GPU pacing/reference input latency.
 - Packaged artifact launch on real machines: release CI launches the installed layout only through `--smoke-test` on hosted runners; fresh-machine installs, Fedora, Wayland and click-through remain `UNVERIFIED` per the [release record](../records/20261106-v0-1-0-release.md).
 - Cross-user bridge DoS acceptance or reserved slot.
+- Open workspace redesign `UNVERIFIED` items above (real-server SSH, native-backdrop visuals).
 
 Accepted residuals such as read-only preview, optional OpenCode only, no worktree lifecycle management, no code signing or notarization (installers and auto-update now exist; see the [release record](../records/20261106-v0-1-0-release.md)), and same-user token exposure are documented in the [v1 evidence record](../records/20261026-v1-evidence.md) and [Security](../security.md).
 

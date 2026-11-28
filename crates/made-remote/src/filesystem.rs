@@ -114,11 +114,15 @@ impl Filesystem {
         Ok(batches
             .iter()
             .enumerate()
-            .map(|(i, batch)| Operation::Listed {
-                path: path.clone(),
-                entries: batch.to_vec(),
-                truncated: listing.truncated,
-                done: i + 1 == batches.len(),
+            .map(|(i, batch)| {
+                let done = i + 1 == batches.len();
+                // The client rejects `truncated` on a non-final frame.
+                Operation::Listed {
+                    path: path.clone(),
+                    entries: batch.to_vec(),
+                    truncated: listing.truncated && done,
+                    done,
+                }
             })
             .collect())
     }

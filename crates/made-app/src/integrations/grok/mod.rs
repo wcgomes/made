@@ -93,12 +93,6 @@ pub(crate) fn workspace_grok_branded(
                 && running))
 }
 
-/// Official Grok mark from `assets/grok.svg`, outside the Material icon
-/// inventory.
-pub(crate) fn mark() -> Mark {
-    DESCRIPTOR.mark
-}
-
 /// The Grok state of a tab built over `list`.
 #[cfg(test)]
 pub(crate) fn tab_state(

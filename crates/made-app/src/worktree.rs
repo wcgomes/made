@@ -16,18 +16,28 @@
 //! a frame. [`GitRunner::read_status`] is the same kind of call for
 //! `status --porcelain=v1 -z`: read-only, fixed arguments, and never a reason
 //! to block the explorer.
+//!
+//! The Open workspace screen reads the worktree list and change counts of its
+//! launch target through [`WorktreeReads`]: bounded, on a worker thread, with
+//! each reply tagged by the generation of the request it answers.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 pub use made_remote::git::{
-    group_status, is_read_only_git_args, parse_porcelain_v1_z, ChangeKind, FolderMark, GitCommand,
-    GitLimits, GitStatusGroup, GitStatusRead, GitStatusRow, GitStatusSnapshot, MetadataStatus,
-    PorcelainRecord, WorktreeMetadata, GIT_PROGRAM_ENV, GROUP_CHANGES, GROUP_MERGE, GROUP_STAGED,
-    GROUP_UNTRACKED, READ_ONLY_GIT_ARGUMENTS, WORKTREE_MANAGEMENT_AVAILABLE,
+    group_status, is_read_only_git_args, parse_porcelain_v1_z, parse_worktree_entries,
+    ChangeCounts, ChangeKind, FolderMark, GitCommand, GitLimits, GitStatusGroup, GitStatusRead,
+    GitStatusRow, GitStatusSnapshot, MetadataStatus, PillKind, PorcelainRecord, WorktreeEntry,
+    WorktreeMetadata, GIT_PROGRAM_ENV, GROUP_CHANGES, GROUP_MERGE, GROUP_STAGED, GROUP_UNTRACKED,
+    READ_ONLY_GIT_ARGUMENTS, WORKTREE_MANAGEMENT_AVAILABLE,
 };
+
+use crate::open_workspace::{CountsState, GitState, WorktreeItem};
 
 /// Runs the fixed read-only git commands through the shared remote observer.
 #[derive(Debug, Clone)]
@@ -121,6 +131,286 @@ impl GitRunner {
             };
         }
         self.inner.read_status(directory, toplevel)
+    }
+}
+
+impl GitRunner {
+    /// The same executable with the bounded limits the Open workspace screen
+    /// requires.
+    fn bounded(&self) -> made_remote::git::GitRunner {
+        made_remote::git::GitRunner::with_limits(self.program(), GitLimits::BOUNDED)
+    }
+
+    /// Read the Open workspace git state of `target`: the top level of the
+    /// working tree that contains it and every working tree of the repository
+    /// (main first, then repository order) from the read-only
+    /// `worktree list --porcelain`, run from `target`. A non-repository, a
+    /// missing git or a failed read is [`GitState::NoRepository`]. Counts are
+    /// left pending; read them with [`Self::read_change_counts`].
+    pub fn read_open_workspace_target(&self, target: &Path) -> GitState {
+        self.read_target_unless(target, &|| false)
+            .unwrap_or(GitState::NoRepository)
+    }
+
+    /// [`Self::read_open_workspace_target`], abandoned (`None`) when
+    /// `superseded` holds between its two git commands.
+    fn read_target_unless(&self, target: &Path, superseded: &dyn Fn() -> bool) -> Option<GitState> {
+        let runner = self.bounded();
+        let Some(toplevel) = runner
+            .read_bytes(GitCommand::ShowToplevel, target)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .map(|text| canonical(Path::new(&text)))
+        else {
+            return Some(GitState::NoRepository);
+        };
+        if superseded() {
+            return None;
+        }
+        let entries = runner
+            .read_bytes(GitCommand::WorktreeList, target)
+            .map(|bytes| parse_worktree_entries(&String::from_utf8_lossy(&bytes)))
+            .unwrap_or_default();
+        let mut worktrees: Vec<WorktreeItem> = entries
+            .into_iter()
+            .map(|entry| {
+                let path = canonical(&entry.path);
+                WorktreeItem {
+                    missing: entry.missing || fs::read_dir(&path).is_err(),
+                    label: entry.head_label(),
+                    path,
+                    counts: CountsState::Pending,
+                }
+            })
+            .collect();
+        if !worktrees.iter().any(|item| item.path == toplevel) {
+            // Without a usable list the working tree itself is the only item.
+            worktrees = vec![WorktreeItem {
+                path: toplevel.clone(),
+                label: None,
+                missing: false,
+                counts: CountsState::Pending,
+            }];
+        }
+        Some(GitState::Repository {
+            toplevel,
+            worktrees,
+            counts: CountsState::Pending,
+        })
+    }
+
+    /// Whole-working-tree change counts of the working tree at `worktree`
+    /// (its top level), from the bounded read-only status read.
+    pub fn read_change_counts(&self, worktree: &Path) -> CountsState {
+        match self.bounded().read_status(worktree, Some(worktree)) {
+            GitStatusRead::Ready(snapshot) => {
+                CountsState::Ready(ChangeCounts::from_snapshot(&snapshot))
+            }
+            GitStatusRead::Failed { .. } | GitStatusRead::Unavailable { .. } => CountsState::Failed,
+        }
+    }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// One reply of an Open workspace git read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeReadUpdate {
+    /// The git state of the requested launch target.
+    Target {
+        /// Generation of the request.
+        generation: u64,
+        /// Repository and worktree list, counts pending.
+        state: GitState,
+    },
+    /// Change counts of one working tree of that state.
+    Counts {
+        /// Generation of the request.
+        generation: u64,
+        /// Working-tree top level the counts belong to.
+        path: PathBuf,
+        /// Its counts.
+        counts: CountsState,
+    },
+}
+
+/// Off-thread Open workspace git reads on one worker thread, started with
+/// the first request. Requests do not queue: the worker takes the newest
+/// one, checks between git commands whether it was superseded and then
+/// moves to the newest, so at most one git process runs at a time however
+/// fast the target changes. Replies of any request but the latest are
+/// discarded.
+#[derive(Debug)]
+pub struct WorktreeReads {
+    runner: GitRunner,
+    latest: Option<u64>,
+    shared: Arc<WorkerSlot>,
+    worker: Option<thread::JoinHandle<()>>,
+    sender: Sender<WorktreeReadUpdate>,
+    receiver: Receiver<WorktreeReadUpdate>,
+}
+
+/// The newest request and whether the owner is gone.
+#[derive(Debug, Default)]
+struct WorkerSlot {
+    state: Mutex<WorkerState>,
+    wake: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct WorkerState {
+    request: Option<(u64, PathBuf)>,
+    latest: u64,
+    closed: bool,
+}
+
+impl WorkerSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WorkerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Whether `generation` is no longer the newest request.
+    fn superseded(&self, generation: u64) -> bool {
+        let state = self.lock();
+        state.closed || state.latest != generation
+    }
+
+    /// Block until a request is waiting; `None` once the owner is gone.
+    fn next(&self) -> Option<(u64, PathBuf)> {
+        let mut state = self.lock();
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(request) = state.request.take() {
+                return Some(request);
+            }
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+}
+
+impl WorktreeReads {
+    /// Reads with `runner`'s executable and the bounded limits.
+    pub fn new(runner: GitRunner) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            runner,
+            latest: None,
+            shared: Arc::new(WorkerSlot::default()),
+            worker: None,
+            sender,
+            receiver,
+        }
+    }
+
+    /// Read `target` for request `generation`, superseding earlier requests.
+    /// The worker reads the worktree list, then the counts of every listed
+    /// worktree when `target` is a top level with linked worktrees, else of
+    /// the working tree that contains `target`. A worker that cannot start
+    /// leaves the screen without git details.
+    pub fn request(&mut self, generation: u64, target: PathBuf) {
+        self.latest = Some(generation);
+        {
+            let mut state = self.shared.lock();
+            state.latest = generation;
+            state.request = Some((generation, target));
+        }
+        self.shared.wake.notify_one();
+        if self.worker.is_none() {
+            let runner = self.runner.clone();
+            let shared = Arc::clone(&self.shared);
+            let sender = self.sender.clone();
+            self.worker = thread::Builder::new()
+                .name("made-open-workspace-git".to_owned())
+                .spawn(move || {
+                    while let Some((generation, target)) = shared.next() {
+                        read_target(&runner, &shared, &sender, generation, &target);
+                    }
+                })
+                .ok();
+        }
+    }
+
+    /// Replies of the latest request received so far.
+    pub fn poll(&mut self) -> Vec<WorktreeReadUpdate> {
+        let latest = self.latest;
+        self.receiver
+            .try_iter()
+            .filter(|update| {
+                let generation = match update {
+                    WorktreeReadUpdate::Target { generation, .. }
+                    | WorktreeReadUpdate::Counts { generation, .. } => *generation,
+                };
+                Some(generation) == latest
+            })
+            .collect()
+    }
+}
+
+impl Drop for WorktreeReads {
+    /// Stop the worker after its current git command; never waits for it.
+    fn drop(&mut self) {
+        self.shared.lock().closed = true;
+        self.shared.wake.notify_one();
+    }
+}
+
+/// One request on the worker, abandoned between git commands as soon as a
+/// newer request arrives.
+fn read_target(
+    runner: &GitRunner,
+    shared: &WorkerSlot,
+    sender: &Sender<WorktreeReadUpdate>,
+    generation: u64,
+    target: &Path,
+) {
+    let Some(state) = runner.read_target_unless(target, &|| shared.superseded(generation)) else {
+        return;
+    };
+    if shared.superseded(generation) {
+        return;
+    }
+    let counted: Vec<PathBuf> = match &state {
+        GitState::NoRepository => Vec::new(),
+        GitState::Repository {
+            toplevel,
+            worktrees,
+            ..
+        } if toplevel == target && worktrees.len() > 1 => worktrees
+            .iter()
+            .filter(|item| !item.missing)
+            .map(|item| item.path.clone())
+            .collect(),
+        GitState::Repository { toplevel, .. } => vec![toplevel.clone()],
+    };
+    if sender
+        .send(WorktreeReadUpdate::Target { generation, state })
+        .is_err()
+    {
+        return;
+    }
+    for path in counted {
+        if shared.superseded(generation) {
+            return;
+        }
+        let counts = runner.read_change_counts(&path);
+        let update = WorktreeReadUpdate::Counts {
+            generation,
+            path,
+            counts,
+        };
+        if sender.send(update).is_err() {
+            return;
+        }
     }
 }
 
@@ -295,6 +585,7 @@ mod tests {
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=all",
+                "--ignore-submodules=dirty",
                 "--",
                 "."
             ]

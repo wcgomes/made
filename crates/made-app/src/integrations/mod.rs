@@ -161,6 +161,12 @@ pub trait Integration: Sync + 'static {
     fn supports_peer_version(&self, _version: &str) -> bool {
         true
     }
+
+    /// Whether `reason_code`, this integration's primary reason, only says
+    /// that the program is absent (not installed or not on PATH).
+    fn reason_is_absence(&self, _reason_code: &str) -> bool {
+        false
+    }
 }
 
 /// The pill and the one sentence beside it on a diagnostics row.
@@ -834,6 +840,12 @@ pub fn rank_order(list: IntegrationList) -> Vec<usize> {
 pub fn session_channel_position(list: IntegrationList) -> Option<usize> {
     list.iter()
         .position(|entry| entry.follow() == FollowKind::SessionChannel)
+}
+
+/// The catalog label of the session-channel owner of `list`: the program the
+/// session map, the bridge and its diagnostics belong to.
+pub fn session_channel_label(list: IntegrationList) -> Option<&'static str> {
+    Some(list[session_channel_position(list)?].descriptor().label)
 }
 
 /// The tab state of the session-channel owner of `list`.

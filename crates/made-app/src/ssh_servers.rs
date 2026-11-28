@@ -185,6 +185,213 @@ pub struct ServerRegistry<S> {
     claude: std::collections::HashSet<AuthorityId>,
     next_attempt: u64,
 }
+/// One field of the Open workspace add/edit host form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostField {
+    Name,
+    Host,
+    User,
+    Port,
+    KeyFile,
+    Directory,
+}
+
+/// The add/edit host form draft. It has no credential field; dropping it is
+/// Cancel and writes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostForm {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: String,
+    pub key_file: String,
+    pub directory: String,
+}
+
+impl HostForm {
+    /// The form prefilled with a saved record, for Edit.
+    pub fn from_metadata(metadata: &ServerMetadata) -> Self {
+        Self {
+            name: metadata.display_name.clone(),
+            host: metadata.host.clone(),
+            user: metadata.user.clone().unwrap_or_default(),
+            port: metadata
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            key_file: metadata.key_file.clone().unwrap_or_default(),
+            directory: metadata
+                .initial_directory
+                .as_ref()
+                .map(|path| String::from_utf8_lossy(path.as_bytes()).into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Validate every field, returning the record or one error per invalid
+    /// field in form order. The record rules are [`ServerMetadata::validate`]'s.
+    pub fn validate(&self) -> Result<ServerMetadata, Vec<(HostField, &'static str)>> {
+        fn text(value: &str, max: usize) -> bool {
+            !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+        }
+        fn target(value: &str) -> bool {
+            text(value, 255)
+                && !value.starts_with('-')
+                && !value.chars().any(char::is_whitespace)
+                && !value.contains(['@', '/', '\\'])
+        }
+        let optional = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        };
+        let mut errors = Vec::new();
+        let name = self.name.trim();
+        if !text(name, 128) {
+            errors.push((
+                HostField::Name,
+                "Enter a display name of up to 128 characters.",
+            ));
+        }
+        let host = self.host.trim();
+        if !target(host) {
+            errors.push((
+                HostField::Host,
+                "Enter a host or alias without spaces, @, / or a leading -.",
+            ));
+        }
+        let user = optional(&self.user);
+        if user.as_deref().is_some_and(|user| !target(user)) {
+            errors.push((
+                HostField::User,
+                "Enter a user name without spaces, @, / or a leading -.",
+            ));
+        }
+        let port = match optional(&self.port) {
+            None => None,
+            Some(port) => match port.parse::<u16>() {
+                Ok(port) if port > 0 => Some(port),
+                _ => {
+                    errors.push((HostField::Port, "Port must be a number from 1 to 65535."));
+                    None
+                }
+            },
+        };
+        let key_file = optional(&self.key_file);
+        // Relative and `~` references stay valid, as in the saved record;
+        // OpenSSH resolves them.
+        if key_file.as_deref().is_some_and(|key| !text(key, 4096)) {
+            errors.push((
+                HostField::KeyFile,
+                "Key file must be a path of up to 4096 characters. Its contents are never stored.",
+            ));
+        }
+        let initial_directory = match optional(&self.directory) {
+            None => None,
+            Some(directory) => {
+                let trimmed = directory.trim_end_matches('/');
+                let directory = if trimmed.is_empty() { "/" } else { trimmed };
+                match RemotePath::new(directory.as_bytes().to_vec()) {
+                    Ok(path) => Some(path),
+                    Err(_) => {
+                        errors.push((
+                            HostField::Directory,
+                            "Initial directory must be an absolute POSIX path.",
+                        ));
+                        None
+                    }
+                }
+            }
+        };
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let metadata = ServerMetadata {
+            display_name: name.to_owned(),
+            host: host.to_owned(),
+            user,
+            port,
+            key_file,
+            initial_directory,
+        };
+        metadata
+            .validate()
+            .map(|()| metadata)
+            .map_err(|_| vec![(HostField::Host, "Check the host details.")])
+    }
+}
+
+/// `[user@]host[:port]` of a record, the address line of its host button.
+pub fn host_address(metadata: &ServerMetadata) -> String {
+    let mut address = String::new();
+    if let Some(user) = &metadata.user {
+        address.push_str(user);
+        address.push('@');
+    }
+    address.push_str(&metadata.host);
+    if let Some(port) = metadata.port {
+        address.push_str(&format!(":{port}"));
+    }
+    address
+}
+
+/// One SSH host button of the host bar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub id: AuthorityId,
+    /// Saved display name.
+    pub name: String,
+    /// `[user@]host[:port]`.
+    pub address: String,
+}
+
+/// A host management action of an SSH host button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAction {
+    Edit,
+    TestConnection,
+    Remove,
+}
+
+impl HostAction {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Edit => "Edit",
+            Self::TestConnection => "Test connection",
+            Self::Remove => "Remove",
+        }
+    }
+}
+
+/// Actions a host button offers: none for Local.
+pub fn host_actions(host: crate::open_workspace::HostId) -> &'static [HostAction] {
+    match host {
+        crate::open_workspace::HostId::Local => &[],
+        crate::open_workspace::HostId::Ssh(_) => &[
+            HostAction::Edit,
+            HostAction::TestConnection,
+            HostAction::Remove,
+        ],
+    }
+}
+
+/// A pending Remove that the user must confirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalPrompt {
+    id: AuthorityId,
+    message: String,
+}
+
+impl RemovalPrompt {
+    pub fn id(&self) -> AuthorityId {
+        self.id
+    }
+
+    /// Confirmation text naming the host.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 impl<S: ServerStorage> ServerRegistry<S> {
     /// Failure never calls replace: preserve corrupt/foreign-version originals.
     /// Local startup can continue without a registry and display this error.
@@ -265,6 +472,82 @@ impl<S: ServerStorage> ServerRegistry<S> {
         self.servers = servers;
         Ok(())
     }
+    /// Host buttons in saved-record order.
+    pub fn host_entries(&self) -> Vec<HostEntry> {
+        self.servers
+            .iter()
+            .map(|server| HostEntry {
+                id: server.id,
+                name: server.metadata.display_name.clone(),
+                address: host_address(&server.metadata),
+            })
+            .collect()
+    }
+
+    /// The saved servers as the Open workspace screen needs them.
+    pub fn screen_hosts(&self) -> Vec<crate::open_workspace::SshHost> {
+        self.servers
+            .iter()
+            .map(|server| crate::open_workspace::SshHost {
+                id: server.id,
+                initial_directory: server
+                    .metadata
+                    .initial_directory
+                    .as_ref()
+                    .and_then(crate::open_workspace::remote_key),
+            })
+            .collect()
+    }
+
+    /// Save a validated add-host form as the last record.
+    pub fn add_host(&mut self, form: &HostForm) -> Result<AuthorityId, RegistryError> {
+        let metadata = form
+            .validate()
+            .map_err(|_| RegistryError::InvalidMetadata)?;
+        self.add(metadata)
+    }
+
+    /// The Edit form prefilled with a record.
+    pub fn edit_form(&self, id: AuthorityId) -> Option<HostForm> {
+        self.servers
+            .iter()
+            .find(|server| server.id == id)
+            .map(|server| HostForm::from_metadata(&server.metadata))
+    }
+
+    /// Save a validated edit form over a record; consent and detection clear
+    /// as for every edit.
+    pub fn edit_host(
+        &mut self,
+        id: AuthorityId,
+        form: &HostForm,
+    ) -> Result<Option<ProbeTicket>, RegistryError> {
+        let metadata = form
+            .validate()
+            .map_err(|_| RegistryError::InvalidMetadata)?;
+        self.edit(id, metadata)
+    }
+
+    /// Ask to remove a record; nothing is removed until confirmed.
+    pub fn removal_prompt(&self, id: AuthorityId) -> Option<RemovalPrompt> {
+        let server = self.servers.iter().find(|server| server.id == id)?;
+        Some(RemovalPrompt {
+            id,
+            message: format!(
+                "Remove {}? Open tabs stay open on this server.",
+                crate::sanitize::sanitize_display(&server.metadata.display_name, 128)
+            ),
+        })
+    }
+
+    /// Remove a confirmed record. Live tabs keep their own snapshot.
+    pub fn remove_confirmed(
+        &mut self,
+        prompt: RemovalPrompt,
+    ) -> Result<Option<ProbeTicket>, RegistryError> {
+        self.remove(prompt.id)
+    }
+
     pub fn add(&mut self, metadata: ServerMetadata) -> Result<AuthorityId, RegistryError> {
         metadata.validate()?;
         if self.servers.len() >= MAX_SERVERS {
@@ -422,6 +705,19 @@ impl<S: ServerStorage> ServerRegistry<S> {
     /// between servers.
     pub fn can_launch_claude(&self, id: AuthorityId) -> bool {
         self.claude.contains(&id) && matches!(self.probes.get(&id), Some(ProbeState::Complete(_)))
+    }
+    /// Whether this server can start `target`: Terminal SSH whenever the
+    /// record exists, a TUI only when this server's own probe detected it.
+    /// Local targets are never offered here.
+    pub fn can_launch_target(&self, target: crate::tui::TerminalTarget) -> bool {
+        use crate::tui::TerminalTarget as T;
+        match target {
+            T::RemoteShell { authority } => self.servers.iter().any(|s| s.id == authority),
+            T::RemoteOpenCode { authority } => self.can_launch_opencode(authority),
+            T::RemoteGrok { authority } => self.can_launch_grok(authority),
+            T::RemoteClaude { authority } => self.can_launch_claude(authority),
+            T::Shell | T::Tui(_) => false,
+        }
     }
     /// Record the `claude` line of a finished probe for one server. Call it
     /// after the probe completed; a later probe attempt forgets it.
@@ -862,6 +1158,89 @@ impl StageAttempt {
     pub fn poll(&self) -> Option<Result<(), AttemptError>> {
         self.done.try_recv().ok()
     }
+}
+
+/// The far end of a scripted [`StageAttempt`] or [`ProbeAttempt`]: it sends
+/// prompts and the outcome, and reads the answers.
+#[cfg(test)]
+pub(crate) struct ScriptedAttempt<T> {
+    pub prompts: std::sync::mpsc::SyncSender<made_platform::ssh_askpass::PromptRequest>,
+    answers: std::sync::mpsc::Receiver<ProbeAnswer>,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub done: std::sync::mpsc::Sender<Result<T, AttemptError>>,
+}
+
+#[cfg(test)]
+impl<T> ScriptedAttempt<T> {
+    /// The next answer: the prompt id and whether it carried a value.
+    pub fn answer(&self) -> Option<(u64, bool)> {
+        self.answers
+            .try_recv()
+            .ok()
+            .map(|answer| (answer.id, answer.answer.is_some()))
+    }
+}
+
+/// The app's ends of a scripted attempt.
+#[cfg(test)]
+struct AttemptEnds<T> {
+    prompts: std::sync::mpsc::Receiver<made_platform::ssh_askpass::PromptRequest>,
+    answers: std::sync::mpsc::Sender<ProbeAnswer>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: std::sync::mpsc::Receiver<Result<T, AttemptError>>,
+}
+
+#[cfg(test)]
+fn scripted<T>() -> (ScriptedAttempt<T>, AttemptEnds<T>) {
+    let (prompt_tx, prompts) = std::sync::mpsc::sync_channel(4);
+    let (answers, answer_rx) = std::sync::mpsc::channel();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    (
+        ScriptedAttempt {
+            prompts: prompt_tx,
+            answers: answer_rx,
+            cancelled: std::sync::Arc::clone(&cancel),
+            done: done_tx,
+        },
+        AttemptEnds {
+            prompts,
+            answers,
+            cancel,
+            done,
+        },
+    )
+}
+
+/// A [`StageAttempt`] driven by the returned script; no SSH runs.
+#[cfg(test)]
+pub(crate) fn scripted_stage() -> (StageAttempt, ScriptedAttempt<()>) {
+    let (script, ends) = scripted();
+    (
+        StageAttempt {
+            prompts: ends.prompts,
+            answers: ends.answers,
+            cancel: ends.cancel,
+            done: ends.done,
+        },
+        script,
+    )
+}
+
+/// A [`ProbeAttempt`] for `ticket` driven by the returned script; no SSH runs.
+#[cfg(test)]
+pub(crate) fn scripted_probe(ticket: ProbeTicket) -> (ProbeAttempt, ScriptedAttempt<ProbeReport>) {
+    let (script, ends) = scripted();
+    (
+        ProbeAttempt {
+            ticket,
+            prompts: ends.prompts,
+            answers: ends.answers,
+            cancel: ends.cancel,
+            done: ends.done,
+        },
+        script,
+    )
 }
 
 /// Stage only after explicit consent. The payload must already include the
@@ -1483,6 +1862,182 @@ pub fn connect_companion(
         fingerprint: None,
     })?;
     Ok(CompanionSession { client, failures })
+}
+
+/// The transport of the Open workspace screen's browse grant: OpenSSH in the
+/// product. Tests substitute a scripted stream.
+pub struct BrowseStream(Box<dyn made_remote::client::ClientStream>);
+
+impl BrowseStream {
+    pub fn new(stream: impl made_remote::client::ClientStream) -> Self {
+        Self(Box::new(stream))
+    }
+}
+
+impl made_remote::client::ClientStream for BrowseStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write(bytes)
+    }
+    fn poll(&mut self) -> Option<made_platform::ssh::SshEvent> {
+        self.0.poll()
+    }
+    fn detach(&mut self) {
+        self.0.detach();
+    }
+    fn poll_prompt(&mut self) -> Option<made_platform::ssh_askpass::PromptRequest> {
+        self.0.poll_prompt()
+    }
+    fn answer_prompt(
+        &mut self,
+        id: u64,
+        answer: Option<made_platform::ssh_askpass::PromptAnswer>,
+    ) -> std::io::Result<()> {
+        self.0.answer_prompt(id, answer)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ServerWire {
+    written: Vec<u8>,
+    events: std::collections::VecDeque<made_platform::ssh::SshEvent>,
+    prompts: std::collections::VecDeque<made_platform::ssh_askpass::PromptRequest>,
+    answers: Vec<(u64, bool)>,
+}
+
+/// The far end of a scripted browse transport: it reads the frames the app
+/// wrote, queues replies, transport events and SSH prompts, and records the
+/// prompt answers. No SSH runs.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ScriptedServer(std::sync::Arc<std::sync::Mutex<ServerWire>>);
+
+#[cfg(test)]
+impl ScriptedServer {
+    /// A transport ending at this server.
+    pub fn stream(&self) -> BrowseStream {
+        BrowseStream::new(ScriptedServerStream(self.clone()))
+    }
+
+    /// The browse requests written since the last call.
+    pub fn requests(&self) -> Vec<made_remote::protocol::BrowseEnvelope> {
+        let bytes = std::mem::take(&mut self.0.lock().unwrap().written);
+        let mut decoder = made_remote::protocol::BrowseFrameDecoder::new();
+        let mut rest = bytes.as_slice();
+        let mut frames = Vec::new();
+        while !rest.is_empty() {
+            let (used, frame) = decoder.push(rest).unwrap();
+            rest = &rest[used..];
+            frames.extend(frame);
+        }
+        frames
+    }
+
+    /// Queue the reply `operation` to `request`.
+    pub fn reply(
+        &self,
+        request: &made_remote::protocol::BrowseEnvelope,
+        operation: made_remote::protocol::BrowseOperation,
+    ) {
+        let reply = made_remote::protocol::BrowseEnvelope::new(
+            request.identity.clone(),
+            request.request_id,
+            operation,
+        );
+        let bytes = made_remote::protocol::encode_browse(&reply).unwrap();
+        self.event(made_platform::ssh::SshEvent::Data(bytes));
+    }
+
+    /// Queue a transport event.
+    pub fn event(&self, event: made_platform::ssh::SshEvent) {
+        self.0.lock().unwrap().events.push_back(event);
+    }
+
+    /// Queue an interactive SSH prompt.
+    pub fn prompt(&self, id: u64, text: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .prompts
+            .push_back(made_platform::ssh_askpass::PromptRequest {
+                id,
+                text: text.to_owned(),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            });
+    }
+
+    /// The prompt answers since the last call: id and whether it had a value.
+    pub fn answers(&self) -> Vec<(u64, bool)> {
+        std::mem::take(&mut self.0.lock().unwrap().answers)
+    }
+}
+
+#[cfg(test)]
+struct ScriptedServerStream(ScriptedServer);
+
+#[cfg(test)]
+impl made_remote::client::ClientStream for ScriptedServerStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0 .0.lock().unwrap().written.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn poll(&mut self) -> Option<made_platform::ssh::SshEvent> {
+        self.0 .0.lock().unwrap().events.pop_front()
+    }
+    fn detach(&mut self) {}
+    fn poll_prompt(&mut self) -> Option<made_platform::ssh_askpass::PromptRequest> {
+        self.0 .0.lock().unwrap().prompts.pop_front()
+    }
+    fn answer_prompt(
+        &mut self,
+        id: u64,
+        answer: Option<made_platform::ssh_askpass::PromptAnswer>,
+    ) -> std::io::Result<()> {
+        self.0
+             .0
+            .lock()
+            .unwrap()
+            .answers
+            .push((id, answer.is_some()));
+        Ok(())
+    }
+}
+
+/// Open the Open workspace screen's browse grant (SSH-12) on the staged
+/// companion: the same fixed `--stdio` command and header as a tab, whose
+/// first frame is `browse`'s `BrowseOpen`. Call it only after the SSH-06
+/// staging consent; it never stages, starts a shell or touches a tab.
+pub fn connect_browse(
+    metadata: &ServerMetadata,
+    version: &str,
+    target: &str,
+    browse: crate::remote_workspace::RemoteBrowse,
+) -> Result<crate::remote_workspace::BrowseConnection<BrowseStream>, AttemptError> {
+    if companion_artifact(target).is_none() {
+        return Err(AttemptError {
+            class: crate::remote_session::SshFailureClass::MissingCapability,
+            detail:
+                "The remote companion is not packaged with this build. Made did not browse locally."
+                    .to_owned(),
+            fingerprint: None,
+        });
+    }
+    let header =
+        made_platform::ssh::companion_header(version, target).map_err(|_| AttemptError {
+            class: crate::remote_session::SshFailureClass::Other,
+            detail: "remote target is not supported".to_owned(),
+            fingerprint: None,
+        })?;
+    let mut process = spawn_ssh(metadata, made_platform::ssh::SshCommand::Companion, None)?;
+    process.write(&header).map_err(|_| AttemptError {
+        class: crate::remote_session::SshFailureClass::Other,
+        detail: "could not send the companion header".to_owned(),
+        fingerprint: None,
+    })?;
+    Ok(crate::remote_workspace::BrowseConnection::new(
+        BrowseStream::new(process),
+        browse,
+    ))
 }
 
 pub fn probe_failure_detail(code: ErrorCode) -> &'static str {

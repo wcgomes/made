@@ -11,7 +11,7 @@ The earlier product flow opened a folder picker before any work could start. Tha
 With no workspace argument, open the current user's **platform-resolved home directory** as a normal terminal + Explorer workspace.
 
 - `--workspace <path>` or a positional folder wins over `--picker`.
-- `--picker` and the Open folder action show the explicit picker.
+- `--picker` and the `+` action show the explicit picker (since 2026-11-27 the Open workspace screen; see [ADR 0012](0012-open-workspace-screen.md)).
 - An invalid, missing, unreadable, or unresolvable home shows a visible non-blocking error and keeps a usable terminal in a fallback directory. It does not block on the picker or crash.
 - Home resolution belongs to `made-platform`; the app maps the result to the normal workspace path.
 - Closing the final tab returns to the picker, not automatically to home.

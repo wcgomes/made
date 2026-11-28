@@ -19,6 +19,7 @@ pub mod explorer_view;
 pub mod integration_status;
 pub mod integrations;
 pub mod metrics;
+pub mod open_workspace;
 pub mod preferences;
 pub mod remote_session;
 pub mod remote_workspace;

@@ -489,27 +489,158 @@ pub fn paint_ellipsized_centered(
     galley
 }
 
-/// Paint a small app-drawn directory disclosure triangle.
+/// Stroke width of the thin disclosure chevron.
+pub const DISCLOSURE_STROKE: f32 = 1.25;
+
+/// The thin disclosure chevron: an open polyline about 8px tall and 4px deep
+/// with round caps, pointing right when collapsed and down when expanded,
+/// centered on `center`. Callers pass `TEXT_TERTIARY` at rest and
+/// `TEXT_SECONDARY` on hovered or selected rows.
+pub fn disclosure_shapes(center: egui::Pos2, expanded: bool, color: Color32) -> Vec<egui::Shape> {
+    let offsets = if expanded {
+        [(-4.0, -2.0), (0.0, 2.0), (4.0, -2.0)]
+    } else {
+        [(-2.0, -4.0), (2.0, 0.0), (-2.0, 4.0)]
+    };
+    let points: Vec<egui::Pos2> = offsets
+        .iter()
+        .map(|(x, y)| center + egui::vec2(*x, *y))
+        .collect();
+    let cap = DISCLOSURE_STROKE / 2.0;
+    vec![
+        egui::Shape::Path(egui::epaint::PathShape::line(
+            points.clone(),
+            Stroke::new(DISCLOSURE_STROKE, color),
+        )),
+        egui::Shape::circle_filled(points[0], cap, color),
+        egui::Shape::circle_filled(points[2], cap, color),
+    ]
+}
+
+/// Paint the thin app-drawn directory disclosure chevron.
 pub fn paint_disclosure(
     painter: &egui::Painter,
     center: egui::Pos2,
     expanded: bool,
     color: Color32,
 ) {
-    let points = if expanded {
-        vec![
-            center + egui::vec2(-4.0, -3.0),
-            center + egui::vec2(4.0, -3.0),
-            center + egui::vec2(0.0, 3.0),
-        ]
-    } else {
-        vec![
-            center + egui::vec2(-3.5, -4.0),
-            center + egui::vec2(3.5, 0.0),
-            center + egui::vec2(-3.5, 4.0),
-        ]
-    };
-    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    painter.extend(disclosure_shapes(center, expanded, color));
+}
+
+/// Connection-state glyph of an SSH host button. Each state has its own
+/// shape so the state never relies on color alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStatusGlyph {
+    /// Hollow ring.
+    NotConnected,
+    /// Ring with a center dot.
+    Connecting,
+    /// Filled dot.
+    Connected,
+    /// Filled diamond.
+    ApprovalNeeded,
+    /// Short bar.
+    Cancelled,
+    /// Filled triangle.
+    Failed,
+}
+
+/// Shapes of a host status glyph, about 7px across, on a small disc of
+/// `backdrop` so it reads over the host icon it badges.
+pub fn host_status_shapes(
+    center: egui::Pos2,
+    status: HostStatusGlyph,
+    backdrop: Color32,
+) -> Vec<egui::Shape> {
+    let point = |x: f32, y: f32| center + egui::vec2(x, y);
+    let mut shapes = vec![egui::Shape::circle_filled(center, 5.5, backdrop)];
+    match status {
+        HostStatusGlyph::NotConnected => {
+            shapes.push(egui::Shape::circle_stroke(
+                center,
+                2.5,
+                Stroke::new(1.25, TEXT_TERTIARY),
+            ));
+        }
+        HostStatusGlyph::Connecting => {
+            shapes.push(egui::Shape::circle_stroke(
+                center,
+                2.75,
+                Stroke::new(1.0, INFO),
+            ));
+            shapes.push(egui::Shape::circle_filled(center, 1.0, INFO));
+        }
+        HostStatusGlyph::Connected => {
+            shapes.push(egui::Shape::circle_filled(center, 3.0, SUCCESS));
+        }
+        HostStatusGlyph::ApprovalNeeded => {
+            shapes.push(egui::Shape::convex_polygon(
+                vec![
+                    point(0.0, -3.5),
+                    point(3.5, 0.0),
+                    point(0.0, 3.5),
+                    point(-3.5, 0.0),
+                ],
+                WARNING,
+                Stroke::NONE,
+            ));
+        }
+        HostStatusGlyph::Cancelled => {
+            shapes.push(egui::Shape::rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(6.0, 2.0)),
+                CornerRadius::same(1),
+                TEXT_TERTIARY,
+            ));
+        }
+        HostStatusGlyph::Failed => {
+            shapes.push(egui::Shape::convex_polygon(
+                vec![point(0.0, -3.3), point(3.4, 2.7), point(-3.4, 2.7)],
+                ERROR,
+                Stroke::NONE,
+            ));
+        }
+    }
+    shapes
+}
+
+/// Radius of the cutout disc behind an SSH tab badge.
+pub const SSH_TAB_BADGE_RADIUS: f32 = 6.0;
+
+/// Shapes of the SSH host badge of a workspace tab: a 9px server glyph (the
+/// host bar's SSH icon shape) while the transport is connected, else the host
+/// bar's state shape, on a cutout disc of `cutout` so it reads over any icon.
+pub fn ssh_tab_badge_shapes(
+    center: egui::Pos2,
+    status: Option<HostStatusGlyph>,
+    cutout: Color32,
+    color: Color32,
+) -> Vec<egui::Shape> {
+    if let Some(status) = status {
+        let mut shapes = host_status_shapes(center, status, cutout);
+        if let Some(egui::Shape::Circle(disc)) = shapes.first_mut() {
+            disc.radius = SSH_TAB_BADGE_RADIUS;
+        }
+        return shapes;
+    }
+    let point = |x: f32, y: f32| center + egui::vec2(x, y);
+    let stroke = Stroke::new(1.0, color);
+    let mut shapes = vec![
+        egui::Shape::circle_filled(center, SSH_TAB_BADGE_RADIUS, cutout),
+        egui::Shape::rect_stroke(
+            egui::Rect::from_center_size(center, egui::vec2(9.0, 7.5)),
+            CornerRadius::same(1),
+            stroke,
+            StrokeKind::Middle,
+        ),
+    ];
+    for y in [-1.6, 1.6] {
+        shapes.push(egui::Shape::circle_filled(point(-2.4, y), 0.65, color));
+        shapes.push(egui::Shape::line_segment(
+            [point(-1.1, y), point(3.0, y)],
+            stroke,
+        ));
+    }
+    shapes
 }
 
 // ── Geometry ────────────────────────────────────────────────────────────────
@@ -943,8 +1074,18 @@ pub enum IconGlyph {
     Folders,
     /// Forked chevrons: linked-worktree mark in the REPOS header.
     LinkedWorktree,
-    /// Two-bay rack: SSH server management. Not a key.
+    /// Two-bay rack: an SSH host on the Open workspace host bar. Not a key.
     Servers,
+    /// Monitor on a stand: the Local host on the Open workspace host bar.
+    Computer,
+    /// Git repository indicator beside the Open workspace launch path.
+    GitRepository,
+    /// Arrow up: go to the parent folder.
+    Up,
+    /// Circular arrow: re-read the folder tree.
+    Refresh,
+    /// Three dots: the `Host actions` menu of an SSH host.
+    More,
 }
 
 /// Linked-worktree mark beside the worktree name. Not the source-control toggle.
@@ -1176,54 +1317,35 @@ fn paint_icon_with(
             paint_ring(bottom, rings.lowest);
         }
         IconGlyph::Folders => {
-            // Two portrait pages. `front` is already absolute; do not pass
-            // its edges back through `point()`.
-            let front = egui::Rect::from_min_max(point(-2.5, -3.5), point(5.5, 5.5));
-            let back = front.translate(egui::vec2(-2.0, -2.0));
-            let pad = 2.0;
-            let left_of_front = egui::Rect::from_min_max(
-                egui::pos2(back.left() - pad, back.top() - pad),
-                egui::pos2(front.left(), back.bottom() + pad),
-            );
-            let above_front = egui::Rect::from_min_max(
-                egui::pos2(front.left(), back.top() - pad),
-                egui::pos2(back.right() + pad, front.top()),
-            );
-            let radius = CornerRadius::same(2);
-            painter.with_clip_rect(left_of_front).rect_stroke(
-                back,
-                radius,
-                stroke,
-                StrokeKind::Middle,
-            );
-            painter.with_clip_rect(above_front).rect_stroke(
-                back,
-                radius,
-                stroke,
-                StrokeKind::Middle,
-            );
-            painter.rect_stroke(front, radius, stroke, StrokeKind::Middle);
-            let fold = 2.2;
-            let right = front.right();
-            let top = front.top();
-            painter.line_segment(
-                [egui::pos2(right - fold, top), egui::pos2(right, top + fold)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right - fold, top),
-                    egui::pos2(right - fold, top + fold),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(right - fold, top + fold),
-                    egui::pos2(right, top + fold),
-                ],
-                stroke,
-            );
+            // Classic folder outline: a body with a tab raised on its top
+            // left, one closed stroke. Corners are rounded like the 2px rect
+            // glyphs; the tab's slant joints take a smaller radius.
+            let (left, right, tab_top, shoulder, bottom) = (-6.5, 6.5, -5.0, -3.0, 5.0);
+            let corners = [
+                (point(left, bottom), 2.0),
+                (point(left, tab_top), 1.5),
+                (point(-1.25, tab_top), 0.75),
+                (point(0.5, shoulder), 0.75),
+                (point(right, shoulder), 2.0),
+                (point(right, bottom), 2.0),
+            ];
+            let mut outline = Vec::new();
+            for (index, &(at, radius)) in corners.iter().enumerate() {
+                let prev = corners[(index + corners.len() - 1) % corners.len()].0;
+                let next = corners[(index + 1) % corners.len()].0;
+                let enter = at + (prev - at).normalized() * radius;
+                let leave = at + (next - at).normalized() * radius;
+                // Quadratic Bézier from `enter` through the corner to `leave`.
+                for step in 0..=4 {
+                    let t = step as f32 / 4.0;
+                    let u = 1.0 - t;
+                    outline.push(egui::pos2(
+                        u * u * enter.x + 2.0 * u * t * at.x + t * t * leave.x,
+                        u * u * enter.y + 2.0 * u * t * at.y + t * t * leave.y,
+                    ));
+                }
+            }
+            painter.add(egui::Shape::closed_line(outline, stroke));
         }
         IconGlyph::Servers => {
             // Rack face, not a key and not a 14×11 panel. The Explorer and
@@ -1234,6 +1356,49 @@ fn paint_icon_with(
             for y in [-2.15, 2.15] {
                 painter.circle_filled(point(-3.35, y), 0.85, color);
                 line(vec![point(-1.7, y), point(4.0, y)]);
+            }
+        }
+        IconGlyph::Computer => {
+            let screen = egui::Rect::from_min_max(point(-6.5, -5.5), point(6.5, 3.5));
+            painter.rect_stroke(screen, CornerRadius::same(2), stroke, StrokeKind::Middle);
+            line(vec![point(0.0, 3.5), point(0.0, 5.75)]);
+            line(vec![point(-3.5, 5.75), point(3.5, 5.75)]);
+        }
+        IconGlyph::GitRepository => {
+            // The source-control branch with hollow rings and no change tint.
+            paint_icon_with(
+                painter,
+                rect,
+                IconGlyph::SourceControl,
+                color,
+                None,
+                false,
+                false,
+            );
+        }
+        IconGlyph::Up => {
+            line(vec![point(0.0, 5.5), point(0.0, -5.0)]);
+            line(vec![point(-4.0, -1.0), point(0.0, -5.0), point(4.0, -1.0)]);
+        }
+        IconGlyph::Refresh => {
+            // Open arc from about -22° clockwise round to -68°, then a head.
+            let radius = 5.0;
+            let points: Vec<egui::Pos2> = (0..=24)
+                .map(|step| {
+                    let angle = (-22.5_f32 + step as f32 * (315.0 / 24.0)).to_radians();
+                    center + egui::vec2(angle.cos(), angle.sin()) * radius
+                })
+                .collect();
+            line(points);
+            painter.add(egui::Shape::convex_polygon(
+                vec![point(4.13, -3.70), point(1.07, -2.59), point(2.76, -6.65)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        IconGlyph::More => {
+            for x in [-4.0, 0.0, 4.0] {
+                painter.circle_filled(point(x, 0.0), 1.2, color);
             }
         }
         IconGlyph::LinkedWorktree => {
@@ -1377,77 +1542,121 @@ fn menu_label_origin_y(galley: &egui::Galley, center_y: f32) -> f32 {
     center_y - body_center
 }
 
-/// Full-width menu row: leading mark and left-aligned label in one click target.
-///
-/// [`ghost_action`] stays centered and icon-free. This row fills a justified
-/// menu with an 8px inset and an 8px gap after the 14px icon slot. Both labels
-/// share one baseline, and the letterform body — not the galley line box — is
-/// centered on the icon.
-pub(crate) fn menu_labeled_action(
+/// Fill and label color of an Open workspace launch button. Every launch
+/// button, Terminal and each TUI alike, shares these: rest `BG_SELECTED` with
+/// a `TEXT_SECONDARY` label, hover `ACCENT_TINT` with `TEXT_PRIMARY`, pressed
+/// `BG_HOVER` with `TEXT_PRIMARY`. No stroke and no accent fill.
+pub fn launch_button_colors(hovered: bool, pressed: bool) -> (Color32, Color32) {
+    if pressed {
+        (BG_HOVER, TEXT_PRIMARY)
+    } else if hovered {
+        (ACCENT_TINT, TEXT_PRIMARY)
+    } else {
+        (BG_SELECTED, TEXT_SECONDARY)
+    }
+}
+
+/// Opacity of a disabled launch button; its shape is unchanged.
+pub const LAUNCH_DISABLED_OPACITY: f32 = 0.45;
+
+/// Width of a launch button with `label` at `height` (26 wide, 24 compact).
+pub fn launch_button_width(ui: &Ui, label: &str, height: f32) -> f32 {
+    let (left, right) = launch_button_padding(height);
+    let text = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            FontId::proportional(BUTTON_SIZE),
+            TEXT_SECONDARY,
+        )
+        .size()
+        .x;
+    left + 16.0 + 6.0 + text + right
+}
+
+fn launch_button_padding(height: f32) -> (f32, f32) {
+    if height < 26.0 {
+        (8.0, 10.0)
+    } else {
+        (10.0, 12.0)
+    }
+}
+
+/// One Open workspace launch button: radius 6, `height` tall, a 16px leading
+/// mark and a label, painted with [`launch_button_colors`] and the 2px gap
+/// plus 2px `FOCUS` ring on keyboard focus. A disabled button keeps the shape
+/// at reduced opacity and shows `tooltip` as the reason.
+pub(crate) fn launch_action(
     ui: &mut Ui,
     id: egui::Id,
     leading: MenuLeading,
     label: &str,
     height: f32,
-    gap: Color32,
+    enabled: bool,
+    tooltip: &str,
 ) -> ActionResponse {
-    const PAD_X: f32 = 8.0;
-    const ICON_GAP: f32 = 8.0;
-    let font = FontId::proportional(11.5);
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), font.clone(), TEXT_TERTIARY)
-        .size()
-        .x;
-    let height = height.max(24.0);
-    let width = (PAD_X + ICON_GLYPH_WIDTH + ICON_GAP + text_width + PAD_X).max(24.0);
-    // `allocate_at_least` keeps the justified menu width. During the popup's
-    // sizing pass, cross-justify is off, so the menu measures the widest row.
-    let (rect, _) = ui.allocate_at_least(egui::vec2(width, height), egui::Sense::hover());
-    let response = ui.interact(rect, id, egui::Sense::click());
-    let hovered = response.hovered();
-    let fill = if hovered {
-        BG_HOVER
+    let width = launch_button_width(ui, label, height);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    // A disabled button stays a Tab stop so its reason is reachable from the
+    // keyboard; it never activates.
+    let sense = if enabled {
+        egui::Sense::click()
     } else {
-        Color32::TRANSPARENT
+        egui::Sense::FOCUSABLE
     };
-    let color = if hovered { TEXT_PRIMARY } else { TEXT_TERTIARY };
+    let response = ui.interact(rect, id, sense);
+    let hovered = enabled && response.hovered();
+    let pressed = enabled && response.is_pointer_button_down_on();
+    let (fill, text) = launch_button_colors(hovered, pressed);
+    let opacity = if enabled {
+        1.0
+    } else {
+        LAUNCH_DISABLED_OPACITY
+    };
+    let fill = fill.gamma_multiply(opacity);
+    let text = text.gamma_multiply(opacity);
     ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
-    let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(
-            rect.left() + PAD_X + ICON_GLYPH_WIDTH * 0.5,
-            rect.center().y,
-        ),
-        egui::vec2(ICON_GLYPH_WIDTH, ICON_GLYPH_WIDTH),
+    let (left, _) = launch_button_padding(height);
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + left, rect.center().y - 8.0),
+        egui::Vec2::splat(16.0),
     );
     match leading {
-        MenuLeading::Glyph(glyph) => paint_icon(ui.painter(), icon_rect, glyph, color),
+        MenuLeading::Glyph(glyph) => paint_icon(ui.painter(), icon_rect, glyph, text),
         MenuLeading::Image { uri, bytes } => {
-            let image_rect =
-                egui::Rect::from_center_size(icon_rect.center(), egui::Vec2::splat(16.0));
-            egui::Image::from_bytes(uri, bytes).paint_at(ui, image_rect);
+            egui::Image::from_bytes(uri, bytes)
+                .tint(Color32::WHITE.gamma_multiply(opacity))
+                .paint_at(ui, icon_rect);
         }
     }
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(BUTTON_SIZE), text);
     ui.painter().galley(
         egui::pos2(
-            icon_rect.right() + ICON_GAP,
+            icon_rect.right() + 6.0,
             menu_label_origin_y(&galley, rect.center().y),
         ),
         galley,
-        color,
+        text,
     );
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if response.has_focus() {
-        paint_focus_ring(ui, rect, CornerRadius::same(6), gap);
+        paint_focus_ring(ui, rect, CornerRadius::same(6), BG_CARD);
     }
-    let keyboard = response.has_focus()
+    let keyboard = enabled
+        && response.has_focus()
         && ui.input(|input| {
             input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
         });
-    let activated = response.clicked() || keyboard;
+    let activated = enabled && (response.clicked() || keyboard);
+    if !enabled && response.has_focus() {
+        response.show_tooltip_text(tooltip.to_owned());
+    }
+    let response = response.on_hover_text(tooltip.to_owned());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
     ActionResponse {
         response,
         activated,
@@ -2075,6 +2284,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disclosure_chevron_is_a_thin_stroked_open_polyline() {
+        let center = egui::pos2(40.0, 20.0);
+        for (expanded, tip) in [(false, egui::vec2(2.0, 0.0)), (true, egui::vec2(0.0, 2.0))] {
+            let shapes = disclosure_shapes(center, expanded, TEXT_TERTIARY);
+            let paths: Vec<_> = shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Path(path) => Some(path),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(paths.len(), 1, "one polyline");
+            let path = paths[0];
+            assert!(!path.closed, "open polyline");
+            assert_eq!(path.fill, Color32::TRANSPARENT, "no fill");
+            assert_eq!(path.points.len(), 3);
+            assert!((path.stroke.width - DISCLOSURE_STROKE).abs() < f32::EPSILON);
+            assert!((1.0..=1.5).contains(&DISCLOSURE_STROKE));
+            assert_eq!(
+                path.stroke.color,
+                egui::epaint::ColorMode::Solid(TEXT_TERTIARY)
+            );
+            // Tip points right when collapsed, down when expanded.
+            assert_eq!(path.points[1], center + tip);
+            let rect = egui::Rect::from_points(&path.points);
+            let (tall, deep) = if expanded {
+                (rect.width(), rect.height())
+            } else {
+                (rect.height(), rect.width())
+            };
+            assert!((tall - 8.0).abs() < 0.01, "about 8px tall: {tall}");
+            assert!((deep - 4.0).abs() < 0.01, "about 4px deep: {deep}");
+            assert!((rect.center() - center).length() < 0.01, "centered");
+            // Round caps: a filled dot of half the stroke at each end only.
+            let caps: Vec<_> = shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Circle(circle) => Some(circle),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(caps.len(), 2);
+            for cap in caps {
+                assert!((cap.radius - DISCLOSURE_STROKE / 2.0).abs() < f32::EPSILON);
+                assert_eq!(cap.fill, TEXT_TERTIARY);
+                assert!(cap.center == path.points[0] || cap.center == path.points[2]);
+            }
+            assert!(
+                shapes
+                    .iter()
+                    .all(|shape| matches!(shape, egui::Shape::Path(_) | egui::Shape::Circle(_))),
+                "no filled polygon"
+            );
+        }
+        let hovered = disclosure_shapes(center, false, TEXT_SECONDARY);
+        assert!(hovered.iter().any(|shape| matches!(
+            shape,
+            egui::Shape::Path(path) if path.stroke.color == egui::epaint::ColorMode::Solid(TEXT_SECONDARY)
+        )));
+    }
+
+    #[test]
+    fn host_status_glyphs_differ_in_shape_not_only_color() {
+        use HostStatusGlyph::*;
+        let center = egui::pos2(10.0, 10.0);
+        let signature = |status| {
+            host_status_shapes(center, status, BG_CARD)
+                .iter()
+                .skip(1)
+                .map(|shape| match shape {
+                    egui::Shape::Circle(circle) if circle.fill == Color32::TRANSPARENT => "ring",
+                    egui::Shape::Circle(_) => "dot",
+                    egui::Shape::Path(path) if path.points.len() == 4 => "diamond",
+                    egui::Shape::Path(_) => "triangle",
+                    egui::Shape::Rect(_) => "bar",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+                .join("+")
+        };
+        let all = [
+            NotConnected,
+            Connecting,
+            Connected,
+            ApprovalNeeded,
+            Cancelled,
+            Failed,
+        ];
+        let shapes: Vec<String> = all.iter().map(|status| signature(*status)).collect();
+        for (index, shape) in shapes.iter().enumerate() {
+            assert!(
+                !shapes[index + 1..].contains(shape),
+                "{:?} shares its shape {shape}",
+                all[index]
+            );
+        }
+    }
+
+    #[test]
     fn tokens_match_the_contract() {
         assert_eq!(BG_CARD, Color32::from_rgb(0x17, 0x1A, 0x20));
         assert_eq!(ACCENT, Color32::from_rgb(0x8B, 0xD5, 0xA7));
@@ -2331,6 +2639,219 @@ mod tests {
                 "{name} text on fallback Explorer header must meet 4.5:1, got {ratio:.2}"
             );
         }
+    }
+
+    /// WCAG contrast helpers over sRGB [0, 1] channels.
+    fn srgb(color: [u8; 3]) -> [f32; 3] {
+        color.map(|channel| f32::from(channel) / 255.0)
+    }
+
+    fn srgb_of(color: Color32) -> [f32; 3] {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        srgb([r, g, b])
+    }
+
+    fn over(top: Color32, under: [f32; 3]) -> [f32; 3] {
+        let alpha = f32::from(top.to_srgba_unmultiplied()[3]) / 255.0;
+        let top = srgb_of(top);
+        [0, 1, 2].map(|i| top[i] * alpha + under[i] * (1.0 - alpha))
+    }
+
+    fn contrast_ratio(a: [f32; 3], b: [f32; 3]) -> f32 {
+        fn luminance(rgb: [f32; 3]) -> f32 {
+            let linear = |c: f32| {
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+        }
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The Open workspace card shares the explorer's fallback glass pair; its
+    /// text keeps AA over a bright composited desktop without native blur.
+    /// Notices keep their own opaque tint, also checked here.
+    #[test]
+    fn open_workspace_fallback_glass_text_meets_aa_over_bright_desktop() {
+        let clear = over(BG_CLEAR, [1.0, 1.0, 1.0]);
+        let card = over(explorer_card_glass(false), clear);
+        let header = over(explorer_header_glass(false), clear);
+        assert_eq!(explorer_card_glass(false), BG_CARD_GLASS);
+        assert_eq!(explorer_header_glass(false), BG_HEADER_GLASS);
+        let mut failures = Vec::new();
+        for (name, text, surface, floor) in [
+            ("primary / card glass", TEXT_PRIMARY, card, 4.5),
+            ("secondary / card glass", TEXT_SECONDARY, card, 4.5),
+            (
+                "tertiary (launch label, meta) / card glass",
+                TEXT_TERTIARY,
+                card,
+                4.5,
+            ),
+            ("error / card glass", ERROR, card, 4.5),
+            ("primary / header glass", TEXT_PRIMARY, header, 4.5),
+            ("secondary / header glass", TEXT_SECONDARY, header, 4.5),
+            (
+                "tertiary (version) / header glass",
+                TEXT_TERTIARY,
+                header,
+                4.5,
+            ),
+            ("error notice / error tint", ERROR, srgb_of(ERROR_TINT), 4.5),
+            (
+                "tertiary report / opaque panel",
+                TEXT_TERTIARY,
+                srgb_of(BG_HEADER),
+                4.5,
+            ),
+        ] {
+            let ratio = contrast_ratio(srgb_of(text), surface);
+            if ratio < floor {
+                failures.push(format!("{name}: {ratio:.2} < {floor}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// The documented opaque reading-surface pairs (Calm Editor accessibility
+    /// table) hold at or above their documented ratio and their AA floor:
+    /// 4.5:1 for text, 3:1 for the control boundary.
+    #[test]
+    fn opaque_reading_surface_pairs_meet_the_documented_ratios() {
+        let palette = terminal_palette();
+        let ansi_red = palette.ansi[1];
+        let pairs = [
+            (
+                "primary / card",
+                srgb_of(TEXT_PRIMARY),
+                srgb_of(BG_CARD),
+                14.21,
+                4.5,
+            ),
+            (
+                "secondary / card",
+                srgb_of(TEXT_SECONDARY),
+                srgb_of(BG_CARD),
+                9.73,
+                4.5,
+            ),
+            (
+                "tertiary / card",
+                srgb_of(TEXT_TERTIARY),
+                srgb_of(BG_CARD),
+                6.78,
+                4.5,
+            ),
+            (
+                "tertiary / chrome",
+                srgb_of(TEXT_TERTIARY),
+                srgb_of(BG_CHROME),
+                6.90,
+                4.5,
+            ),
+            (
+                "accent / card",
+                srgb_of(ACCENT),
+                srgb_of(BG_CARD),
+                10.10,
+                4.5,
+            ),
+            (
+                "accent text / accent",
+                srgb_of(ACCENT_TEXT),
+                srgb_of(ACCENT),
+                10.91,
+                4.5,
+            ),
+            (
+                "success / tint",
+                srgb_of(SUCCESS),
+                srgb_of(SUCCESS_TINT),
+                7.12,
+                4.5,
+            ),
+            (
+                "warning / tint",
+                srgb_of(WARNING),
+                srgb_of(WARNING_TINT),
+                7.54,
+                4.5,
+            ),
+            (
+                "error / tint",
+                srgb_of(ERROR),
+                srgb_of(ERROR_TINT),
+                5.73,
+                4.5,
+            ),
+            ("info / tint", srgb_of(INFO), srgb_of(INFO_TINT), 6.74, 4.5),
+            ("focus / card", srgb_of(FOCUS), srgb_of(BG_CARD), 13.56, 3.0),
+            (
+                "selected tab primary",
+                srgb_of(TEXT_PRIMARY),
+                srgb_of(BG_TAB_SELECTED),
+                13.10,
+                4.5,
+            ),
+            (
+                "hover tab primary",
+                srgb_of(TEXT_PRIMARY),
+                srgb_of(BG_TAB_HOVER),
+                14.13,
+                4.5,
+            ),
+            (
+                "terminal fg / bg",
+                srgb(palette.foreground),
+                srgb(palette.background),
+                14.15,
+                4.5,
+            ),
+            (
+                "terminal selection",
+                srgb(palette.selection_foreground),
+                srgb(palette.selection_background),
+                11.47,
+                4.5,
+            ),
+            (
+                "ANSI red / terminal",
+                srgb(ansi_red),
+                srgb(palette.background),
+                4.76,
+                4.5,
+            ),
+            (
+                "ANSI bright black adjusted / terminal",
+                srgb(palette.ansi[8]),
+                srgb(palette.background),
+                4.55,
+                4.5,
+            ),
+            (
+                "control border / card",
+                srgb_of(BORDER_CONTROL),
+                srgb_of(BG_CARD),
+                314.0 / 100.0,
+                3.0,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, text, surface, documented, floor) in pairs {
+            let ratio = contrast_ratio(text, surface);
+            if ratio + 0.01 < documented || ratio < floor {
+                failures.push(format!(
+                    "{name}: {ratio:.2} (documented {documented}, floor {floor})"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+        // Card edges are decorative; the control boundary is BORDER_CONTROL.
+        assert!(contrast_ratio(srgb_of(BORDER), srgb_of(BG_CARD)) < 3.0);
     }
 
     #[test]

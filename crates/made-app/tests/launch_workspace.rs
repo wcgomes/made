@@ -738,3 +738,162 @@ fn quote_posix(path: &Path) -> String {
     let text = path.to_string_lossy();
     format!("'{}'", text.replace('\'', "'\\''"))
 }
+
+// ---- Open workspace: launch in the effective launch path ---------------------
+// (open-workspace-redesign, phase 4)
+
+/// Program, arguments, environment, cwd and explorer root of the active tab,
+/// with `dir` written as `<dir>` and the per-tab spool masked, in the shape
+/// of the phase 0 app-launch characterization.
+#[cfg(unix)]
+fn launch_record(model: &made_app::AppModel, dir: &Path) -> String {
+    let dir = dir.to_string_lossy().into_owned();
+    let mask = |text: &str| text.replace(&dir, "<dir>");
+    let workbench = model.workbench().expect("the launch started a tab");
+    let options = workbench.terminal().expect("local terminal").options();
+    let set: Vec<String> = options
+        .env
+        .iter()
+        .map(|(key, value)| {
+            let key = key.to_string_lossy();
+            let value = if key == made_bridge::config::CONFIG_CONTENT_ENV {
+                "<composed configuration>".to_owned()
+            } else if key == SPOOL {
+                "<spool>".to_owned()
+            } else {
+                mask(&value.to_string_lossy())
+            };
+            format!("{key}={value}")
+        })
+        .collect();
+    format!(
+        "program: {:?}\nargs: {:?}\nset: {set:?}\nremoved: {:?}\ncwd: {}\nexplorer: {}\n",
+        options.shell,
+        options.args,
+        options.env_remove,
+        mask(&options.cwd.to_string_lossy()),
+        workbench
+            .launch_plan()
+            .map_or("<none>".to_owned(), |plan| mask(
+                &plan.explorer_root.to_string_lossy()
+            )),
+    )
+}
+
+/// A model whose Open workspace screen is up over one running shell tab.
+#[cfg(unix)]
+fn model_over_a_running_tab(first: &Path) -> (made_app::AppModel, made_app::WorkspaceId) {
+    let mut model = made_app::AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        made_app::AppOptions::new(),
+    );
+    model.open_plan(LaunchPlan::open(first, WorkspaceSource::Picker).unwrap());
+    model.ensure_workbench();
+    let id = model.active_workspace_id().expect("first tab");
+    model.begin_new_workspace();
+    (model, id)
+}
+
+#[cfg(unix)]
+#[test]
+fn open_workspace_launches_start_in_the_chosen_folder_and_change_only_the_cwd() {
+    if isolated_claude_launch(
+        "open_workspace_launches_start_in_the_chosen_folder_and_change_only_the_cwd",
+    ) {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let api = work.path().join("work").join("api");
+    fs::create_dir_all(&api).unwrap();
+    let api = api.canonicalize().unwrap();
+    let home = host_platform().home_dir().unwrap().canonicalize().unwrap();
+    let first = work.path().canonicalize().unwrap();
+
+    // Terminal: a first launch at the picker folder versus the screen's
+    // Terminal button at `api` beside a running tab.
+    let mut reference = made_app::AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        made_app::AppOptions::new(),
+    );
+    let picker_dir = reference
+        .launch()
+        .picker()
+        .unwrap()
+        .current_dir()
+        .to_path_buf();
+    reference.begin_terminal_workspace_in(&picker_dir).unwrap();
+    reference.ensure_workbench();
+    let expected = launch_record(&reference, &picker_dir);
+    reference.shutdown();
+
+    let (mut model, first_id) = model_over_a_running_tab(&first);
+    model.begin_terminal_workspace_in(&api).unwrap();
+    model.ensure_workbench();
+    let launched = model.active_workspace_id().unwrap();
+    assert_ne!(launched, first_id);
+    assert_eq!(launch_record(&model, &api), expected, "terminal");
+    let workbench = model.workbench().unwrap();
+    assert_eq!(workbench.terminal().unwrap().options().cwd, api);
+    assert_eq!(workbench.launch_plan().unwrap().explorer_root, api);
+    assert!(
+        model
+            .workspace(first_id)
+            .and_then(made_app::Workbench::terminal)
+            .is_some_and(|terminal| terminal.is_running()),
+        "the current tab keeps running"
+    );
+    model.shutdown();
+
+    // Each TUI: a first launch in the home folder versus the screen's button
+    // at `api` beside a running tab.
+    for tui in [OPENCODE, GROK, CLAUDE_CODE] {
+        let mut reference = made_app::AppModel::from_launch(
+            WorkspaceLaunch::waiting_for_picker(),
+            made_app::AppOptions::new(),
+        );
+        reference.begin_tui_workspace_in(tui, &home).unwrap();
+        reference.ensure_workbench();
+        let expected = launch_record(&reference, &home);
+        reference.shutdown();
+
+        let (mut model, first_id) = model_over_a_running_tab(&first);
+        model.begin_tui_workspace_in(tui, &api).unwrap();
+        model.ensure_workbench();
+        let label = tui.descriptor().label;
+        assert_ne!(model.active_workspace_id(), Some(first_id), "{label}");
+        assert_eq!(model.workspace_count(), 2, "{label}");
+        assert_eq!(launch_record(&model, &api), expected, "{label}");
+        let options = model.workbench().unwrap().terminal().unwrap().options();
+        assert_eq!(options.cwd, api, "{label}");
+        let program = PathBuf::from(options.shell.clone().expect("absolute program"));
+        assert!(program.is_absolute(), "{label}: {program:?}");
+        assert!(
+            model
+                .workspace(first_id)
+                .and_then(made_app::Workbench::terminal)
+                .is_some_and(|terminal| terminal.is_running()),
+            "{label}: the current tab keeps running"
+        );
+        model.shutdown();
+    }
+}
+
+#[test]
+fn an_invalid_launch_path_keeps_the_screen_and_starts_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("vanished");
+    let file = temp.path().join("file.txt");
+    fs::write(&file, "x").unwrap();
+    let mut model = made_app::AppModel::from_launch(
+        WorkspaceLaunch::waiting_for_picker(),
+        made_app::AppOptions::new(),
+    );
+    for path in [&missing, &file] {
+        assert!(model.begin_terminal_workspace_in(path).is_err());
+        assert!(model.begin_tui_workspace_in(GROK, path).is_err());
+        assert!(model.is_picker(), "the screen stays open");
+        assert!(!model.start_pending());
+    }
+    model.ensure_workbench();
+    assert_eq!(model.workspace_count(), 0, "nothing was launched");
+}

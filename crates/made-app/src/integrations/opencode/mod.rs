@@ -69,6 +69,10 @@ impl Integration for OpenCode {
     fn supports_peer_version(&self, version: &str) -> bool {
         diagnostics::is_supported_version(version)
     }
+
+    fn reason_is_absence(&self, reason_code: &str) -> bool {
+        reason_code == crate::integration_status::ReasonCode::OpenCodeMissing.code()
+    }
 }
 
 /// Whether OpenCode is active in a workspace tab.

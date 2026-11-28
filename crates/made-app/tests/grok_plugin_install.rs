@@ -261,7 +261,9 @@ fn expect_install(installed: Option<&str>) {
         install.elapsed() < Duration::from_secs(3) && !release_exists(),
         "the install command must be running, not finished, before Grok starts"
     );
-    model.begin_tui_workspace(GROK);
+    model
+        .begin_tui_workspace_in(GROK, &home_dir())
+        .expect("grok launches in the home folder");
     let grok_startup = Instant::now();
     wait_until(
         Duration::from_secs(6),
@@ -430,7 +432,9 @@ fn expect_staged_missing() {
         "shell and explorer must start without the staged copy"
     );
     let shell_id = model.workspace_ids().next().unwrap();
-    model.begin_tui_workspace(GROK);
+    model
+        .begin_tui_workspace_in(GROK, &home_dir())
+        .expect("grok launches in the home folder");
     wait_until(
         Duration::from_secs(6),
         "Grok must still start without the staged copy",
@@ -463,6 +467,14 @@ fn hooks_unavailable(model: &AppModel) -> bool {
                     .contains("session-status hooks are unavailable")
             })
     })
+}
+
+/// The home folder the Open workspace screen starts in.
+fn home_dir() -> PathBuf {
+    use made_platform::Platform;
+    made_platform::host_platform()
+        .home_dir()
+        .expect("home directory")
 }
 
 fn wait_until(limit: Duration, message: &str, mut ready: impl FnMut() -> bool) {

@@ -19,6 +19,9 @@ pub const DEFAULT_TITLE_CHARS: usize = 48;
 /// Default path width used by [`SessionRow::display_path`] callers.
 pub const DEFAULT_PATH_CHARS: usize = 64;
 
+/// The title a session row shows when its session has none.
+pub const UNTITLED: &str = "(untitled)";
+
 /// One open root-session row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
@@ -47,7 +50,7 @@ pub struct SessionRow {
 impl SessionRow {
     fn from_info(info: &SessionInfo, active: bool) -> Self {
         let title = if info.title.is_empty() {
-            "(untitled)".to_owned()
+            UNTITLED.to_owned()
         } else {
             info.title.clone()
         };

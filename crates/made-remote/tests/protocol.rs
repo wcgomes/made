@@ -1272,3 +1272,591 @@ fn open_url_request_is_bounded_normalized_and_server_only() {
     )
     .is_err());
 }
+
+fn browse_identity() -> BrowseIdentity {
+    BrowseIdentity {
+        authority: AuthorityId([7; 16]),
+        grant: BrowseGrant::random().unwrap(),
+        epoch: 3,
+    }
+}
+
+fn browse(
+    identity: &BrowseIdentity,
+    request_id: u64,
+    operation: BrowseOperation,
+) -> BrowseEnvelope {
+    BrowseEnvelope::new(identity.clone(), request_id, operation)
+}
+
+fn decode_browse(bytes: &[u8]) -> Result<BrowseEnvelope, ProtocolError> {
+    let mut decoder = BrowseFrameDecoder::new();
+    let (consumed, frame) = decoder.push(bytes)?;
+    assert_eq!(consumed, bytes.len());
+    decoder.finish()?;
+    frame.ok_or(ProtocolError::Malformed)
+}
+
+fn wire(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn listed_entries(entries: impl IntoIterator<Item = String>) -> Vec<DirectoryEntry> {
+    entries
+        .into_iter()
+        .map(|raw| DirectoryEntry {
+            path: path(&raw),
+            kind: EntryKind::File,
+        })
+        .collect()
+}
+
+#[test]
+fn browse_requests_and_replies_round_trip_under_one_grant() {
+    let identity = browse_identity();
+    let dir = path("/srv/project");
+    let child = path("/srv/project/src");
+    let mut requests = vec![
+        BrowseOperation::BrowseOpen,
+        BrowseOperation::BrowseClose,
+        BrowseOperation::BrowseList { path: dir.clone() },
+        BrowseOperation::BrowseCheck { path: dir.clone() },
+    ];
+    for command in [
+        GitRead::ShowToplevel,
+        GitRead::Branch,
+        GitRead::GitDir,
+        GitRead::CommonDir,
+        GitRead::WorktreeList,
+        GitRead::CommitId,
+        GitRead::CommitSubject,
+        GitRead::Status,
+    ] {
+        requests.push(BrowseOperation::BrowseGitRead {
+            path: dir.clone(),
+            command,
+        });
+    }
+    for (index, operation) in requests.into_iter().enumerate() {
+        let request = browse(&identity, index as u64 + 1, operation);
+        request.validate_request().unwrap();
+        let decoded = decode_browse(&encode_browse(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        BrowseReplyProgress::new(request).unwrap();
+    }
+
+    let reply_pairs = [
+        (
+            BrowseOperation::BrowseOpen,
+            BrowseOperation::BrowseOpened {
+                home: Some(path("/home/user")),
+            },
+        ),
+        (
+            BrowseOperation::BrowseOpen,
+            BrowseOperation::BrowseOpened { home: None },
+        ),
+        (BrowseOperation::BrowseClose, BrowseOperation::BrowseClosed),
+        (
+            BrowseOperation::BrowseList { path: dir.clone() },
+            BrowseOperation::BrowseListed {
+                path: dir.clone(),
+                entries: vec![DirectoryEntry {
+                    path: child.clone(),
+                    kind: EntryKind::Directory,
+                }],
+                truncated: false,
+                done: true,
+            },
+        ),
+        (
+            BrowseOperation::BrowseCheck { path: dir.clone() },
+            BrowseOperation::BrowseChecked {
+                requested: dir.clone(),
+                result: DirectoryCheck::Directory {
+                    path: path("/private/srv/project"),
+                },
+            },
+        ),
+        (
+            BrowseOperation::BrowseCheck { path: dir.clone() },
+            BrowseOperation::BrowseChecked {
+                requested: dir.clone(),
+                result: DirectoryCheck::Missing,
+            },
+        ),
+        (
+            BrowseOperation::BrowseCheck { path: dir.clone() },
+            BrowseOperation::BrowseChecked {
+                requested: dir.clone(),
+                result: DirectoryCheck::Unreadable,
+            },
+        ),
+        (
+            BrowseOperation::BrowseCheck { path: dir.clone() },
+            BrowseOperation::BrowseChecked {
+                requested: dir.clone(),
+                result: DirectoryCheck::NotDirectory,
+            },
+        ),
+        (
+            BrowseOperation::BrowseGitRead {
+                path: dir.clone(),
+                command: GitRead::Status,
+            },
+            BrowseOperation::BrowseGitResult {
+                path: dir.clone(),
+                command: GitRead::Status,
+                offset: 0,
+                data: Chunk::new(b" M a\0".to_vec()).unwrap(),
+                done: true,
+            },
+        ),
+        (
+            BrowseOperation::BrowseList { path: dir.clone() },
+            BrowseOperation::Error {
+                code: ErrorCode::Unavailable,
+            },
+        ),
+    ];
+    for (request, reply) in reply_pairs {
+        let request = browse(&identity, 9, request);
+        let reply = browse(&identity, 9, reply);
+        let decoded = decode_browse(&encode_browse(&reply).unwrap()).unwrap();
+        assert_eq!(decoded, reply);
+        reply.validate_reply(&request).unwrap();
+        let mut progress = BrowseReplyProgress::new(request).unwrap();
+        progress.accept(&reply).unwrap();
+        progress.finish().unwrap();
+        // A reply is never itself a request.
+        assert_eq!(
+            reply.validate_request(),
+            Err(ProtocolError::UnexpectedResponse)
+        );
+        assert!(BrowseReplyProgress::new(reply).is_err());
+    }
+
+    // Replies must echo the request's path and Git command.
+    let list = browse(
+        &identity,
+        4,
+        BrowseOperation::BrowseList { path: dir.clone() },
+    );
+    let other_listed = browse(
+        &identity,
+        4,
+        BrowseOperation::BrowseListed {
+            path: child.clone(),
+            entries: vec![],
+            truncated: false,
+            done: true,
+        },
+    );
+    assert_eq!(
+        other_listed.validate_reply(&list),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    let git = browse(
+        &identity,
+        5,
+        BrowseOperation::BrowseGitRead {
+            path: dir.clone(),
+            command: GitRead::Branch,
+        },
+    );
+    for wrong in [
+        BrowseOperation::BrowseGitResult {
+            path: dir.clone(),
+            command: GitRead::Status,
+            offset: 0,
+            data: Chunk::new(vec![]).unwrap(),
+            done: true,
+        },
+        BrowseOperation::BrowseGitResult {
+            path: child.clone(),
+            command: GitRead::Branch,
+            offset: 0,
+            data: Chunk::new(vec![]).unwrap(),
+            done: true,
+        },
+        BrowseOperation::BrowseChecked {
+            requested: dir.clone(),
+            result: DirectoryCheck::Missing,
+        },
+        BrowseOperation::BrowseOpened { home: None },
+    ] {
+        assert_eq!(
+            browse(&identity, 5, wrong).validate_reply(&git),
+            Err(ProtocolError::UnexpectedResponse)
+        );
+    }
+    // The grant never appears in Debug output.
+    assert_eq!(format!("{:?}", identity.grant), "BrowseGrant(<redacted>)");
+    assert_eq!(
+        format!("{:?}", BrowseOperation::BrowseList { path: dir }),
+        "BrowseOperation(<redacted>)"
+    );
+}
+
+#[test]
+fn browse_frames_reject_unknown_fields_oversize_and_traversal() {
+    let identity = browse_identity();
+    let valid = browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseList { path: path("/srv") },
+    );
+    let json = serde_json::to_value(&valid).unwrap();
+    let mut extra_envelope = json.clone();
+    extra_envelope["tab"] = serde_json::json!(1);
+    let mut extra_identity = json.clone();
+    extra_identity["identity"]["generation"] = serde_json::json!(1);
+    let mut extra_data = json.clone();
+    extra_data["operation"]["data"]["recursive"] = serde_json::json!(true);
+    let mut relative = json.clone();
+    relative["operation"]["data"]["path"] = serde_json::json!(b"srv".to_vec());
+    let mut traversal = json.clone();
+    traversal["operation"]["data"]["path"] = serde_json::json!(b"/srv/../etc".to_vec());
+    let mut zero_epoch = json.clone();
+    zero_epoch["identity"]["epoch"] = serde_json::json!(0);
+    let mut zero_request = json.clone();
+    zero_request["request_id"] = serde_json::json!(0);
+    let mut short_grant = json.clone();
+    short_grant["identity"]["grant"] = serde_json::json!([1, 2, 3]);
+    let mut other_major = json.clone();
+    other_major["major"] = serde_json::json!(2);
+    for value in [
+        extra_envelope,
+        extra_identity,
+        extra_data,
+        relative,
+        traversal,
+        zero_epoch,
+        zero_request,
+        short_grant,
+        other_major,
+    ] {
+        assert!(
+            decode_browse(&wire(&serde_json::to_vec(&value).unwrap())).is_err(),
+            "accepted {value}"
+        );
+    }
+    let mut checked = serde_json::to_value(browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseChecked {
+            requested: path("/srv"),
+            result: DirectoryCheck::Directory { path: path("/srv") },
+        },
+    ))
+    .unwrap();
+    checked["operation"]["data"]["result"]["Directory"]["contents"] = serde_json::json!("x");
+    assert!(decode_browse(&wire(&serde_json::to_vec(&checked).unwrap())).is_err());
+
+    // The server home rides only the open reply, as an absolute path.
+    let opened = serde_json::to_value(browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseOpened {
+            home: Some(path("/home/user")),
+        },
+    ))
+    .unwrap();
+    let mut extra_open = opened.clone();
+    extra_open["operation"]["data"]["shell"] = serde_json::json!("/bin/sh");
+    let mut relative_home = opened.clone();
+    relative_home["operation"]["data"]["home"] = serde_json::json!(b"home/user".to_vec());
+    let mut traversing_home = opened.clone();
+    traversing_home["operation"]["data"]["home"] = serde_json::json!(b"/home/../etc".to_vec());
+    let mut text_home = opened;
+    text_home["operation"]["data"]["home"] = serde_json::json!("/home/user");
+    for value in [extra_open, relative_home, traversing_home, text_home] {
+        assert!(
+            decode_browse(&wire(&serde_json::to_vec(&value).unwrap())).is_err(),
+            "accepted {value}"
+        );
+    }
+    // A home is never a request: a client cannot supply one.
+    assert_eq!(
+        browse(&identity, 1, BrowseOperation::BrowseOpened { home: None }).validate_request(),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+
+    // Oversized frames fail on the length prefix, before allocation.
+    let mut decoder = BrowseFrameDecoder::new();
+    assert_eq!(
+        decoder
+            .push(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes())
+            .unwrap_err(),
+        ProtocolError::Limit
+    );
+    assert_eq!(
+        BrowseFrameDecoder::new()
+            .push(&0u32.to_be_bytes())
+            .unwrap_err(),
+        ProtocolError::Malformed
+    );
+    let mut partial = BrowseFrameDecoder::new();
+    partial.push(&[0, 0]).unwrap();
+    assert!(partial.finish().is_err());
+
+    // Per-frame reply bounds.
+    let dir = path("/srv");
+    let listed = |entries| {
+        browse(
+            &identity,
+            1,
+            BrowseOperation::BrowseListed {
+                path: dir.clone(),
+                entries,
+                truncated: false,
+                done: true,
+            },
+        )
+    };
+    let too_many = listed_entries((0..=MAX_LIST_BATCH).map(|i| format!("/srv/{i}")));
+    assert_eq!(listed(too_many).validate(), Err(ProtocolError::Limit));
+    for bad in ["/srv", "/srv/a/b", "/other/a"] {
+        assert_eq!(
+            listed(listed_entries([bad.to_owned()])).validate(),
+            Err(ProtocolError::Path),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        listed(listed_entries(["/srv/a".to_owned(), "/srv/a".to_owned()])).validate(),
+        Err(ProtocolError::Path)
+    );
+    let git_over = browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseGitResult {
+            path: dir.clone(),
+            command: GitRead::Status,
+            offset: MAX_GIT_BYTES,
+            data: Chunk::new(vec![b'x']).unwrap(),
+            done: true,
+        },
+    );
+    assert_eq!(git_over.validate(), Err(ProtocolError::Limit));
+    assert!(encode_browse(&git_over).is_err());
+
+    // Aggregate listing bound: the screen-scoped 1000-entry cap.
+    assert_eq!(MAX_BROWSE_ENTRIES, 1000);
+    let request = browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseList { path: dir.clone() },
+    );
+    let mut progress = BrowseReplyProgress::new(request.clone()).unwrap();
+    let mut next = 0;
+    while next < MAX_BROWSE_ENTRIES {
+        let end = (next + 8).min(MAX_BROWSE_ENTRIES);
+        let entries = listed_entries((next..end).map(|i| format!("/srv/{i}")));
+        next = end;
+        progress
+            .accept(&browse(
+                &identity,
+                1,
+                BrowseOperation::BrowseListed {
+                    path: dir.clone(),
+                    entries,
+                    truncated: false,
+                    done: false,
+                },
+            ))
+            .unwrap();
+    }
+    assert_eq!(progress.entry_count(), MAX_BROWSE_ENTRIES);
+    assert_eq!(
+        progress
+            .accept(&listed(listed_entries(["/srv/extra".to_owned()])))
+            .unwrap_err(),
+        ProtocolError::Limit
+    );
+    assert!(progress.finish().is_err(), "an over-cap stream is poisoned");
+
+    // Duplicates across batches are rejected.
+    let mut repeated = BrowseReplyProgress::new(request.clone()).unwrap();
+    let partial_batch = |done| {
+        browse(
+            &identity,
+            1,
+            BrowseOperation::BrowseListed {
+                path: dir.clone(),
+                entries: listed_entries(["/srv/a".to_owned()]),
+                truncated: false,
+                done,
+            },
+        )
+    };
+    repeated.accept(&partial_batch(false)).unwrap();
+    assert_eq!(
+        repeated.accept(&partial_batch(true)).unwrap_err(),
+        ProtocolError::Path
+    );
+
+    // Truncation is final; nothing is accepted after completion.
+    let mut truncated = BrowseReplyProgress::new(request).unwrap();
+    truncated
+        .accept(&browse(
+            &identity,
+            1,
+            BrowseOperation::BrowseListed {
+                path: dir.clone(),
+                entries: vec![],
+                truncated: true,
+                done: true,
+            },
+        ))
+        .unwrap();
+    assert!(truncated.is_truncated());
+    truncated.finish().unwrap();
+    assert!(truncated.accept(&listed(vec![])).is_err());
+
+    // Git streams must be contiguous and bounded.
+    let git = browse(
+        &identity,
+        2,
+        BrowseOperation::BrowseGitRead {
+            path: dir.clone(),
+            command: GitRead::Status,
+        },
+    );
+    let mut git_progress = BrowseReplyProgress::new(git).unwrap();
+    assert_eq!(
+        git_progress
+            .accept(&browse(
+                &identity,
+                2,
+                BrowseOperation::BrowseGitResult {
+                    path: dir,
+                    command: GitRead::Status,
+                    offset: 5,
+                    data: Chunk::new(vec![b'x']).unwrap(),
+                    done: true,
+                },
+            ))
+            .unwrap_err(),
+        ProtocolError::Transfer
+    );
+}
+
+#[test]
+fn foreign_browse_grants_epochs_and_request_ids_are_rejected() {
+    let identity = browse_identity();
+    let request = browse(
+        &identity,
+        4,
+        BrowseOperation::BrowseCheck { path: path("/srv") },
+    );
+    let reply = |identity: BrowseIdentity, request_id| {
+        BrowseEnvelope::new(
+            identity,
+            request_id,
+            BrowseOperation::BrowseChecked {
+                requested: path("/srv"),
+                result: DirectoryCheck::Missing,
+            },
+        )
+    };
+    reply(identity.clone(), 4).validate_reply(&request).unwrap();
+    let mut foreign_grant = identity.clone();
+    foreign_grant.grant = BrowseGrant::random().unwrap();
+    let mut foreign_authority = identity.clone();
+    foreign_authority.authority = AuthorityId([8; 16]);
+    let mut stale_epoch = identity.clone();
+    stale_epoch.epoch = 2;
+    for foreign in [foreign_grant, foreign_authority, stale_epoch] {
+        assert!(!foreign.matches(&identity));
+        assert_eq!(
+            reply(foreign, 4).validate_reply(&request),
+            Err(ProtocolError::Identity)
+        );
+    }
+    assert_eq!(
+        reply(identity.clone(), 5).validate_reply(&request),
+        Err(ProtocolError::Identity)
+    );
+    let mut progress = BrowseReplyProgress::new(request).unwrap();
+    let mut stranger = identity.clone();
+    stranger.grant = BrowseGrant::random().unwrap();
+    assert!(progress.accept(&reply(stranger, 4)).is_err());
+    assert!(progress.accept(&reply(identity, 4)).is_err(), "poisoned");
+}
+
+#[test]
+fn browse_grants_and_tab_grants_never_address_each_other() {
+    let identity = browse_identity();
+    let browse_frame = encode_browse(&browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseList { path: path("/srv") },
+    ))
+    .unwrap();
+    // A browse frame never decodes as a tab frame.
+    assert!(FrameDecoder::new().push(&browse_frame).is_err());
+    // A tab frame never decodes as a browse frame, whatever its verb.
+    for operation in [
+        Operation::List { path: path("/srv") },
+        Operation::RootValidate { path: path("/srv") },
+        Operation::GitRead {
+            command: GitRead::Status,
+        },
+        Operation::Preview {
+            path: path("/srv/a"),
+        },
+        Operation::Close,
+        Operation::Heartbeat,
+    ] {
+        assert!(decode_browse(&encode(&frame(operation)).unwrap()).is_err());
+    }
+
+    // Tab verbs inside a browse envelope and browse verbs inside a tab
+    // envelope are unknown operations, not reinterpretations.
+    let mut tab_verb = serde_json::to_value(browse(
+        &identity,
+        1,
+        BrowseOperation::BrowseList { path: path("/srv") },
+    ))
+    .unwrap();
+    for op in [
+        "List",
+        "Preview",
+        "Open",
+        "TerminalInput",
+        "UploadBegin",
+        "RootSelect",
+    ] {
+        tab_verb["operation"]["op"] = serde_json::json!(op);
+        assert!(serde_json::from_value::<BrowseEnvelope>(tab_verb.clone()).is_err());
+    }
+    let mut browse_verb =
+        serde_json::to_value(frame(Operation::List { path: path("/srv") })).unwrap();
+    for op in [
+        "BrowseOpen",
+        "BrowseList",
+        "BrowseCheck",
+        "BrowseGitRead",
+        "BrowseClose",
+    ] {
+        browse_verb["operation"]["op"] = serde_json::json!(op);
+        assert!(serde_json::from_value::<WireEnvelope>(browse_verb.clone()).is_err());
+    }
+
+    // A tab capability's bytes in the grant field are a different grant.
+    let tab_identity = frame(Operation::Close).identity;
+    let mut borrowed = serde_json::to_value(&identity).unwrap();
+    borrowed["grant"] = serde_json::to_value(&tab_identity.tab).unwrap();
+    let borrowed: BrowseIdentity = serde_json::from_value(borrowed).unwrap();
+    assert!(!borrowed.matches(&identity));
+    // An identity that names a tab is not a browse identity at all, and the
+    // reverse.
+    assert!(
+        serde_json::from_value::<BrowseIdentity>(serde_json::to_value(&tab_identity).unwrap())
+            .is_err()
+    );
+    assert!(serde_json::from_value::<Identity>(serde_json::to_value(&identity).unwrap()).is_err());
+}

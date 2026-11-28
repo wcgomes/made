@@ -23,8 +23,8 @@ Files are added only when the integration has that concern. Code used by two or 
 |---|---|
 | `key` | Unique internal key; list equality is by key. |
 | `program` | Executable name resolved through `PATH` by detection. |
-| `label` | Product label for the new-tab menu and an open tab. |
-| `menu_item_id` | Identifier of the new-tab menu item. |
+| `label` | Catalog label: the launch button and the tab label when there is no session title. |
+| `menu_item_id` | Id of the Open workspace launch button (name predates the screen). |
 | `scope_id`, `scope_name` | Identifier and name in the v1 scope declaration. |
 | `root_source_id` | Identifier reported when the integration owns the explorer root, if any. |
 | `mark` | `Mark::Vendored` icon file name or `Mark::Image` owned bytes. |
@@ -70,7 +70,7 @@ A report is checked against the session channel first, then against higher-ranke
 
 1. Create `integrations/<name>/mod.rs` with a `Descriptor` const and an implementation of `Integration`; add `tab.rs` and other files as needed.
 2. Pick a unique key and a rank not used by another entry. Give the descriptor `Mark::Image` with the integration's own bytes: `Mark::Vendored` names an icon file in the explorer icon inventory, so a vendored mark also needs an edit to that inventory (a core file). The test that every `PRODUCT` mark resolves covers both kinds.
-3. Add three lines to `integrations/mod.rs`: the `pub mod <name>;` declaration (with `#[doc(hidden)]`, like the others), the const `pub const <NAME>: IntegrationRef = &<name>::<Type>;`, and the `<NAME>` entry in `PRODUCT` at the menu position you want.
+3. Add three lines to `integrations/mod.rs`: the `pub mod <name>;` declaration (with `#[doc(hidden)]`, like the others), the const `pub const <NAME>: IntegrationRef = &<name>::<Type>;`, and the `<NAME>` entry in `PRODUCT` at the launch-bar position you want.
 4. Declare follow kind and policy, env policy and diagnostics row as needed; ship the integration's own assets and channel code.
 5. Run the gates in [Build and test](../operations/build-and-test.md). The pin test `integration_modules.rs` lists every descriptor field of `PRODUCT` and fails until you update it for the new entry.
 
@@ -79,6 +79,7 @@ A report is checked against the session channel first, then against higher-ranke
 Adding an integration needs no edit to another integration's module or the core, with these exceptions:
 
 - Remote and SSH code (`ssh_servers.rs`, `remote_workspace.rs`, `remote_session.rs` and the delimited remote paths in core files) is excluded from the neutrality rule and may use an integration's typed helpers directly. A remote launch, consent or companion protocol change still needs edits there.
+- The neutrality guard in [`integration_modules.rs`](../../crates/made-app/tests/integration_modules.rs): core files must not name opencode, grok or claude outside `// BEGIN remote-path` … `// END remote-path` regions (the `REMOTE_FILES` are exempt whole). `REGION_COUNTS` and `EXEMPT_LINE_COUNTS` pin the region count and exempt line count per core file and must match exactly, so adding, widening or shrinking a region fails until the pins change in review. Pins should only go down; when core text needs an integration-specific label, take it from a catalog descriptor or helper such as `integrations::session_channel_label` instead of widening a region.
 - The central redaction key list (`is_sensitive_env_key` in [`made-platform`](../../crates/made-platform/src/lib.rs)), only when the new integration's environment value carries a secret the generic patterns do not match.
 - Packaging, CI scripts and the release layout.
 - Spec contract changes such as the `V1 Scope Boundary` declaration.
@@ -86,6 +87,6 @@ Adding an integration needs no edit to another integration's module or the core,
 
 ## How the extension property is proved
 
-[`fake_integration.rs`](../../crates/made-app/tests/fake_integration.rs) defines `FakeAgent` only in test code, absent from `PRODUCT`, and plugs it in through an injected `IntegrationList` at two ranks (one above Claude Code). It appears in every seam without a production edit: menu rows, detection reaction, launch arguments and variables, app and tab state, polling and teardown, follow ranking, tab presentation, diagnostics and About rows, copied report lines and smoke markers. Companion tests run each seam over the product list, the list plus the fake and the list without Claude Code and assert that the output is exactly the list's entries, so a seam that stops iterating the list fails a committed test. Copy this file's `FakeAgent` as the template for a new integration's tests.
+[`fake_integration.rs`](../../crates/made-app/tests/fake_integration.rs) defines `FakeAgent` only in test code, absent from `PRODUCT`, and plugs it in through an injected `IntegrationList` at two ranks (one above Claude Code). It appears in every seam without a production edit: launch buttons, detection reaction, launch arguments and variables, app and tab state, polling and teardown, follow ranking, tab presentation, diagnostics and About rows, copied report lines and smoke markers. Companion tests run each seam over the product list, the list plus the fake and the list without Claude Code and assert that the output is exactly the list's entries, so a seam that stops iterating the list fails a committed test. Copy this file's `FakeAgent` as the template for a new integration's tests.
 
 Related: [ADR 0009](../decisions/0009-static-integration-modules.md), [Architecture](../architecture.md), [Terminal-first runtime](../runtime/terminal-first.md#root-precedence).

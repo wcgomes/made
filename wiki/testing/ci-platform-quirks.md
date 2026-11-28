@@ -74,10 +74,23 @@ Distilled from the 2026-10-27/28 cross-platform CI stabilization. These are non-
 - The glibc 2.31 companion job runs its tests as root in a container, where a mode-000 path stays readable. A permission-denial assertion must first check that the permission is enforced and skip otherwise, as the other unreadable-path tests do. Tests that feed a host temp path as a remote POSIX path, or use the Unix `:` separator, are gated to Unix.
 - Test: [`claude.rs`](../../crates/made-remote/tests/claude.rs).
 
+## Stale helper binaries in target/
+
+- Tests that expect `made-askpass` to be absent can pass or fail depending on a stale copy left in `target/debug/deps/` by an earlier build. A test that needs the helper uses `isolated_with_askpass` in [`workspace_tabs.rs`](../../crates/made-app/tests/workspace_tabs.rs), which copies the test executable plus a fake helper into a temp directory, so the result never depends on what `target/` holds.
+
+## Fork-inherited lock fds
+
+- `Command::new("mkfifo")` (any program spawned by name from a test) forks first, so the child briefly inherits the parent's flock'd fds and can keep the Claude Code spool `owner.lock` held after the test released it. A single cleanup sweep may therefore leave the spool in place. Spool tests use the bounded `sweep_until_removed` in [`claude_spool.rs`](../../crates/made-app/tests/claude_spool.rs) instead of asserting a single sweep.
+
+## Known flaky and location-dependent tests
+
+- `claude_agents` is location-dependent: its result can change with the checkout location, so compare against a clean HEAD in the same location.
+- Under load: the `workspace_tabs` root and preview tests, `unavailable_root`, and made-explorer's `oversized_file_is_reclassified…` can time out. Re-run alone before treating a failure as a regression; never relax the assertion.
+
 ## CI invocation
 
 - CI runs `cargo test --workspace --locked --no-fail-fast`, so all failing test binaries report in one run; fix the aggregate rather than assuming the first failure is the only one.
 - `made-app` tests run on Windows only in the `windows-2025` entry of the `ci.yml` `cargo test --workspace` matrix. [`ci-windows.yml`](../../.github/workflows/ci-windows.yml) runs targeted package tests (platform contract, PTY, the hook crates) plus smoke, never `made-app` tests.
-- Clippy runs only on Linux (`ubuntu-24.04` lint job). Locally on macOS, `cargo clippy --workspace --all-targets --locked -- -D warnings` fails with dead-code errors in [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) for items used only under `#[cfg(target_os = "linux")]`; that is a host difference, not a regression.
+- Clippy runs only on Linux (`ubuntu-24.04` lint job). Locally on macOS, `cargo clippy --workspace --all-targets --locked -- -D warnings` fails with four dead-code errors in [`ui_model.rs`](../../crates/made-app/tests/ui_model.rs) for items used only under `#[cfg(target_os = "linux")]`; that is a host difference, not a regression.
 - Also on macOS (2026-11-27), three host-dependent tests fail on a clean HEAD: `real_bash_reports_initial_and_cd_preserving_rc_hooks_and_relaunch_cleanup` in [`pty.rs`](../../crates/made-terminal/tests/pty.rs), and `private_cwd_sink_reports_without_any_terminal_output_and_keeps_profiles` and `real_installed_shells_preserve_startup_files_and_emit_local_reports` in [`shell_integration.rs`](../../crates/made-platform/tests/shell_integration.rs); compare against clean HEAD before treating them as regressions.
 - Workflow: [`ci.yml`](../../.github/workflows/ci.yml).
