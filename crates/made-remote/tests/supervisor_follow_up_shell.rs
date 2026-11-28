@@ -762,7 +762,7 @@ fn the_follow_up_shell_environment_is_what_a_terminal_ssh_shell_gets() {
             pane.until_reply(&mut stream, request),
             Operation::ShellStarted { .. }
         ));
-        pane.until_output(&mut stream, "$ ");
+        pane.until_prompt(&mut stream);
         let actual = shell_env(&mut fixture, &mut stream, &mut pane);
         fixture.close(stream);
         let differing: Vec<_> = expected

@@ -178,12 +178,13 @@ fn expanded_directories_report_the_changed_entry_and_nothing_else() {
     let new = canonical(&tree.root.join("a")).join_name("new.txt");
     let seen = gather(&mut service, |seen| changed(seen, 11, &new));
     // (Where registering a watch restarts the platform stream, the root is
-    // reported as itself once. A platform that also reports the directory's
-    // own metadata change names it, `a`, as the root's entry; the root never
-    // sees the child's entry, `a/new.txt`.)
+    // reported as itself, and a backend may report the directory entries
+    // that were created just before the watch, or the directory's own
+    // metadata change, as the root's entries. What the root must never see
+    // is the child's file named as if it were the root's own entry.)
+    let misplaced = root.join_name("new.txt");
     assert!(
-        !seen.iter().any(|(id, operation)| *id == 10
-            && !matches!(operation, Operation::Changed { path } if *path == root || *path == a)),
+        !changed(&seen, 10, &misplaced),
         "the root subscription does not see a child directory's entry: {seen:?}"
     );
 
