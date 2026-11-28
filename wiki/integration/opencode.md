@@ -1,12 +1,12 @@
 # OpenCode Bridge
 
-Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches OpenCode automatically: the user runs `opencode` in a Made terminal, or explicitly chooses OpenCode from the `+` menu when it is detected on `PATH`, and the plugin loads from configuration injected into the terminal process (the user shell or a directly launched OpenCode TUI). The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md).
+Made integrates OpenCode v2 through its official CLI/TUI plugin API and a per-workspace loopback WebSocket bridge. Made never launches OpenCode automatically: the user runs `opencode` in a Made terminal, or explicitly launches it from the Open workspace screen when it is detected on `PATH`, and the plugin loads from configuration injected into the terminal process (the user shell or a directly launched OpenCode TUI). The bridge carries normalized state and focus commands; it is not a remote API. Normative integration requirements live in [`spec.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/spec.md); field and protocol rationale is in [`design.md`](../../specs/changes/archive/20261029-opencode-session-follow-v1/design.md).
 
 ## Launching from Made
 
 `made-platform::detect_programs` performs a metadata-only `PATH` lookup, over the program names of the integration list, on a background thread started at launch. It never spawns the program, verifies its version, or waits for a service, and empty or relative `PATH` segments are ignored rather than resolved against the current directory. Shell and explorer startup never depend on the result. A macOS Finder/Dock launch corrects `PATH` first; see [macOS GUI launch PATH](../runtime/terminal-first.md#macos-gui-launch-path).
 
-The `+` control follows the integrated-TUI catalog in [Grok](grok.md): `Terminal` stays first, then detected programs in catalog order OpenCode, Grok, then Claude Code. Undetected programs are omitted. With no detected TUI and no saved SSH server it opens the folder picker and shows no menu; saved servers add their per-server SSH launch rows after the local rows. The OpenCode row keeps the vendored 16px `opencode.svg` and its launch injection. Choosing OpenCode starts the absolute path that the same lookup finds, never the bare name `opencode`, as the PTY child of a new home-directory tab — no shell first and no picker — while the current tab keeps running. Revealed About diagnostics use the same short row as Grok: inactive while OpenCode is not connected, ready while session follow is connected, and not on PATH when detection does not find it. The wording lives in the active [Grok session-follow spec](../../specs/grok-session-follow.md).
+The Open workspace launch bar follows the integrated-TUI catalog: Terminal first, then detected programs in catalog order OpenCode, Grok, then Claude Code. The OpenCode button keeps the vendored 16px `opencode.svg` and its launch injection, and starts the absolute path that the same lookup finds, never the bare name `opencode`, as the PTY child of a new tab in the effective launch path, with no shell first, while the current tab keeps running. Revealed About diagnostics use the same short row as Grok; the wording lives in `OpenCode diagnostics wording` of the [Grok session-follow spec](../../specs/grok-session-follow.md), and generic flows never name a program (`Program-neutral wording` in [`made-ui-ux.md`](../../specs/made-ui-ux.md)).
 
 OpenCode ignores `BROWSER` and calls `open`/`xdg-open` directly, so its URLs open without the ask-before-open card; a `PATH` shim was rejected ([ADR 0011](../decisions/0011-browser-helper-url-socket.md)).
 
@@ -16,7 +16,7 @@ OpenCode ignores `BROWSER` and calls `open`/`xdg-open` directly, so its URLs ope
 ```text
 Made workspace tab
   terminal PTY
-    user runs `opencode` (or the `+` menu starts it directly)
+    user runs `opencode` (or the Open workspace launch bar starts it directly)
       OpenCode v2 TUI + app-owned plugin
         ws://127.0.0.1:<ephemeral>/made
           made-bridge (one listener per tab)
@@ -25,7 +25,7 @@ Made workspace tab
 
 Each workspace tab owns its listener, pane id, and 256-bit token. There is no shared multiplexed bridge. A second authenticated connection for the same pane replaces the first with close code `4409`; a cross-pane hello is rejected before replacement or state disclosure.
 
-In an SSH workspace the same bridge runs inside the server-side companion, and normalized state reaches the client only over the SSH transport; the tab's `OpenCode` label, icon, dots, and diagnostics come from that tab's remote integration and session state, never from the host. The client requests the companion's `Capabilities` after each attach. A connected tab whose session state is `Unavailable` reports inactive "OpenCode is not running." for Grok and Claude Code launch targets or when the companion has OpenCode and answers `Unavailable` (no plugin hello yet), else inactive "OpenCode is not detected on this server." when the tab's own probe did not detect it; only other errors stay degraded ([`diagnostics.rs`](../../crates/made-app/src/diagnostics.rs)). See SSH-06 in [`specs/ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md).
+In an SSH workspace the same bridge runs inside the server-side companion, and normalized state reaches the client only over the SSH transport; the tab's label, icon, dots, and diagnostics come from that tab's remote integration and session state, never from the host. The client requests the companion's `Capabilities` after each attach. Remote transport reasons are program-neutral (SSH-09); OpenCode is named only once observed, and the mapping is `RemoteOpenCodeReport` in [`diagnostics.rs`](../../crates/made-app/src/diagnostics.rs). See SSH-06 in [`specs/ssh-remote-workspaces.md`](../../specs/ssh-remote-workspaces.md).
 
 OpenCode v2 is not a single process. Default `opencode` uses a managed background service, while `opencode --standalone` still starts a private `serve --stdio --port 0`. Made does not own either service lifecycle and does not attach to the user's service. The Phase 0 full session-follow harness used `--standalone`; managed mode was load-tested only.
 

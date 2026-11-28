@@ -11,3 +11,4 @@
 - [0009: Static Integration Modules](0009-static-integration-modules.md) — trait list, ranks, follow policy — Compile-time integration modules, not a plugin system.
 - [0010: Bundled DejaVu Terminal Font](0010-bundled-dejavu-terminal-font.md) — terminal font, DejaVu, glyph coverage — Bundled DejaVu Sans Mono plus Iosevka symbols for the terminal grid.
 - [0011: BROWSER Helper and URL Socket](0011-browser-helper-url-socket.md) — BROWSER, made-open, URL card — Ask-before-open URL routing via helper and same-user socket.
+- [0012: Open Workspace Screen](0012-open-workspace-screen.md) — Open workspace, picker, SSH hosts — One screen replaces picker, plus menu and SSH window.

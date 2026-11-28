@@ -4,8 +4,8 @@ Claude Code is the third integrated TUI. Made learns about it through two indepe
 
 ## Catalog and launch
 
-- Catalog order is OpenCode, Grok, Claude Code; undetected programs are omitted. The row is labeled Claude Code and paints the official mark from [`claude-code.svg`](../../crates/made-app/assets/claude-code.svg) (source URL recorded in the file).
-- Choosing it starts the absolute `claude` path with no arguments as the child of a new home-directory tab, with no shell first and no picker. Made passes no Claude Code arguments, edits no Claude Code file and runs no other `claude` subcommand except the read-only `claude agents --json` listing used for explorer follow (see [Explorer follow](#explorer-follow)).
+- Catalog order is OpenCode, Grok, Claude Code; undetected programs get no launch button. The button is labeled Claude Code and paints the official mark from [`claude-code.svg`](../../crates/made-app/assets/claude-code.svg) (source URL recorded in the file).
+- Activating it starts the absolute `claude` path with no arguments as the PTY child of a new tab in the effective launch path (the folder or worktree chosen on the Open workspace screen), with no shell first. Made passes no Claude Code arguments, edits no Claude Code file and runs no other `claude` subcommand except the read-only `claude agents --json` listing used for explorer follow (see [Explorer follow](#explorer-follow)).
 - Claude Code honors `BROWSER`, so its login URL goes to the ask-before-open card locally and over SSH ([URL open requests](../runtime/terminal-first.md#url-open-requests)).
 - Detection is the shared metadata-only `PATH` lookup (macOS Finder/Dock launches: [launch PATH](../runtime/terminal-first.md#macos-gui-launch-path)). Plugin loading does not depend on it, so a shell-typed `claude` is covered too.
 
@@ -42,7 +42,7 @@ Claude Code is the third integrated TUI. Made learns about it through two indepe
 
 ## Presence, precedence and presentation
 
-- **Precedence.** Explorer root: OpenCode > Claude Code > Grok > shell. Tab presentation: OpenCode active > Claude Code present > Grok open > folder. Claude Code outranks Grok because a running Claude Code is in the foreground of its tab. Remote tabs use the same order (AIA-05, SSH-11), with the remote shell cwd and launch directory in place of the shell and the server-name label in place of the folder.
+- **Precedence.** Explorer root: OpenCode > Claude Code > Grok > shell. Tab presentation: OpenCode active > Claude Code present > Grok open > shell. Claude Code outranks Grok because a running Claude Code is in the foreground of its tab. Remote tabs use the same order (AIA-05, SSH-11), with the remote shell cwd and launch directory in place of the local ones. The tab label is the hook-derived session title, else `Claude Code` (`Brand and Workspace Tabs` in [`made-ui-ux.md`](../../specs/made-ui-ux.md)).
 - **Dots.** Protocol status wins over hook-derived status, which wins over idle. A finished turn shows idle; there is no new unread treatment.
 - **Tooltip title.** The terminal's own window title, sanitized and capped at 120 characters, read only while a `claude-code` protocol status is live in that tab because the structured status proves which program owns the title. Otherwise the hook session title, otherwise `Claude Code`. A window title never feeds status or identity and is never trusted as a path; its only effect on a directory is selecting an agent-view background session (see [Explorer follow](#explorer-follow)). See [security](../security.md) and [Layout and controls](../ui/layout-and-controls.md).
 - **OS window title.** Always `Made`. It is never derived from a tab's terminal title or the workspace; a terminal title applies only to its own tab.

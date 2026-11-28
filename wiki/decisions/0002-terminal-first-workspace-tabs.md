@@ -15,7 +15,7 @@ One native window with ordered, independent workspace tabs. Each tab is a comple
 - The left surface shows either the live terminal or a full-left read-only preview, never both or a stacked split.
 - OpenCode sessions are an optional map inside the selected workspace, not workspace tabs.
 - Hidden tabs continue bounded output/bridge work but never paint grids.
-- Closing a tab releases only its resources; closing the last tab returns to the picker and starts no process.
+- Closing a tab releases only its resources; closing the last tab returns to the picker (now the Open workspace screen, [ADR 0012](0012-open-workspace-screen.md)) and starts no process.
 - No restart persistence, terminal splits, or multi-window.
 
 ## Consequences
