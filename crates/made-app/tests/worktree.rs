@@ -1068,10 +1068,18 @@ fn rapid_target_changes_run_one_git_process_at_a_time() {
     );
     let mut reads = WorktreeReads::new(GitRunner::with_program(&slow_git));
     // Holding Down: one target change per frame.
+    let requesting = std::time::Instant::now();
     for generation in 1..=30 {
         reads.request(generation, temp.path().join(format!("dir-{generation}")));
         std::thread::sleep(Duration::from_millis(5));
     }
+    // Each read holds the single worker for at least 200 ms, so a latest-wins
+    // slot starts at most one read per 200 ms while requests arrive, plus the
+    // final one. A loaded runner stretches the request loop, not this bound's
+    // meaning: a backlog would still start one read per request.
+    let span = requesting.elapsed().as_millis();
+    let max_runs = usize::try_from(span / 200 + 2).unwrap();
+    assert!(max_runs < 30, "the request loop took {span} ms");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut updates = Vec::new();
     while !updates
@@ -1103,7 +1111,10 @@ fn rapid_target_changes_run_one_git_process_at_a_time() {
         }
     }
     assert_eq!(peak, 1, "git reads overlapped:\n{logged}");
-    assert!(runs <= 3, "superseded targets kept forking git: {runs}");
+    assert!(
+        runs <= max_runs,
+        "superseded targets kept forking git: {runs} runs in a {span} ms request loop"
+    );
 }
 
 #[cfg(unix)]
