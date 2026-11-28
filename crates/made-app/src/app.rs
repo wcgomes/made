@@ -1601,6 +1601,10 @@ impl AppModel {
                 workbench.set_visible(false);
             }
             self.active = Some(id);
+            // A remote tab has no local launch plan to restore, so leaving
+            // the picker surface is explicit: otherwise `launch` stays on the
+            // picker and the Open workspace card never closes.
+            self.leave_picker_for_remote();
             self.reset_ui_focus = true;
             if let Some(workbench) = self.workbench_mut() {
                 workbench.set_visible(true);
@@ -4675,6 +4679,61 @@ mod tests {
     }
 
     #[test]
+    fn the_remote_cleanup_notice_floats_in_the_corner_not_in_the_strip() {
+        let temp = tempfile::tempdir().unwrap();
+        let picker = crate::WorkspacePicker::new(temp.path()).unwrap();
+        let mut model = AppModel::from_launch(
+            crate::workspace::WorkspaceLaunch::Picker {
+                picker,
+                error: None,
+            },
+            AppOptions::new(),
+        );
+        let (sender, watch) = mpsc::channel();
+        model.remote_closes.push(watch);
+        sender
+            .send(crate::remote_session::CloseReport::Unconfirmed)
+            .unwrap();
+        model.poll_remote_closes();
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // The first pass only sizes the floating area.
+        let mut output = ctx.run_ui(raw.clone(), |ui| {
+            crate::ui::workspace_strip(&mut model, ui);
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(raw, |ui| {
+            crate::ui::workspace_strip(&mut model, ui);
+        });
+        output.textures_delta.clear();
+        fn find(shape: &egui::Shape) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == "remote cleanup unconfirmed" => {
+                    Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(find),
+                _ => None,
+            }
+        }
+        let rect = output
+            .shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape))
+            .expect("the notice is painted");
+        assert!(
+            rect.top() > 700.0 && rect.left() < 100.0,
+            "the notice sits in the bottom-left corner, not under the tab strip: {rect:?}"
+        );
+    }
+
+    #[test]
     fn confirmed_remote_close_shows_no_notice_and_unconfirmed_does() {
         let temp = tempfile::tempdir().unwrap();
         let picker = crate::WorkspacePicker::new(temp.path()).unwrap();
@@ -4750,6 +4809,8 @@ mod tests {
             helper_version: "probe".to_owned(),
             grok: false,
             python3: false,
+            watch_dirs: false,
+            start_shell: false,
         }
     }
 
@@ -5248,6 +5309,87 @@ mod tests {
         assert!(painted(&mut fixture).iter().any(|text| text == EMPTY));
     }
 
+    /// Run test `name` again in a child process with a temporary home and
+    /// `TMPDIR`, since starting a workbench needs isolated app paths. Returns
+    /// `true` in the parent once the child passed.
+    fn in_isolated_child(name: &str) -> bool {
+        const CHILD: &str = "MADE_APP_MODEL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("app::tests::{name}"), "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("TMPDIR", home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
+    /// Open workspace over a server already running a remote tab, folder
+    /// browsed: the close control and Escape both return to that tab.
+    #[test]
+    fn open_workspace_over_a_used_ssh_server_closes_with_the_control_and_escape() {
+        use crate::remote_workspace::RemoteWorkspace;
+        use made_remote::protocol::{Identity, TabCapability};
+
+        if in_isolated_child(
+            "open_workspace_over_a_used_ssh_server_closes_with_the_control_and_escape",
+        ) {
+            return;
+        }
+        let mut fixture = Fixture::opened(None, Some("/home/me"));
+        fixture.list("/home/me", &["/home/me/app"]);
+        let workspace = RemoteWorkspace::new(
+            Identity {
+                authority: fixture.id,
+                tab: TabCapability::random().unwrap(),
+                epoch: 1,
+                generation: 1,
+            },
+            path("/home/me/app"),
+        )
+        .unwrap();
+        fixture
+            .model
+            .attach_remote_model(fixture.id, workspace, false)
+            .unwrap();
+        let remote = fixture.model.active_workspace_id().unwrap();
+        assert!(!fixture.model.is_picker());
+
+        for escape in [false, true] {
+            fixture.model.begin_new_workspace();
+            fixture.sync();
+            assert!(fixture.model.is_picker());
+            fixture.model.screen_select_host(HostId::Ssh(fixture.id));
+            fixture.sync();
+            frame(&mut fixture, Vec::new());
+            if escape {
+                press(&mut fixture, egui::Key::Escape);
+            } else {
+                assert!(fixture.model.close_picker());
+                frame(&mut fixture, Vec::new());
+            }
+            assert!(
+                !fixture.model.is_picker(),
+                "the card closes (escape: {escape})"
+            );
+            assert_eq!(fixture.model.active_workspace_id(), Some(remote));
+        }
+    }
+
     #[test]
     fn a_connection_failure_dismisses_with_escape_and_clears_on_host_change_or_success() {
         let mut fixture = Fixture::staging(None);
@@ -5582,6 +5724,28 @@ mod tests {
         frame(&mut fixture, vec![enter(false)]);
         assert_eq!(fixture.model.screen_test_report(), None);
         assert!(fixture.model.is_picker());
+    }
+
+    #[test]
+    fn enter_in_the_password_field_submits_like_continue() {
+        let mut fixture = Fixture::staging(None);
+        fixture.stage().prompts.send(prompt(1, PASSWORD)).unwrap();
+        for _ in 0..2 {
+            frame(&mut fixture, Vec::new());
+        }
+        assert!(fixture.model.screen_prompt().is_some());
+        *fixture.model.prompt_draft() = "secret".to_owned();
+        let field = crate::ui::ssh_field_id("screen-prompt");
+        fixture.ctx.memory_mut(|memory| memory.request_focus(field));
+        frame(&mut fixture, Vec::new());
+        assert_eq!(
+            fixture.stage().answer(),
+            None,
+            "nothing is sent before Enter"
+        );
+        press(&mut fixture, egui::Key::Enter);
+        assert_eq!(fixture.stage().answer(), Some((1, true)));
+        assert!(fixture.model.screen_prompt().is_none());
     }
 
     #[test]

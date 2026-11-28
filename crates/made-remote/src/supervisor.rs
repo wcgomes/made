@@ -22,7 +22,7 @@
 use crate::{
     claude::{self, ClaudeSpool, ClaudeTracker, ListingWorker},
     clipboard::Uploads,
-    filesystem::Filesystem,
+    filesystem::{Filesystem, WatchOutcome},
     git::GitRunner,
     grok::{self, GrokTracker},
     integration::Integration,
@@ -38,13 +38,14 @@ use made_terminal::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc,
     },
@@ -54,6 +55,36 @@ use std::{
 
 /// Scrollback bound shared with the local terminal. Not a replay log.
 pub const SCROLLBACK_LINES: usize = 10_000;
+
+/// Leaves the alternate screen and resets the input and display modes a
+/// full-screen program may leave set when it exits: the scroll region and
+/// origin mode (with the cursor kept where it is), autowrap, attributes,
+/// cursor visibility and shape, cursor and keypad application modes, mouse
+/// and focus reporting (including the UTF-8 and urxvt mouse encodings), the
+/// enhanced keyboard protocol, bracketed paste and the window title. The terminal
+/// pane uses the same bytes when it starts a shell after a local TUI exit.
+pub const LEAVE_PROGRAM_MODES: &[u8] = b"\x1b[?1049l\x1b7\x1b[?6l\x1b[r\x1b8\x1b[?7h\x1b[0m\x1b[?25h\x1b[0 q\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[<99u\x1b]2;\x07";
+
+/// Starts the OpenCode integration a plain shell launch owns.
+pub type IntegrationStart = Box<dyn FnOnce() -> Option<Integration> + Send>;
+
+/// The shell a `StartShell` request runs: what `LaunchTarget::Shell` runs,
+/// with the environment a fresh `Terminal SSH` shell gets.
+pub struct FollowUpShell {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    /// Set on top of the launch's environment: what a shell launch receives
+    /// beyond this launch (`launch::LaunchEnvironment::follow_up`).
+    pub env: Vec<(OsString, OsString)>,
+    /// Starts the OpenCode integration a shell launch owns, for a launch that
+    /// has none (Grok Build and Claude Code own no bridge until a shell takes
+    /// their place). Its variable goes to the shell.
+    pub integration: Option<IntegrationStart>,
+}
+
+/// Longest wait for output a finished child printed before its exit was
+/// reported, when its terminal gives way to the follow-up shell.
+const EXIT_OUTPUT_DRAIN: Duration = Duration::from_millis(100);
 
 /// About one forwarded URL request per tab in this window; repeats of the
 /// last URL inside it are coalesced.
@@ -158,6 +189,16 @@ pub fn runtime_directory(base: &Path, identity: &Identity) -> Result<PathBuf, Er
     Ok(base.join("remote/runtime").join(name))
 }
 
+fn set_var(
+    env: &mut Vec<(OsString, OsString)>,
+    key: impl Into<OsString>,
+    value: impl Into<OsString>,
+) {
+    let key = key.into();
+    env.retain(|(existing, _)| *existing != key);
+    env.push((key, value.into()));
+}
+
 fn io_error(_: impl std::fmt::Debug) -> ErrorCode {
     ErrorCode::Io
 }
@@ -198,6 +239,13 @@ impl NativeSession {
         self.process.try_is_running().unwrap_or(false)
     }
 
+    /// Whether the child is known to have ended. A monitor failure leaves
+    /// its state unknown, which is not an end: replacing it could kill a
+    /// child that still runs.
+    pub fn has_ended(&self) -> bool {
+        self.process.try_is_running().is_ok_and(|running| !running)
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), ErrorCode> {
         self.process.resize(rows, cols).map_err(io_error)?;
         self.vt.resize(rows, cols);
@@ -222,6 +270,45 @@ impl NativeSession {
 
     pub fn terminate(&mut self) -> bool {
         self.process.terminate().is_ok()
+    }
+
+    /// Replace the exited child by a new one in the same terminal, keeping
+    /// the bounded VT state: the screen and scrollback the old child left
+    /// stay, and the modes it may have left set are reset. Returns the old
+    /// child's output that was still queued, then the mode reset, in the order
+    /// the host has to apply them; the VT already holds all of it. A child
+    /// that cannot start leaves the session untouched.
+    pub fn restart(
+        &mut self,
+        platform: &dyn made_platform::Platform,
+        options: PtyOptions,
+    ) -> Result<Vec<Vec<u8>>, ErrorCode> {
+        if !self.has_ended() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        let mut next = PtyProcess::spawn(platform, options).map_err(io_error)?;
+        std::mem::swap(&mut self.process, &mut next);
+        let mut old = next;
+        // The exit can be reported before the reader forwarded the child's
+        // last bytes; a process it left behind may keep writing, so the
+        // deadline ends the drain.
+        let mut pieces = Vec::new();
+        let end = Instant::now() + EXIT_OUTPUT_DRAIN;
+        loop {
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(PtyEvent::Data(data)) = old.recv_timeout(remaining) else {
+                break;
+            };
+            self.vt.feed(&data);
+            pieces.push(data);
+        }
+        let _ = old.terminate();
+        self.vt.feed(LEAVE_PROGRAM_MODES);
+        pieces.push(LEAVE_PROGRAM_MODES.to_vec());
+        Ok(pieces)
     }
 
     /// Feed already-read PTY bytes into the bounded core. Raw bytes are not kept.
@@ -371,14 +458,16 @@ fn encode_resnapshot(core: &TerminalCore, primary: &PrimaryRetention) -> Vec<u8>
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[0m");
     paint_history(&mut out, &primary.history, primary.screen.size.rows);
-    out.extend_from_slice(b"\x1b[H\x1b[2J");
+    // No `ESC[2J`: `paint_viewport` writes every cell of every row, and the
+    // client feeds this into a fresh grid. An erase-display would also push a
+    // blank line into the client's scrollback, which surfaces as an empty
+    // first row above the prompt once the pane grows past the attach size.
     paint_viewport(&mut out, &primary.screen);
     push_modes(&mut out, &primary.modes);
     push_cursor(&mut out, &primary.screen);
     if core.alternate_screen() {
         out.extend_from_slice(b"\x1b[?1049h");
         let alternate = core.snapshot();
-        out.extend_from_slice(b"\x1b[H\x1b[2J");
         paint_viewport(&mut out, &alternate);
         push_modes(&mut out, &core.input_modes());
         push_cursor(&mut out, &alternate);
@@ -390,12 +479,18 @@ fn paint_history(out: &mut Vec<u8>, history: &[LineSnapshot], rows: usize) {
     if history.is_empty() || rows == 0 {
         return;
     }
-    push_cup(out, rows - 1, 0);
+    // Write the history from the top row, then scroll the viewport blank:
+    // every history line ends up in the client's scrollback and no blank
+    // line precedes it. The viewport is painted over the empty grid next.
+    push_cup(out, 0, 0);
     for line in history {
         push_line_text(out, line);
         if !line.wrapped {
             out.extend_from_slice(b"\r\n");
         }
+    }
+    for _ in 1..rows {
+        out.extend_from_slice(b"\r\n");
     }
 }
 
@@ -574,10 +669,13 @@ pub fn live_terminal_output(bytes: &[u8]) -> Option<Operation> {
 
 /// Claude Code state rides the data lane too, so it reaches the client after
 /// the resnapshot frames queued before it, never ahead of the completing one.
+/// So does the child's exit: it follows every output frame the child printed
+/// before it, and the state pushed before it.
 fn is_data(operation: &Operation) -> bool {
     matches!(
         operation,
         Operation::TerminalOutput { .. }
+            | Operation::TerminalExit { .. }
             | Operation::Listed { .. }
             | Operation::GitResult { .. }
             | Operation::PreviewResult { .. }
@@ -613,6 +711,7 @@ pub fn generation_exempt(operation: &Operation) -> bool {
             | Operation::Cancel { .. }
             | Operation::TerminalInput { .. }
             | Operation::TerminalResize { .. }
+            | Operation::StartShell { .. }
             | Operation::SessionState
             | Operation::Focus { .. }
             | Operation::GrokState
@@ -666,8 +765,108 @@ pub struct Supervisor {
     pty_size: (u16, u16),
     /// The child is the user's shell rather than a TUI launched by Made.
     shell_target: bool,
+    /// The remote interactive shell a `StartShell` request starts after the
+    /// launch child ended. Absent for a companion that was not given one.
+    follow_up: Option<FollowUpShell>,
+    /// The launch environment before any shell bootstrap, which the follow-up
+    /// shell starts from, and the companion that reports its directory.
+    launch_env: Vec<(OsString, OsString)>,
+    companion: PathBuf,
+    /// Output the replaced child printed last, then the mode reset, still to
+    /// reach the attached client before the new shell's own output.
+    relay_tail: VecDeque<Vec<u8>>,
+    /// The current child's exit was queued for the attached client. A child
+    /// exits once: reporting it every pass would flood the client and reach
+    /// the shell that replaces the child.
+    exit_reported: bool,
     redraw: Option<RedrawNudge>,
     closed: bool,
+    git_reads: GitReads,
+}
+
+/// One Git read waiting for the Git thread.
+struct GitJob {
+    identity: Identity,
+    request_id: u64,
+    command: crate::protocol::GitRead,
+    directory: PathBuf,
+}
+
+struct GitDone {
+    identity: Identity,
+    request_id: u64,
+    command: crate::protocol::GitRead,
+    outcome: Result<Vec<u8>, ErrorCode>,
+}
+
+/// Git reads run on their own thread, one at a time. A `git status` of a big
+/// repository takes long enough to stall the loop that relays the terminal and
+/// answers every other request, and the client refreshes Git on every change
+/// notification and on its periodic safety net.
+struct GitReads {
+    jobs: SyncSender<GitJob>,
+    results: Receiver<GitDone>,
+    /// The attachment epoch and root generation reads are still wanted for.
+    /// A queued read of an older one is skipped before it runs.
+    current: Arc<GitWanted>,
+}
+
+#[derive(Default)]
+struct GitWanted {
+    epoch: AtomicU64,
+    generation: AtomicU64,
+}
+
+impl GitWanted {
+    fn set(&self, identity: Option<&Identity>) {
+        let (epoch, generation) = identity.map_or((0, 0), |i| (i.epoch, i.generation));
+        self.epoch.store(epoch, Ordering::Relaxed);
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+    fn wants(&self, identity: &Identity) -> bool {
+        self.epoch.load(Ordering::Relaxed) == identity.epoch
+            && self.generation.load(Ordering::Relaxed) == identity.generation
+    }
+}
+
+/// Reads queued for the Git thread; the client never has more in flight than
+/// `MAX_IN_FLIGHT`, so this only bounds a misbehaving one.
+const GIT_QUEUE: usize = 64;
+
+impl GitReads {
+    fn start() -> Self {
+        let (jobs, job_rx) = mpsc::sync_channel::<GitJob>(GIT_QUEUE);
+        let (done_tx, results) = mpsc::channel();
+        let current = Arc::new(GitWanted::default());
+        let wanted = Arc::clone(&current);
+        thread::spawn(move || {
+            let runner = GitRunner::new();
+            while let Ok(job) = job_rx.recv() {
+                // Nobody waits for the read of a detached attachment or a
+                // previous root: do not spend a `git status` on it.
+                if !wanted.wants(&job.identity) {
+                    continue;
+                }
+                let outcome = runner
+                    .read_bytes(job.command.into(), &job.directory)
+                    .map_err(|_| ErrorCode::Unavailable);
+                let done = GitDone {
+                    identity: job.identity,
+                    request_id: job.request_id,
+                    command: job.command,
+                    outcome,
+                };
+                if done_tx.send(done).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs,
+            results,
+            current,
+        }
+    }
 }
 
 /// Delay between the transient and the real window size of a redraw nudge.
@@ -734,6 +933,7 @@ impl Supervisor {
             None
         };
         ensure_utf8_locale(&mut launch.env, installed_locales);
+        let launch_env = launch.env.clone();
         let shell_plan = if matches!(
             first.operation,
             Operation::Open {
@@ -785,7 +985,7 @@ impl Supervisor {
                 staged,
             },
         );
-        let grok_detected = grok::detect_on_path(&environment, "grok").is_some();
+        let grok_detected = grok::detect_grok(&environment).is_some();
         // Claude Code ingestion reads only this tab's spool; the listing runs
         // the detected claude under the server user's app-owned coordination.
         let claude_tracker = ClaudeTracker::new(
@@ -835,9 +1035,24 @@ impl Supervisor {
                     ..
                 }
             ),
+            follow_up: None,
+            launch_env,
+            companion: companion.to_path_buf(),
+            relay_tail: VecDeque::new(),
+            exit_reported: false,
             redraw: None,
             closed: false,
+            git_reads: GitReads::start(),
         })
+    }
+
+    /// Let the host start the remote interactive shell in this attachment's
+    /// terminal once the launch child ended (`StartShell`): after a launch-bar
+    /// TUI's clean exit, and for the `Open shell` action of an unclean end of
+    /// a TUI or of a plain shell.
+    pub fn with_follow_up_shell(mut self, shell: FollowUpShell) -> Self {
+        self.follow_up = Some(shell);
+        self
     }
 
     fn install_attachment(&mut self, connection: RpcConnection) -> Result<(), ErrorCode> {
@@ -925,6 +1140,10 @@ impl Supervisor {
         self.claude.reset_attachment();
         self.claude_state_pending = None;
         self.claude_subscribed = false;
+        // The new attachment's resnapshot already holds what the tail carries,
+        // and it has not learned that the child ended.
+        self.relay_tail.clear();
+        self.exit_reported = false;
         self.uploads.pending_abort_all();
         thread::spawn(move || {
             while let Ok(frame) = read_envelope(&mut reader) {
@@ -943,6 +1162,10 @@ impl Supervisor {
                     due: Instant::now(),
                 }
             });
+        // A new attachment starts without subscriptions: its client asks for
+        // them again after the resnapshot, under its own request ids.
+        self.filesystem.cancel_watch();
+        self.git_reads.current.set(Some(&identity));
         self.attachment = Some(Attachment {
             stream,
             input,
@@ -960,6 +1183,10 @@ impl Supervisor {
     }
 
     fn detach_frontend(&mut self) {
+        // Nobody reads notifications while detached, and the next client
+        // subscribes again after its resnapshot.
+        self.filesystem.cancel_watch();
+        self.git_reads.current.set(None);
         if let Some(attachment) = self.attachment.take() {
             let _ = attachment.stream.shutdown(Shutdown::Both);
             drop(attachment);
@@ -1060,19 +1287,24 @@ impl Supervisor {
     }
 
     /// Full is backpressure: keep the frontend. Only a disconnected queue drops it.
-    fn enqueue(&mut self, frame: WireEnvelope) {
+    /// Whether the frame is on its way: queued, or parked until the queue has room.
+    fn enqueue(&mut self, frame: WireEnvelope) -> bool {
         let Some(attachment) = self.attachment.as_mut() else {
-            return;
+            return false;
         };
         match attachment.output.try_send(frame) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(TrySendError::Full(frame)) => {
                 if attachment.pending_control.len() < MAX_IN_FLIGHT {
                     attachment.pending_control.push(frame);
+                    true
+                } else {
+                    false
                 }
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.detach_frontend();
+                false
             }
         }
     }
@@ -1093,6 +1325,8 @@ impl Supervisor {
                     // Honest runtime detection. tmux stays false on the wire.
                     grok: self.grok_detected,
                     python3: false,
+                    start_shell: true,
+                    watch_dirs: true,
                 },
             },
             Heartbeat => {
@@ -1113,6 +1347,7 @@ impl Supervisor {
                 if let Some(attachment) = &mut self.attachment {
                     attachment.identity.generation = self.identity.generation;
                     attachment.watch_request = None;
+                    self.git_reads.current.set(Some(&attachment.identity));
                 }
                 result
             }
@@ -1125,15 +1360,37 @@ impl Supervisor {
                 }
                 Changed { path: path.clone() }
             }
+            WatchDir { path } => match self.filesystem.watch_dir(path, request.request_id)? {
+                WatchOutcome::Live => Changed { path: path.clone() },
+                // Established on the watcher thread, never on this loop; the
+                // acknowledgement follows from `poll_events`.
+                WatchOutcome::Pending => return Ok(vec![]),
+            },
+            UnwatchDir { path } => {
+                self.filesystem.unwatch_dir(path);
+                Ack
+            }
             Rescan { path } => {
                 self.filesystem.list(path)?;
                 Changed { path: path.clone() }
             }
             GitRead { command } => {
-                let bytes = GitRunner::new()
-                    .read_bytes((*command).into(), self.filesystem.root())
-                    .map_err(|_| ErrorCode::Unavailable)?;
-                return Ok(chunk_git(*command, &bytes));
+                // Answered from `poll_events` when the Git thread is done.
+                self.git_reads
+                    .jobs
+                    .try_send(GitJob {
+                        identity: request.identity.clone(),
+                        request_id: request.request_id,
+                        command: *command,
+                        directory: self.filesystem.root().to_path_buf(),
+                    })
+                    .map_err(|error| match error {
+                        // The queue is full: back-pressure, ask again.
+                        TrySendError::Full(_) => ErrorCode::Limit,
+                        // The Git thread is gone: say so, do not look busy.
+                        TrySendError::Disconnected(_) => ErrorCode::Unavailable,
+                    })?;
+                return Ok(vec![]);
             }
             SessionState => self
                 .integration
@@ -1176,6 +1433,12 @@ impl Supervisor {
                 self.redraw = None;
                 Ack
             }
+            StartShell {
+                directory,
+                fallback,
+            } => ShellStarted {
+                path: self.start_follow_up_shell(directory, fallback)?,
+            },
             UploadBegin { upload_id, total } => {
                 self.uploads.begin(*upload_id, *total)?;
                 Ack
@@ -1203,6 +1466,7 @@ impl Supervisor {
                         self.filesystem.cancel_watch();
                     }
                 }
+                self.filesystem.cancel_watch_request(*request_id);
                 if let Some(integration) = &mut self.integration {
                     integration.cancel(*request_id);
                 }
@@ -1211,6 +1475,126 @@ impl Supervisor {
             _ => return Err(ErrorCode::InvalidRequest),
         };
         Ok(vec![reply])
+    }
+
+    /// Start the remote interactive shell in this terminal after the launch
+    /// child exited, keeping the screen and scrollback it left. The shell runs
+    /// at the terminal's current size in `directory`, or in `fallback` when
+    /// that is not a usable directory on this server; the directory it starts
+    /// in is returned. The child's last output and the reset of the modes it
+    /// may have left set reach the client before the shell's own output.
+    fn start_follow_up_shell(
+        &mut self,
+        directory: &RemotePath,
+        fallback: &RemotePath,
+    ) -> Result<RemotePath, ErrorCode> {
+        // Only a child known to have ended is replaced: a shell already
+        // running here, whether this request or `Terminal SSH` started it,
+        // stays, and so does a child whose state the monitor lost.
+        if !self.session.has_ended() {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        let (program, args, extra) = self
+            .follow_up
+            .as_ref()
+            .map(|shell| (shell.program.clone(), shell.args.clone(), shell.env.clone()))
+            .ok_or(ErrorCode::Unavailable)?;
+        let (path, cwd) = [directory, fallback]
+            .into_iter()
+            .find_map(|candidate| {
+                let native = crate::filesystem::native(candidate).ok()?;
+                fs::metadata(&native)
+                    .is_ok_and(|metadata| metadata.is_dir())
+                    .then(|| (candidate.clone(), native))
+            })
+            .ok_or(ErrorCode::Unavailable)?;
+        // The environment a fresh `Terminal SSH` shell gets: the launch's own,
+        // with what a shell launch has beyond it.
+        let mut env = self.launch_env.clone();
+        for (key, value) in extra {
+            set_var(&mut env, key, value);
+        }
+        // A shell launch owns the OpenCode integration; start the one a Grok
+        // Build or Claude Code launch did not. A failed start leaves the
+        // terminal without it, as at a shell launch.
+        if self.integration.is_none() {
+            if let Some(start) = self
+                .follow_up
+                .as_mut()
+                .and_then(|shell| shell.integration.take())
+            {
+                self.integration = start();
+            }
+        }
+        if let Some(integration) = &self.integration {
+            let (key, value) = integration.environment();
+            set_var(&mut env, key, value);
+        }
+        // The Claude Code spool binding needs the tab's spool; create it when
+        // the launch had none, or drop the binding, as at a shell launch.
+        let binding = claude::spool_path(&self.runtime);
+        if self._claude_spool.is_none()
+            && env
+                .iter()
+                .any(|(key, value)| key == claude::CLAUDE_SPOOL_ENV && Path::new(value) == binding)
+        {
+            match ClaudeSpool::create(&self.runtime) {
+                Ok(spool) => {
+                    // Bound now, so a start that fails below and is retried
+                    // finds the tracker reading it.
+                    self._claude_spool = Some(spool);
+                    self.claude.bind_spool(binding);
+                }
+                Err(_) => env.retain(|(key, _)| key != claude::CLAUDE_SPOOL_ENV),
+            }
+        }
+        let mut request = made_platform::PtyRequest::new(program.as_os_str(), &cwd);
+        request.args = args;
+        request.env = env;
+        let plan = ShellLaunchPlan::with_cwd_sink(
+            request,
+            self.companion.clone(),
+            self.cwd_sink.path().into(),
+        );
+        let launch = ChildLaunch {
+            program,
+            args: plan.request().args.clone(),
+            cwd: cwd.clone(),
+            env: plan.request().env.clone(),
+        };
+        let child_bytes = serde_json::to_vec(&launch).map_err(io_error)?;
+        publish_private(&self.runtime, "child-shell.json", &child_bytes)?;
+        let options = PtyOptions::new(&cwd)
+            .with_shell(&self.companion)
+            .with_args([
+                OsString::from("--child"),
+                self.runtime.join("child-shell.json").into_os_string(),
+            ])
+            .with_size(PtySize {
+                rows: self.pty_size.0,
+                cols: self.pty_size.1,
+            });
+        let pieces = self
+            .session
+            .restart(&made_platform::host_platform(), options)?;
+        // What the old child printed last may still wait for the client.
+        if let Some(bytes) = self
+            .attachment
+            .as_mut()
+            .and_then(|attachment| attachment.pending_relay.take())
+        {
+            self.relay_tail.push_back(bytes);
+        }
+        self.relay_tail.extend(pieces);
+        self.shell_plan = Some(plan);
+        self.exit_reported = false;
+        self.shell_target = true;
+        self.shell_cwd = Some(path.clone());
+        self.redraw = None;
+        // Output and state of the exited child belong to it alone.
+        self.grok.rebind(self.session.pid(), false);
+        self.claude.rebind(self.session.pid(), false);
+        Ok(path)
     }
 
     fn step_redraw_nudge(&mut self) {
@@ -1378,6 +1762,43 @@ impl Supervisor {
                 }
             }
         }
+        // Git reads the Git thread finished. One of a previous attachment
+        // (another epoch) is dropped, never sent to the current client.
+        while let Ok(done) = self.git_reads.results.try_recv() {
+            let Some(attachment) = &self.attachment else {
+                continue;
+            };
+            if !transport_matches(&done.identity, &attachment.identity) {
+                continue;
+            }
+            let operations = match done.outcome {
+                Ok(bytes) => chunk_git(done.command, &bytes),
+                Err(code) => vec![Operation::Error { code }],
+            };
+            for operation in operations {
+                self.enqueue(WireEnvelope::new(
+                    done.identity.clone(),
+                    done.request_id,
+                    operation,
+                ));
+            }
+        }
+        // `WatchDir` registrations that finished: acknowledged, or refused.
+        for (id, operation) in self.filesystem.poll_watch_results() {
+            if let Some(attachment) = &self.attachment {
+                let frame = WireEnvelope::new(attachment.identity.clone(), id, operation);
+                self.enqueue(frame);
+            }
+        }
+        // Per-directory and Git notifications of the `WatchDir` subscriptions.
+        // A full output queue drops one; the client's periodic refresh is the
+        // backstop for any notification that does not arrive.
+        for (id, operation) in self.filesystem.poll_changes() {
+            if let Some(attachment) = &self.attachment {
+                let frame = WireEnvelope::new(attachment.identity.clone(), id, operation);
+                self.enqueue(frame);
+            }
+        }
         if let Some(integration) = &mut self.integration {
             let events = integration.poll();
             if let Some(attachment) = &self.attachment {
@@ -1484,6 +1905,14 @@ impl Supervisor {
                     return;
                 }
             }
+            // The replaced child's last output and the mode reset go first.
+            if let Some(bytes) = self.relay_tail.pop_front() {
+                if self.attachment.is_some() && !self.relay_terminal(bytes.clone()) {
+                    self.relay_tail.push_front(bytes);
+                    return;
+                }
+                continue;
+            }
             let Some(event) = self.session.poll() else {
                 return;
             };
@@ -1498,13 +1927,17 @@ impl Supervisor {
                     }
                 }
                 PtyEvent::Exited(status) => {
-                    if let Some(attachment) = &self.attachment {
-                        let frame = WireEnvelope::new(
-                            attachment.identity.clone(),
-                            attachment.request,
-                            Operation::TerminalExit { code: status.code },
-                        );
-                        self.enqueue(frame);
+                    // A reaped child reports its exit status on every poll;
+                    // the client learns of it once per attachment.
+                    if !self.exit_reported {
+                        if let Some(attachment) = &self.attachment {
+                            let frame = WireEnvelope::new(
+                                attachment.identity.clone(),
+                                attachment.request,
+                                Operation::TerminalExit { code: status.code },
+                            );
+                            self.exit_reported = self.enqueue(frame);
+                        }
                     }
                     return;
                 }

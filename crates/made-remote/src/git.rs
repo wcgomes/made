@@ -1465,3 +1465,100 @@ fn mark(
         current = dir.parent();
     }
 }
+
+/// The metadata directories one working tree's Git state lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirs {
+    /// Holds this working tree's `HEAD` and `index`. For a linked worktree it
+    /// is `<common>/worktrees/<name>`, for a plain repository `<root>/.git`.
+    pub git_dir: PathBuf,
+    /// Holds the refs and `packed-refs` shared by every worktree.
+    pub common_dir: PathBuf,
+}
+
+/// Most parent directories searched for a `.git` entry.
+const MAX_GIT_ASCENT: usize = 64;
+/// A `.git` file or `commondir` file is one short line; never read more.
+const MAX_GIT_POINTER_BYTES: u64 = 4096;
+
+/// Resolve the metadata directories of the repository `start` is inside,
+/// without running Git: a `.git` directory, or a `.git` file whose
+/// `gitdir: <path>` line points at one (linked worktrees and submodules), and
+/// the `commondir` pointer of a linked worktree. `None` when no repository is
+/// found. Only file metadata and two pointer lines are read.
+///
+/// What a repository can point at is bounded, because the result is watched:
+/// a `.git` entry that exists but does not resolve ends the search (it is not
+/// skipped in favour of an enclosing repository); a target must be a regular
+/// Git directory (it holds a `HEAD` file); a `commondir` must be the
+/// directory the worktree's own Git directory lives under (`<common>/
+/// worktrees/<name>`); and the `refs` directory must be a real directory, not
+/// a link to some other tree.
+pub fn resolve_git_dirs(start: &Path) -> Option<GitDirs> {
+    let mut directory = Some(start);
+    for _ in 0..MAX_GIT_ASCENT {
+        let current = directory?;
+        let dot_git = current.join(".git");
+        if let Ok(metadata) = fs::metadata(&dot_git) {
+            let git_dir = if metadata.is_dir() {
+                Some(dot_git)
+            } else if metadata.is_file() {
+                read_pointer(&dot_git)
+                    .and_then(|line| {
+                        line.strip_prefix("gitdir:")
+                            .map(|rest| rest.trim().to_owned())
+                    })
+                    .map(|target| current.join(target))
+            } else {
+                None
+            };
+            // Present but unusable: stop here, never ascend past it.
+            let git_dir = fs::canonicalize(git_dir?).ok()?;
+            if !is_git_directory(&git_dir) {
+                return None;
+            }
+            let common_dir = match read_pointer(&git_dir.join("commondir")) {
+                Some(target) => {
+                    let common = fs::canonicalize(git_dir.join(target.trim())).ok()?;
+                    // A linked worktree's directory lives under the common one.
+                    if !is_git_directory(&common) || !git_dir.starts_with(common.join("worktrees"))
+                    {
+                        return None;
+                    }
+                    common
+                }
+                None => git_dir.clone(),
+            };
+            return Some(GitDirs {
+                git_dir,
+                common_dir,
+            });
+        }
+        directory = current.parent();
+    }
+    None
+}
+
+/// A Git directory holds a regular `HEAD` file.
+fn is_git_directory(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && fs::metadata(path.join("HEAD")).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Whether `<common>/refs` can be watched recursively: a real directory of
+/// the repository, not a link to another tree.
+pub fn refs_directory(common_dir: &Path) -> Option<PathBuf> {
+    let refs = common_dir.join("refs");
+    fs::symlink_metadata(&refs)
+        .is_ok_and(|metadata| metadata.is_dir())
+        .then_some(refs)
+}
+
+fn read_pointer(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(MAX_GIT_POINTER_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    text.lines().next().map(str::to_owned)
+}

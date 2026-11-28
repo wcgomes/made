@@ -1047,6 +1047,24 @@ impl ClaudeTracker {
         self.spool.is_some()
     }
 
+    /// The tab's spool was created after the tracker: the shell that takes
+    /// the launch's place has it bound, the launch had none.
+    pub fn bind_spool(&mut self, spool: PathBuf) {
+        self.spool = Some(SpoolTail::new(spool));
+    }
+
+    /// The managed child was replaced (by the follow-up shell). Sessions the
+    /// old child owned are not the new child's: they are dropped, and the next
+    /// pass pushes the result.
+    pub fn rebind(&mut self, root: Option<u32>, direct: bool) {
+        self.root = root.filter(|pid| *pid != 0);
+        self.direct = direct;
+        self.sessions = OwnedSessions::default();
+        self.own_trigger = None;
+        self.pending_listing = None;
+        self.pushed = None;
+    }
+
     /// A new attachment discards revision history so the client applies a
     /// fresh snapshot. Records are never replayed: the spool offset survives.
     pub fn reset_attachment(&mut self) {

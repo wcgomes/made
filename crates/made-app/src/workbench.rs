@@ -69,6 +69,12 @@ const SHELL_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Coalesce explorer watcher bursts before reading git status again.
 const GIT_STATUS_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Longest a remote TUI's clean exit waits for its last directory report to
+/// settle the explorer root before the shell is requested in the root as it is.
+const REMOTE_SHELL_SETTLE: Duration = Duration::from_secs(2);
+/// Longest the companion has to answer a request to start the remote shell
+/// before the exit banner shows.
+const REMOTE_SHELL_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
 
@@ -207,6 +213,26 @@ enum RemotePhase {
     Failed,
 }
 
+/// The PTY size an attach asks for. A reattach keeps the size the previous
+/// pane had: the child's program still believes in that size, and asking for
+/// the default would resize it to 120x36 and back, which makes an inline TUI
+/// repaint at the wrong width over a screen laid out for the real one.
+fn remote_open_size(
+    open: crate::remote_session::SessionOpen,
+    previous: Option<&TerminalPane>,
+) -> (u16, u16) {
+    match (open, previous) {
+        (crate::remote_session::SessionOpen::Reattach, Some(pane)) => {
+            let size = pane.size();
+            (
+                size.rows.clamp(1, u16::MAX as usize) as u16,
+                size.cols.clamp(2, u16::MAX as usize) as u16,
+            )
+        }
+        _ => (DEFAULT_ROWS as u16, DEFAULT_COLS as u16),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum OpenRetry {
     Probe,
@@ -266,6 +292,11 @@ struct RemoteTab {
     /// operations, from its `Capabilities.helper_version`; `None` until the
     /// reply. An older supervisor is never sent them.
     claude_supported: Option<bool>,
+    /// Whether the current attach's supervisor decodes `StartShell`, from its
+    /// `Capabilities.start_shell`; `None` until the reply. A supervisor that
+    /// predates the request treats it as a fatal decode error, so it is never
+    /// sent it.
+    start_shell: Option<bool>,
     /// Pending `ClaudeState` request of the current attach.
     claude_state_request: Option<u64>,
     // END remote-path
@@ -310,6 +341,55 @@ struct RemoteTab {
     remote_target: Option<String>,
     upload: Option<PendingUpload>,
     next_upload: u64,
+    /// Where the clean exit of this tab's TUI stands on the way to the remote
+    /// shell that takes its place.
+    shell_start: ShellStart,
+}
+
+/// The clean exit of a remote TUI launched from the launch bar is answered by
+/// the remote interactive shell in the same pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellStart {
+    /// The TUI runs, or its exit has not been looked at yet.
+    Idle,
+    /// The companion's capabilities are not known yet; the start waits for
+    /// them, a moment at most.
+    Waiting(Instant),
+    /// The TUI exited and its follow is released; the explorer root settles.
+    Settling(Instant),
+    /// The start request is out under this id since this moment.
+    Requested(u64, Instant),
+    /// The shell cannot be started: the exit banner shows.
+    Failed,
+}
+
+/// Whether the tab's SSH attachment is connected and current: the session
+/// can take a request and the terminal is attached to it.
+fn remote_session_attached(remote: &RemoteTab) -> bool {
+    matches!(remote.phase, RemotePhase::Ready)
+        && remote.workspace.connection() == crate::remote_workspace::ConnectionState::Connected
+        && remote.attach_request.is_none()
+        && !remote.holding_input
+        && remote.client.is_some()
+}
+
+/// A client reset (a root transition) drops the pending `StartShell` and its
+/// answer with it: ask again, once the transition is done and the tab knows
+/// its new root. A shell the companion had already started answers
+/// `InvalidRequest`, which the tab takes as that shell.
+fn rearm_shell_start(remote: &mut RemoteTab, client: &made_remote::client::RemoteClient) {
+    if let ShellStart::Requested(_, since) = remote.shell_start {
+        let request = client.request(
+            made_remote::protocol::Operation::StartShell {
+                directory: remote.workspace.root().clone(),
+                fallback: remote.workspace.launch_directory().clone(),
+            },
+            None,
+        );
+        if let Ok(id) = request {
+            remote.shell_start = ShellStart::Requested(id, since);
+        }
+    }
 }
 
 // BEGIN remote-path (AIA-02)
@@ -317,7 +397,10 @@ struct RemoteTab {
 /// decodes the Claude Code operations. An older supervisor treats an unknown
 /// operation as a fatal decode error, so only a supervisor of this release or
 /// a newer one is sent them; an unparsable version is older. Pre-release and
-/// build suffixes are ignored, so `0.2.0-beta.1` counts as `0.2.0`.
+/// build suffixes are ignored, so `0.2.0-beta.1` counts as `0.2.0`. The same
+/// gate decides whether `StartShell` is sent (see `poll_follow_up_shell`):
+/// every operation added since is covered by the release that adds it, which
+/// raises the app version above every supervisor that cannot decode it.
 fn claude_ops_supported(helper: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
         let core = version.split(['-', '+']).next()?;
@@ -401,6 +484,7 @@ impl RemoteTab {
             companion_opencode: None,
             capabilities_request: None,
             claude_supported: None,
+            start_shell: None,
             claude_state_request: None,
             // END remote-path
             probe: None,
@@ -429,6 +513,7 @@ impl RemoteTab {
             remote_target: None,
             upload: None,
             next_upload: 1,
+            shell_start: ShellStart::Idle,
         })
     }
 }
@@ -810,6 +895,7 @@ impl Workbench {
             companion_opencode: None,
             capabilities_request: None,
             claude_supported: None,
+            start_shell: None,
             claude_state_request: None,
             // END remote-path
             probe: None,
@@ -838,6 +924,7 @@ impl Workbench {
             remote_target: None,
             upload: None,
             next_upload: 1,
+            shell_start: ShellStart::Idle,
         };
         Self::start_with(
             PRODUCT,
@@ -1256,10 +1343,17 @@ impl Workbench {
         }
     }
 
-    /// Whether this local shell tab's shell exited cleanly, so the tab closes
-    /// as its close action closes it.
+    /// Whether this shell tab's shell (local, or remote with its attachment
+    /// intact) exited cleanly, so the tab closes as its close action closes it.
     pub fn shell_exited_cleanly(&self) -> bool {
-        self.terminal_target == TerminalTarget::Shell
+        let plain_shell = match self.terminal_target {
+            TerminalTarget::Shell => true,
+            // A remote shell closes its tab only while its SSH attachment is
+            // intact: a lost transport keeps the tab for Reconnect.
+            TerminalTarget::RemoteShell { .. } => self.remote_attached(),
+            _ => false,
+        };
+        plain_shell
             && self
                 .terminal
                 .as_ref()
@@ -2323,6 +2417,17 @@ impl Workbench {
         self.cancel_remote_attempt("the remote host key is not in the app trust file");
     }
 
+    /// The remote tab is still establishing its session: not a failure, and
+    /// no terminal yet.
+    pub fn remote_connecting(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| {
+            matches!(
+                remote.phase,
+                RemotePhase::Connecting | RemotePhase::Staging | RemotePhase::AwaitingAttach
+            )
+        })
+    }
+
     pub fn remote_can_reconnect(&self) -> bool {
         self.remote.as_ref().is_some_and(|remote| {
             remote.attached_once && matches!(remote.phase, RemotePhase::Failed)
@@ -3041,6 +3146,7 @@ impl Workbench {
             terminal.apply_clipboard_store(&self.platform, ctx, self.diag.log_mut());
         }
         self.poll_integrations(Instant::now());
+        self.poll_follow_up_shell(Instant::now());
         self.pump_remote_upload();
         // Remote output belongs to this tab, not the window. A hidden tab
         // must not drive an immediate repaint of the active local tab: that
@@ -3160,6 +3266,21 @@ impl Workbench {
         let Some(failure) = failure else {
             return;
         };
+        // The card stays a fixed sentence; ssh's own last words go to the
+        // local log only, so a drop can be diagnosed afterwards.
+        if let Some(tail) = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.failures.take_tail())
+        {
+            self.diag.log_mut().record(
+                LogLevel::Error,
+                format!(
+                    "ssh connection ended: {}",
+                    crate::sanitize::sanitize_log_text(&tail)
+                ),
+            );
+        }
         if let Some(client) = self.remote.as_mut().and_then(|remote| remote.client.take()) {
             client.disconnect();
         }
@@ -3477,6 +3598,7 @@ impl Workbench {
             return;
         };
         let directory = remote.workspace.launch_directory().clone();
+        let (rows, cols) = remote_open_size(remote.session_open, self.terminal.as_ref());
         // BEGIN remote-path (AIA-02)
         let launch = if remote.opencode {
             made_remote::protocol::LaunchTarget::OpenCode
@@ -3492,8 +3614,8 @@ impl Workbench {
             remote.session_open,
             directory,
             launch,
-            DEFAULT_ROWS as u16,
-            DEFAULT_COLS as u16,
+            rows,
+            cols,
         );
         debug_assert!(crate::remote_session::allow_before_attached(&operation));
         // Remote output arrives on the transport thread. Without a wake the
@@ -3537,6 +3659,8 @@ impl Workbench {
 
     fn pump_remote_client(&mut self) {
         let mut remote_urls = Vec::new();
+        let mut shell_reply = None;
+        let mut running_shell = false;
         let (attach_reply, upload_replies, disconnected) =
             {
                 let Some(remote) = self.remote.as_mut() else {
@@ -3588,6 +3712,15 @@ impl Workbench {
                             attach_reply = Some(reply);
                             continue;
                         }
+                        // The companion's answer to the request to start the
+                        // remote shell after a TUI exit.
+                        if matches!(
+                            remote.shell_start,
+                            ShellStart::Requested(id, _) if id == reply.request_id
+                        ) {
+                            shell_reply = Some(reply);
+                            continue;
+                        }
                         // BEGIN remote-path (AIA-02)
                         // A failed Capabilities reply leaves the signal unknown.
                         if remote.capabilities_request == Some(reply.request_id) {
@@ -3597,6 +3730,19 @@ impl Workbench {
                             } = &reply.operation
                             {
                                 remote.companion_opencode = Some(capabilities.opencode);
+                                remote.workspace.set_watch_dirs(capabilities.watch_dirs);
+                                remote.start_shell = Some(capabilities.start_shell);
+                                // A launch-bar program has no shell plan: a
+                                // supervisor that reports one runs the shell
+                                // a start request put in its place, whose
+                                // answer this tab never saw (a reattach).
+                                running_shell = capabilities.shell_cwd
+                                    && matches!(
+                                        self.terminal_target,
+                                        TerminalTarget::RemoteOpenCode { .. }
+                                            | TerminalTarget::RemoteGrok { .. }
+                                            | TerminalTarget::RemoteClaude { .. }
+                                    );
                                 arm_claude_state(remote, &client, &capabilities.helper_version);
                             }
                             continue;
@@ -3632,17 +3778,39 @@ impl Workbench {
                             made_remote::protocol::Operation::Listed { done, .. }
                             | made_remote::protocol::Operation::PreviewResult { done, .. }
                             | made_remote::protocol::Operation::GitResult { done, .. } => *done,
-                            made_remote::protocol::Operation::Changed { .. } => false,
+                            // A subscription's acknowledgement is followed by
+                            // pushes under the same id: keep the mapping for
+                            // as long as the workspace holds the stream.
+                            made_remote::protocol::Operation::Changed { .. }
+                            | made_remote::protocol::Operation::GitChanged => false,
                             _ => true,
                         };
+                        let push = matches!(
+                            reply.operation,
+                            made_remote::protocol::Operation::Changed { .. }
+                                | made_remote::protocol::Operation::GitChanged
+                        );
                         let mut reply = reply;
-                        if let Some(workspace_id) = remote.id_map.get(&client_id).copied() {
+                        let mapped = remote.id_map.get(&client_id).copied();
+                        if let Some(workspace_id) = mapped {
                             reply.request_id = workspace_id;
                             if terminal {
                                 remote.id_map.remove(&client_id);
                             }
                         }
+                        // A notification of a request this tab no longer maps
+                        // (released, or from before a root change) is dropped:
+                        // its id is the client's, not a workspace request's.
+                        if push && mapped.is_none() {
+                            continue;
+                        }
                         let accepted = remote.workspace.accept(reply);
+                        // A notification that belongs to no live stream (a
+                        // `Rescan` answer, a push after the unsubscribe)
+                        // leaves nothing to keep the mapping for.
+                        if push && !mapped.is_some_and(|id| remote.workspace.is_stream(id)) {
+                            remote.id_map.remove(&client_id);
+                        }
                         if listed {
                             let root = remote.workspace.root().clone();
                             let entries = remote
@@ -3690,6 +3858,7 @@ impl Workbench {
                                 // BEGIN remote-path (AIA-02)
                                 rearm_claude_state(remote, &client);
                                 // END remote-path
+                                rearm_shell_start(remote, &client);
                             }
                         }
                     }
@@ -3750,6 +3919,12 @@ impl Workbench {
             self.fail_remote_transport();
             return;
         }
+        if let Some(reply) = shell_reply {
+            self.finish_follow_up_shell(reply);
+        }
+        if running_shell {
+            self.adopt_follow_up_shell(None);
+        }
         if attach_reply.is_some() || !upload_replies.is_empty() {
             self.finish_remote_replies(attach_reply, upload_replies);
         }
@@ -3781,6 +3956,7 @@ impl Workbench {
                     continue;
                 }
                 let workspace_id = command.request_id;
+                let command_identity = command.identity;
                 let operation = command.operation;
                 let root_select = matches!(
                     &operation,
@@ -3805,9 +3981,23 @@ impl Workbench {
                     rearm_claude_state(remote, &client);
                     // END remote-path
                 }
-                match client.request(operation, grant.as_ref()) {
+                match client.request(operation.clone(), grant.as_ref()) {
                     Ok(client_id) => {
                         remote.id_map.insert(client_id, workspace_id);
+                    }
+                    // The client's in-flight window is full: back-pressure,
+                    // not a broken link. Keep the command and its place in
+                    // line and try again on the next pump; the workspace's own
+                    // request deadline ends it if the window never opens.
+                    Err(made_remote::protocol::ProtocolError::Limit) => {
+                        remote
+                            .workspace
+                            .requeue(made_remote::protocol::WireEnvelope::new(
+                                command_identity,
+                                workspace_id,
+                                operation,
+                            ));
+                        break;
                     }
                     Err(_) => {
                         remote.workspace.disconnect();
@@ -3816,7 +4006,20 @@ impl Workbench {
                 }
             }
             let _ = remote.workspace.expire(Instant::now());
-            let _ = remote.workspace.reconcile();
+            // Notifications are primary; the safety net only runs while the
+            // tab is shown, and `reconcile` then reloads what it marked.
+            // A hidden tab only marks what changed: it reloads on being
+            // shown, so a background tab costs the server nothing per push.
+            if self.visible {
+                remote.workspace.refresh_safety_net(Instant::now());
+                let _ = remote.workspace.reconcile();
+            }
+            let released = remote.workspace.take_released_streams();
+            if !released.is_empty() {
+                remote
+                    .id_map
+                    .retain(|_, workspace_id| !released.contains(workspace_id));
+            }
         };
         self.sync_remote_sessions();
         // BEGIN remote-path (AIA-02)
@@ -3915,10 +4118,12 @@ impl Workbench {
             // BEGIN remote-path (AIA-02)
             remote.claude_supported = None;
             remote.claude_state_request = None;
+            remote.start_shell = None;
             // END remote-path
             remote.deferred_shell_cwd = None;
             remote.holding_input = false;
             remote.upload = None;
+            remote.shell_start = ShellStart::Idle;
             // Stale remote session rows must not outlive the transport.
             self.session_map.clear();
         }
@@ -4053,12 +4258,14 @@ impl Workbench {
         }
         remote.attached_once = true;
         remote.phase = RemotePhase::Ready;
+        remote.shell_start = ShellStart::Idle;
         // BEGIN remote-path (AIA-02)
         // The companion's own OpenCode capability for this attach feeds the
         // diagnostics row. Attach never depends on the reply.
         remote.companion_opencode = None;
         remote.claude_supported = None;
         remote.claude_state_request = None;
+        remote.start_shell = None;
         remote.capabilities_request = remote.client.as_ref().and_then(|client| {
             client
                 .request(made_remote::protocol::Operation::Capabilities, None)
@@ -4072,7 +4279,8 @@ impl Workbench {
             return;
         };
         let target = self.terminal_target;
-        let mut pane = TerminalPane::open_remote(target, DEFAULT_ROWS as u16, DEFAULT_COLS as u16);
+        let (rows, cols) = remote_open_size(open, self.terminal.as_ref());
+        let mut pane = TerminalPane::open_remote(target, rows, cols);
         pane.attach_remote_transport(Box::new(client.terminal_transport()));
         self.terminal = Some(pane);
         // A new remote terminal waits for its own fresh emission.
@@ -4084,6 +4292,240 @@ impl Workbench {
         }
         // An empty queue here is not completion. Input stays paused until done.
         self.pull_resnapshot();
+    }
+
+    /// A remote TUI launched from the launch bar (OpenCode, Grok Build or
+    /// Claude Code) that exited with status 0 while the SSH attachment stays
+    /// connected gives way to the remote interactive shell `Terminal SSH`
+    /// starts, in the same pane and on the same attachment, with no exit
+    /// banner. The banner's `Open shell` action starts the same shell after
+    /// any other end while the attachment is connected. The shell starts in
+    /// the explorer root once the directory reports the TUI made before it
+    /// ended are applied; the companion falls back to the launch folder when
+    /// that root is no longer usable on the server. A companion that cannot
+    /// start it leaves the exit banner with the reason.
+    fn poll_follow_up_shell(&mut self, now: Instant) {
+        let clean_tui_exit = matches!(
+            self.terminal_target,
+            TerminalTarget::RemoteOpenCode { .. }
+                | TerminalTarget::RemoteGrok { .. }
+                | TerminalTarget::RemoteClaude { .. }
+        ) && self
+            .terminal
+            .as_ref()
+            .is_some_and(TerminalPane::exited_cleanly);
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        let attached = remote_session_attached(remote);
+        match remote.shell_start {
+            ShellStart::Failed => {}
+            // A lost transport is not a TUI exit: the tab offers Reconnect.
+            ShellStart::Idle if !clean_tui_exit || !attached => {}
+            ShellStart::Idle => self.begin_follow_up_shell(now),
+            ShellStart::Waiting(_) | ShellStart::Settling(_) if !attached => {
+                remote.shell_start = ShellStart::Idle;
+            }
+            ShellStart::Waiting(since) => {
+                if remote.start_shell.is_some() {
+                    self.begin_follow_up_shell(now);
+                } else if remote.capabilities_request.is_none()
+                    || now.saturating_duration_since(since) >= REMOTE_SHELL_SETTLE
+                {
+                    self.fail_follow_up_shell(
+                        "The server's abilities are not known yet. Try again in a moment.",
+                    );
+                }
+            }
+            ShellStart::Settling(since) => {
+                if !remote.workspace.root_settled()
+                    && now.saturating_duration_since(since) < REMOTE_SHELL_SETTLE
+                {
+                    return;
+                }
+                let directory = remote.workspace.root().clone();
+                let fallback = remote.workspace.launch_directory().clone();
+                let request = remote.client.as_ref().map(|client| {
+                    client.request(
+                        made_remote::protocol::Operation::StartShell {
+                            directory,
+                            fallback,
+                        },
+                        None,
+                    )
+                });
+                match request {
+                    Some(Ok(id)) => remote.shell_start = ShellStart::Requested(id, now),
+                    _ => self.fail_follow_up_shell("The request could not be sent. Try again."),
+                }
+            }
+            ShellStart::Requested(_, since) => {
+                if now.saturating_duration_since(since) >= REMOTE_SHELL_START_TIMEOUT {
+                    self.fail_follow_up_shell(
+                        "The server did not answer. Check the connection and try again.",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Start the remote shell for the tab whose program ended: release the
+    /// TUI's follow, so the shell starts where it left the tab, and let the
+    /// explorer root settle. A companion that cannot decode the request is
+    /// never sent it; the banner says why.
+    fn begin_follow_up_shell(&mut self, now: Instant) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        match remote.start_shell {
+            Some(true) => {}
+            Some(false) => {
+                self.fail_follow_up_shell(
+                    "This server's Made helper is older than the app. Close this tab and open the server again to update it.",
+                );
+                return;
+            }
+            // The capabilities reply is on its way: wait for it, a moment at
+            // most; when it never comes, say that, not that the helper is old.
+            None => {
+                if remote.capabilities_request.is_some() {
+                    if !matches!(remote.shell_start, ShellStart::Waiting(_)) {
+                        remote.shell_start = ShellStart::Waiting(now);
+                    }
+                } else {
+                    self.fail_follow_up_shell(
+                        "The server's abilities are not known yet. Try again in a moment.",
+                    );
+                }
+                return;
+            }
+        }
+        // The TUI's own end of follow is not the user's navigation: the shell
+        // starts where the TUI left the tab.
+        let directory = remote.workspace.tui_exit_directory(now);
+        let _ = remote.workspace.release_tui_follow(directory);
+        remote.shell_start = ShellStart::Settling(now);
+        self.poll_follow_up_shell(now);
+    }
+
+    /// The exit banner's `Open shell` action of a remote tab whose SSH
+    /// transport is connected: start the remote shell in the same pane after
+    /// any end of its program, under the rules of a clean TUI exit. Returns
+    /// whether the action applies; a lost transport has Reconnect instead.
+    pub(crate) fn open_remote_shell(&mut self) -> bool {
+        let Some(remote) = self.remote.as_ref() else {
+            return false;
+        };
+        // The action belongs to the exit banner of a connected session.
+        if !remote_session_attached(remote)
+            || !self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.exit_banner_message().is_some())
+        {
+            return false;
+        }
+        match remote.shell_start {
+            // A start is on its way; the banner follows its outcome.
+            ShellStart::Waiting(..) | ShellStart::Settling(..) | ShellStart::Requested(..) => {}
+            ShellStart::Idle | ShellStart::Failed => {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.set_open_shell_failure(None);
+                }
+                self.begin_follow_up_shell(Instant::now());
+            }
+        }
+        true
+    }
+
+    /// The companion answered the request to start the remote shell. On
+    /// success the tab presents as a plain remote terminal tab, in the same
+    /// pane: the ended program's per-terminal integration state and launch
+    /// target are released. State a session channel carries goes when its
+    /// integration reports the disconnect.
+    fn finish_follow_up_shell(&mut self, reply: made_remote::protocol::WireEnvelope) {
+        use made_remote::protocol::{ErrorCode, Operation};
+        match reply.operation {
+            Operation::ShellStarted { path } => self.adopt_follow_up_shell(Some(path)),
+            // A child still runs in this terminal. A tab that saw its program
+            // end is out of step with a shell that already runs there: take
+            // that shell. Without an exit the program's state is unknown.
+            Operation::Error {
+                code: ErrorCode::InvalidRequest,
+            } => {
+                let ended = self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.exit_status().is_some());
+                if ended {
+                    self.adopt_follow_up_shell(None);
+                } else {
+                    self.fail_follow_up_shell(
+                        "The program may still be running on the server, so no shell was started. Close this tab and open the server again if it does not respond.",
+                    );
+                }
+            }
+            _ => self.fail_follow_up_shell(
+                "The server could not start it. Try again, or close this tab and open the server again.",
+            ),
+        }
+    }
+
+    /// The tab's terminal now runs the remote shell, started in `path` (or
+    /// already running there when the folder is not known).
+    fn adopt_follow_up_shell(&mut self, path: Option<made_remote::protocol::RemotePath>) {
+        let Some(authority) = self.terminal_target.authority() else {
+            return;
+        };
+        self.diag.log_mut().record(
+            LogLevel::Info,
+            format!(
+                "terminal {} ended; the remote shell started",
+                self.terminal_target.log_label()
+            ),
+        );
+        self.teardown_tab_states();
+        self.terminal_target = TerminalTarget::RemoteShell { authority };
+        if let Some(remote) = self.remote.as_mut() {
+            // Whichever answer told the tab, the terminal's child is a new one:
+            // a reset can have discarded the `ShellStarted` that does this
+            // for the client, so it is done here as well.
+            if let Some(client) = remote.client.as_ref() {
+                client.child_replaced();
+            }
+            remote.opencode = false;
+            remote.grok = false;
+            remote.claude = false;
+            remote.shell_start = ShellStart::Idle;
+            // The shell may have started in the launch folder instead.
+            if let Some(path) = path.filter(|path| remote.workspace.shell_cwd() != Some(path)) {
+                let identity = remote.workspace.identity().clone();
+                let _ = remote.workspace.report_shell_cwd(&identity, path);
+            }
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.restart_remote_in_place(self.terminal_target);
+        }
+    }
+
+    /// The remote shell cannot be started: the tab keeps the exit banner and
+    /// its `Open shell` action, now with the reason. Nothing runs locally and
+    /// nothing is retried until the user asks again.
+    fn fail_follow_up_shell(&mut self, reason: &str) {
+        self.diag.log_mut().record(
+            LogLevel::Warn,
+            format!(
+                "terminal {} ended; the remote shell could not start: {reason}",
+                self.terminal_target.log_label()
+            ),
+        );
+        if let Some(remote) = self.remote.as_mut() {
+            remote.shell_start = ShellStart::Failed;
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.force_exit_banner();
+            terminal.set_open_shell_failure(Some(reason.to_owned()));
+        }
     }
 
     fn pump_remote_terminal(&mut self) -> bool {
@@ -5948,6 +6390,9 @@ fn operation_name(operation: &made_remote::protocol::Operation) -> &'static str 
         Operation::Preview { .. } => "Preview",
         Operation::Refresh { .. } => "Refresh",
         Operation::Watch { .. } => "Watch",
+        Operation::WatchDir { .. } => "WatchDir",
+        Operation::UnwatchDir { .. } => "UnwatchDir",
+        Operation::GitChanged => "GitChanged",
         Operation::Rescan { .. } => "Rescan",
         Operation::GitRead { .. } => "GitRead",
         Operation::SessionState => "SessionState",
@@ -5965,6 +6410,22 @@ mod tests {
     use crate::integrations::claude_code::launch::{CLAUDE_CODE_PLUGIN_DIRS_ENV, CLAUDE_SPOOL_ENV};
     use crate::integrations::grok::diagnostics::GrokDiagnosticsRow;
     use crate::integrations::{claude_code, grok, GROK, OPENCODE};
+
+    #[test]
+    fn reattach_asks_for_the_previous_pane_size_not_the_default() {
+        use crate::remote_session::SessionOpen;
+        let mut log = crate::diagnostics::DiagnosticLog::new();
+        let mut pane = TerminalPane::open_remote(TerminalTarget::Shell, 40, 160);
+        pane.resize(50, 200, &mut log);
+        let default = (DEFAULT_ROWS as u16, DEFAULT_COLS as u16);
+        assert_eq!(
+            remote_open_size(SessionOpen::Reattach, Some(&pane)),
+            (50, 200)
+        );
+        // A new session has no earlier size; a reattach without a pane too.
+        assert_eq!(remote_open_size(SessionOpen::New, Some(&pane)), default);
+        assert_eq!(remote_open_size(SessionOpen::Reattach, None), default);
+    }
 
     #[test]
     fn the_claude_ops_gate_ignores_pre_release_and_build_suffixes() {
@@ -8136,6 +8597,8 @@ mod tests {
             stream: FakeRemoteStream,
             identity: Identity,
             root: RemotePath,
+            /// Every root the tab asked the companion to select, in order.
+            selected: Vec<RemotePath>,
         }
 
         impl RemoteBench {
@@ -8235,6 +8698,10 @@ mod tests {
         }
 
         fn remote_bench() -> RemoteBench {
+            remote_bench_at(remote_path("/home/vscode"))
+        }
+
+        fn remote_bench_at(root: RemotePath) -> RemoteBench {
             let mut registry =
                 crate::ssh_servers::ServerRegistry::load(MemoryServerStorage(None)).unwrap();
             let authority = registry
@@ -8248,7 +8715,6 @@ mod tests {
                 })
                 .unwrap();
             let snapshot = registry.snapshot(authority).unwrap();
-            let root = remote_path("/home/vscode");
             let identity = Identity {
                 authority,
                 tab: made_remote::protocol::TabCapability::random().unwrap(),
@@ -8263,6 +8729,9 @@ mod tests {
             remote.workspace = workspace;
             remote.phase = RemotePhase::Ready;
             workbench.remote = Some(remote);
+            // A shown tab: a hidden one only marks changes (see
+            // `a_hidden_remote_tab_reloads_what_changed_when_shown`).
+            workbench.visible = true;
             let stream = FakeRemoteStream {
                 events: Arc::new(Mutex::new(VecDeque::new())),
                 written: Arc::new(Mutex::new(Vec::new())),
@@ -8279,6 +8748,7 @@ mod tests {
                 stream,
                 identity,
                 root,
+                selected: Vec::new(),
             }
         }
 
@@ -8445,6 +8915,8 @@ mod tests {
                                         helper_version: "test".to_owned(),
                                         grok: false,
                                         python3: false,
+                                        watch_dirs: false,
+                                        start_shell: false,
                                     },
                                 },
                             );
@@ -9739,6 +10211,9 @@ mod tests {
                     helper_version: helper.to_owned(),
                     grok: false,
                     python3: false,
+                    // A supervisor of this release subscribes per directory.
+                    watch_dirs: helper == APP_VERSION,
+                    start_shell: false,
                 },
             }
         }
@@ -9758,7 +10233,19 @@ mod tests {
                     result
                 }
                 Operation::List { path } => listed(path),
-                Operation::Watch { path } => Operation::Changed { path: path.clone() },
+                Operation::Watch { path } | Operation::WatchDir { path } => {
+                    Operation::Changed { path: path.clone() }
+                }
+                Operation::UnwatchDir { .. } => Operation::Ack,
+                // A repository, so Git is worth asking about.
+                Operation::GitRead {
+                    command: made_remote::protocol::GitRead::ShowToplevel,
+                } => Operation::GitResult {
+                    command: made_remote::protocol::GitRead::ShowToplevel,
+                    offset: 0,
+                    data: Chunk::new(b"/home/vscode\n".to_vec()).unwrap(),
+                    done: true,
+                },
                 Operation::GitRead { .. } | Operation::SessionState | Operation::GrokState => {
                     Operation::Error {
                         code: ErrorCode::Unavailable,
@@ -10854,6 +11341,2035 @@ mod tests {
             );
             assert_eq!(remote.workspace.root(), &session_root);
         }
+
+        // ---- Remote TUI exit (SSH-05) ----
+
+        /// Output a TUI leaves behind: a last line on the primary screen, then
+        /// the alternate screen, mouse reporting and bracketed paste, none of
+        /// which it leaves again.
+        const TUI_SCREEN: &[u8] = b"last line\r\n\x1b[?1049h\x1b[?1000h\x1b[?2004hinside";
+        /// What the companion relays when it starts the shell: the modes the
+        /// TUI set are left, in the data lane behind the TUI's own output.
+        const LEFT_MODES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?2004l";
+
+        /// An attached remote tab launched as `kind` ("shell", "opencode",
+        /// "grok" or "claude") whose supervisor decodes the newest operations,
+        /// as its `Capabilities.helper_version` would have said.
+        fn attached_bench(kind: &str) -> (RemoteBench, u64) {
+            let mut bench = remote_bench();
+            let authority = bench.identity.authority;
+            {
+                let remote = bench.workbench.remote.as_mut().unwrap();
+                remote.opencode = kind == "opencode";
+                remote.grok = kind == "grok";
+                remote.claude = kind == "claude";
+            }
+            bench.workbench.terminal_target = match kind {
+                "shell" => TerminalTarget::RemoteShell { authority },
+                "opencode" => TerminalTarget::RemoteOpenCode { authority },
+                "grok" => TerminalTarget::RemoteGrok { authority },
+                _ => TerminalTarget::RemoteClaude { authority },
+            };
+            let attach = bench.attach();
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::Attached,
+            ));
+            bench.send(WireEnvelope::new(
+                bench.identity.clone(),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ));
+            wait_for_attach(&mut bench);
+            for _ in 0..400 {
+                bench.pump();
+                if !bench.workbench.remote.as_ref().unwrap().holding_input {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            bench.workbench.remote.as_mut().unwrap().start_shell = Some(true);
+            (bench, attach)
+        }
+
+        /// What the companion answers to the tab's root traffic.
+        fn answer_roots(bench: &mut RemoteBench, frame: &WireEnvelope) {
+            match &frame.operation {
+                Operation::RootValidate { path } => bench.reply(frame, root_result(frame, path)),
+                Operation::RootSelect { path } => {
+                    bench.selected.push(path.clone());
+                    let mut result = root_result(frame, path);
+                    if let Operation::RootResult { generation, .. } = &mut result {
+                        *generation += 1;
+                    }
+                    bench.reply(frame, result);
+                }
+                Operation::List { path } => bench.reply(frame, listed(path)),
+                _ => {}
+            }
+        }
+
+        /// Run the tab's real remote tick until `handle` stops it.
+        fn tick_until(
+            bench: &mut RemoteBench,
+            mut handle: impl FnMut(&mut RemoteBench, Option<WireEnvelope>) -> bool,
+        ) {
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                bench.workbench.tick_remote(&ctx);
+                for frame in bench.take_written() {
+                    if handle(bench, Some(frame)) {
+                        return;
+                    }
+                }
+                if handle(bench, None) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("remote workbench did not reach the expected state");
+        }
+
+        /// Tick for `ticks` rounds, answering root traffic, and return what
+        /// the tab wrote.
+        fn tick_collect(bench: &mut RemoteBench, ticks: usize) -> Vec<WireEnvelope> {
+            let ctx = egui::Context::default();
+            let mut written = Vec::new();
+            for _ in 0..ticks {
+                bench.workbench.tick_remote(&ctx);
+                for frame in bench.take_written() {
+                    answer_roots(bench, &frame);
+                    written.push(frame);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            written
+        }
+
+        fn remote_exit(bench: &RemoteBench, attach: u64, code: u32) {
+            bench.send(WireEnvelope::new(
+                current_identity(bench),
+                attach,
+                Operation::TerminalExit { code },
+            ));
+        }
+
+        fn is_start_shell(frame: &WireEnvelope) -> bool {
+            matches!(frame.operation, Operation::StartShell { .. })
+        }
+
+        /// Tick until the tab asked the companion to start its shell.
+        fn await_start_shell(bench: &mut RemoteBench) -> (WireEnvelope, RemotePath, RemotePath) {
+            let mut start = None;
+            tick_until(bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    answer_roots(bench, &frame);
+                    if is_start_shell(&frame) {
+                        start = Some(frame);
+                    }
+                }
+                start.is_some()
+            });
+            let frame = start.unwrap();
+            let Operation::StartShell {
+                directory,
+                fallback,
+            } = frame.operation.clone()
+            else {
+                unreachable!()
+            };
+            (frame, directory, fallback)
+        }
+
+        fn banner(bench: &RemoteBench) -> Option<String> {
+            bench
+                .workbench
+                .terminal
+                .as_ref()
+                .and_then(TerminalPane::exit_banner_message)
+        }
+
+        /// Answer the start the way the companion does, relay the modes it
+        /// leaves, and wait for the tab to present as the plain remote shell
+        /// started in `path` with its explorer there.
+        fn finish_start_shell(
+            bench: &mut RemoteBench,
+            attach: u64,
+            start: &WireEnvelope,
+            path: &RemotePath,
+        ) {
+            bench.reply(start, Operation::ShellStarted { path: path.clone() });
+            bench.send(WireEnvelope::new(
+                current_identity(bench),
+                attach,
+                Operation::TerminalOutput {
+                    data: Chunk::new(LEFT_MODES.to_vec()).unwrap(),
+                    done: false,
+                },
+            ));
+            tick_until(bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    answer_roots(bench, &frame);
+                }
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                matches!(
+                    bench.workbench.terminal_target,
+                    TerminalTarget::RemoteShell { .. }
+                ) && remote.workspace.root() == path
+                    && remote.workspace.shell_cwd() == Some(path)
+                    && !bench
+                        .workbench
+                        .terminal
+                        .as_ref()
+                        .unwrap()
+                        .alternate_screen()
+            });
+        }
+
+        /// Spec `Remote TUI exits cleanly`: the same pane, still attached to
+        /// the same server, gets the remote shell in the followed folder with
+        /// the screen kept, no banner and no new login.
+        #[test]
+        fn a_clean_remote_tui_exit_starts_the_remote_shell_in_the_followed_folder() {
+            let (mut bench, attach) = attached_bench("grok");
+            let followed = remote_path("/grok-a");
+            remote_terminal_bytes(&mut bench, attach, TUI_SCREEN);
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &followed);
+            assert!(bench.workbench.remote_grok_running());
+            let identity = current_identity(&bench);
+
+            remote_exit(&bench, attach, 0);
+            let (start, _, _) = await_start_shell(&mut bench);
+            // The companion's tracker then reports the TUI gone, which on its
+            // own would hand the explorer back to the launch folder.
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(2, false, vec![]),
+            ));
+            match &start.operation {
+                Operation::StartShell {
+                    directory,
+                    fallback,
+                } => {
+                    assert_eq!(directory, &followed, "the tab's current explorer root");
+                    assert_eq!(fallback, &bench.root, "the tab's launch folder");
+                }
+                other => panic!("expected StartShell, got {other:?}"),
+            }
+            assert_eq!(banner(&bench), None, "no banner while the shell starts");
+            assert!(bench
+                .workbench
+                .terminal
+                .as_ref()
+                .unwrap()
+                .exit_status()
+                .is_some());
+
+            finish_start_shell(&mut bench, attach, &start, &followed);
+            let written = tick_collect(&mut bench, 10);
+            assert!(
+                written.iter().all(|frame| !matches!(
+                    frame.operation,
+                    Operation::Open { .. }
+                        | Operation::Attach { .. }
+                        | Operation::StartShell { .. }
+                )),
+                "nothing reopens or restarts anything: {written:?}"
+            );
+            assert!(
+                bench.selected.is_empty(),
+                "the explorer never left the followed folder after the exit: {:?}",
+                bench.selected
+            );
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(
+                !remote.opencode && !remote.grok && !remote.claude,
+                "no TUI launch target is left on the tab"
+            );
+            assert!(matches!(remote.phase, RemotePhase::Ready));
+            assert!(remote.prompt.is_none(), "no authentication or trust prompt");
+            assert_eq!(
+                remote.client.as_ref().map(|client| client.identity()),
+                Some(identity),
+                "the same attachment"
+            );
+            let terminal = bench.workbench.terminal.as_ref().unwrap();
+            assert_eq!(banner(&bench), None);
+            assert!(terminal.exit_status().is_none());
+            assert!(terminal.is_running() && !terminal.input_paused());
+            assert_eq!(terminal.pid(), None, "nothing runs on this host");
+            assert!(!terminal.alternate_screen());
+            assert!(
+                terminal.screen_text().contains("last line"),
+                "{}",
+                terminal.screen_text()
+            );
+            assert!(!bench.workbench.remote_grok_running());
+            assert!(bench.workbench.remote_grok_activities().is_empty());
+            assert!(
+                crate::ui::tab_brand(&bench.workbench).is_none(),
+                "the tab presents as a plain remote terminal"
+            );
+            assert_eq!(
+                bench.workbench.terminal_target().program_label(),
+                "Terminal SSH"
+            );
+            assert!(
+                bench.workbench.remote_host().is_some(),
+                "the SSH host badge stays"
+            );
+
+            // The shell started after a TUI exit closes the tab like any other.
+            assert!(!bench.workbench.shell_exited_cleanly());
+            remote_exit(&bench, attach, 0);
+            tick_collect(&mut bench, 3);
+            assert!(bench.workbench.shell_exited_cleanly());
+        }
+
+        /// The companion reports the TUI's session gone in the same moment as
+        /// its exit, and that report can reach the tab first. The shell still
+        /// starts in the folder the TUI had the tab in, and the explorer ends
+        /// there.
+        #[test]
+        fn a_tui_release_that_precedes_its_exit_does_not_change_the_shell_folder() {
+            let (mut bench, attach) = attached_bench("grok");
+            let followed = remote_path("/grok-a");
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &followed);
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(2, false, vec![]),
+            ));
+            remote_exit(&bench, attach, 0);
+            let (start, directory, fallback) = await_start_shell(&mut bench);
+            assert_eq!(directory, followed, "where the TUI had the tab");
+            assert_eq!(fallback, bench.root);
+            assert_eq!(banner(&bench), None);
+            finish_start_shell(&mut bench, attach, &start, &followed);
+            assert_eq!(
+                bench.workbench.remote.as_ref().unwrap().workspace.root(),
+                &followed
+            );
+        }
+
+        /// The same for remote OpenCode and Claude Code, which follow no
+        /// folder of their own here.
+        #[test]
+        fn a_clean_exit_of_remote_opencode_and_claude_code_starts_the_shell_too() {
+            for kind in ["opencode", "claude"] {
+                let (mut bench, attach) = attached_bench(kind);
+                remote_terminal_bytes(&mut bench, attach, TUI_SCREEN);
+                remote_exit(&bench, attach, 0);
+                let (start, directory, fallback) = await_start_shell(&mut bench);
+                assert_eq!(directory, bench.root, "{kind}");
+                assert_eq!(fallback, bench.root, "{kind}");
+                assert_eq!(banner(&bench), None, "{kind}");
+                let root = bench.root.clone();
+                finish_start_shell(&mut bench, attach, &start, &root);
+                assert!(crate::ui::tab_brand(&bench.workbench).is_none(), "{kind}");
+                assert!(!bench.workbench.remote_opencode_active(), "{kind}");
+                if kind == "claude" {
+                    assert!(!bench.workbench.claude_tab().unwrap().present());
+                }
+                assert!(bench.workbench.terminal.as_ref().unwrap().is_running());
+            }
+        }
+
+        /// Spec `Remote TUI exits cleanly`, second run: the followed folder is
+        /// gone on the server, the companion starts the shell in the launch
+        /// folder and the explorer follows it there.
+        #[test]
+        fn a_remote_tui_exit_with_a_removed_root_starts_the_shell_in_the_launch_folder() {
+            let (mut bench, attach) = attached_bench("grok");
+            let followed = remote_path("/grok-a");
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &followed);
+            remote_exit(&bench, attach, 0);
+            let (start, directory, fallback) = await_start_shell(&mut bench);
+            assert_eq!(directory, followed);
+            assert_eq!(fallback, bench.root);
+            // `directory` is not a usable directory on the server any more:
+            // the companion reports the launch folder it started in.
+            let launch = bench.root.clone();
+            finish_start_shell(&mut bench, attach, &start, &launch);
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert_eq!(remote.workspace.root(), &launch);
+            assert_eq!(banner(&bench), None);
+        }
+
+        /// Spec `Remote shell exits cleanly`: a clean exit of Terminal SSH
+        /// closes the tab; a TUI's does not.
+        #[test]
+        fn a_clean_remote_shell_exit_closes_the_tab_but_a_tui_exit_does_not() {
+            let (mut bench, attach) = attached_bench("shell");
+            assert!(!bench.workbench.shell_exited_cleanly());
+            remote_exit(&bench, attach, 0);
+            tick_collect(&mut bench, 3);
+            assert!(
+                bench.workbench.shell_exited_cleanly(),
+                "the app closes such a tab as its close action does"
+            );
+            assert_eq!(banner(&bench), None, "no banner on the way out");
+
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 0);
+            tick_collect(&mut bench, 3);
+            assert!(
+                !bench.workbench.shell_exited_cleanly(),
+                "a TUI's clean exit starts the shell instead of closing the tab"
+            );
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected` for the
+        /// shell: non-zero, signal and a lost transport keep the tab.
+        #[test]
+        fn an_unclean_remote_shell_end_keeps_the_tab_and_the_banner() {
+            for code in [3, 1] {
+                let (mut bench, attach) = attached_bench("shell");
+                remote_exit(&bench, attach, code);
+                tick_collect(&mut bench, 3);
+                assert!(!bench.workbench.shell_exited_cleanly(), "code {code}");
+                assert_eq!(
+                    banner(&bench),
+                    Some(format!("Terminal SSH exited (exit code {code})."))
+                );
+                assert_eq!(action_label(&bench), "Open shell");
+            }
+            let (mut bench, attach) = attached_bench("shell");
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            remote_exit(&bench, attach, 0);
+            tick_collect(&mut bench, 3);
+            assert!(
+                !bench.workbench.shell_exited_cleanly(),
+                "a lost transport is not a clean exit"
+            );
+            assert!(bench.workbench.remote_can_reconnect());
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected` for a TUI:
+        /// no shell is started, nothing runs locally.
+        #[test]
+        fn an_unclean_remote_tui_end_keeps_the_banner_and_starts_no_shell() {
+            for code in [3, 1] {
+                let (mut bench, attach) = attached_bench("grok");
+                remote_exit(&bench, attach, code);
+                let written = tick_collect(&mut bench, 40);
+                assert!(!written.iter().any(is_start_shell), "code {code}");
+                assert_eq!(
+                    banner(&bench),
+                    Some(format!("Grok SSH exited (exit code {code})."))
+                );
+                assert_eq!(action_label(&bench), "Open shell");
+                assert!(matches!(
+                    bench.workbench.terminal_target,
+                    TerminalTarget::RemoteGrok { .. }
+                ));
+                assert_eq!(bench.workbench.terminal.as_ref().unwrap().pid(), None);
+            }
+            // The transport dropped with the exit: not a TUI exit.
+            let (mut bench, attach) = attached_bench("claude");
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            remote_exit(&bench, attach, 0);
+            let written = tick_collect(&mut bench, 40);
+            assert!(!written.iter().any(is_start_shell));
+            assert!(
+                bench.workbench.remote_can_reconnect(),
+                "the tab offers Reconnect on its transport card"
+            );
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected`: the
+        /// companion cannot start the shell (it refuses, or is too old to
+        /// know the request), so the user keeps the banner, once, with no retry.
+        #[test]
+        fn a_failed_shell_start_keeps_the_banner_and_the_open_shell_action() {
+            // The companion refuses.
+            let (mut bench, attach) = attached_bench("grok");
+            remote_terminal_bytes(&mut bench, attach, TUI_SCREEN);
+            remote_exit(&bench, attach, 0);
+            let (start, _, _) = await_start_shell(&mut bench);
+            bench.reply(
+                &start,
+                Operation::Error {
+                    code: ErrorCode::Unavailable,
+                },
+            );
+            let written = tick_collect(&mut bench, 40);
+            assert!(!written.iter().any(is_start_shell), "never retried");
+            assert!(banner(&bench)
+                .is_some_and(|text| text.starts_with("Grok SSH exited (exit code 0).")
+                    && text.contains("Could not open a shell")));
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteGrok { .. }
+            ));
+            assert_eq!(bench.workbench.terminal.as_ref().unwrap().pid(), None);
+            assert!(!bench.workbench.shell_exited_cleanly());
+
+            // A companion from before the request existed is never sent it,
+            // and a companion whose abilities never arrived is not called old.
+            for (supported, request, reason) in
+                [(Some(false), true, "older"), (None, false, "not known yet")]
+            {
+                let (mut bench, attach) = attached_bench("grok");
+                let remote = bench.workbench.remote.as_mut().unwrap();
+                remote.start_shell = supported;
+                if !request {
+                    remote.capabilities_request = None;
+                }
+                remote_exit(&bench, attach, 0);
+                let written = tick_collect(&mut bench, 40);
+                assert!(!written.iter().any(is_start_shell), "{supported:?}");
+                let text = banner(&bench).unwrap();
+                assert!(
+                    text.starts_with("Grok SSH exited (exit code 0).") && text.contains(reason),
+                    "{supported:?}: {text}"
+                );
+                assert_eq!(text.contains("older"), reason == "older", "{text}");
+            }
+        }
+
+        /// The abilities reply of the companion is still on its way when the
+        /// TUI exits: the tab waits for it, a moment at most, rather than call
+        /// the companion old; the banner stays off meanwhile.
+        #[test]
+        fn a_clean_exit_waits_for_the_companions_abilities() {
+            let (mut bench, attach) = attached_bench("grok");
+            bench.workbench.remote.as_mut().unwrap().start_shell = None;
+            remote_exit(&bench, attach, 0);
+            let written = tick_collect(&mut bench, 20);
+            assert!(!written.iter().any(is_start_shell));
+            assert_eq!(banner(&bench), None, "no banner while it waits");
+            // The reply arrives.
+            bench.workbench.remote.as_mut().unwrap().start_shell = Some(true);
+            let (start, _, _) = await_start_shell(&mut bench);
+            let root = bench.root.clone();
+            finish_start_shell(&mut bench, attach, &start, &root);
+            assert_eq!(banner(&bench), None);
+        }
+
+        /// A root transition resets the client and drops the pending start
+        /// request with its answer: the tab asks again, and the answer to the
+        /// second request is the one it takes.
+        #[test]
+        fn a_root_transition_does_not_lose_the_start_request() {
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 0);
+            let (first, _, _) = await_start_shell(&mut bench);
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    9,
+                    true,
+                    vec![grok_session("b", Some("/grok-b"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            let mut second = None;
+            tick_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    answer_roots(bench, &frame);
+                    if is_start_shell(&frame) {
+                        second = Some(frame);
+                    }
+                }
+                second.is_some()
+            });
+            let second = second.unwrap();
+            assert_ne!(second.request_id, first.request_id);
+            // Asked again once, after the transition, with the new root.
+            match &second.operation {
+                Operation::StartShell { directory, .. } => {
+                    assert_eq!(directory, &remote_path("/grok-b"));
+                }
+                other => panic!("expected StartShell, got {other:?}"),
+            }
+            let more = tick_collect(&mut bench, 20);
+            assert!(!more.iter().any(is_start_shell), "asked once: {more:?}");
+            let root = remote_path("/grok-b");
+            finish_start_shell(&mut bench, attach, &second, &root);
+            assert_eq!(banner(&bench), None);
+        }
+
+        /// A client reset can discard the `ShellStarted` that resets the
+        /// client's terminal; the tab that then adopts the shell (its second
+        /// request answered `InvalidRequest`) resets it itself, so the shell
+        /// takes input and resizes.
+        #[test]
+        fn an_adopted_shell_takes_input_after_a_reset_discarded_the_answer() {
+            use made_terminal::TerminalTransport;
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 0);
+            let (_first, _, _) = await_start_shell(&mut bench);
+            // The exit made the client's terminal read as ended.
+            let mut transport = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .terminal_transport();
+            assert!(transport.write(b"x").is_err());
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    9,
+                    true,
+                    vec![grok_session("b", Some("/grok-b"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            let mut second = None;
+            tick_until(&mut bench, |bench, frame| {
+                if let Some(frame) = frame {
+                    answer_roots(bench, &frame);
+                    if is_start_shell(&frame) {
+                        second = Some(frame);
+                    }
+                }
+                second.is_some()
+            });
+            // The companion had started the shell already.
+            bench.reply(
+                &second.unwrap(),
+                Operation::Error {
+                    code: ErrorCode::InvalidRequest,
+                },
+            );
+            tick_collect(&mut bench, 10);
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteShell { .. }
+            ));
+            assert_eq!(
+                transport.status(),
+                made_terminal::TransportStatus::Connected
+            );
+            assert!(transport.write(b"x").is_ok(), "input reaches the shell");
+            assert!(transport.resize(30, 100).is_ok(), "and so does a resize");
+        }
+
+        /// The companion refuses a start while the child's state is unknown
+        /// (its monitor failed, the pane has no exit): the tab keeps its
+        /// program and says why; it does not adopt a shell.
+        #[test]
+        fn a_refusal_without_an_ended_program_is_a_reason_not_an_adoption() {
+            let (mut bench, attach) = attached_bench("grok");
+            bench.workbench.remote.as_mut().unwrap().shell_start =
+                ShellStart::Requested(1, Instant::now());
+            bench.workbench.finish_follow_up_shell(WireEnvelope::new(
+                current_identity(&bench),
+                1,
+                Operation::Error {
+                    code: ErrorCode::InvalidRequest,
+                },
+            ));
+            let _ = attach;
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteGrok { .. }
+            ));
+            assert_eq!(
+                bench.workbench.remote.as_ref().unwrap().shell_start,
+                ShellStart::Failed
+            );
+        }
+
+        /// A reattach after the companion started the shell, whose answer the
+        /// tab never saw: the capabilities say a shell runs, and the tab takes
+        /// it, so that shell's exit closes the tab instead of starting another.
+        #[test]
+        fn a_reattach_that_finds_the_started_shell_takes_it() {
+            let (mut bench, attach) = attached_bench("grok");
+            let request = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .capabilities_request
+                .expect("the abilities are asked for after the attach");
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                request,
+                Operation::CapabilitiesResult {
+                    capabilities: made_remote::protocol::Capabilities {
+                        target: made_remote::protocol::RemoteTarget::LinuxX64,
+                        tmux: false,
+                        opencode: false,
+                        shell_cwd: true,
+                        helper_version: env!("CARGO_PKG_VERSION").to_owned(),
+                        grok: false,
+                        python3: false,
+                        start_shell: true,
+                        watch_dirs: false,
+                    },
+                },
+            ));
+            tick_collect(&mut bench, 10);
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteShell { .. }
+            ));
+            remote_exit(&bench, attach, 0);
+            let written = tick_collect(&mut bench, 10);
+            assert!(!written.iter().any(is_start_shell), "no second shell");
+            assert!(bench.workbench.shell_exited_cleanly(), "its exit closes");
+        }
+
+        /// The companion still has a child running: a tab that saw its
+        /// program end takes the shell that runs there; a tab that did not
+        /// keeps its banner with the reason.
+        #[test]
+        fn a_refused_start_over_a_running_child_resyncs_or_says_why() {
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            bench.workbench.restart_terminal();
+            let (start, _, _) = await_start_shell(&mut bench);
+            bench.reply(
+                &start,
+                Operation::Error {
+                    code: ErrorCode::InvalidRequest,
+                },
+            );
+            tick_collect(&mut bench, 10);
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteShell { .. }
+            ));
+            let terminal = bench.workbench.terminal.as_ref().unwrap();
+            assert!(terminal.exit_status().is_none() && terminal.is_running());
+            assert_eq!(banner(&bench), None);
+        }
+
+        /// The banner action of an exited remote pane never runs a program on
+        /// this host.
+        #[test]
+        fn the_banner_action_of_an_exited_remote_pane_runs_nothing_locally() {
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            assert_eq!(bench.workbench.terminal.as_ref().unwrap().pid(), None);
+            bench.workbench.restart_terminal();
+            assert_eq!(
+                bench.workbench.terminal.as_ref().unwrap().pid(),
+                None,
+                "no local process was started in the remote pane"
+            );
+            assert!(bench
+                .workbench
+                .terminal
+                .as_ref()
+                .unwrap()
+                .exit_status()
+                .is_some());
+        }
+
+        // ---- `Open shell`: the banner action of a connected remote tab ----
+
+        fn action_label(bench: &RemoteBench) -> String {
+            bench
+                .workbench
+                .terminal
+                .as_ref()
+                .unwrap()
+                .banner_action_label()
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected`: every
+        /// unclean end of every kind of remote tab, and a follow-up shell that
+        /// could not start, show the banner with `Open shell` and no
+        /// Reconnect.
+        #[test]
+        fn an_unclean_remote_end_offers_open_shell_while_the_transport_is_connected() {
+            for kind in ["shell", "opencode", "grok", "claude"] {
+                for code in [3, 1] {
+                    let (mut bench, attach) = attached_bench(kind);
+                    remote_exit(&bench, attach, code);
+                    tick_collect(&mut bench, 3);
+                    assert!(banner(&bench).is_some(), "{kind} {code}");
+                    assert_eq!(action_label(&bench), "Open shell", "{kind} {code}");
+                }
+            }
+            // A clean TUI exit whose shell the companion refused to start.
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 0);
+            let (start, _, _) = await_start_shell(&mut bench);
+            bench.reply(
+                &start,
+                Operation::Error {
+                    code: ErrorCode::Unavailable,
+                },
+            );
+            tick_collect(&mut bench, 5);
+            assert!(banner(&bench).is_some());
+            assert_eq!(action_label(&bench), "Open shell");
+            // A companion that cannot decode the request.
+            let (mut bench, attach) = attached_bench("claude");
+            bench.workbench.remote.as_mut().unwrap().start_shell = Some(false);
+            remote_exit(&bench, attach, 0);
+            tick_collect(&mut bench, 5);
+            assert!(banner(&bench).is_some());
+            assert_eq!(action_label(&bench), "Open shell");
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected`:
+        /// activating it starts the shell in the explorer root with the screen
+        /// kept and the ended program released.
+        #[test]
+        fn open_shell_starts_the_remote_shell_after_an_unclean_end() {
+            let (mut bench, attach) = attached_bench("grok");
+            let followed = remote_path("/grok-a");
+            remote_terminal_bytes(&mut bench, attach, TUI_SCREEN);
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &followed);
+            let identity = current_identity(&bench);
+            remote_exit(&bench, attach, 3);
+            let written = tick_collect(&mut bench, 5);
+            assert!(
+                !written.iter().any(is_start_shell),
+                "nothing starts by itself"
+            );
+            assert_eq!(
+                banner(&bench),
+                Some("Grok SSH exited (exit code 3).".to_owned())
+            );
+
+            bench.workbench.restart_terminal();
+            let (start, directory, fallback) = await_start_shell(&mut bench);
+            assert_eq!(directory, followed, "the tab's current explorer root");
+            assert_eq!(fallback, bench.root, "the tab's launch folder");
+            finish_start_shell(&mut bench, attach, &start, &followed);
+            let written = tick_collect(&mut bench, 10);
+            assert!(
+                written.iter().all(|frame| !matches!(
+                    frame.operation,
+                    Operation::Open { .. }
+                        | Operation::Attach { .. }
+                        | Operation::TerminalInput { .. }
+                )),
+                "no reopen, no replayed input: {written:?}"
+            );
+            let remote = bench.workbench.remote.as_ref().unwrap();
+            assert!(matches!(remote.phase, RemotePhase::Ready));
+            assert!(remote.prompt.is_none(), "no authentication or trust prompt");
+            assert_eq!(
+                remote.client.as_ref().map(|client| client.identity()),
+                Some(identity)
+            );
+            assert!(!remote.opencode && !remote.grok && !remote.claude);
+            let terminal = bench.workbench.terminal.as_ref().unwrap();
+            assert_eq!(banner(&bench), None);
+            assert!(terminal.exit_status().is_none() && terminal.is_running());
+            assert_eq!(terminal.pid(), None, "nothing runs on this host");
+            assert!(terminal.screen_text().contains("last line"));
+            assert!(!bench.workbench.remote_grok_running());
+            assert!(crate::ui::tab_brand(&bench.workbench).is_none());
+            assert!(bench.workbench.remote_host().is_some());
+            assert_eq!(
+                bench.workbench.terminal_target().program_label(),
+                "Terminal SSH"
+            );
+        }
+
+        /// The same for a remote shell that ended unclean, and in the launch
+        /// folder when the explorer root is not usable.
+        #[test]
+        fn open_shell_restarts_a_remote_shell_and_falls_back_to_the_launch_folder() {
+            let (mut bench, attach) = attached_bench("shell");
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            bench.workbench.restart_terminal();
+            let (start, directory, fallback) = await_start_shell(&mut bench);
+            assert_eq!(
+                (directory, fallback),
+                (bench.root.clone(), bench.root.clone())
+            );
+            let root = bench.root.clone();
+            finish_start_shell(&mut bench, attach, &start, &root);
+            // A shell tab is a shell tab before and after: wait for the pane
+            // to take the new child.
+            tick_collect(&mut bench, 10);
+            let terminal = bench.workbench.terminal.as_ref().unwrap();
+            assert!(terminal.exit_status().is_none() && terminal.is_running());
+            assert_eq!(banner(&bench), None);
+
+            // The followed folder is gone: the companion started in the launch
+            // folder and the explorer follows it there.
+            let (mut bench, attach) = attached_bench("grok");
+            let followed = remote_path("/grok-a");
+            bench.send(grok_snapshot_envelope(
+                &current_identity(&bench),
+                attach,
+                grok_snapshot(
+                    1,
+                    true,
+                    vec![grok_session("a", Some("/grok-a"), 1, GrokActivity::Idle)],
+                ),
+            ));
+            settle_grok_root(&mut bench, &followed);
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            bench.workbench.restart_terminal();
+            let (start, _, _) = await_start_shell(&mut bench);
+            let launch = bench.root.clone();
+            finish_start_shell(&mut bench, attach, &start, &launch);
+            assert_eq!(
+                bench.workbench.remote.as_ref().unwrap().workspace.root(),
+                &launch
+            );
+        }
+
+        /// Spec `Unclean remote end offers Open shell while connected`: a
+        /// refused start keeps the banner with an actionable reason, and the
+        /// action can be tried again.
+        #[test]
+        fn a_failed_open_shell_keeps_the_banner_with_a_reason_and_can_be_retried() {
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            bench.workbench.restart_terminal();
+            let (start, _, _) = await_start_shell(&mut bench);
+            bench.reply(
+                &start,
+                Operation::Error {
+                    code: ErrorCode::Unavailable,
+                },
+            );
+            tick_collect(&mut bench, 5);
+            let text = banner(&bench).unwrap();
+            assert!(text.starts_with("Grok SSH exited (exit code 3)."), "{text}");
+            assert!(text.contains("Could not open a shell"), "{text}");
+            assert_eq!(action_label(&bench), "Open shell");
+            assert!(matches!(
+                bench.workbench.terminal_target,
+                TerminalTarget::RemoteGrok { .. }
+            ));
+            assert_eq!(bench.workbench.terminal.as_ref().unwrap().pid(), None);
+
+            bench.workbench.restart_terminal();
+            let (start, _, _) = await_start_shell(&mut bench);
+            let root = bench.root.clone();
+            finish_start_shell(&mut bench, attach, &start, &root);
+            assert_eq!(banner(&bench), None);
+        }
+
+        /// An older companion cannot decode the request: `Open shell` fails at
+        /// once with the reason, without sending it and without waiting.
+        #[test]
+        fn open_shell_against_an_older_companion_fails_at_once_with_the_reason() {
+            for (supported, request, reason) in
+                [(Some(false), true, "older"), (None, false, "not known yet")]
+            {
+                let (mut bench, attach) = attached_bench("grok");
+                let remote = bench.workbench.remote.as_mut().unwrap();
+                remote.start_shell = supported;
+                if !request {
+                    remote.capabilities_request = None;
+                }
+                remote_exit(&bench, attach, 3);
+                tick_collect(&mut bench, 3);
+                bench.workbench.restart_terminal();
+                let written = tick_collect(&mut bench, 40);
+                assert!(!written.iter().any(is_start_shell), "{supported:?}");
+                let text = banner(&bench).unwrap();
+                assert!(text.contains("Could not open a shell"), "{text}");
+                assert!(text.contains(reason), "{text}");
+                assert_eq!(text.contains("older"), reason == "older", "{text}");
+                assert_eq!(action_label(&bench), "Open shell");
+            }
+        }
+
+        /// Spec `Lost transport keeps Reconnect and nothing runs locally`: a
+        /// lost transport offers Reconnect and no `Open shell`; nothing is
+        /// started locally and no input is replayed.
+        #[test]
+        fn a_lost_transport_keeps_reconnect_and_offers_no_open_shell() {
+            let (mut bench, attach) = attached_bench("grok");
+            remote_exit(&bench, attach, 3);
+            tick_collect(&mut bench, 3);
+            assert_eq!(action_label(&bench), "Open shell");
+            bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .as_ref()
+                .unwrap()
+                .disconnect();
+            let written = tick_collect(&mut bench, 5);
+            assert!(bench.workbench.remote_can_reconnect());
+            assert_eq!(action_label(&bench), "Reconnect Grok SSH");
+            assert!(!written.iter().any(is_start_shell));
+            assert!(
+                !written
+                    .iter()
+                    .any(|frame| matches!(frame.operation, Operation::TerminalInput { .. })),
+                "no input is replayed"
+            );
+            assert_eq!(bench.workbench.terminal.as_ref().unwrap().pid(), None);
+        }
+
+        /// Attach a remote tab to a supervisor of `helper` and serve its
+        /// snapshot until the root listing is current and the root watch is
+        /// acknowledged. Returns every frame the tab sent while settling.
+        fn watched_bench(helper: &str) -> (RemoteBench, Vec<WireEnvelope>) {
+            let mut bench = remote_bench();
+            let attach = bench.attach();
+            for operation in [
+                Operation::Attached,
+                Operation::TerminalOutput {
+                    data: Chunk::new(b"terminal-live".to_vec()).unwrap(),
+                    done: true,
+                },
+            ] {
+                bench.send(WireEnvelope::new(bench.identity.clone(), attach, operation));
+            }
+            let mut sent = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                for frame in bench.take_written() {
+                    serve(&bench, &frame, helper);
+                    sent.push(frame);
+                }
+                bench.pump();
+                let watched = sent.iter().any(|frame| {
+                    matches!(
+                        frame.operation,
+                        Operation::Watch { .. } | Operation::WatchDir { .. }
+                    )
+                });
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                let listed = remote
+                    .workspace
+                    .projection()
+                    .directories
+                    .get(&bench.root)
+                    .is_some_and(|d| d.freshness == crate::remote_workspace::Freshness::Current);
+                if remote.attached_once && !remote.holding_input && watched && listed {
+                    return (bench, sent);
+                }
+                assert!(Instant::now() < deadline, "the remote tab did not settle");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Pump and serve for `rounds` rounds, returning the frames sent.
+        fn drive(bench: &mut RemoteBench, helper: &str, rounds: usize) -> Vec<WireEnvelope> {
+            let mut sent = Vec::new();
+            for _ in 0..rounds {
+                bench.pump();
+                for frame in bench.take_written() {
+                    serve(bench, &frame, helper);
+                    sent.push(frame);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            bench.pump();
+            sent
+        }
+
+        /// Pump and serve until nothing is sent for a while, then past the
+        /// minimum gap between Git refreshes, so a test starts from rest.
+        fn quiesce(bench: &mut RemoteBench, helper: &str) -> Vec<WireEnvelope> {
+            // These tests count what a push causes: the periodic backstop
+            // stays out of the way.
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .set_safety_net(Duration::from_secs(3600), Duration::from_secs(3600));
+            let mut all = Vec::new();
+            for _ in 0..2 {
+                loop {
+                    let frames = drive(bench, helper, 12);
+                    if frames.is_empty() {
+                        break;
+                    }
+                    all.extend(frames);
+                }
+                thread::sleep(Duration::from_millis(600));
+            }
+            all
+        }
+
+        /// D1: the companion keeps pushing `Changed` under the Watch request
+        /// id after it acknowledged. The workbench used to reject every one
+        /// of them (the pending entry was gone), so a remote create, delete or
+        /// rename never reloaded the Explorer or the Git view.
+        #[test]
+        fn pushed_changed_after_the_watch_ack_reloads_the_listing() {
+            let helper = "0.0.1";
+            let (mut bench, sent) = watched_bench(helper);
+            let watch = sent
+                .iter()
+                .find(|frame| matches!(frame.operation, Operation::Watch { .. }))
+                .expect("the root watch was requested");
+            let root = bench.root.clone();
+            // Nothing is outstanding once the snapshot settled.
+            quiesce(&mut bench, helper);
+
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                watch.request_id,
+                Operation::Changed { path: root.clone() },
+            ));
+            let after = drive(&mut bench, helper, 20);
+            assert!(
+                after.iter().any(
+                    |frame| matches!(&frame.operation, Operation::List { path } if path == &root)
+                ),
+                "a pushed Changed reloads the watched directory"
+            );
+            assert!(
+                after
+                    .iter()
+                    .any(|frame| matches!(frame.operation, Operation::GitRead { .. })),
+                "a pushed Changed refreshes Git from the remote authority"
+            );
+        }
+
+        // ---- the real supervisor, the real client and the real tab ----
+
+        /// The SSH stream of a client, here a loopback socket to the
+        /// supervisor (the transport the SSH frontend relays).
+        struct LoopbackStream {
+            stream: std::net::TcpStream,
+            received: std::sync::mpsc::Receiver<Vec<u8>>,
+        }
+
+        impl made_remote::client::ClientStream for LoopbackStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                use std::io::Write;
+                self.stream.write_all(bytes)
+            }
+            fn poll(&mut self) -> Option<SshEvent> {
+                self.received.try_recv().ok().map(SshEvent::Data)
+            }
+            fn detach(&mut self) {
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+
+        struct RealBench {
+            bench: RemoteBench,
+            ctx: egui::Context,
+            _temp: tempfile::TempDir,
+            runner: Option<thread::JoinHandle<Result<(), ErrorCode>>>,
+        }
+
+        /// A remote tab launched as `kind` ("shell", "opencode", "grok" or
+        /// "claude") attached to a real supervisor over a loopback socket. The
+        /// launch child runs `script`; the shell that takes its place is bash.
+        /// A small script stands in for the companion's `--child` wrapper.
+        fn real_bench(kind: &str, script: &str) -> RealBench {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(temp.path()).unwrap();
+            let workspace = base.join("work");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let runtime = base.join("remote/runtime/sha256-0123456789abcdef");
+            made_platform::ensure_private_directory(&runtime).unwrap();
+            std::fs::write(base.join("tui.sh"), script).unwrap();
+            let wrapper = base.join("companion.sh");
+            let body = if kind == "shell" {
+                "#!/bin/sh\nexec /bin/bash --noprofile --norc\n"
+            } else {
+                "#!/bin/sh\ncase \"$(basename \"$2\")\" in\n  child.json) exec /bin/sh \"$(dirname \"$0\")/tui.sh\" ;;\n  *) exec /bin/bash --noprofile --norc ;;\nesac\n"
+            };
+            std::fs::write(&wrapper, body).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let root = RemotePath::new(workspace.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+            let mut bench = remote_bench_at(root.clone());
+            let authority = bench.identity.authority;
+            let (target, launch) = match kind {
+                "shell" => (
+                    TerminalTarget::RemoteShell { authority },
+                    LaunchTarget::Shell,
+                ),
+                "opencode" => (
+                    TerminalTarget::RemoteOpenCode { authority },
+                    LaunchTarget::OpenCode,
+                ),
+                "grok" => (TerminalTarget::RemoteGrok { authority }, LaunchTarget::Grok),
+                _ => (
+                    TerminalTarget::RemoteClaude { authority },
+                    LaunchTarget::Claude,
+                ),
+            };
+            bench.workbench.terminal_target = target;
+            {
+                let remote = bench.workbench.remote.as_mut().unwrap();
+                remote.opencode = kind == "opencode";
+                remote.grok = kind == "grok";
+                remote.claude = kind == "claude";
+                remote.client = None;
+                remote.attach_request = None;
+                remote.phase = RemotePhase::Connecting;
+            }
+            let first = WireEnvelope::new(
+                bench.identity.clone(),
+                1,
+                Operation::Open {
+                    directory: root.clone(),
+                    target: launch,
+                    rows: 24,
+                    cols: 80,
+                },
+            );
+            let mut supervisor = made_remote::supervisor::Supervisor::create(
+                &first,
+                runtime.clone(),
+                &base,
+                &wrapper,
+                made_remote::supervisor::ChildLaunch {
+                    program: "/bin/sh".into(),
+                    args: Vec::new(),
+                    cwd: workspace.clone(),
+                    env: vec![
+                        ("HOME".into(), base.clone().into_os_string()),
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                        ("PS1".into(), "$ ".into()),
+                    ],
+                },
+                None,
+            )
+            .expect("supervisor create");
+            supervisor = supervisor.with_follow_up_shell(made_remote::supervisor::FollowUpShell {
+                program: "/bin/bash".into(),
+                args: vec!["--noprofile".into(), "--norc".into()],
+                env: Vec::new(),
+                integration: None,
+            });
+            let runner = thread::spawn(move || supervisor.run());
+            let limit = Instant::now() + Duration::from_secs(20);
+            let endpoint: made_remote::supervisor::Endpoint = loop {
+                assert!(Instant::now() < limit, "endpoint.json was never published");
+                if let Ok(bytes) = std::fs::read(runtime.join("endpoint.json")) {
+                    break serde_json::from_slice(&bytes).expect("endpoint");
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            let mut stream = std::net::TcpStream::connect(endpoint.addr).expect("connect");
+            stream.set_nodelay(true).unwrap();
+            stream
+                .write_all(&made_remote::supervisor::capability_bytes(&first.identity).unwrap())
+                .unwrap();
+            stream.write_all(&first.identity.authority.0).unwrap();
+            stream
+                .write_all(&first.identity.epoch.to_be_bytes())
+                .unwrap();
+            let (tx, received) = std::sync::mpsc::channel();
+            let mut reader = stream.try_clone().unwrap();
+            thread::spawn(move || {
+                use std::io::Read;
+                let mut buffer = vec![0; 64 * 1024];
+                while let Ok(read) = reader.read(&mut buffer) {
+                    if read == 0 || tx.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let client = made_remote::client::RemoteClient::new(
+                LoopbackStream { stream, received },
+                bench.identity.clone(),
+                root,
+            )
+            .unwrap();
+            bench.workbench.arm_remote_client(client);
+            let mut real = RealBench {
+                bench,
+                ctx: egui::Context::default(),
+                _temp: temp,
+                runner: Some(runner),
+            };
+            real.until("the tab attaches", |bench| {
+                let remote = bench.workbench.remote.as_ref().unwrap();
+                remote.attached_once && !remote.holding_input && bench.workbench.terminal.is_some()
+            });
+            real
+        }
+
+        impl RealBench {
+            fn tick(&mut self) {
+                self.bench.workbench.tick_remote(&self.ctx);
+                // Root traffic goes to the real supervisor; nothing to answer.
+            }
+
+            fn until(&mut self, what: &str, mut ready: impl FnMut(&RemoteBench) -> bool) {
+                let limit = Instant::now() + Duration::from_secs(20);
+                loop {
+                    self.tick();
+                    if ready(&self.bench) {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < limit,
+                        "deadline: {what}; supervisor ended {:?}; target {:?}, banner {:?}, shell start {:?}, abilities {:?}",
+                        self.runner.as_ref().map(|runner| runner.is_finished()),
+                        self.bench.workbench.terminal_target,
+                        banner(&self.bench),
+                        self.bench.workbench.remote.as_ref().map(|remote| remote.shell_start),
+                        self.bench.workbench.remote.as_ref().map(|remote| remote.start_shell),
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn settle(&mut self, ms: u64) {
+                let end = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < end {
+                    self.tick();
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn type_line(&mut self, text: &str) {
+                let workbench = &mut self.bench.workbench;
+                let terminal = workbench.terminal.as_mut().unwrap();
+                for ch in text.chars() {
+                    terminal.send_key(
+                        made_terminal::Key::Char(ch),
+                        made_terminal::Modifiers::default(),
+                        workbench.diag.log_mut(),
+                    );
+                }
+                terminal.send_key(
+                    made_terminal::Key::Enter,
+                    made_terminal::Modifiers::default(),
+                    workbench.diag.log_mut(),
+                );
+            }
+
+            fn screen_has(&mut self, needle: &str) {
+                self.until(needle, |bench| {
+                    bench
+                        .workbench
+                        .terminal
+                        .as_ref()
+                        .unwrap()
+                        .screen_text()
+                        .contains(needle)
+                });
+            }
+
+            fn is_plain_shell_running(bench: &RemoteBench) -> bool {
+                matches!(
+                    bench.workbench.terminal_target,
+                    TerminalTarget::RemoteShell { .. }
+                ) && bench.workbench.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.exit_status().is_none() && terminal.is_running()
+                })
+            }
+
+            fn finish(mut self) {
+                if let Some(client) = self
+                    .bench
+                    .workbench
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.client.clone())
+                {
+                    let _ = client.request(Operation::Close, None);
+                }
+                self.settle(300);
+                if let Some(runner) = self.runner.take() {
+                    let _ = runner.join();
+                }
+            }
+        }
+
+        /// Spec `Remote TUI exits cleanly` and `Remote shell exits cleanly`,
+        /// through the real supervisor, client and tab: the shell that takes
+        /// the TUI's place takes input and resizes, the tab stays open, and
+        /// `exit` in it closes the tab.
+        #[test]
+        fn a_real_tui_exit_gives_a_shell_that_works_and_whose_exit_closes_the_tab() {
+            let mut real = real_bench(
+                "grok",
+                "printf 'last line\\r\\n\\033[?1049h\\033[?1000h'; exit 0",
+            );
+            real.until("the shell takes the TUI's place", |bench| {
+                RealBench::is_plain_shell_running(bench)
+                    && !bench
+                        .workbench
+                        .terminal
+                        .as_ref()
+                        .unwrap()
+                        .alternate_screen()
+            });
+            // No stale exit follows the new shell.
+            real.settle(1_500);
+            assert!(RealBench::is_plain_shell_running(&real.bench));
+            assert!(!real.bench.workbench.shell_exited_cleanly());
+            assert_eq!(banner(&real.bench), None);
+            assert!(real
+                .bench
+                .workbench
+                .terminal
+                .as_ref()
+                .unwrap()
+                .screen_text()
+                .contains("last line"));
+            real.type_line("echo hi$((1+1))");
+            real.screen_has("hi2");
+            let workbench = &mut real.bench.workbench;
+            workbench
+                .terminal
+                .as_mut()
+                .unwrap()
+                .resize(30, 100, workbench.diag.log_mut());
+            real.type_line("stty size");
+            real.screen_has("30 100");
+            assert!(RealBench::is_plain_shell_running(&real.bench));
+            assert!(!real.bench.workbench.shell_exited_cleanly());
+
+            real.type_line("exit");
+            real.until("the tab closes", |bench| {
+                bench.workbench.shell_exited_cleanly()
+            });
+            real.finish();
+        }
+
+        /// `Open shell` after an unclean end, and after a plain `Terminal SSH`
+        /// shell ended, through the real supervisor: typing then works.
+        #[test]
+        fn a_real_open_shell_after_an_unclean_end_takes_input() {
+            for (kind, script) in [("claude", "exit 3"), ("shell", "")] {
+                let mut real = real_bench(kind, script);
+                if kind == "shell" {
+                    real.until("the shell prompt", |bench| {
+                        RealBench::is_plain_shell_running(bench)
+                    });
+                    real.type_line("exit 3");
+                }
+                real.until("the banner", |bench| banner(bench).is_some());
+                assert_eq!(
+                    action_label(&real.bench),
+                    "Open shell",
+                    "{kind}: the transport is connected"
+                );
+                real.bench.workbench.restart_terminal();
+                real.until("the shell runs", |bench| {
+                    RealBench::is_plain_shell_running(bench) && banner(bench).is_none()
+                });
+                real.type_line("echo back$((2+2))");
+                real.screen_has("back4");
+                real.settle(1_000);
+                assert!(
+                    RealBench::is_plain_shell_running(&real.bench),
+                    "{kind}: no stale exit"
+                );
+                assert!(!real.bench.workbench.shell_exited_cleanly(), "{kind}");
+                real.finish();
+            }
+        }
+
+        fn watch_frame<'a>(
+            frames: &'a [WireEnvelope],
+            wanted: &RemotePath,
+        ) -> Option<&'a WireEnvelope> {
+            frames.iter().find(
+                |frame| matches!(&frame.operation, Operation::WatchDir { path } if path == wanted),
+            )
+        }
+
+        fn lists(frames: &[WireEnvelope], wanted: &RemotePath) -> bool {
+            frames
+                .iter()
+                .any(|frame| matches!(&frame.operation, Operation::List { path } if path == wanted))
+        }
+
+        fn git_reads(frames: &[WireEnvelope]) -> bool {
+            frames
+                .iter()
+                .any(|frame| matches!(frame.operation, Operation::GitRead { .. }))
+        }
+
+        /// A current companion: one subscription per shown directory, pushes
+        /// that name the changed entry, and `GitChanged` for the repository.
+        /// Only what a push names is reloaded, `.git/index` included (it
+        /// reaches the tab as `GitChanged`, never as a listing change).
+        #[test]
+        fn pushed_notifications_reload_only_what_changed() {
+            let helper = APP_VERSION;
+            let (mut bench, mut sent) = watched_bench(helper);
+            sent.extend(quiesce(&mut bench, helper));
+            let root = bench.root.clone();
+            let src = remote_path("/home/vscode/src");
+            let root_watch = watch_frame(&sent, &root)
+                .expect("the root is subscribed per directory")
+                .request_id;
+
+            // Expanding a folder subscribes to it.
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .expand(src.clone())
+                .unwrap();
+            let expanded = drive(&mut bench, helper, 10);
+            let src_watch = watch_frame(&expanded, &src)
+                .expect("an expanded folder is subscribed")
+                .request_id;
+            quiesce(&mut bench, helper);
+
+            // A nested entry changes: that folder and Git reload, nothing else.
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                src_watch,
+                Operation::Changed {
+                    path: remote_path("/home/vscode/src/new.txt"),
+                },
+            ));
+            let after = drive(&mut bench, helper, 20);
+            assert!(lists(&after, &src), "the folder that changed reloads");
+            assert!(!lists(&after, &root), "no other folder reloads");
+            assert!(git_reads(&after), "Git is refreshed");
+
+            // `.git/index` moved: Git reloads, no listing does.
+            quiesce(&mut bench, helper);
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                root_watch,
+                Operation::GitChanged,
+            ));
+            let after = drive(&mut bench, helper, 20);
+            assert!(git_reads(&after), "GitChanged refreshes Git");
+            assert!(
+                !after
+                    .iter()
+                    .any(|frame| matches!(frame.operation, Operation::List { .. })),
+                "GitChanged reloads no listing"
+            );
+
+            // A path the subscription cannot name is refused, not applied.
+            quiesce(&mut bench, helper);
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                src_watch,
+                Operation::Changed {
+                    path: remote_path("/home/vscode/elsewhere/x"),
+                },
+            ));
+            let after = drive(&mut bench, helper, 15);
+            assert!(!lists(&after, &src) && !git_reads(&after));
+
+            // Collapsing releases the subscription and its pushes stop counting.
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .collapse(&src);
+            let after = drive(&mut bench, helper, 10);
+            assert!(
+                after.iter().any(|frame| matches!(
+                    &frame.operation,
+                    Operation::UnwatchDir { path } if path == &src
+                )),
+                "a collapsed folder is unsubscribed"
+            );
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                src_watch,
+                Operation::Changed {
+                    path: remote_path("/home/vscode/src/late.txt"),
+                },
+            ));
+            let after = drive(&mut bench, helper, 15);
+            assert!(!lists(&after, &src) && !git_reads(&after));
+        }
+
+        /// M5: a hidden remote tab only marks what changed; it reloads on
+        /// being shown, so a background tab costs the server nothing per push.
+        #[test]
+        fn a_hidden_remote_tab_reloads_what_changed_when_shown() {
+            let helper = APP_VERSION;
+            let (mut bench, mut sent) = watched_bench(helper);
+            sent.extend(quiesce(&mut bench, helper));
+            let root = bench.root.clone();
+            let root_watch = watch_frame(&sent, &root).unwrap().request_id;
+            bench.workbench.visible = false;
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                root_watch,
+                Operation::Changed {
+                    path: remote_path("/home/vscode/new.txt"),
+                },
+            ));
+            let hidden = drive(&mut bench, helper, 15);
+            assert!(!lists(&hidden, &root) && !git_reads(&hidden));
+            bench.workbench.visible = true;
+            let shown = drive(&mut bench, helper, 15);
+            assert!(lists(&shown, &root), "the listing reloads once shown");
+            assert!(git_reads(&shown), "and so does Git");
+        }
+
+        /// M4: the client's in-flight window being full is back-pressure. The
+        /// command waits for the next pump instead of the link being treated
+        /// as broken.
+        #[test]
+        fn a_full_client_window_holds_a_command_back_instead_of_disconnecting() {
+            let helper = APP_VERSION;
+            let (mut bench, _) = watched_bench(helper);
+            quiesce(&mut bench, helper);
+            let client = bench
+                .workbench
+                .remote
+                .as_ref()
+                .unwrap()
+                .client
+                .clone()
+                .unwrap();
+            // Fill the window as a burst of other traffic (heartbeats) would.
+            let mut filled = 0;
+            while client.request(Operation::Heartbeat, None).is_ok() {
+                filled += 1;
+            }
+            assert!(filled > 0);
+            bench.pump();
+            thread::sleep(Duration::from_millis(100));
+            bench.pump();
+            let beats: Vec<_> = bench
+                .take_written()
+                .into_iter()
+                .filter(|frame| matches!(frame.operation, Operation::Heartbeat))
+                .collect();
+            assert_eq!(beats.len(), filled);
+
+            let src = remote_path("/home/vscode/src");
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .expand(src.clone())
+                .unwrap();
+            let held = drive(&mut bench, helper, 10);
+            assert!(!lists(&held, &src), "the window is full: nothing is sent");
+            assert_eq!(
+                bench.workbench.remote_connection(),
+                Some(crate::remote_workspace::ConnectionState::Connected),
+                "back-pressure is not a disconnect"
+            );
+            // The window opens: the held command goes out, in order.
+            for beat in &beats {
+                bench.reply(beat, Operation::Ack);
+            }
+            let released = drive(&mut bench, helper, 10);
+            assert!(lists(&released, &src), "the held command is sent");
+            assert_eq!(
+                bench.workbench.remote_connection(),
+                Some(crate::remote_workspace::ConnectionState::Connected)
+            );
+        }
+
+        /// m2: a notification under an id this tab does not map is dropped, not
+        /// handed to the workspace as if it were one of its own request ids.
+        #[test]
+        fn a_notification_under_an_unmapped_id_is_dropped() {
+            let helper = APP_VERSION;
+            let (mut bench, _) = watched_bench(helper);
+            quiesce(&mut bench, helper);
+            let root = bench.root.clone();
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                987_654,
+                Operation::Changed { path: root.clone() },
+            ));
+            bench.send(WireEnvelope::new(
+                current_identity(&bench),
+                987_655,
+                Operation::GitChanged,
+            ));
+            let after = drive(&mut bench, helper, 15);
+            assert!(!lists(&after, &root) && !git_reads(&after));
+        }
+
+        /// A real companion supervisor on a loopback socket, behind the tab's
+        /// real client: the bench's fake stream is relayed to it and back.
+        /// Nothing here reaches a remote host. The supervisor's launch child is
+        /// an idle script, so no terminal program is needed.
+        struct LoopbackCompanion {
+            stop: Arc<std::sync::atomic::AtomicBool>,
+            relay: Option<thread::JoinHandle<()>>,
+            runner: Option<thread::JoinHandle<Result<(), ErrorCode>>>,
+            _temp: tempfile::TempDir,
+        }
+
+        impl Drop for LoopbackCompanion {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(relay) = self.relay.take() {
+                    let _ = relay.join();
+                }
+                // The supervisor ends with its lease or when the test exits;
+                // its thread is not waited for.
+                self.runner.take();
+            }
+        }
+
+        fn loopback_companion(
+            bench: &RemoteBench,
+            workspace: &std::path::Path,
+        ) -> LoopbackCompanion {
+            use made_remote::supervisor::{capability_bytes, ChildLaunch, Endpoint, Supervisor};
+            use std::io::{Read, Write};
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().unwrap();
+            let runtime = temp.path().join("remote/runtime/sha256-0123456789abcdef");
+            made_platform::ensure_private_directory(&runtime).unwrap();
+            // The "companion" executable the supervisor starts as its child.
+            let companion = temp.path().join("fake-companion");
+            std::fs::write(&companion, "#!/bin/sh\nexec sleep 600\n").unwrap();
+            std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let first = WireEnvelope::new(
+                bench.identity.clone(),
+                1,
+                Operation::Open {
+                    directory: bench.root.clone(),
+                    target: LaunchTarget::Shell,
+                    rows: 24,
+                    cols: 80,
+                },
+            );
+            let supervisor = Supervisor::create(
+                &first,
+                runtime.clone(),
+                temp.path(),
+                &companion,
+                ChildLaunch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "sleep 600".into()],
+                    cwd: workspace.to_path_buf(),
+                    env: vec![
+                        ("HOME".into(), temp.path().into()),
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                    ],
+                },
+                None,
+            )
+            .expect("supervisor create");
+            let runner = thread::spawn(move || supervisor.run());
+            let limit = Instant::now() + Duration::from_secs(20);
+            let endpoint: Endpoint = loop {
+                assert!(Instant::now() < limit, "endpoint.json was never published");
+                if let Ok(bytes) = std::fs::read(runtime.join("endpoint.json")) {
+                    break serde_json::from_slice(&bytes).expect("endpoint");
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            let mut socket = std::net::TcpStream::connect(endpoint.addr).unwrap();
+            socket.set_nodelay(true).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            let mut preamble = capability_bytes(&bench.identity).unwrap().to_vec();
+            preamble.extend_from_slice(&bench.identity.authority.0);
+            preamble.extend_from_slice(&bench.identity.epoch.to_be_bytes());
+            let written = bench.stream.written.clone();
+            let events = bench.stream.events.clone();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopped = stop.clone();
+            let relay = thread::spawn(move || {
+                let mut first = Some(preamble);
+                let mut chunk = vec![0u8; 65536];
+                while !stopped.load(Ordering::Relaxed) {
+                    let out = std::mem::take(&mut *written.lock().unwrap());
+                    if !out.is_empty() {
+                        let mut bytes = first.take().unwrap_or_default();
+                        bytes.extend(out);
+                        if socket.write_all(&bytes).is_err() {
+                            break;
+                        }
+                    }
+                    match socket.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => events
+                            .lock()
+                            .unwrap()
+                            .push_back(SshEvent::Data(chunk[..n].to_vec())),
+                        Err(_) => {}
+                    }
+                }
+            });
+            LoopbackCompanion {
+                stop,
+                relay: Some(relay),
+                runner: Some(runner),
+                _temp: temp,
+            }
+        }
+
+        fn git_in(directory: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args([
+                    "-c",
+                    "user.name=Made Test",
+                    "-c",
+                    "user.email=made-test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+        }
+
+        /// Pump the tab until `done`, at most `limit`.
+        fn pump_for(
+            bench: &mut RemoteBench,
+            limit: Duration,
+            mut done: impl FnMut(&RemoteBench) -> bool,
+        ) -> bool {
+            let deadline = Instant::now() + limit;
+            while Instant::now() < deadline {
+                bench.pump();
+                bench.workbench.poll_integrations(Instant::now());
+                if done(bench) {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        /// m9: the whole chain, no fakes between the file system and the
+        /// tab's projection. A real supervisor and a real filesystem watcher,
+        /// the real client, the workbench pump and the workspace: a write in a
+        /// nested expanded folder and a `git add` reach the projection as a
+        /// pushed notification and a reload, with no manual refresh.
+        #[test]
+        fn a_nested_write_and_a_git_add_reach_the_projection_through_a_real_supervisor() {
+            let temp = tempfile::tempdir().unwrap();
+            let workspace = std::fs::canonicalize(temp.path()).unwrap().join("work");
+            std::fs::create_dir_all(workspace.join("src/deep")).unwrap();
+            std::fs::write(workspace.join("src/one.txt"), "1").unwrap();
+            git_in(&workspace, &["init", "-b", "main"]);
+            git_in(&workspace, &["add", "-A"]);
+            git_in(&workspace, &["commit", "-m", "first"]);
+
+            let root = RemotePath::new(workspace.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+            let mut bench = remote_bench_at(root.clone());
+            let _companion = loopback_companion(&bench, &workspace);
+            let attach = bench.attach();
+            let _ = attach;
+
+            // Attached, the root listed, Git read, the root subscribed.
+            assert!(
+                pump_for(&mut bench, Duration::from_secs(120), |bench| {
+                    let workspace = bench.workbench.remote_workspace().unwrap();
+                    let projection = workspace.projection();
+                    bench.workbench.remote.as_ref().unwrap().attached_once
+                        && projection.git_root_known
+                        && projection.directories.get(&root).is_some_and(|d| {
+                            d.freshness == crate::remote_workspace::Freshness::Current
+                                && !d.entries.is_empty()
+                        })
+                }),
+                "the tab did not attach and list the root"
+            );
+
+            // Expand `src`; its subscription is made and acknowledged.
+            let src = RemotePath::new(
+                workspace
+                    .join("src")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .expand(src.clone())
+                .unwrap();
+            assert!(pump_for(&mut bench, Duration::from_secs(60), |bench| {
+                bench
+                    .workbench
+                    .remote_workspace()
+                    .unwrap()
+                    .projection()
+                    .directories
+                    .get(&src)
+                    .is_some_and(|d| d.freshness == crate::remote_workspace::Freshness::Current)
+            }));
+
+            // The subscription is established asynchronously (on macOS,
+            // slowly): write only once the companion acknowledged it, so what
+            // is measured is the notification and not the safety net.
+            assert!(pump_for(&mut bench, Duration::from_secs(180), |bench| {
+                bench.workbench.remote_workspace().unwrap().is_watched(&src)
+            }));
+            // Let the reload the acknowledgement causes, and whatever else
+            // follows a registration, finish first.
+            pump_for(&mut bench, Duration::from_secs(4), |_| false);
+
+            // A write in the expanded nested folder shows up in the listing
+            // without a reload from the user, within the SSH-09 budget (a
+            // generous bound for a loaded machine: macOS FSEvents here).
+            let wanted = RemotePath::new(
+                workspace
+                    .join("src/new.txt")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            std::fs::write(workspace.join("src/new.txt"), "n").unwrap();
+            let wrote = Instant::now();
+            assert!(
+                pump_for(&mut bench, Duration::from_secs(10), |bench| {
+                    bench
+                        .workbench
+                        .remote_workspace()
+                        .unwrap()
+                        .projection()
+                        .directories
+                        .get(&src)
+                        .is_some_and(|d| d.entries.iter().any(|e| e.path == wanted))
+                }),
+                "the written file never reached the listing"
+            );
+            let latency = wrote.elapsed();
+            eprintln!("[e2e] nested write -> projection listing {latency:?}");
+            assert!(latency < Duration::from_secs(3), "{latency:?}");
+
+            // `git add`: the Source Control projection shows the staged file.
+            // Git's metadata watch follows the root's acknowledgement on the
+            // companion's watcher thread; it was given time above.
+            std::fs::write(workspace.join("staged.txt"), "s").unwrap();
+            git_in(&workspace, &["add", "staged.txt"]);
+            let wrote = Instant::now();
+            assert!(
+                pump_for(&mut bench, Duration::from_secs(10), |bench| {
+                    bench
+                        .workbench
+                        .remote_workspace()
+                        .unwrap()
+                        .projection()
+                        .git_view
+                        .as_ref()
+                        .is_some_and(|view| {
+                            view.groups.iter().any(|group| {
+                                group.title == "Staged Changes"
+                                    && group
+                                        .rows
+                                        .iter()
+                                        .any(|row| row.path.as_bytes().ends_with(b"/staged.txt"))
+                            })
+                        })
+                }),
+                "the staged file never reached Source Control"
+            );
+            let git_latency = wrote.elapsed();
+            assert!(git_latency < Duration::from_secs(3), "{git_latency:?}");
+            eprintln!("[e2e] git add -> projection git view {git_latency:?}");
+            assert_eq!(
+                bench.workbench.remote_connection(),
+                Some(crate::remote_workspace::ConnectionState::Connected)
+            );
+        }
+
+        /// A companion that predates `WatchDir` is never sent it or its
+        /// release, however much is expanded.
+        #[test]
+        fn an_older_companion_only_gets_the_root_watch() {
+            let helper = "0.0.1";
+            let (mut bench, mut sent) = watched_bench(helper);
+            let src = remote_path("/home/vscode/src");
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .expand(src.clone())
+                .unwrap();
+            sent.extend(drive(&mut bench, helper, 15));
+            bench
+                .workbench
+                .remote_workspace_mut()
+                .unwrap()
+                .collapse(&src);
+            sent.extend(drive(&mut bench, helper, 15));
+            assert!(sent
+                .iter()
+                .any(|frame| matches!(frame.operation, Operation::Watch { .. })));
+            assert!(!sent.iter().any(|frame| matches!(
+                frame.operation,
+                Operation::WatchDir { .. } | Operation::UnwatchDir { .. }
+            )));
+        }
     }
 
     #[test]
@@ -11111,6 +13627,8 @@ mod tests {
                     helper_version: "probe".to_owned(),
                     grok: false,
                     python3: false,
+                    watch_dirs: false,
+                    start_shell: false,
                 },
                 claude: false,
             }
@@ -11138,6 +13656,82 @@ mod tests {
                 idle_workbench(TerminalTarget::Shell, None).remote_transport_glyph(),
                 None
             );
+        }
+
+        fn error_text_painted(output: &egui::FullOutput) -> bool {
+            fn visit(shape: &egui::Shape) -> bool {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        text.override_text_color == Some(crate::theme::ERROR)
+                            || text
+                                .galley
+                                .job
+                                .sections
+                                .iter()
+                                .any(|section| section.format.color == crate::theme::ERROR)
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().any(visit),
+                    _ => false,
+                }
+            }
+            output.shapes.iter().any(|clipped| visit(&clipped.shape))
+        }
+
+        #[test]
+        fn a_connecting_tab_shows_a_neutral_state_and_only_a_failure_shows_the_error() {
+            let (mut workbench, _script, _) = probing();
+            workbench.set_visible(true);
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            for phase in [
+                RemotePhase::Connecting,
+                RemotePhase::Staging,
+                RemotePhase::AwaitingAttach,
+            ] {
+                workbench.remote.as_mut().unwrap().phase = phase;
+                let output = workbench_frame(&ctx, &mut workbench, 900.0, Vec::new());
+                let text = ui_text(&output);
+                assert!(text.contains("Connecting"), "{text}");
+                assert!(!text.contains("Terminal unavailable"), "{text}");
+                assert!(!error_text_painted(&output), "no error styling: {text}");
+            }
+            workbench.remote.as_mut().unwrap().phase = RemotePhase::Failed;
+            let output = workbench_frame(&ctx, &mut workbench, 900.0, Vec::new());
+            assert!(ui_text(&output).contains("Terminal unavailable"));
+            assert!(error_text_painted(&output), "a real failure stays red");
+        }
+
+        #[test]
+        fn enter_in_the_tab_password_field_submits_the_prompt() {
+            let (mut workbench, script, _) = probing();
+            workbench.set_visible(true);
+            script.prompts.send(prompt(1)).unwrap();
+            workbench.poll_remote_prompt();
+            assert!(shown(&workbench));
+            *workbench.remote_prompt_draft().unwrap() = "secret".to_owned();
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            for _ in 0..3 {
+                workbench_frame(&ctx, &mut workbench, 900.0, Vec::new());
+            }
+            ctx.memory_mut(|memory| memory.request_focus(crate::ui::ssh_field_id("prompt")));
+            workbench_frame(&ctx, &mut workbench, 900.0, Vec::new());
+            assert_eq!(script.answer(), None, "nothing is sent before Enter");
+            for pressed in [true, false] {
+                workbench_frame(
+                    &ctx,
+                    &mut workbench,
+                    900.0,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Enter,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            assert_eq!(script.answer(), Some((1, true)));
         }
 
         #[test]

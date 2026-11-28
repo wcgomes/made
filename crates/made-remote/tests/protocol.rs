@@ -886,6 +886,8 @@ fn grok_capabilities_are_backward_safe_and_session_snapshot_is_not_overloaded() 
     assert!(caps.python3);
     let encoded = serde_json::to_string(&Capabilities {
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
         ..caps
     })
     .unwrap();
@@ -1859,4 +1861,124 @@ fn browse_grants_and_tab_grants_never_address_each_other() {
             .is_err()
     );
     assert!(serde_json::from_value::<Identity>(serde_json::to_value(&identity).unwrap()).is_err());
+}
+
+/// `StartShell` is a request (confined to no filesystem root: it reads
+/// nothing) answered by exactly one `ShellStarted`, and its frames round-trip.
+#[test]
+fn start_shell_is_a_request_answered_by_shell_started_only() {
+    let request = frame(Operation::StartShell {
+        directory: path("/work/followed"),
+        fallback: path("/work"),
+    });
+    request.validate().unwrap();
+    // Outside the current root, like any shell the user starts.
+    request
+        .validate_request(&path("/elsewhere"), None)
+        .expect("a shell start is not a path request");
+    let mut decoder = FrameDecoder::new();
+    let (_, parsed) = decoder.push(&encode(&request).unwrap()).unwrap();
+    assert_eq!(parsed.unwrap().operation, request.operation);
+
+    let mut progress = ReplyProgress::new(request.clone()).unwrap();
+    progress
+        .accept(&response(
+            &request,
+            Operation::ShellStarted {
+                path: path("/work/followed"),
+            },
+        ))
+        .unwrap();
+    progress.finish().unwrap();
+    // No other success reply answers it.
+    for wrong in [Operation::Ack, Operation::Attached] {
+        assert_eq!(
+            response(&request, wrong).validate_reply(&request),
+            Err(ProtocolError::UnexpectedResponse)
+        );
+    }
+    // A reply is not a request.
+    let reply = frame(Operation::ShellStarted {
+        path: path("/work"),
+    });
+    assert_eq!(
+        reply.validate_request(&path("/work"), None),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+    assert!(made_remote::supervisor::generation_exempt(
+        &request.operation
+    ));
+    assert!(!request.operation.is_terminal());
+    assert_eq!(PROTOCOL_MAJOR, 1, "an added operation, not a new major");
+}
+
+/// `WatchDir`, `UnwatchDir` and `GitChanged`: subscription verbs are confined
+/// to the root like `Watch`, pair only with their replies, and a pre-existing
+/// companion's `Capabilities` (no `watch_dirs`) reads as "not supported".
+#[test]
+fn directory_watch_verbs_are_confined_paired_and_additive() {
+    let root = path("/project");
+    let inside = path("/project/src");
+    let outside = path("/other");
+    for operation in [
+        Operation::WatchDir {
+            path: inside.clone(),
+        },
+        Operation::UnwatchDir {
+            path: inside.clone(),
+        },
+    ] {
+        frame(operation.clone())
+            .validate_request(&root, None)
+            .unwrap();
+        let escaped = match operation {
+            Operation::WatchDir { .. } => Operation::WatchDir {
+                path: outside.clone(),
+            },
+            _ => Operation::UnwatchDir {
+                path: outside.clone(),
+            },
+        };
+        assert_eq!(
+            frame(escaped).validate_request(&root, None),
+            Err(ProtocolError::Path)
+        );
+        assert!(ReplyProgress::new(frame(operation)).is_ok());
+    }
+    // A notification is never a request.
+    assert_eq!(
+        frame(Operation::GitChanged).validate_request(&root, None),
+        Err(ProtocolError::UnexpectedResponse)
+    );
+
+    let watch = frame(Operation::WatchDir {
+        path: inside.clone(),
+    });
+    let answer = |request: &WireEnvelope, operation| {
+        WireEnvelope::new(request.identity.clone(), request.request_id, operation)
+    };
+    let acknowledged = |operation| answer(&watch, operation).validate_reply(&watch);
+    acknowledged(Operation::Changed {
+        path: inside.clone(),
+    })
+    .unwrap();
+    assert!(acknowledged(Operation::Changed { path: root.clone() }).is_err());
+    assert!(acknowledged(Operation::GitChanged).is_err());
+    acknowledged(Operation::Error {
+        code: ErrorCode::Limit,
+    })
+    .unwrap();
+    let unwatch = frame(Operation::UnwatchDir { path: inside });
+    answer(&unwatch, Operation::Ack)
+        .validate_reply(&unwatch)
+        .unwrap();
+    assert!(answer(&unwatch, Operation::Changed { path: root })
+        .validate_reply(&unwatch)
+        .is_err());
+
+    // Additive within major 1: an older companion omits the field.
+    let old = r#"{"target":"LinuxX64","tmux":false,"opencode":false,"shell_cwd":false,"helper_version":"0.2.0"}"#;
+    let capabilities: Capabilities = serde_json::from_str(old).unwrap();
+    assert!(!capabilities.watch_dirs);
+    assert_eq!(PROTOCOL_MAJOR, 1);
 }

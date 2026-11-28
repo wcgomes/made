@@ -9,8 +9,11 @@ use made_remote::{
     git::GitRunner,
     grok::{self, GrokFiles},
     integration::{resolve_config, Integration},
+    launch,
     protocol::*,
-    supervisor::{self, read_envelope, write_envelope, ChildLaunch, Endpoint, Supervisor},
+    supervisor::{
+        self, read_envelope, write_envelope, ChildLaunch, Endpoint, FollowUpShell, Supervisor,
+    },
 };
 use serde::Deserialize;
 use std::{
@@ -107,7 +110,7 @@ fn capabilities() -> io::Result<Capabilities> {
     // plugin install from here (SSH-09/SSH-10). No interpreter is detected; the
     // frozen `Capabilities.python3` field is always encoded false.
     let environment = Environment::current();
-    let grok = grok::detect_on_path(&environment, "grok").is_some();
+    let grok = grok::detect_grok(&environment).is_some();
     Ok(Capabilities {
         target,
         tmux: false,
@@ -116,6 +119,8 @@ fn capabilities() -> io::Result<Capabilities> {
         helper_version: env!("CARGO_PKG_VERSION").into(),
         grok,
         python3: false,
+        watch_dirs: true,
+        start_shell: true,
     })
 }
 fn run() -> io::Result<()> {
@@ -247,14 +252,57 @@ fn relay(mut input: impl io::Read, mut output: impl io::Write) -> io::Result<()>
         let read = match input.read(&mut buffer) {
             Ok(0) => return Ok(()),
             Ok(read) => read,
+            // Reads carry no timeout (it is cleared before the relay starts),
+            // so only an interrupted read is retried; any other error ends
+            // the relay instead of spinning.
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        output.write_all(&buffer[..read])?;
+        write_all_retry(&mut output, &buffer[..read], RELAY_STALL_LIMIT)?;
         // `Stdout` is line-buffered; every v1 frame is minified JSON with no
         // newline, so an unflushed frame would wait for unrelated output.
         output.flush()?;
     }
+}
+
+/// The supervisor socket carries a 2 s write timeout. Under sustained output
+/// the peer can stay slow for longer than that while perfectly alive, so a
+/// timeout is backpressure, not a dead transport. A closed peer still fails
+/// at once (broken pipe/reset); only a peer that makes no progress at all for
+/// this long is given up on.
+const RELAY_STALL_LIMIT: Duration = Duration::from_secs(120);
+
+fn is_backpressure(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// `write_all` that survives write timeouts without losing its position.
+fn write_all_retry(
+    output: &mut impl io::Write,
+    mut bytes: &[u8],
+    stall_limit: Duration,
+) -> io::Result<()> {
+    let mut last_progress = Instant::now();
+    while !bytes.is_empty() {
+        match output.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                bytes = &bytes[written..];
+                last_progress = Instant::now();
+            }
+            Err(error) if is_backpressure(&error) => {
+                if last_progress.elapsed() >= stall_limit {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// One bounded frame payload, or `None` on a clean end of input.
@@ -487,14 +535,16 @@ fn daemon() -> io::Result<()> {
     let platform = made_platform::host_platform();
     let shell = convert(platform.resolve_shell(None))?;
     let environment = Environment::current();
+    let shell_program = PathBuf::from(&shell.program);
+    let shell_args = shell.args.clone();
     let (program, args) = match target {
-        LaunchTarget::Shell => (PathBuf::from(&shell.program), shell.args),
+        LaunchTarget::Shell => (shell_program.clone(), shell.args),
         LaunchTarget::OpenCode => (find("opencode")?, Vec::new()),
         // Direct Grok launch: the detected absolute grok with the single
         // `dashboard` argument. No shell first, no plugin configuration, no
         // bridge, no composed OpenCode config.
         LaunchTarget::Grok => {
-            let program = grok::detect_on_path(&environment, "grok").ok_or_else(fail)?;
+            let program = grok::detect_grok(&environment).ok_or_else(fail)?;
             (program, vec![OsString::from("dashboard")])
         }
         // Direct Claude Code launch: the detected absolute claude with no
@@ -513,6 +563,9 @@ fn daemon() -> io::Result<()> {
         .unwrap_or_else(|| home.join(".config"))
         .join("opencode/cli.json");
     let user_config = resolve_config(v2, paths.opencode_config_path.clone());
+    let plugin_dir = paths.plugin_dir.clone();
+    let plugin_root = paths.plugin_root.clone();
+    let inline_config = config::inline_config_from_env();
     // Failure of optional plugin composition leaves terminal/fs available.
     // Grok and Claude Code use no bridge, no plugin environment and no composed
     // config, so those launches skip integration ownership entirely.
@@ -520,41 +573,35 @@ fn daemon() -> io::Result<()> {
         None
     } else {
         Integration::start(
-            &paths.plugin_dir,
-            &paths.plugin_root,
-            user_config,
-            config::inline_config_from_env(),
+            &plugin_dir,
+            &plugin_root,
+            user_config.clone(),
+            inline_config.clone(),
             "remote".into(),
         )
         .ok()
     };
-    let mut env = platform.environment(&[], &[]).with_terminal_defaults();
-    if let Some(i) = &integration {
-        let (key, value) = i.environment();
-        env.set(key, value);
-    }
+    let has_integration = integration.is_some();
     // Claude Code: the server-staged plugin entry, composed with the remote
     // user's own list, and this tab's spool, for shell and Claude Code
     // launches only. No host value is involved; an inherited spool binding
     // never reaches another tab's processes.
-    env.remove(claude::CLAUDE_SPOOL_ENV);
     let staged = claude::staged_plugin_dir(&std::env::current_exe()?);
-    let composed = claude::launch_environment(
+    let composed = launch::compose(
         *target,
+        &platform.environment(&[], &[]).with_terminal_defaults(),
+        integration.as_ref().map(Integration::environment),
         staged.as_deref(),
         &environment,
         &claude::spool_path(&runtime),
     );
-    for (key, value) in composed.env {
-        env.set(key, value);
-    }
     let launch = ChildLaunch {
         program,
         args,
         cwd: convert(native(directory))?,
-        env: env.into_vec(),
+        env: composed.launch,
     };
-    let supervisor = convert(Supervisor::create(
+    let mut supervisor = convert(Supervisor::create(
         &first,
         runtime,
         &paths.data_dir,
@@ -562,6 +609,28 @@ fn daemon() -> io::Result<()> {
         launch,
         integration,
     ))?;
+    // A launch child that ended gives way to the shell `Terminal SSH` runs, in
+    // the same attachment, when the desktop asks for it. That shell gets what
+    // a fresh `Terminal SSH` shell gets, including the OpenCode bridge a Grok
+    // Build or Claude Code launch does not own until then.
+    let integration: Option<supervisor::IntegrationStart> = (!has_integration).then(|| {
+        Box::new(move || {
+            Integration::start(
+                &plugin_dir,
+                &plugin_root,
+                user_config,
+                inline_config,
+                "remote".into(),
+            )
+            .ok()
+        }) as supervisor::IntegrationStart
+    });
+    supervisor = supervisor.with_follow_up_shell(FollowUpShell {
+        program: shell_program,
+        args: shell_args,
+        env: composed.follow_up,
+        integration,
+    });
     convert(supervisor.run())
 }
 fn child(state: &Path) -> io::Result<()> {
@@ -593,7 +662,7 @@ fn install_mode() -> io::Result<()> {
             .map(|directory| directory.join("plugins/grok-made"))
     });
     let report = grok::install_grok_plugin(grok::InstallInputs {
-        grok: grok::detect_on_path(&environment, "grok"),
+        grok: grok::detect_grok(&environment),
         files: GrokFiles::from_environment(&environment),
         staged,
         data_dir: paths().ok().map(|paths| paths.data_dir),
@@ -997,6 +1066,83 @@ mod tests {
         relay(&frame[..], &mut output).unwrap();
         assert_eq!(output.bytes, frame);
         assert_eq!(output.flushes, 1);
+    }
+
+    use std::time::Duration;
+
+    /// A writer that times out like a socket with `SO_SNDTIMEO` whose peer is
+    /// slow: every other write attempt reports `TimedOut`, and one write is
+    /// partial.
+    struct SlowWriter {
+        bytes: Vec<u8>,
+        calls: usize,
+        stall_forever: bool,
+    }
+    impl io::Write for SlowWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.stall_forever || self.calls % 2 == 1 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let n = buf.len().min(3);
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn relay_treats_write_timeouts_as_backpressure_and_loses_no_bytes() {
+        let frame = b"\0\0\0\x1d{\"operation\":{\"op\":\"Attached\"}}";
+        let mut output = SlowWriter {
+            bytes: Vec::new(),
+            calls: 0,
+            stall_forever: false,
+        };
+        relay(&frame[..], &mut output).expect("a slow peer is not a dead one");
+        assert_eq!(output.bytes, frame);
+    }
+
+    #[test]
+    fn a_peer_that_never_makes_progress_still_fails() {
+        let mut output = SlowWriter {
+            bytes: Vec::new(),
+            calls: 0,
+            stall_forever: true,
+        };
+        let error =
+            super::write_all_retry(&mut output, b"x", Duration::from_millis(30)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn relay_read_timeout_is_an_error_not_a_spin() {
+        struct TimesOut;
+        impl io::Read for TimesOut {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::TimedOut.into())
+            }
+        }
+        let mut output = Recorder::default();
+        let error = relay(TimesOut, &mut output).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_closed_peer_fails_immediately() {
+        struct Closed;
+        impl io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = super::write_all_retry(&mut Closed, b"x", Duration::from_secs(60)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[cfg(unix)]

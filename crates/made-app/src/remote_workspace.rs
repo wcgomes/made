@@ -10,8 +10,8 @@ use std::{
 use made_remote::protocol::{
     ClaudeListingResult, ClaudeSessionSnapshot, DirectoryEntry, ErrorCode, GitRead, GrokEventKind,
     GrokSessionEvent, GrokSessionInfo, GrokSessionSnapshot, Identity, Operation, PreviewKind,
-    ProtocolError, RemotePath, ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_IN_FLIGHT,
-    MAX_QUEUED_CHUNKS, MAX_TREE_DEPTH, MAX_TREE_ROWS, RPC_TIMEOUT,
+    ProtocolError, RemotePath, ReplyProgress, WireEnvelope, CLOSE_TIMEOUT, MAX_DIR_WATCHES,
+    MAX_IN_FLIGHT, MAX_QUEUED_CHUNKS, MAX_TREE_DEPTH, MAX_TREE_ROWS, RPC_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +170,10 @@ pub enum RemoteResult {
     },
     Grok(GrokSessionSnapshot),
     Changed(RemotePath),
+    /// The Git state of the watched root changed (a pushed notification).
+    GitChanged,
+    /// A subscription was released (the `Ack` of an `UnwatchDir`).
+    Released,
     Error(ErrorCode),
     Closed {
         confirmed: bool,
@@ -226,6 +230,54 @@ pub struct RemoteWorkspace {
     resnapshot: bool,
     close_state: CloseState,
     watch: Option<(Identity, RemotePath)>,
+    /// The companion decodes `WatchDir`/`UnwatchDir` (its `Capabilities`
+    /// say so). Without it only the root-only `Watch` is ever sent.
+    watch_dirs_ok: bool,
+    /// Subscriptions by directory: asked for, live, or refused.
+    dir_watches: HashMap<RemotePath, WatchState>,
+    /// Live notification streams by workspace request id. A subscription's
+    /// acknowledgement completes its request; every later `Changed` /
+    /// `GitChanged` under the same id is a push read through here.
+    streams: HashMap<u64, Stream>,
+    /// Stream ids dropped since the caller last asked, so the transport can
+    /// forget their id mapping.
+    released_streams: Vec<u64>,
+    /// How long a refused subscription waits before it is asked for again.
+    watch_retry: std::time::Duration,
+    /// The safety net's two cadences (uncovered directories and Git, covered
+    /// directories).
+    net_intervals: (std::time::Duration, std::time::Duration),
+    /// Subscriptions to release, sent as the request budget allows.
+    unwatch_queue: VecDeque<RemotePath>,
+    /// When each folder was expanded (a counter), so the newest keep their
+    /// subscription when there are more folders than the table holds.
+    expand_seq: HashMap<RemotePath, u64>,
+    expand_counter: u64,
+    /// How long the last Git refresh took, to space the next ones.
+    git_last: Option<std::time::Duration>,
+    /// The current Git refresh's duration is already in `git_last`.
+    git_timed: bool,
+    /// When each folder's listing was last requested, so a subscription
+    /// acknowledged after a read that began later need not reload it.
+    read_requested: HashMap<RemotePath, Instant>,
+    preview_requested: Option<Instant>,
+    /// Consecutive Git refreshes the safety net started that Git refused, and
+    /// when it last started one: the safety net backs off from a repository
+    /// Git will not read.
+    git_failures: u32,
+    git_net_at: Option<Instant>,
+    /// Directories, the preview and Git that a change touched while their
+    /// read was already in flight: that read may predate the change, so its
+    /// result is stale on arrival and the read is repeated.
+    dir_dirty: HashSet<RemotePath>,
+    preview_dirty: bool,
+    git_dirty: bool,
+    /// When the last Git refresh started, to bound the rate under a burst.
+    git_started: Option<Instant>,
+    /// Safety-net timers: the next full pass, and the next one that also
+    /// reloads directories a live subscription already covers.
+    net_at: Option<Instant>,
+    net_slow_at: Option<Instant>,
     integration_epoch: u64,
     /// Monotonic Grok inventory revision within the transport epoch.
     grok_revision: u64,
@@ -250,11 +302,71 @@ pub struct RemoteWorkspace {
     /// A Claude Code directory whose check failed transiently, retried once
     /// its backoff has passed.
     claude_retry: Option<(RemotePath, Instant)>,
+    /// The root a TUI's follow (OpenCode session or view, Claude Code, Grok)
+    /// stood on when the tab last left it for a root of its own, and when.
+    tui_released: Option<(RemotePath, Instant)>,
+}
+
+/// A TUI that exits ends its own follow as it goes: its companion reports the
+/// session gone in the same moment as the exit, in either order. A departure
+/// from the TUI's root this recently before the exit is observed belongs to
+/// the exit, not to the user.
+const TUI_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `source` is a root a TUI established.
+fn follows_tui(source: RootSource) -> bool {
+    matches!(
+        source,
+        RootSource::View | RootSource::Session | RootSource::Claude | RootSource::Grok
+    )
 }
 
 /// How long a transiently failed Claude Code directory waits before it is
 /// checked again, like the local liveness retry.
 const CLAUDE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Notifications are the primary way a remote change reaches the Explorer and
+/// Git view; this timer is the backstop for a dropped event, a refused watch
+/// and a companion that predates `WatchDir`. Every pass reloads the
+/// directories no live subscription covers and Git (a change in a folder
+/// nobody expanded is visible to no subscription, only to status).
+const SAFETY_NET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// Directories a live subscription covers are reloaded this rarely.
+const SAFETY_NET_WATCHED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// At least this long between the starts of two Git refreshes, so a build
+/// writing continuously cannot keep eight Git commands running back to back;
+/// longer when the last refresh was slow (a multiple of how long it took).
+const GIT_REFRESH_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+const GIT_REFRESH_GAP_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a refused subscription waits before it is asked for again.
+const WATCH_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// Requests this workspace keeps in flight. The client allows
+/// `MAX_IN_FLIGHT`; the heartbeat and a resize share those slots, so the
+/// workspace stops two short of them. (A snapshot alone needs twelve.)
+pub const IN_FLIGHT_BUDGET: usize = MAX_IN_FLIGHT - 2;
+
+/// One directory's subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchState {
+    /// Asked for under this workspace request id; not acknowledged yet.
+    Requested(u64),
+    /// Acknowledged: pushes arrive under this id.
+    Active(u64),
+    /// Refused or timed out at this moment; asked for again after
+    /// `WATCH_RETRY` (or when the root changes).
+    Failed(Instant),
+}
+
+/// What a notification stream's pushes mean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stream {
+    /// The root-only `Watch` of a companion without `WatchDir`: a push names
+    /// the watched path and anything beneath it may have changed.
+    Legacy(RemotePath),
+    /// A `WatchDir`: a push names an entry of the directory, or the
+    /// directory. The root's stream also carries `GitChanged`.
+    Dir(RemotePath),
+}
 
 impl RemoteWorkspace {
     pub fn new(identity: Identity, root: RemotePath) -> Result<Self, ProtocolError> {
@@ -299,6 +411,27 @@ impl RemoteWorkspace {
             resnapshot: false,
             close_state: CloseState::Open,
             watch: None,
+            watch_dirs_ok: false,
+            dir_watches: HashMap::new(),
+            streams: HashMap::new(),
+            released_streams: Vec::new(),
+            watch_retry: WATCH_RETRY,
+            net_intervals: (SAFETY_NET_INTERVAL, SAFETY_NET_WATCHED_INTERVAL),
+            unwatch_queue: VecDeque::new(),
+            expand_seq: HashMap::new(),
+            expand_counter: 0,
+            git_last: None,
+            git_timed: false,
+            read_requested: HashMap::new(),
+            preview_requested: None,
+            git_failures: 0,
+            git_net_at: None,
+            dir_dirty: HashSet::new(),
+            preview_dirty: false,
+            git_dirty: false,
+            git_started: None,
+            net_at: None,
+            net_slow_at: None,
             integration_epoch: 0,
             grok_revision: 0,
             grok_hooks_ready: None,
@@ -310,6 +443,7 @@ impl RemoteWorkspace {
             claude_root: None,
             claude_rejected: None,
             claude_retry: None,
+            tui_released: None,
         })
     }
     pub fn identity(&self) -> &Identity {
@@ -368,7 +502,7 @@ impl RemoteWorkspace {
                 return Err(ProtocolError::Identity);
             }
         }
-        if self.pending.len() >= MAX_IN_FLIGHT {
+        if self.pending.len() >= IN_FLIGHT_BUDGET {
             return Err(ProtocolError::Limit);
         }
         if !matches!(
@@ -379,6 +513,8 @@ impl RemoteWorkspace {
                 | Operation::Preview { .. }
                 | Operation::Refresh { .. }
                 | Operation::Watch { .. }
+                | Operation::WatchDir { .. }
+                | Operation::UnwatchDir { .. }
                 | Operation::Rescan { .. }
                 | Operation::GitRead { .. }
                 | Operation::SessionState
@@ -397,6 +533,8 @@ impl RemoteWorkspace {
             | Operation::Preview { path }
             | Operation::Refresh { path }
             | Operation::Watch { path }
+            | Operation::WatchDir { path }
+            | Operation::UnwatchDir { path }
             | Operation::Rescan { path } => self.check_tree_path(path)?,
             _ => {}
         }
@@ -482,6 +620,13 @@ impl RemoteWorkspace {
         {
             return Err(ProtocolError::Identity);
         }
+        // A subscription's acknowledgement completed its request; what follows
+        // under the same id is a push, never a reply.
+        if !self.pending.contains_key(&reply.request_id) {
+            if let Some(stream) = self.streams.get(&reply.request_id).cloned() {
+                return self.accept_push(&stream, &reply);
+            }
+        }
         let pending = self
             .pending
             .get_mut(&reply.request_id)
@@ -492,6 +637,7 @@ impl RemoteWorkspace {
             return Err(error);
         }
         let purpose = pending.purpose;
+        let started = pending.started;
         let original = pending.request.operation.clone();
         let result = match reply.operation {
             Operation::RootResult {
@@ -565,6 +711,9 @@ impl RemoteWorkspace {
                 accepted,
             }),
             Operation::Changed { path } => Some(RemoteResult::Changed(path)),
+            Operation::Ack if matches!(original, Operation::UnwatchDir { .. }) => {
+                Some(RemoteResult::Released)
+            }
             Operation::Error { code } => Some(RemoteResult::Error(code)),
             Operation::Closed { confirmed } => Some(RemoteResult::Closed { confirmed }),
             _ => return Err(ProtocolError::UnexpectedResponse),
@@ -577,10 +726,113 @@ impl RemoteWorkspace {
             self.outbox
                 .retain(|request| request.identity.matches(&self.identity));
         }
+        if let Some(RemoteResult::Changed(path)) = &result {
+            match &original {
+                Operation::Watch { .. } => {
+                    self.streams
+                        .insert(reply.request_id, Stream::Legacy(path.clone()));
+                }
+                Operation::WatchDir { .. } => {
+                    self.streams
+                        .insert(reply.request_id, Stream::Dir(path.clone()));
+                    self.dir_watches
+                        .insert(path.clone(), WatchState::Active(reply.request_id));
+                    // What was read before the subscription was requested may
+                    // have changed since: read it again once. A read that
+                    // began after the request (the subscription goes first)
+                    // is already covered by it.
+                    let covered =
+                        |requested: Option<&Instant>| requested.is_some_and(|at| *at > started);
+                    if !covered(self.read_requested.get(path)) {
+                        self.stale_directory(path);
+                    }
+                    if *path == self.root && !covered(self.git_started.as_ref()) {
+                        self.stale_git();
+                    }
+                    if self
+                        .projection
+                        .preview
+                        .as_ref()
+                        .is_some_and(|preview| preview.path.is_direct_child_of(path))
+                        && !covered(self.preview_requested.as_ref())
+                    {
+                        self.stale_preview();
+                    }
+                    self.projection.revision = self.projection.revision.wrapping_add(1);
+                }
+                _ => {}
+            }
+        }
         if let Some(result) = &result {
             self.apply(result, &original, purpose)?;
         }
         Ok(result)
+    }
+
+    /// One notification pushed under an acknowledged subscription. It marks
+    /// what it names stale; the next `reconcile` reloads exactly that.
+    fn accept_push(
+        &mut self,
+        stream: &Stream,
+        reply: &WireEnvelope,
+    ) -> Result<Option<RemoteResult>, ProtocolError> {
+        reply.validate()?;
+        match (&reply.operation, stream) {
+            (Operation::Changed { path }, Stream::Legacy(watched)) => {
+                if !path.is_within(watched) {
+                    return Err(ProtocolError::Path);
+                }
+                self.mark_changed(path)?;
+                Ok(Some(RemoteResult::Changed(path.clone())))
+            }
+            (Operation::Changed { path }, Stream::Dir(dir)) => {
+                if path != dir && !path.is_direct_child_of(dir) {
+                    return Err(ProtocolError::Path);
+                }
+                self.mark_path_changed(path);
+                Ok(Some(RemoteResult::Changed(path.clone())))
+            }
+            (Operation::GitChanged, Stream::Dir(dir)) if *dir == self.root => {
+                self.stale_git();
+                self.projection.revision = self.projection.revision.wrapping_add(1);
+                Ok(Some(RemoteResult::GitChanged))
+            }
+            _ => Err(ProtocolError::UnexpectedResponse),
+        }
+    }
+
+    /// Whether the companion acknowledged a subscription to `path`'s changes.
+    pub fn is_watched(&self, path: &RemotePath) -> bool {
+        matches!(self.dir_watches.get(path), Some(WatchState::Active(_)))
+    }
+
+    /// Whether `request_id` is a live notification stream.
+    pub fn is_stream(&self, request_id: u64) -> bool {
+        self.streams.contains_key(&request_id)
+    }
+
+    /// Request ids of streams dropped since the last call.
+    pub fn take_released_streams(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.released_streams)
+    }
+
+    /// The safety net's cadences: how often uncovered directories and Git
+    /// are reloaded, and how often covered directories are (3 and 15 seconds
+    /// unless set).
+    pub fn set_safety_net(&mut self, uncovered: std::time::Duration, covered: std::time::Duration) {
+        self.net_intervals = (uncovered, covered);
+    }
+
+    /// How long a refused subscription waits before it is asked for again
+    /// (30 seconds unless set).
+    pub fn set_watch_retry(&mut self, wait: std::time::Duration) {
+        self.watch_retry = wait;
+    }
+
+    /// Whether the companion decodes `WatchDir`, from its `Capabilities`. Off,
+    /// only the root-only `Watch` is sent and the safety net does the rest.
+    pub fn set_watch_dirs(&mut self, supported: bool) {
+        self.watch_dirs_ok = supported;
     }
 
     /// Apply an unsolicited session snapshot that was not matched to a pending
@@ -769,7 +1021,10 @@ impl RemoteWorkspace {
         self.session_revision = 0;
         self.shell = None;
         self.shell_report = None;
+        self.tui_released = None;
         self.watch = None;
+        self.clear_watches();
+        self.watch_dirs_ok = false;
         self.integration_epoch = 0;
         self.clear_grok();
         self.clear_claude();
@@ -853,6 +1108,14 @@ impl RemoteWorkspace {
         self.outbox.pop_front()
     }
 
+    /// Put back a drained envelope the transport could not take yet (its
+    /// in-flight window was full), ahead of everything queued after it.
+    pub fn requeue(&mut self, request: WireEnvelope) {
+        if self.pending.contains_key(&request.request_id) {
+            self.outbox.push_front(request);
+        }
+    }
+
     fn enqueue(
         &mut self,
         operation: Operation,
@@ -906,6 +1169,9 @@ impl RemoteWorkspace {
             }
             Operation::Focus { .. } => {
                 self.projection.focus = None;
+            }
+            Operation::WatchDir { path } => {
+                self.dir_watches.remove(path);
             }
             _ => {}
         }
@@ -1000,6 +1266,9 @@ impl RemoteWorkspace {
             |p| matches!(&p.request.operation, Operation::List { path: old } if old == &path),
         )?;
         let id = self.enqueue(Operation::List { path: path.clone() }, None, Purpose::User)?;
+        // This read starts after every change seen so far.
+        self.dir_dirty.remove(&path);
+        self.read_requested.insert(path.clone(), Instant::now());
         let projection = self
             .projection
             .directories
@@ -1014,7 +1283,12 @@ impl RemoteWorkspace {
         Ok(id)
     }
     pub fn expand(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
+        // The subscription goes ahead of the listing, so the listing is read
+        // with the watch already requested and needs no second read.
+        self.watch_now(&path);
         let id = self.load_directory(path.clone())?;
+        self.expand_counter += 1;
+        self.expand_seq.insert(path.clone(), self.expand_counter);
         self.projection.expanded.insert(path);
         self.projection.revision = self.projection.revision.wrapping_add(1);
         Ok(id)
@@ -1048,6 +1322,8 @@ impl RemoteWorkspace {
             None,
             Purpose::User,
         )?;
+        self.preview_dirty = false;
+        self.preview_requested = Some(Instant::now());
         self.projection.preview = Some(PreviewProjection {
             path,
             kind: None,
@@ -1068,6 +1344,8 @@ impl RemoteWorkspace {
             )
         })?;
         let id = self.enqueue(Operation::Refresh { path }, None, Purpose::User)?;
+        self.preview_dirty = false;
+        self.preview_requested = Some(Instant::now());
         if let Some(preview) = &mut self.projection.preview {
             preview.freshness = Freshness::Loading;
             self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
@@ -1127,13 +1405,17 @@ impl RemoteWorkspace {
             GitRead::CommitSubject,
             GitRead::Status,
         ];
-        if self.pending.len() + COMMANDS.len() > MAX_IN_FLIGHT
+        if self.pending.len() + COMMANDS.len() > IN_FLIGHT_BUDGET
             || self.outbox.len() + COMMANDS.len() > MAX_QUEUED_CHUNKS
         {
             return Err(ProtocolError::Limit);
         }
         let previous_view = self.projection.git_view.take();
         self.projection.git.clear();
+        // These reads start after every change seen so far.
+        self.git_dirty = false;
+        self.git_started = Some(Instant::now());
+        self.git_timed = false;
         for command in COMMANDS {
             self.enqueue(Operation::GitRead { command }, None, Purpose::User)?;
             self.projection.git.push(GitProjection {
@@ -1261,7 +1543,10 @@ impl RemoteWorkspace {
 
     /// Explicit remote picker grant. Only the exact chosen POSIX path is granted.
     pub fn select_root(&mut self, path: RemotePath) -> Result<u64, ProtocolError> {
-        self.transition(path, RootSource::Selection)
+        let id = self.transition(path, RootSource::Selection)?;
+        // The user chose this folder; it is not the end of a TUI's follow.
+        self.tui_released = None;
+        Ok(id)
     }
     fn candidate(&self) -> Result<(RemotePath, RootSource), ProtocolError> {
         if self.integration == IntegrationState::Connected {
@@ -1338,7 +1623,53 @@ impl RemoteWorkspace {
         }
         Ok(())
     }
+    /// Whether the last root transition completed (or none ran). A root that
+    /// is still being selected is not yet the root the tab stands on.
+    pub fn root_settled(&self) -> bool {
+        self.follow_request.is_none()
+    }
+
+    /// The folder a TUI that exited at `now` leaves the tab in: the root its
+    /// follow stood on (also when the TUI's own end of follow just moved the
+    /// tab off it), the one it was moving the tab to, or else the current root.
+    pub fn tui_exit_directory(&self, now: Instant) -> RemotePath {
+        if let Some((root, at)) = &self.tui_released {
+            if now.saturating_duration_since(*at) <= TUI_RELEASE_GRACE {
+                return root.clone();
+            }
+        }
+        self.projection
+            .requested_root
+            .clone()
+            .unwrap_or_else(|| self.root.clone())
+    }
+
+    /// End everything a TUI that exited established for this tab: its roots
+    /// and the session state it owned. The shell that takes its place starts
+    /// in `directory`, which therefore becomes the tab's shell root, so the
+    /// explorer stays there; state carried by the session channel is released
+    /// when the integration reports its disconnect.
+    pub fn release_tui_follow(&mut self, directory: RemotePath) -> Result<(), ProtocolError> {
+        self.grok_root = None;
+        self.grok_newest = None;
+        self.claude_root = None;
+        self.claude_rejected = None;
+        self.claude_retry = None;
+        self.projection.grok = None;
+        self.projection.claude = None;
+        self.shell = Some(directory.clone());
+        if self.projection.requested_root.as_ref() == Some(&directory) {
+            // A transition is already taking the tab there.
+            self.projection.source = RootSource::Shell;
+            return Ok(());
+        }
+        self.follow()
+    }
+
     fn transition(&mut self, path: RemotePath, source: RootSource) -> Result<u64, ProtocolError> {
+        if follows_tui(self.projection.source) && !follows_tui(source) && path != self.root {
+            self.tui_released = Some((self.root.clone(), Instant::now()));
+        }
         // A single root transition owns the next generation. Drop old work
         // silently: the client is reset before RootSelect, and per-request
         // Cance frames would exhaust its bounded in-flight queue.
@@ -1355,10 +1686,27 @@ impl RemoteWorkspace {
         self.follow_request = Some(id);
         Ok(id)
     }
+    /// Subscriptions belong to one root generation of one attachment.
+    fn clear_watches(&mut self) {
+        self.released_streams.extend(self.streams.keys().copied());
+        self.streams.clear();
+        self.dir_watches.clear();
+        self.unwatch_queue.clear();
+        self.read_requested.clear();
+        self.git_failures = 0;
+        self.git_net_at = None;
+        self.dir_dirty.clear();
+        self.preview_dirty = false;
+        self.git_dirty = false;
+        self.net_at = None;
+        self.net_slow_at = None;
+    }
     fn clear_root_projection(&mut self) {
         self.watch = None;
+        self.clear_watches();
         self.projection.directories.clear();
         self.projection.expanded.clear();
+        self.expand_seq.clear();
         self.projection.selected = None;
         self.projection.git_selected = None;
         self.projection.git_root_known = false;
@@ -1393,17 +1741,293 @@ impl RemoteWorkspace {
         if matches!(purpose, Purpose::Resnapshot) {
             self.refresh_grok()?;
         }
+        // The subscription goes first: what is read after it is covered by it.
+        if self.watch_dirs_ok {
+            self.sync_watches();
+        } else {
+            self.enqueue(
+                Operation::Watch {
+                    path: self.root.clone(),
+                },
+                None,
+                Purpose::User,
+            )?;
+        }
         self.load_directory(self.root.clone())?;
         self.refresh_git()?;
         self.refresh_sessions()?;
-        self.enqueue(
-            Operation::Watch {
-                path: self.root.clone(),
-            },
+        Ok(())
+    }
+
+    /// Keep one `WatchDir` subscription per directory the Explorer shows and
+    /// drop the ones it no longer shows. Wanted, in this order: the root, the
+    /// folder holding the open preview, then the visible expanded folders
+    /// (every ancestor expanded; a folder under a collapsed one is not
+    /// visible) newest first, at most `MAX_DIR_WATCHES` in all. A refused or
+    /// timed-out subscription is asked for again after `WATCH_RETRY`; the
+    /// safety net covers it meanwhile.
+    fn sync_watches(&mut self) {
+        if !self.watch_dirs_ok
+            || self.connection != ConnectionState::Connected
+            || self.close_state != CloseState::Open
+            || self.projection.root_state != Freshness::Current
+            || self.follow_request.is_some()
+        {
+            return;
+        }
+        let mut desired = vec![self.root.clone()];
+        if let Some(parent) = self
+            .projection
+            .preview
+            .as_ref()
+            .and_then(|preview| remote_parent(&preview.path))
+        {
+            if parent.is_within(&self.root) && !desired.contains(&parent) {
+                desired.push(parent);
+            }
+        }
+        let mut expanded: Vec<_> = self
+            .projection
+            .expanded
+            .iter()
+            .filter(|path| {
+                **path != self.root
+                    && self.projection.directories.contains_key(*path)
+                    && self.expanded_chain(path)
+            })
+            .cloned()
+            .collect();
+        expanded
+            .sort_by_key(|path| std::cmp::Reverse(self.expand_seq.get(path).copied().unwrap_or(0)));
+        for path in expanded {
+            if desired.len() >= MAX_DIR_WATCHES {
+                break;
+            }
+            if !desired.contains(&path) {
+                desired.push(path);
+            }
+        }
+        let released: Vec<_> = self
+            .dir_watches
+            .keys()
+            .filter(|path| !desired.contains(path))
+            .cloned()
+            .collect();
+        for path in released {
+            self.release_watch(&path);
+        }
+        self.drain_unwatches();
+        for path in desired {
+            if let Some(WatchState::Failed(at)) = self.dir_watches.get(&path) {
+                if at.elapsed() < self.watch_retry {
+                    continue;
+                }
+                self.dir_watches.remove(&path);
+            }
+            if self.dir_watches.contains_key(&path)
+                || self.unwatch_queue.contains(&path)
+                || self.pending.len() >= IN_FLIGHT_BUDGET
+                || self.outbox.len() >= MAX_QUEUED_CHUNKS
+            {
+                continue;
+            }
+            if let Ok(id) = self.enqueue(
+                Operation::WatchDir { path: path.clone() },
+                None,
+                Purpose::User,
+            ) {
+                self.dir_watches.insert(path, WatchState::Requested(id));
+            }
+        }
+    }
+
+    /// Subscribe to a folder that is about to be listed, when there is room.
+    fn watch_now(&mut self, path: &RemotePath) {
+        if !self.watch_dirs_ok
+            || self.connection != ConnectionState::Connected
+            || self.close_state != CloseState::Open
+            || self.projection.root_state != Freshness::Current
+            || self.follow_request.is_some()
+            || *path == self.root
+            || self.dir_watches.contains_key(path)
+            || self.unwatch_queue.contains(path)
+            || self.dir_watches.len() >= MAX_DIR_WATCHES
+            || self.pending.len() >= IN_FLIGHT_BUDGET
+            || self.outbox.len() >= MAX_QUEUED_CHUNKS
+            || self.check_tree_path(path).is_err()
+        {
+            return;
+        }
+        if let Ok(id) = self.enqueue(
+            Operation::WatchDir { path: path.clone() },
             None,
             Purpose::User,
-        )?;
-        Ok(())
+        ) {
+            self.dir_watches
+                .insert(path.clone(), WatchState::Requested(id));
+        }
+    }
+
+    /// Every folder between `path` and the root is expanded: `path` is shown.
+    fn expanded_chain(&self, path: &RemotePath) -> bool {
+        let mut current = remote_parent(path);
+        while let Some(parent) = current {
+            if parent == self.root {
+                return true;
+            }
+            if !self.projection.expanded.contains(&parent) {
+                return false;
+            }
+            current = remote_parent(&parent);
+        }
+        false
+    }
+
+    /// Forget a directory's subscription and queue its release.
+    fn release_watch(&mut self, path: &RemotePath) {
+        let Some(state) = self.dir_watches.remove(path) else {
+            return;
+        };
+        if let WatchState::Requested(id) | WatchState::Active(id) = state {
+            self.pending.remove(&id);
+            self.outbox.retain(|request| request.request_id != id);
+            self.streams.remove(&id);
+            self.released_streams.push(id);
+            self.queue_unwatch(path);
+        }
+    }
+
+    /// Tell the companion to drop a subscription, as the request budget
+    /// allows (see `drain_unwatches`).
+    fn queue_unwatch(&mut self, path: &RemotePath) {
+        if !self.unwatch_queue.contains(path) {
+            self.unwatch_queue.push_back(path.clone());
+        }
+    }
+
+    /// Send queued releases as ordinary requests, so they count against the
+    /// in-flight budget and a mass collapse cannot crowd out everything else.
+    fn drain_unwatches(&mut self) {
+        while self.pending.len() < IN_FLIGHT_BUDGET && self.outbox.len() < MAX_QUEUED_CHUNKS {
+            let Some(path) = self.unwatch_queue.pop_front() else {
+                return;
+            };
+            if self.connection != ConnectionState::Connected || self.close_state != CloseState::Open
+            {
+                self.unwatch_queue.clear();
+                return;
+            }
+            if self
+                .enqueue(Operation::UnwatchDir { path }, None, Purpose::User)
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The safety net. Call from the refresh timer while the tab is shown.
+    /// Notifications are the primary path; this reloads, at most every few
+    /// seconds and never while the same read is in flight, the directories no
+    /// live subscription covers (all of them for a companion without
+    /// `WatchDir`) and Git, and the covered directories much more rarely.
+    pub fn refresh_safety_net(&mut self, now: Instant) {
+        if self.connection != ConnectionState::Connected
+            || self.close_state != CloseState::Open
+            || self.projection.root_state != Freshness::Current
+        {
+            self.net_at = None;
+            return;
+        }
+        let Some(last) = self.net_at else {
+            self.net_at = Some(now);
+            self.net_slow_at = Some(now);
+            return;
+        };
+        if now.saturating_duration_since(last) < self.net_intervals.0 {
+            return;
+        }
+        self.net_at = Some(now);
+        let slow = self
+            .net_slow_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= self.net_intervals.1);
+        if slow {
+            self.net_slow_at = Some(now);
+        }
+        let covered =
+            |path: &RemotePath| matches!(self.dir_watches.get(path), Some(WatchState::Active(_)));
+        let targets: Vec<_> = std::iter::once(&self.root)
+            .chain(self.projection.expanded.iter())
+            .filter(|path| {
+                self.projection
+                    .directories
+                    .get(*path)
+                    .is_some_and(|directory| {
+                        matches!(
+                            directory.freshness,
+                            Freshness::Current | Freshness::Unavailable(_)
+                        )
+                    })
+                    && (slow || !covered(path))
+            })
+            .cloned()
+            .collect();
+        let preview_uncovered = self
+            .projection
+            .preview
+            .as_ref()
+            .and_then(|preview| remote_parent(&preview.path))
+            .is_some_and(|parent| !covered(&parent));
+        for path in targets {
+            self.stale_directory(&path);
+        }
+        // The previewed file is reread on the same terms as its folder: often
+        // when no subscription covers the folder, rarely when one does.
+        if (slow || preview_uncovered)
+            && self
+                .projection
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.freshness == Freshness::Current)
+        {
+            self.stale_preview();
+        }
+        if self.projection.git_root_known {
+            // A repository Git refuses to read is asked about less and less
+            // often (3 s, 6 s, ... up to a minute), not every pass.
+            let wait = (self.net_intervals.0 * (1 << self.git_failures.min(5)))
+                .min(std::time::Duration::from_secs(60));
+            let due = self
+                .git_net_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= wait);
+            if due
+                && !self
+                    .projection
+                    .git
+                    .iter()
+                    .any(|git| matches!(git.freshness, Freshness::Loading | Freshness::Stale))
+            {
+                self.git_net_at = Some(now);
+                self.stale_git();
+            }
+        } else if self.root_lists_repository() {
+            // A repository appeared under a root that had none.
+            let _ = self.refresh_git_if_idle();
+        }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+    }
+
+    /// The root's listing shows a `.git` entry.
+    fn root_lists_repository(&self) -> bool {
+        self.projection
+            .directories
+            .get(&self.root)
+            .is_some_and(|directory| {
+                directory
+                    .entries
+                    .iter()
+                    .any(|entry| remote_name(&entry.path) == b".git")
+            })
     }
     pub fn resnapshot_pending(&self) -> bool {
         self.resnapshot
@@ -1462,6 +2086,9 @@ impl RemoteWorkspace {
         self.mark_changed(path)
     }
 
+    /// A change somewhere at or under `path`, or in a directory containing it
+    /// (the root-only watch of an older companion): everything cached around
+    /// it may be stale.
     fn mark_changed(&mut self, path: &RemotePath) -> Result<(), ProtocolError> {
         let affected: Vec<_> = self
             .projection
@@ -1471,13 +2098,96 @@ impl RemoteWorkspace {
             .cloned()
             .collect();
         for directory in affected {
-            if let Some(projection) = self.projection.directories.get_mut(&directory) {
-                projection.freshness = Freshness::Stale;
+            self.stale_directory(&directory);
+        }
+        self.stale_preview();
+        self.stale_git();
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// An entry (or directory) named by a `WatchDir` push changed: reload the
+    /// listing it is in and its own listing when it is a loaded directory, the
+    /// preview when it is or contains the previewed file, and Git. No other
+    /// directory is touched.
+    fn mark_path_changed(&mut self, path: &RemotePath) {
+        let affected: Vec<_> = self
+            .projection
+            .directories
+            .keys()
+            .filter(|directory| *directory == path || path.is_direct_child_of(directory))
+            .cloned()
+            .collect();
+        for directory in affected {
+            self.stale_directory(&directory);
+        }
+        if self
+            .projection
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.path.is_within(path))
+        {
+            self.stale_preview();
+        }
+        self.stale_git();
+        // A repository created (or the first one found) under the root.
+        if !self.projection.git_root_known
+            && remote_name(path) == b".git"
+            && path.is_direct_child_of(&self.root)
+        {
+            let _ = self.refresh_git_if_idle();
+        }
+        self.projection.revision = self.projection.revision.wrapping_add(1);
+    }
+
+    /// A read already in flight may predate the change, so it is not
+    /// cancelled but remembered: its result is applied as stale and the read
+    /// is repeated (a result that arrives first must not hide the change).
+    fn stale_directory(&mut self, path: &RemotePath) {
+        if let Some(directory) = self.projection.directories.get_mut(path) {
+            if directory.freshness == Freshness::Loading {
+                self.dir_dirty.insert(path.clone());
+            } else {
+                directory.freshness = Freshness::Stale;
             }
         }
+    }
+
+    fn stale_preview(&mut self) {
         if let Some(preview) = &mut self.projection.preview {
-            preview.freshness = Freshness::Stale;
+            if preview.freshness == Freshness::Loading {
+                self.preview_dirty = true;
+            } else {
+                preview.freshness = Freshness::Stale;
+            }
             self.projection.preview_revision = self.projection.preview_revision.wrapping_add(1);
+        }
+    }
+
+    fn stale_git(&mut self) {
+        // Git is only worth asking when a repository was seen: a root that is
+        // not one answers every read with an error, over and over.
+        if !self.projection.git_root_known {
+            // The first read is still deciding whether this is a repository:
+            // remember the change, and look again when it lands.
+            if self
+                .projection
+                .git
+                .iter()
+                .any(|git| git.freshness == Freshness::Loading)
+            {
+                self.git_dirty = true;
+            }
+            return;
+        }
+        if self
+            .projection
+            .git
+            .iter()
+            .any(|git| git.freshness == Freshness::Loading)
+        {
+            self.git_dirty = true;
+            return;
         }
         for git in &mut self.projection.git {
             git.freshness = Freshness::Stale;
@@ -1485,8 +2195,49 @@ impl RemoteWorkspace {
         if let Some(view) = &mut self.projection.git_view {
             view.freshness = Freshness::Stale;
         }
-        self.projection.revision = self.projection.revision.wrapping_add(1);
-        Ok(())
+    }
+
+    /// The least time between the starts of two Git refreshes: a multiple of
+    /// the last one's duration, so a slow repository is asked less often.
+    fn git_gap(&self) -> std::time::Duration {
+        self.git_last.map_or(GIT_REFRESH_GAP, |last| {
+            (last * 2).clamp(GIT_REFRESH_GAP, GIT_REFRESH_GAP_MAX)
+        })
+    }
+
+    /// Git reads that finished while a change was pending are stale as a set.
+    fn settle_git_dirty(&mut self) {
+        if !self.git_timed
+            && !self
+                .projection
+                .git
+                .iter()
+                .any(|git| git.freshness == Freshness::Loading)
+        {
+            self.git_timed = true;
+            if let Some(started) = self.git_started {
+                self.git_last = Some(started.elapsed());
+            }
+            // Whether Git could read the repository at all.
+            let refused = self.projection.git.iter().any(|git| {
+                git.command == GitRead::Status && matches!(git.freshness, Freshness::Unavailable(_))
+            });
+            self.git_failures = if refused {
+                (self.git_failures + 1).min(5)
+            } else {
+                0
+            };
+        }
+        if self.git_dirty
+            && !self
+                .projection
+                .git
+                .iter()
+                .any(|git| git.freshness == Freshness::Loading)
+        {
+            self.git_dirty = false;
+            self.stale_git();
+        }
     }
 
     /// Call on the refresh timer: prioritize visible directories and coalesce
@@ -1495,6 +2246,18 @@ impl RemoteWorkspace {
         if self.connection != ConnectionState::Connected || self.close_state != CloseState::Open {
             return Ok(());
         }
+        self.sync_watches();
+        // Git needs eight request slots at once: while it is waiting for its
+        // turn, directory reloads leave them free instead of taking them all.
+        let git_waiting = self
+            .projection
+            .git
+            .iter()
+            .any(|git| git.freshness == Freshness::Stale)
+            && self
+                .git_started
+                .is_none_or(|at| at.elapsed() >= self.git_gap());
+        let reserve = if git_waiting { 8 } else { 0 };
         let dirty: Vec<_> = self
             .projection
             .directories
@@ -1503,12 +2266,12 @@ impl RemoteWorkspace {
             .map(|d| d.path.clone())
             .collect();
         for directory in dirty {
-            if self.pending.len() >= MAX_IN_FLIGHT {
+            if self.pending.len() + reserve >= IN_FLIGHT_BUDGET {
                 break;
             }
             self.load_directory(directory)?;
         }
-        if self.pending.len() < MAX_IN_FLIGHT
+        if self.pending.len() + reserve < IN_FLIGHT_BUDGET
             && self
                 .projection
                 .preview
@@ -1517,12 +2280,15 @@ impl RemoteWorkspace {
         {
             self.refresh_preview()?;
         }
-        if self.pending.len() + 8 <= MAX_IN_FLIGHT
+        if self.pending.len() + 8 <= IN_FLIGHT_BUDGET
             && self
                 .projection
                 .git
                 .iter()
                 .any(|g| g.freshness == Freshness::Stale)
+            && self
+                .git_started
+                .is_none_or(|at| at.elapsed() >= self.git_gap())
         {
             self.refresh_git()?;
         }
@@ -1596,7 +2362,13 @@ impl RemoteWorkspace {
                         path: path.clone(),
                         entries: entries.clone(),
                         truncated: *truncated,
-                        freshness: Freshness::Current,
+                        // A change that arrived while this read was in flight
+                        // may not be in it: reload instead of trusting it.
+                        freshness: if self.dir_dirty.remove(path) {
+                            Freshness::Stale
+                        } else {
+                            Freshness::Current
+                        },
                     },
                 );
                 // Deleted nodes lose their selection, expansion and preview.
@@ -1642,7 +2414,11 @@ impl RemoteWorkspace {
                         path: path.clone(),
                         kind: Some(*kind),
                         data: data.clone(),
-                        freshness: Freshness::Current,
+                        freshness: if std::mem::take(&mut self.preview_dirty) {
+                            Freshness::Stale
+                        } else {
+                            Freshness::Current
+                        },
                     });
                     self.projection.preview_revision =
                         self.projection.preview_revision.wrapping_add(1);
@@ -1662,6 +2438,7 @@ impl RemoteWorkspace {
                     self.projection.git_root_known = true;
                 }
                 self.update_git_view()?;
+                self.settle_git_dirty();
             }
             RemoteResult::Session(snapshot) => {
                 if snapshot.revision < self.session_revision {
@@ -1718,10 +2495,12 @@ impl RemoteWorkspace {
             RemoteResult::Changed(path) => {
                 if matches!(original, Operation::Watch { .. }) {
                     self.watch = Some((self.identity.clone(), path.clone()));
-                } else {
+                } else if !matches!(original, Operation::WatchDir { .. }) {
                     self.mark_changed(path)?;
                 }
             }
+            // Only ever a push, handled where it arrives.
+            RemoteResult::GitChanged | RemoteResult::Released => {}
             RemoteResult::Closed { confirmed } => {
                 self.close_state = if *confirmed {
                     CloseState::Confirmed
@@ -1782,6 +2561,15 @@ impl RemoteWorkspace {
                         preview.freshness = Freshness::Unavailable(*code);
                     }
                 }
+                Operation::WatchDir { path } => {
+                    self.dir_watches
+                        .insert(path.clone(), WatchState::Failed(Instant::now()));
+                    // A subscription that took too long may still complete
+                    // on the companion; release it so it holds no slot.
+                    if *code == ErrorCode::Timeout {
+                        self.queue_unwatch(path);
+                    }
+                }
                 Operation::GitRead { command } => {
                     if let Some(git) = self
                         .projection
@@ -1792,6 +2580,7 @@ impl RemoteWorkspace {
                         git.freshness = Freshness::Unavailable(*code);
                     }
                     self.update_git_view()?;
+                    self.settle_git_dirty();
                 }
                 Operation::SessionState => {
                     self.set_integration(IntegrationState::Unavailable);
@@ -2001,6 +2790,16 @@ fn grok_newest_session(snapshot: &GrokSessionSnapshot) -> Option<&GrokSessionInf
         .sessions
         .iter()
         .max_by_key(|session| session.opened_at)
+}
+
+/// The directory holding `path`; `None` for `/`.
+fn remote_parent(path: &RemotePath) -> Option<RemotePath> {
+    let bytes = path.as_bytes();
+    if bytes.len() <= 1 {
+        return None;
+    }
+    let cut = bytes.iter().rposition(|byte| *byte == b'/')?;
+    RemotePath::new(if cut == 0 { &bytes[..1] } else { &bytes[..cut] }).ok()
 }
 
 fn remote_depth(path: &RemotePath, root: &RemotePath) -> usize {

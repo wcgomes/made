@@ -10768,6 +10768,8 @@ fn remote_grok_diagnostics_follow_the_tab_tier_and_server_state() {
         helper_version: "probe".to_owned(),
         grok: true,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let no_grok_capabilities = Capabilities {
         grok: false,
@@ -11028,6 +11030,8 @@ fn grok_ssh_menu_row_and_consent_card_follow_per_server_detection() {
         helper_version: "probe".to_owned(),
         grok: true,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let with_grok = model

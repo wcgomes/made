@@ -19,7 +19,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -218,6 +218,25 @@ impl fmt::Display for WatchError {
     }
 }
 
+impl WatchError {
+    /// Whether the platform refused the watch because a per-user resource
+    /// limit was reached (for example `inotify` watches exhausted, `ENOSPC`).
+    /// Retrying is pointless until something else releases watches.
+    #[must_use]
+    pub fn is_resource_limit(&self) -> bool {
+        match self {
+            Self::Path(_) => false,
+            Self::Notify { source, .. } => {
+                matches!(source.kind, notify::ErrorKind::MaxFilesWatch)
+                    || matches!(
+                        &source.kind,
+                        notify::ErrorKind::Io(error) if error.raw_os_error() == Some(28)
+                    )
+            }
+        }
+    }
+}
+
 impl Error for WatchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -248,7 +267,10 @@ pub struct FsWatcher {
     events: Receiver<Vec<PendingEvent>>,
     pending: VecDeque<WatchEvent>,
     pending_seen: HashSet<WatchEvent>,
-    _watcher: RecommendedWatcher,
+    /// Directories outside `root` that [`FsWatcher::watch_path`] subscribed
+    /// to. Their events are accepted by the debounce thread's normalizer.
+    extra_roots: Arc<Mutex<Vec<PathBuf>>>,
+    watcher: RecommendedWatcher,
     _thread: Option<JoinHandle<()>>,
 }
 
@@ -268,12 +290,24 @@ impl FsWatcher {
         root: impl AsRef<Path>,
         generation: RootGeneration,
     ) -> Result<Self, WatchError> {
-        Self::with_debounce_mode(
+        Self::build(
             root,
             generation,
             DEFAULT_DEBOUNCE,
-            RecursiveMode::NonRecursive,
+            Some(RecursiveMode::NonRecursive),
         )
+    }
+
+    /// Creates a watcher that is attached to nothing yet. `root` only anchors
+    /// event-path normalization; subscribe to directories one at a time with
+    /// [`FsWatcher::watch_path`] and release them with
+    /// [`FsWatcher::unwatch_path`]. One platform watcher (one `inotify`
+    /// instance) serves every subscription.
+    pub fn new_detached(
+        root: impl AsRef<Path>,
+        generation: RootGeneration,
+    ) -> Result<Self, WatchError> {
+        Self::build(root, generation, DEFAULT_DEBOUNCE, None)
     }
 
     /// Watches `root` recursively with an explicit debounce window.
@@ -282,14 +316,14 @@ impl FsWatcher {
         generation: RootGeneration,
         debounce: Duration,
     ) -> Result<Self, WatchError> {
-        Self::with_debounce_mode(root, generation, debounce, RecursiveMode::Recursive)
+        Self::build(root, generation, debounce, Some(RecursiveMode::Recursive))
     }
 
-    fn with_debounce_mode(
+    fn build(
         root: impl AsRef<Path>,
         generation: RootGeneration,
         debounce: Duration,
-        mode: RecursiveMode,
+        mode: Option<RecursiveMode>,
     ) -> Result<Self, WatchError> {
         let guard = PathGuard::new(root)?;
         let root = guard.root().to_path_buf();
@@ -307,20 +341,24 @@ impl FsWatcher {
             source,
         })?;
 
-        watcher
-            .watch(&root, mode)
-            .map_err(|source| WatchError::Notify {
-                path: root.clone(),
-                source,
-            })?;
+        if let Some(mode) = mode {
+            watcher
+                .watch(&root, mode)
+                .map_err(|source| WatchError::Notify {
+                    path: root.clone(),
+                    source,
+                })?;
+        }
 
+        let extra_roots = Arc::new(Mutex::new(Vec::new()));
+        let event_extras = Arc::clone(&extra_roots);
         let event_root = root.clone();
         let rescan_root = root.clone();
         let (events, thread) = start_debounce(
             raw_rx,
             raw_overflow,
             debounce,
-            move |event| normalize_event(event, &event_root, generation),
+            move |event| normalize_event(event, &event_root, &event_extras, generation),
             pair_split_renames,
             move || PendingEvent::Public(WatchEvent::rescan(rescan_root.clone(), generation)),
         );
@@ -332,9 +370,109 @@ impl FsWatcher {
             events,
             pending: VecDeque::new(),
             pending_seen: HashSet::new(),
-            _watcher: watcher,
+            extra_roots,
+            watcher,
             _thread: Some(thread),
         })
+    }
+
+    /// Subscribes to `path` (a directory), directly or recursively. See
+    /// [`FsWatcher::watch_paths`].
+    pub fn watch_path(
+        &mut self,
+        path: impl AsRef<Path>,
+        recursive: bool,
+    ) -> Result<(), WatchError> {
+        self.watch_paths(&[(path.as_ref().to_path_buf(), recursive)])
+    }
+
+    /// Subscribes to several directories at once, each directly or
+    /// recursively. Backends that restart their platform stream for every
+    /// subscription (macOS FSEvents, seconds each on a busy machine) apply
+    /// the whole set in one restart. A path outside the watcher's root is
+    /// accepted too: the caller owns that authorization decision (the remote
+    /// companion watches a repository's metadata directory, which can live
+    /// beside or above the workspace). Events are reported with the canonical
+    /// spelling of each path. Fails with a resource-limit error
+    /// ([`WatchError::is_resource_limit`]) when the platform watch table is
+    /// full; earlier subscriptions stay intact.
+    pub fn watch_paths(&mut self, targets: &[(PathBuf, bool)]) -> Result<(), WatchError> {
+        let mut canonicals = Vec::with_capacity(targets.len());
+        for (path, recursive) in targets {
+            let canonical = fs::canonicalize(path).map_err(|source| {
+                WatchError::Path(PathError::Unreadable {
+                    path: path.clone(),
+                    source,
+                })
+            })?;
+            canonicals.push((canonical, *recursive));
+        }
+        if let Ok(mut extras) = self.extra_roots.lock() {
+            for (canonical, _) in &canonicals {
+                let inside = *canonical == self.root || canonical.starts_with(&self.root);
+                if !inside && !extras.contains(canonical) {
+                    extras.push(canonical.clone());
+                }
+            }
+        }
+        let outcome = {
+            let mut paths = self.watcher.paths_mut();
+            let mut added = Vec::new();
+            let mut failure = None;
+            for (canonical, recursive) in &canonicals {
+                let mode = if *recursive {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
+                match paths.add(canonical, mode) {
+                    Ok(()) => added.push(canonical.clone()),
+                    Err(source) => {
+                        failure = Some(WatchError::Notify {
+                            path: canonical.clone(),
+                            source,
+                        });
+                        break;
+                    }
+                }
+            }
+            if failure.is_some() {
+                // All or nothing: take back what was added before the
+                // failure so a refused set leaves no platform watch behind.
+                for path in &added {
+                    let _ = paths.remove(path);
+                }
+            }
+            let committed = paths.commit();
+            match (failure, committed) {
+                (Some(error), _) => Err(error),
+                (None, Err(source)) => Err(WatchError::Notify {
+                    path: canonicals
+                        .first()
+                        .map(|(path, _)| path.clone())
+                        .unwrap_or_default(),
+                    source,
+                }),
+                (None, Ok(())) => Ok(()),
+            }
+        };
+        if outcome.is_err() {
+            if let Ok(mut extras) = self.extra_roots.lock() {
+                extras.retain(|extra| !canonicals.iter().any(|(path, _)| path == extra));
+            }
+        }
+        outcome
+    }
+
+    /// Releases a subscription made by [`FsWatcher::watch_path`]. Unknown or
+    /// already vanished paths are ignored.
+    pub fn unwatch_path(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let _ = self.watcher.unwatch(&canonical);
+        if let Ok(mut extras) = self.extra_roots.lock() {
+            extras.retain(|extra| extra != &canonical);
+        }
     }
 
     /// Returns the canonical watched root.
@@ -478,11 +616,26 @@ pub(crate) fn normalize_event_path(path: &Path, root: &Path) -> Option<PathBuf> 
     None
 }
 
-fn normalize_event(event: Event, root: &Path, generation: RootGeneration) -> Vec<PendingEvent> {
+fn normalize_event(
+    event: Event,
+    root: &Path,
+    extras: &Mutex<Vec<PathBuf>>,
+    generation: RootGeneration,
+) -> Vec<PendingEvent> {
+    let extras: Vec<PathBuf> = extras
+        .lock()
+        .map(|extras| extras.clone())
+        .unwrap_or_default();
     let paths: Vec<PathBuf> = event
         .paths
         .into_iter()
-        .filter_map(|path| normalize_event_path(&path, root))
+        .filter_map(|path| {
+            normalize_event_path(&path, root).or_else(|| {
+                extras
+                    .iter()
+                    .find_map(|extra| normalize_event_path(&path, extra))
+            })
+        })
         .collect();
     if paths.is_empty() {
         return Vec::new();

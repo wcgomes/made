@@ -882,6 +882,8 @@ pub fn parse_probe_report(bytes: &[u8]) -> Result<ProbeReport, ErrorCode> {
             helper_version: "probe".to_owned(),
             grok: detected(grok),
             python3: false,
+            watch_dirs: false,
+            start_shell: false,
         },
         claude: detected(claude),
     })
@@ -1747,17 +1749,24 @@ fn run_grok_install(
 #[derive(Clone, Default)]
 pub struct SshFailureSlot {
     failure: std::sync::Arc<std::sync::Mutex<Option<made_platform::ssh::SshFailure>>>,
+    /// ssh's last stderr lines for a generic I/O failure; log use only.
+    tail: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl SshFailureSlot {
     pub fn take(&self) -> Option<made_platform::ssh::SshFailure> {
         self.failure.lock().ok().and_then(|mut slot| slot.take())
     }
+
+    pub fn take_tail(&self) -> Option<String> {
+        self.tail.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
 struct ObservingStream {
     inner: made_platform::ssh::SshProcess,
     failure: std::sync::Arc<std::sync::Mutex<Option<made_platform::ssh::SshFailure>>>,
+    tail: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl made_remote::client::ClientStream for ObservingStream {
@@ -1767,6 +1776,12 @@ impl made_remote::client::ClientStream for ObservingStream {
     fn poll(&mut self) -> Option<made_platform::ssh::SshEvent> {
         match self.inner.poll() {
             Some(made_platform::ssh::SshEvent::Failed(failure)) => {
+                if failure.kind() == made_platform::ssh::SshFailureKind::Io {
+                    let tail = self.inner.stderr_tail();
+                    if let (false, Ok(mut slot)) = (tail.is_empty(), self.tail.lock()) {
+                        *slot = Some(tail);
+                    }
+                }
                 if let Ok(mut slot) = self.failure.lock() {
                     *slot = Some(failure);
                 }
@@ -1852,6 +1867,7 @@ pub fn connect_companion(
         ObservingStream {
             inner: process,
             failure: std::sync::Arc::clone(&failures.failure),
+            tail: std::sync::Arc::clone(&failures.tail),
         },
         identity,
         root,

@@ -118,11 +118,15 @@ impl PendingInput {
 }
 
 /// Leaves the alternate screen and resets the input and display modes a
-/// full-screen program may leave set when it exits: the scroll region and
-/// origin mode (with the cursor kept where it is), autowrap, attributes,
-/// cursor visibility and shape, cursor and keypad application modes, mouse
-/// and focus reporting, bracketed paste and the window title.
-const LEAVE_PROGRAM_MODES: &[u8] = b"\x1b[?1049l\x1b7\x1b[?6l\x1b[r\x1b8\x1b[?7h\x1b[0m\x1b[?25h\x1b[0 q\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b]2;\x07";
+/// full-screen program may leave set when it exits. The companion applies the
+/// same reset when it starts a remote shell in a pane.
+const LEAVE_PROGRAM_MODES: &[u8] = made_remote::supervisor::LEAVE_PROGRAM_MODES;
+
+/// The exit banner's action of a remote pane whose SSH transport is connected:
+/// it names no program, for any program ended.
+pub const OPEN_SHELL_LABEL: &str = "Open shell";
+/// Tooltip of [`OPEN_SHELL_LABEL`].
+pub const OPEN_SHELL_TOOLTIP: &str = "Start a shell on the server in this pane";
 
 /// Longest wait for output a finished child printed before its exit was
 /// reported.
@@ -158,6 +162,11 @@ pub struct TerminalPane {
     remote_image_paste: bool,
     pending_image_png: Option<Vec<u8>>,
     remote_image_hint_shown: bool,
+    /// The host decided a clean exit of this remote child is not answered by
+    /// a replacement shell or by closing the tab, so the exit banner shows.
+    exit_banner_forced: bool,
+    /// Why the host could not start a shell after this remote child ended.
+    open_shell_failure: Option<String>,
     options: PtyOptions,
     /// Program this pane runs; names the exit overlay and restart copy.
     target: TerminalTarget,
@@ -237,6 +246,8 @@ impl TerminalPane {
             remote_image_paste: false,
             pending_image_png: None,
             remote_image_hint_shown: false,
+            exit_banner_forced: false,
+            open_shell_failure: None,
             options,
             target: TerminalTarget::Shell,
             encoder,
@@ -301,6 +312,8 @@ impl TerminalPane {
             remote_image_paste: true,
             pending_image_png: None,
             remote_image_hint_shown: false,
+            exit_banner_forced: false,
+            open_shell_failure: None,
             options,
             target,
             encoder,
@@ -1287,9 +1300,36 @@ impl TerminalPane {
         Ok(())
     }
 
+    /// A remote child gave way to another one in this pane (the companion
+    /// started the shell after a TUI exited): forget the exit and the input
+    /// state of the old child and name the new program, keeping the screen,
+    /// the scrollback and the transport. Output still to come from the
+    /// companion carries the old child's last bytes and the mode reset.
+    pub fn restart_remote_in_place(&mut self, target: TerminalTarget) {
+        self.target = target;
+        self.exit_banner_forced = false;
+        self.open_shell_failure = None;
+        self.reset_child_state();
+        // Reports the old child made are not the new child's.
+        self.cwd_reports_seen = self.core.cwd_report_count();
+        self.title = None;
+        self.cwd = self.core.cwd().map(Path::to_path_buf);
+    }
+
+    /// Show the exit banner of a remote child's clean exit: the host did not
+    /// answer it with a replacement shell or by closing the tab.
+    pub fn force_exit_banner(&mut self) {
+        self.exit_banner_forced = true;
+    }
+
     /// Attach a freshly spawned child and clear what belonged to the old one.
     fn reset_for_new_child(&mut self, pty: PtyProcess) {
         self.pty = Some(pty);
+        self.reset_child_state();
+    }
+
+    /// Clear what belonged to the child that is gone.
+    fn reset_child_state(&mut self) {
         self.encoder = InputEncoder::new(self.core.input_modes());
         self.exit = None;
         self.monitor_error = None;
@@ -1884,13 +1924,19 @@ impl TerminalPane {
         ui.painter().rect_filled(thumb, 3.0, thumb_color);
     }
 
-    /// Whether a local child's end is, or may still turn out to be, a clean
-    /// exit, which the workbench answers by replacing or closing the pane.
-    /// The output closes a moment before the exit is reported, so an ended
-    /// output whose child has not been reaped yet counts as pending.
+    /// Whether a child's end is, or may still turn out to be, a clean exit,
+    /// which the workbench answers by replacing the child or closing the tab.
+    /// The output of a local child closes a moment before the exit is
+    /// reported, so an ended output whose child has not been reaped yet counts
+    /// as pending.
     fn clean_exit_pending(&self) -> bool {
-        if self.target.is_remote() || self.monitor_error.is_some() || self.read_error.is_some() {
+        if self.monitor_error.is_some() || self.read_error.is_some() {
             return false;
+        }
+        // A remote child's clean exit is answered by the host, which starts a
+        // shell in this pane or closes the tab, or else shows the banner.
+        if self.target.is_remote() {
+            return !self.exit_banner_forced && self.exit.as_ref().is_some_and(ExitStatus::success);
         }
         let status = self
             .exit
@@ -1902,9 +1948,12 @@ impl TerminalPane {
         }
     }
 
-    fn paint_shell_state(&mut self, ui: &mut Ui, grid_rect: Rect, output: &mut TerminalUiOutput) {
+    /// The sentence of the exit banner that names the program and what ended
+    /// it, or `None` while no banner is due: the child runs, or its clean exit
+    /// is being answered by a replacement shell or by closing the tab.
+    pub(crate) fn exit_banner_message(&self) -> Option<String> {
         if self.clean_exit_pending() {
-            return;
+            return None;
         }
         let label = self.target.program_label();
         let message = if let Some(error) = &self.monitor_error {
@@ -1918,7 +1967,37 @@ impl TerminalPane {
         } else {
             None
         };
-        let Some(message) = message else {
+        message.map(|message| match &self.open_shell_failure {
+            Some(reason) => format!("{message} Could not open a shell: {reason}"),
+            None => message,
+        })
+    }
+
+    /// The exit banner's action label.
+    pub(crate) fn banner_action_label(&self) -> String {
+        // The program's exit leaves the SSH link up; only a lost or failed
+        // link is not connected.
+        let connected = self.remote_transport.as_ref().is_some_and(|transport| {
+            matches!(
+                transport.status(),
+                made_terminal::TransportStatus::Connected
+                    | made_terminal::TransportStatus::Exited(_)
+            )
+        });
+        if self.target.is_remote() && connected {
+            OPEN_SHELL_LABEL.to_owned()
+        } else {
+            self.target.restart_label()
+        }
+    }
+
+    /// Why the remote shell could not be started, shown with the banner.
+    pub(crate) fn set_open_shell_failure(&mut self, reason: Option<String>) {
+        self.open_shell_failure = reason;
+    }
+
+    fn paint_shell_state(&mut self, ui: &mut Ui, grid_rect: Rect, output: &mut TerminalUiOutput) {
+        let Some(message) = self.exit_banner_message() else {
             return;
         };
         let message = crate::sanitize::sanitize_display(&message, 400);
@@ -1930,14 +2009,37 @@ impl TerminalPane {
             520.0
         };
         let overlay_width = (grid_rect.width() - 20.0).min(max_overlay_width).max(180.0);
-        let text_width = (overlay_width - 20.0 - 100.0).max(60.0);
+        // The button is as wide as its label, on one line. Beside the message
+        // when that leaves a readable column; otherwise under it.
+        let button_font = egui::FontId::proportional(11.5);
+        let action_label = self.banner_action_label();
+        let button_width = ui
+            .painter()
+            .layout_no_wrap(
+                action_label.clone(),
+                button_font.clone(),
+                crate::theme::WARNING,
+            )
+            .size()
+            .x
+            + 20.0;
+        let side_by_side = overlay_width - 20.0 - button_width - 10.0 >= 140.0;
+        let text_width = if side_by_side {
+            overlay_width - 20.0 - button_width - 10.0
+        } else {
+            overlay_width - 20.0
+        };
         let galley = ui.painter().layout(
             message.clone(),
             message_font,
             crate::theme::WARNING,
             text_width,
         );
-        let overlay_height = (galley.size().y + 20.0).max(48.0);
+        let overlay_height = if side_by_side {
+            (galley.size().y + 20.0).max(48.0)
+        } else {
+            galley.size().y + 20.0 + 24.0 + 8.0
+        };
         let overlay = Rect::from_min_size(
             egui::Pos2::new(
                 grid_rect.left() + 10.0,
@@ -1957,23 +2059,36 @@ impl TerminalPane {
             galley,
             crate::theme::WARNING,
         );
-        let button_rect = Rect::from_min_size(
-            egui::Pos2::new(overlay.right() - 96.0, overlay.top() + 9.0),
-            Vec2::new(86.0, 24.0),
-        );
-        let restart_clicked = ui
-            .put(
-                button_rect,
-                egui::Button::new(
-                    egui::RichText::new(self.target.restart_label())
-                        .font(egui::FontId::proportional(11.5))
-                        .color(crate::theme::WARNING),
-                )
-                .fill(crate::theme::WARNING_TINT)
-                .stroke(egui::Stroke::new(1.0, crate::theme::WARNING))
-                .corner_radius(egui::CornerRadius::same(6)),
+        let button_rect = if side_by_side {
+            Rect::from_min_size(
+                egui::Pos2::new(overlay.right() - 10.0 - button_width, overlay.top() + 9.0),
+                Vec2::new(button_width, 24.0),
             )
-            .clicked();
+        } else {
+            Rect::from_min_size(
+                egui::Pos2::new(
+                    overlay.right() - 10.0 - button_width,
+                    overlay.bottom() - 32.0,
+                ),
+                Vec2::new(button_width, 24.0),
+            )
+        };
+        let mut action = ui.put(
+            button_rect,
+            egui::Button::new(
+                egui::RichText::new(action_label.clone())
+                    .font(button_font)
+                    .color(crate::theme::WARNING),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .fill(crate::theme::WARNING_TINT)
+            .stroke(egui::Stroke::new(1.0, crate::theme::WARNING))
+            .corner_radius(egui::CornerRadius::same(6)),
+        );
+        if action_label == OPEN_SHELL_LABEL {
+            action = action.on_hover_text(OPEN_SHELL_TOOLTIP);
+        }
+        let restart_clicked = action.clicked();
         if restart_clicked {
             output.restart_requested = true;
         }
@@ -3806,6 +3921,93 @@ mod tests {
         (closed, exited)
     }
 
+    /// The restart button is one line, as wide as its label, and stays inside
+    /// the exit banner at wide and compact widths.
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_banner_button_is_one_line_inside_the_card() {
+        fn rects(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| rects(shape, out)),
+                _ => {}
+            }
+        }
+        fn rows(shape: &egui::Shape, label: &str) -> Option<usize> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.galley.rows.len())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| rows(shape, label)),
+                _ => None,
+            }
+        }
+        let target = TerminalTarget::RemoteClaude {
+            authority: made_remote::protocol::AuthorityId([7; 16]),
+        };
+        let label = target.restart_label();
+        for width in [420.0, 800.0, 1400.0] {
+            let temp = tempfile::tempdir().unwrap();
+            let platform = made_platform::host_platform();
+            let mut pane = TerminalPane::spawn(
+                &platform,
+                PtyOptions::new(temp.path())
+                    .with_shell("/bin/sh")
+                    .with_args(["-c", "exit 3"]),
+            )
+            .expect("spawn the stand-in")
+            .with_target(target);
+            let ctx = egui::Context::default();
+            let mut metrics = Metrics::new();
+            let mut log = DiagnosticLog::new();
+            let mut pump_log = DiagnosticLog::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while pane.exit.is_none() && Instant::now() < deadline {
+                pane.pump(&mut pump_log);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 500.0),
+                )),
+                ..Default::default()
+            };
+            let mut frame = ctx.run_ui(raw, |ui| {
+                pane.ui(ui, &platform, &mut metrics, &mut log);
+            });
+            frame.textures_delta.clear();
+            pane.terminate(&mut pump_log);
+            let mut shapes = Vec::new();
+            for clipped in &frame.shapes {
+                rects(&clipped.shape, &mut shapes);
+            }
+            let card = shapes
+                .iter()
+                .find(|shape| {
+                    shape.fill == crate::theme::BG_ELEVATED
+                        && shape.stroke.color == crate::theme::WARNING
+                })
+                .unwrap_or_else(|| panic!("{width}: the exit banner"))
+                .rect;
+            let button = shapes
+                .iter()
+                .find(|shape| shape.fill == crate::theme::WARNING_TINT)
+                .unwrap_or_else(|| panic!("{width}: the restart button"))
+                .rect;
+            assert!(
+                card.contains_rect(button),
+                "{width}: button {button:?} inside card {card:?}"
+            );
+            let lines = frame
+                .shapes
+                .iter()
+                .find_map(|clipped| rows(&clipped.shape, &label))
+                .expect("the label is painted");
+            assert_eq!(lines, 1, "{width}: the label stays on one line");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_clean_exit_never_paints_the_exit_banner() {
@@ -4476,6 +4678,205 @@ mod tests {
         pane.resume_input();
         assert!(pane.pump(&mut log));
         assert_eq!(pane.output_bytes(), b"snapshot".len() as u64);
+    }
+
+    fn exited_remote_pane(
+        target: crate::tui::TerminalTarget,
+        events: Vec<made_terminal::PtyEvent>,
+    ) -> TerminalPane {
+        let mut pane = TerminalPane::open_remote(target, 24, 80);
+        pane.attach_remote_transport(Box::new(QueuedTransport(events.into())));
+        pane.resume_input();
+        let mut log = DiagnosticLog::new();
+        pane.pump(&mut log);
+        pane
+    }
+
+    fn remote_grok() -> crate::tui::TerminalTarget {
+        crate::tui::TerminalTarget::RemoteGrok {
+            authority: made_remote::protocol::AuthorityId([9; 16]),
+        }
+    }
+
+    /// A remote child's clean exit is the host's to answer; the banner shows
+    /// only once the host decides it is not answered.
+    #[test]
+    fn a_remote_clean_exit_shows_no_banner_until_the_host_forces_it() {
+        let mut pane = exited_remote_pane(
+            remote_grok(),
+            vec![
+                made_terminal::PtyEvent::Data(b"last line".to_vec()),
+                made_terminal::PtyEvent::Exited(made_platform::ExitStatus {
+                    code: 0,
+                    signal: None,
+                }),
+            ],
+        );
+        assert!(pane.exited_cleanly());
+        assert_eq!(pane.exit_banner_message(), None);
+        pane.force_exit_banner();
+        assert_eq!(
+            pane.exit_banner_message().as_deref(),
+            Some("Grok SSH exited (exit code 0).")
+        );
+    }
+
+    /// Unclean ends keep the banner at once: a failure beside the exit, an
+    /// output that closed without a status, a non-zero code and a signal.
+    #[test]
+    fn a_remote_pane_keeps_its_banner_for_every_unclean_end() {
+        use made_terminal::PtyEvent::{Eof, Exited, MonitorError, ReadError};
+        let status = |code, signal: Option<&str>| {
+            Exited(made_platform::ExitStatus {
+                code,
+                signal: signal.map(str::to_owned),
+            })
+        };
+        for (events, expected) in [
+            (vec![MonitorError("m".into())], "monitor failed: m"),
+            (vec![ReadError("r".into())], "output failed: r"),
+            (vec![Eof], "output closed."),
+            (vec![status(3, None)], "exited (exit code 3)."),
+            (vec![status(1, Some("Killed"))], "exited (signal Killed)."),
+        ] {
+            let pane = exited_remote_pane(remote_grok(), events);
+            let banner = pane.exit_banner_message();
+            assert!(
+                banner
+                    .as_deref()
+                    .is_some_and(|text| text.contains(expected)),
+                "{expected}: {banner:?}"
+            );
+            assert!(!pane.exited_cleanly(), "{expected}");
+        }
+    }
+
+    /// The companion started the shell in this pane: the exit is forgotten,
+    /// the screen stays and the pane names its new program.
+    #[test]
+    fn restarting_a_remote_pane_in_place_keeps_the_screen_and_forgets_the_exit() {
+        let authority = made_remote::protocol::AuthorityId([9; 16]);
+        let mut pane = exited_remote_pane(
+            remote_grok(),
+            vec![
+                made_terminal::PtyEvent::Data(b"last line\r\n\x1b[?1049h\x1b[?1000h".to_vec()),
+                made_terminal::PtyEvent::Exited(made_platform::ExitStatus {
+                    code: 0,
+                    signal: None,
+                }),
+            ],
+        );
+        assert!(pane.alternate_screen());
+        pane.force_exit_banner();
+        pane.restart_remote_in_place(crate::tui::TerminalTarget::RemoteShell { authority });
+        assert!(pane.exit_status().is_none());
+        assert_eq!(pane.exit_banner_message(), None);
+        assert!(pane.is_running() && !pane.input_paused());
+        assert_eq!(pane.target.program_label(), "Terminal SSH");
+        // The companion relays the mode reset behind the old output.
+        pane.feed_remote_output(LEAVE_PROGRAM_MODES);
+        assert!(!pane.alternate_screen());
+        assert!(
+            pane.screen_text().contains("last line"),
+            "{}",
+            pane.screen_text()
+        );
+        // A later clean exit of the new child is the new program's own.
+        assert_eq!(pane.exit_banner_message(), None);
+    }
+
+    /// A remote transport that reports `status` and queues `events`.
+    struct StatusTransport(
+        std::collections::VecDeque<made_terminal::PtyEvent>,
+        made_terminal::TransportStatus,
+    );
+
+    impl made_terminal::TerminalTransport for StatusTransport {
+        fn poll(&mut self) -> Option<made_terminal::PtyEvent> {
+            self.0.pop_front()
+        }
+        fn write(&mut self, _bytes: &[u8]) -> Result<(), PtyError> {
+            Ok(())
+        }
+        fn resize(&mut self, _rows: u16, _cols: u16) -> Result<(), PtyError> {
+            Ok(())
+        }
+        fn status(&self) -> made_terminal::TransportStatus {
+            self.1.clone()
+        }
+        fn detach(&mut self) -> Result<(), PtyError> {
+            Ok(())
+        }
+    }
+
+    /// What a remote Grok pane paints once its child exited with `code` while
+    /// its transport reports `status`.
+    #[cfg(unix)]
+    fn remote_banner_text(status: made_terminal::TransportStatus, code: u32) -> String {
+        let mut pane = TerminalPane::open_remote(remote_grok(), 24, 80);
+        pane.attach_remote_transport(Box::new(StatusTransport(
+            [made_terminal::PtyEvent::Exited(made_platform::ExitStatus {
+                code,
+                signal: None,
+            })]
+            .into(),
+            status,
+        )));
+        pane.resume_input();
+        let mut log = DiagnosticLog::new();
+        pane.pump(&mut log);
+        pane.force_exit_banner();
+        let platform = made_platform::host_platform();
+        let ctx = egui::Context::default();
+        let mut metrics = Metrics::new();
+        let (_, frame) = run_terminal_frame_capture(
+            &ctx,
+            &mut pane,
+            &platform,
+            &mut metrics,
+            &mut log,
+            Vec::new(),
+        );
+        frame_text(&frame)
+    }
+
+    /// While the SSH transport is connected the banner's action starts a
+    /// shell and names no program; once it is lost the banner keeps
+    /// Reconnect and offers no `Open shell`.
+    #[cfg(unix)]
+    #[test]
+    fn the_banner_action_follows_the_transport_and_names_no_program() {
+        use made_terminal::TransportStatus;
+        for code in [3, 0] {
+            let text = remote_banner_text(TransportStatus::Connected, code);
+            assert!(text.contains("Open shell"), "{text}");
+            assert!(text.contains("Grok SSH exited"), "{text}");
+            assert!(!text.contains("Reconnect"), "{text}");
+        }
+        for status in [TransportStatus::Disconnected, TransportStatus::Failed] {
+            let text = remote_banner_text(status, 3);
+            assert!(text.contains("Reconnect Grok SSH"), "{text}");
+            assert!(!text.contains("Open shell"), "{text}");
+        }
+    }
+
+    /// The `Open shell` label, tooltip and accessible name (the label) name
+    /// no program.
+    #[test]
+    fn the_open_shell_label_tooltip_and_accessible_name_name_no_program() {
+        for text in [OPEN_SHELL_LABEL, OPEN_SHELL_TOOLTIP] {
+            let lower = text.to_ascii_lowercase();
+            for word in ["opencode", "grok", "claude", "terminal", "ssh"] {
+                assert!(!lower.contains(word), "{text:?} names {word:?}");
+            }
+        }
+        // A pane connected over SSH offers exactly that label.
+        let mut pane = TerminalPane::open_remote(remote_grok(), 24, 80);
+        pane.attach_remote_transport(Box::new(StatusTransport(
+            Default::default(),
+            made_terminal::TransportStatus::Connected,
+        )));
+        assert_eq!(pane.banner_action_label(), OPEN_SHELL_LABEL);
     }
 
     #[test]

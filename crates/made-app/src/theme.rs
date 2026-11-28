@@ -934,6 +934,12 @@ pub fn explorer_header_glass(native_backdrop_applied: bool) -> Color32 {
     }
 }
 
+/// The card's soft shadow: its own width and radius, extended 2px below the
+/// bottom edge, so it never shows past the side or corner curves.
+fn glass_shadow_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(rect.min, rect.max + egui::vec2(0.0, 2.0))
+}
+
 /// In-app frosted fill for the full-height Explorer card.
 ///
 /// Preview and picker cards stay opaque; the terminal card has its own conditional fill. Only the
@@ -946,8 +952,8 @@ pub fn paint_glass_card(
 ) {
     let fill = explorer_card_glass(native_backdrop_applied);
     painter.rect_filled(
-        rect.translate(egui::vec2(0.0, 2.0)).expand(1.0),
-        CornerRadius::same(layout.card_radius.saturating_add(1)),
+        glass_shadow_rect(rect),
+        CornerRadius::same(layout.card_radius),
         GLASS_SHADOW,
     );
     painter.rect(
@@ -967,13 +973,23 @@ pub fn paint_glass_card_header(
     native_backdrop_applied: bool,
 ) {
     let radius = CornerRadius {
-        nw: layout.card_radius,
-        ne: layout.card_radius,
+        nw: layout.card_radius.saturating_sub(1),
+        ne: layout.card_radius.saturating_sub(1),
         sw: 0,
         se: 0,
     };
     let fill = explorer_header_glass(native_backdrop_applied);
-    ui.painter().rect_filled(rect, radius, fill);
+    // Inset from the sides and one radius step tighter than the card, so this
+    // second translucent layer stays under the border's curve at the top
+    // corners instead of doubling the card fill's anti-aliased fringe.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 0.5, rect.top()),
+            egui::pos2(rect.right() - 0.5, rect.bottom()),
+        ),
+        radius,
+        fill,
+    );
     paint_glass_highlight(ui.painter(), rect, layout.card_radius);
     ui.painter().line_segment(
         [
@@ -2282,6 +2298,64 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The card fill and its border share one rect and radius, and the header
+    /// layer on top never passes the border's curve at the top corners.
+    #[test]
+    fn explorer_glass_layers_stay_inside_the_border() {
+        fn rects(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+            match shape {
+                egui::Shape::Rect(rect) => out.push(rect.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| rects(shape, out)),
+                _ => {}
+            }
+        }
+        for (width, height) in [(1280.0, 800.0), (600.0, 400.0)] {
+            let layout = Layout::for_window(width, height);
+            for native in [false, true] {
+                let card =
+                    egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(260.0, 300.0));
+                let header = egui::Rect::from_min_size(
+                    card.min,
+                    egui::vec2(card.width(), layout.card_header_height),
+                );
+                let ctx = egui::Context::default();
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    paint_glass_card(ui.painter(), card, &layout, native);
+                    paint_glass_card_header(ui, header, &layout, native);
+                });
+                output.textures_delta.clear();
+                let mut shapes = Vec::new();
+                for clipped in &output.shapes {
+                    rects(&clipped.shape, &mut shapes);
+                }
+                let find = |fill| {
+                    shapes
+                        .iter()
+                        .find(|shape| shape.fill == fill)
+                        .unwrap_or_else(|| panic!("a {fill:?} fill"))
+                };
+                let shadow = find(GLASS_SHADOW);
+                assert_eq!(shadow.rect.left(), card.left());
+                assert_eq!(shadow.rect.right(), card.right());
+                assert_eq!(shadow.rect.top(), card.top());
+                assert_eq!(shadow.rect.bottom(), card.bottom() + 2.0);
+                assert_eq!(shadow.corner_radius, CornerRadius::same(layout.card_radius));
+                let body = find(explorer_card_glass(native));
+                assert_eq!(body.rect, card);
+                assert_eq!(body.corner_radius, CornerRadius::same(layout.card_radius));
+                assert_eq!(body.stroke.width, 1.0);
+                let top = find(explorer_header_glass(native));
+                assert!(
+                    card.shrink2(egui::vec2(0.5, 0.0)).contains_rect(top.rect),
+                    "header fill {:?} stays inside the card {card:?}",
+                    top.rect
+                );
+                assert!(top.corner_radius.nw < layout.card_radius);
+                assert!(top.corner_radius.ne < layout.card_radius);
+            }
+        }
+    }
 
     #[test]
     fn disclosure_chevron_is_a_thin_stroked_open_polyline() {

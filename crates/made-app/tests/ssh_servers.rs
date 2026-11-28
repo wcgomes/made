@@ -48,6 +48,8 @@ fn capabilities() -> Capabilities {
         helper_version: "1".into(),
         grok: false,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     }
 }
 

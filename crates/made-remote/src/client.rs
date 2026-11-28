@@ -105,6 +105,15 @@ impl State {
         self.answer.take();
         self.attach_request = None;
     }
+    /// A new child runs in this terminal: the old child's exit is history,
+    /// and the terminal takes input and resizes again.
+    fn child_replaced(&mut self) {
+        if matches!(self.status, TransportStatus::Exited(_)) {
+            self.status = TransportStatus::Connected;
+        }
+        self.terminal
+            .retain(|queued| !matches!(queued, QueuedTerminal::Other(PtyEvent::Exited(_))));
+    }
     fn internal_id(&mut self) -> Result<u64, ProtocolError> {
         self.internal_id = self
             .internal_id
@@ -330,6 +339,14 @@ impl State {
                 }
                 return self.deliver(frame);
             }
+            // The Git state of the watched root changed; like `Changed`, only
+            // ever a push under the root subscription's request id.
+            Operation::GitChanged if !self.pending.contains_key(&frame.request_id) => {
+                if !generation_current {
+                    return Ok(());
+                }
+                return self.deliver(frame);
+            }
             Operation::SessionSnapshot { .. } if !self.pending.contains_key(&frame.request_id) => {
                 return self.deliver(frame);
             }
@@ -387,6 +404,9 @@ impl State {
             ) && !matches!(correlated.operation, Operation::Attached);
         let id = correlated.request_id;
         let closed = matches!(correlated.operation, Operation::Closed { .. });
+        if matches!(correlated.operation, Operation::ShellStarted { .. }) {
+            self.child_replaced();
+        }
         self.deliver(correlated)?;
         if done {
             self.pending.remove(&id);
@@ -595,6 +615,15 @@ impl RemoteClient {
     }
     pub fn terminal_transport(&self) -> RemoteTerminalTransport {
         RemoteTerminalTransport(self.clone())
+    }
+    /// The terminal's child was replaced by a shell the companion started:
+    /// the tab learned it from something other than the `ShellStarted` reply
+    /// (a client reset can discard that reply). The old child's exit is
+    /// history and the terminal takes input and resizes again.
+    pub fn child_replaced(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.child_replaced();
+        }
     }
 }
 

@@ -118,6 +118,25 @@ pub fn detect_on_path(environment: &Environment, name: &str) -> Option<PathBuf> 
     find_executable_on_path(OsStr::new(name), path)
 }
 
+/// Grok detection: `PATH` first, then the fixed user-owned install locations
+/// (`~/.grok/bin` is added to `PATH` only by interactive rc files, which a
+/// non-interactive SSH command never reads). Metadata-only like `detect_on_path`.
+pub fn detect_grok(environment: &Environment) -> Option<PathBuf> {
+    if let Some(found) = detect_on_path(environment, "grok") {
+        return Some(found);
+    }
+    let home = environment.get("HOME")?;
+    let home = Path::new(&home);
+    if !home.is_absolute() {
+        return None;
+    }
+    [".grok/bin", ".local/bin", ".cargo/bin"]
+        .iter()
+        .find_map(|relative| {
+            find_executable_on_path(OsStr::new("grok"), home.join(relative).as_os_str())
+        })
+}
+
 #[derive(Clone)]
 struct InventoryRow {
     pid: u32,
@@ -189,6 +208,21 @@ impl GrokTracker {
             last_alive: true,
             last_built_alive: None,
         }
+    }
+
+    /// The managed child was replaced (by the follow-up shell). Sessions of
+    /// the old child are not the new child's: the inventory is rebuilt for
+    /// `child`, and the next pass pushes the result.
+    pub fn rebind(&mut self, child: Option<u32>, grok_target: bool) {
+        self.child = child;
+        self.grok_target = grok_target;
+        self.rows.clear();
+        self.activities.clear();
+        self.cwds.clear();
+        self.ended.clear();
+        self.last_alive = true;
+        self.last_built_alive = None;
+        self.last_inventory = None;
     }
 
     /// A new attachment discards revision history so the client applies a

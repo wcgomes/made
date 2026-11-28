@@ -80,9 +80,11 @@ impl SshCommand {
 // hostname, user, prompt or server response here.
 // Detection is metadata-only: command -v performs PATH lookups on the
 // sanitized PATH and never executes or version-checks a program. OpenCode is
-// additionally looked up in fixed user-owned install locations; grok and claude
-// are PATH-only (SSH-09/SSH-10/SSH-11); no interpreter is looked up.
-const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); printf "%s\n" "$grok"; claude=$(command -v claude || :); printf "%s\n" "$claude"'"#;
+// additionally looked up in fixed user-owned install locations, and so is grok
+// (its installer adds ~/.grok/bin from interactive rc files that a
+// non-interactive ssh command never reads); claude is PATH-only
+// (SSH-09/SSH-10/SSH-11); no interpreter is looked up.
+const PROBE: &str = r#"sh -c 'set -eu; oldifs=$IFS; IFS=:; safe=""; for p in $PATH; do case "$p" in /*) safe=${safe:+$safe:}$p;; esac; done; IFS=$oldifs; PATH=$safe; export PATH; printf "MADE-PROBE-1\n"; uname -s; uname -m; opencode=$(command -v opencode || :); for p in "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode" "$HOME/.cargo/bin/opencode"; do test -x "$p" && { opencode=$p; break; }; done; printf "%s\n" "$opencode"; grok=$(command -v grok || :); for p in "$HOME/.grok/bin/grok" "$HOME/.local/bin/grok" "$HOME/.cargo/bin/grok"; do test -n "$grok" && break; test -x "$p" && { grok=$p; break; }; done; printf "%s\n" "$grok"; claude=$(command -v claude || :); printf "%s\n" "$claude"'"#;
 const COMPANION: &str = r#"sh -c 'set -eu; IFS= read -r version; IFS= read -r target; case "$version" in ""|.|..|*[!a-zA-Z0-9._-]*) exit 64;; esac; case "$target" in x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;; *) exit 65;; esac; case $(uname -s) in Darwin) root="$HOME/Library/Application Support/Made";; Linux) case ${XDG_DATA_HOME-} in /*) root="$XDG_DATA_HOME/made";; *) root="$HOME/.local/share/made";; esac;; *) exit 65;; esac; exec "$root/remote/$version/$target/made-remote" --stdio'"#;
 // Consent-gated Grok plugin install: identical version/target/root/stdin
 // discipline, but the staged companion starts in its `--install-grok-plugin`
@@ -880,7 +882,12 @@ impl fmt::Debug for SshEvent {
     }
 }
 
+/// Bytes of ssh's own diagnostics kept for a failed live connection.
+const STDERR_TAIL_BYTES: usize = 512;
+
 struct StderrSlot {
+    /// The last bytes ssh wrote, for [`SshProcess::stderr_tail`].
+    tail: Vec<u8>,
     done: bool,
     terminal: bool,
     failure: Option<SshFailure>,
@@ -958,6 +965,7 @@ impl SshProcess {
         let stop = stopped.clone();
         let errors = tx.clone();
         let stderr_slot = Arc::new(Mutex::new(StderrSlot {
+            tail: Vec::new(),
             done: false,
             terminal: false,
             failure: None,
@@ -1111,6 +1119,30 @@ impl SshProcess {
             Ok(None) => None,
         }
     }
+    /// The last lines ssh itself wrote to stderr, control characters removed
+    /// and bounded. For the local diagnostics log only, and only for a
+    /// generic I/O failure: the user-facing failure stays a fixed sentence.
+    pub fn stderr_tail(&self) -> String {
+        let Ok(slot) = self.stderr.lock() else {
+            return String::new();
+        };
+        let text = String::from_utf8_lossy(&slot.tail);
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let tail = lines[lines.len().saturating_sub(2)..].join(" | ");
+        tail.chars()
+            .filter(|c| !c.is_control())
+            .rev()
+            .take(240)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
     /// True once `poll` has returned this process's terminal event. Later polls
     /// report `None`, so callers that keep a non-terminal `Failed(Io)` can stop
     /// instead of spinning until their own deadline.
@@ -1279,6 +1311,11 @@ fn drain_stderr(mut stderr: impl Read, slot: &Mutex<StderrSlot>) {
         match stderr.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
+                if let Ok(mut guard) = slot.lock() {
+                    guard.tail.extend_from_slice(&chunk[..n]);
+                    let excess = guard.tail.len().saturating_sub(STDERR_TAIL_BYTES);
+                    guard.tail.drain(..excess);
+                }
                 if raw.len() < 8192 {
                     let take = n.min(8192 - raw.len());
                     raw.extend_from_slice(&chunk[..take]);

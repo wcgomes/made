@@ -224,6 +224,62 @@ fn path_outside_root_does_not_invalidate_the_transport() {
     assert!(client.poll_reply().is_none());
 }
 
+/// A `WatchDir` acknowledgement completes its request; the pushes that follow
+/// under the same id reach the reply queue, and only while they are current
+/// and inside the root.
+#[test]
+fn directory_watch_pushes_after_the_acknowledgement_are_delivered() {
+    let (client, fake) = client();
+    let dir = RemotePath::new(b"/project/src".to_vec()).unwrap();
+    let id = client
+        .request(Operation::WatchDir { path: dir.clone() }, None)
+        .unwrap();
+    push(
+        &fake,
+        client.identity(),
+        id,
+        Operation::Changed { path: dir.clone() },
+    );
+    wait(|| client.poll_reply().is_some());
+
+    let entry = RemotePath::new(b"/project/src/new.txt".to_vec()).unwrap();
+    push(
+        &fake,
+        client.identity(),
+        id,
+        Operation::Changed {
+            path: entry.clone(),
+        },
+    );
+    push(&fake, client.identity(), id, Operation::GitChanged);
+    let mut seen = Vec::new();
+    wait(|| {
+        while let Some(frame) = client.poll_reply() {
+            seen.push(frame.operation);
+        }
+        seen.len() == 2
+    });
+    assert_eq!(seen[0], Operation::Changed { path: entry });
+    assert_eq!(seen[1], Operation::GitChanged);
+
+    // A push from another root generation, or one outside the root, is
+    // dropped without disturbing the transport.
+    let mut old = client.identity();
+    old.generation = 2;
+    push(&fake, old, id, Operation::GitChanged);
+    push(
+        &fake,
+        client.identity(),
+        id,
+        Operation::Changed {
+            path: RemotePath::new(b"/elsewhere/x".to_vec()).unwrap(),
+        },
+    );
+    thread::sleep(Duration::from_millis(50));
+    assert!(client.is_connected());
+    assert!(client.poll_reply().is_none());
+}
+
 #[test]
 fn reply_progress_accumulates_directory_batches_until_done() {
     let (client, fake) = client();
