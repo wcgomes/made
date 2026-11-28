@@ -288,6 +288,30 @@ impl Pane {
         })
     }
 
+    fn until_prompt(&mut self, stream: &mut TcpStream) {
+        let limit = deadline();
+        loop {
+            let ready = |pane: &Self| pane.contains("$ ") || pane.contains("# ");
+            if ready(self) {
+                return;
+            }
+            assert!(
+                Instant::now() < limit,
+                "deadline waiting for a prompt; the pane received {:?}",
+                String::from_utf8_lossy(&self.raw)
+            );
+            match read_envelope(stream) {
+                Ok(frame) => self.feed(&frame.operation),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("attachment socket failed: {error}"),
+            }
+        }
+    }
+
     fn until_output(&mut self, stream: &mut TcpStream, needle: &str) {
         if self.contains(needle) {
             return;
@@ -705,7 +729,9 @@ fn the_follow_up_shell_environment_is_what_a_terminal_ssh_shell_gets() {
     let (mut reference, mut stream) =
         Fixture::boot(|temp, runtime| composed(LaunchTarget::Shell, temp, runtime, ""));
     let mut pane = Pane::new(24, 80);
-    pane.until_output(&mut stream, "$ ");
+    // A shell started directly shows the system's own prompt where the
+    // environment's `PS1` is not honored; root's ends in `# `.
+    pane.until_prompt(&mut stream);
     let expected = shell_env(&mut reference, &mut stream, &mut pane);
     reference.close(stream);
     assert!(

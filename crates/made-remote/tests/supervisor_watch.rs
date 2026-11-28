@@ -630,10 +630,26 @@ fn latency_and_loop_stall_on_a_ten_thousand_file_repository() {
         .map(|command| conn.send(Operation::GitRead { command: *command }))
         .collect();
     let beat = conn.send(Operation::Heartbeat);
-    assert_eq!(conn.reply(beat), Operation::Ack);
+    // A read can finish before the Heartbeat is acknowledged: keep what
+    // arrives meanwhile instead of discarding it.
+    let mut early = Vec::new();
+    let ack = conn.wait(Duration::from_secs(120), |frame| {
+        if frame.request_id == beat {
+            Some(frame.operation.clone())
+        } else {
+            early.push((frame.request_id, frame.operation.clone()));
+            None
+        }
+    });
+    assert_eq!(ack, Operation::Ack);
     let heartbeat = started.elapsed();
     for id in reads {
-        while !matches!(conn.reply(id), Operation::GitResult { done: true, .. }) {}
+        let mut done = early.iter().any(|(request, operation)| {
+            *request == id && matches!(operation, Operation::GitResult { done: true, .. })
+        });
+        while !done {
+            done = matches!(conn.reply(id), Operation::GitResult { done: true, .. });
+        }
     }
     let total = started.elapsed();
     eprintln!(
