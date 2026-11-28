@@ -208,3 +208,65 @@ fn dropping_a_watcher_does_not_block_the_test_thread() {
     let watcher = FsWatcher::new(&root, GENERATION).unwrap();
     drop(watcher);
 }
+
+#[test]
+fn detached_watcher_follows_subscriptions_inside_and_outside_its_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fixture_root(&temp);
+    let one = root.join("one");
+    let two = root.join("two");
+    let beside = root.parent().unwrap().join("beside");
+    for dir in [&one, &two, &beside] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let one = one.canonicalize().unwrap();
+    let two = two.canonicalize().unwrap();
+    let beside = beside.canonicalize().unwrap();
+
+    // Attached to nothing until subscribed: the root's own entries are quiet.
+    let mut watcher = FsWatcher::new_detached(&root, GENERATION).unwrap();
+    fs::write(root.join("quiet.txt"), "x").unwrap();
+    assert!(wait_for(&mut watcher, Duration::from_millis(800), |_| true).is_none());
+
+    watcher.watch_path(&one, false).unwrap();
+    watcher.watch_path(&beside, false).unwrap();
+    fs::write(one.join("a.txt"), "x").unwrap();
+    wait_for(&mut watcher, TIMEOUT, |event| {
+        event.path == one.join("a.txt")
+    })
+    .expect("an event inside a subscribed directory");
+    // A subscription outside the root is reported too (repository metadata).
+    fs::write(beside.join("b.txt"), "x").unwrap();
+    wait_for(&mut watcher, TIMEOUT, |event| {
+        event.path == beside.join("b.txt")
+    })
+    .expect("an event inside a subscribed directory outside the root");
+
+    // An unsubscribed sibling stays quiet, and so does a released directory.
+    fs::write(two.join("c.txt"), "x").unwrap();
+    watcher.unwatch_path(&one);
+    watcher.unwatch_path(&beside);
+    fs::write(one.join("d.txt"), "x").unwrap();
+    fs::write(beside.join("e.txt"), "x").unwrap();
+    assert!(
+        wait_for(&mut watcher, Duration::from_millis(1500), |event| {
+            event.path != one.join("a.txt") && event.path != beside.join("b.txt")
+        })
+        .is_none()
+    );
+}
+
+#[test]
+fn only_a_full_platform_watch_table_is_a_resource_limit() {
+    use made_explorer::watch::WatchError;
+    let limit = |kind| WatchError::Notify {
+        path: PathBuf::from("/x"),
+        source: notify::Error::new(kind),
+    };
+    assert!(limit(notify::ErrorKind::MaxFilesWatch).is_resource_limit());
+    assert!(
+        limit(notify::ErrorKind::Io(std::io::Error::from_raw_os_error(28))).is_resource_limit()
+    );
+    assert!(!limit(notify::ErrorKind::PathNotFound).is_resource_limit());
+    assert!(!limit(notify::ErrorKind::Generic("x".into())).is_resource_limit());
+}

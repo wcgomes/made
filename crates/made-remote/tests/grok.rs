@@ -1478,3 +1478,141 @@ fn grok_files_resolve_the_fixed_home_layout() {
         .is_none()
     );
 }
+
+// POSIX-only: drives a fake grok under a user-owned install directory.
+#[cfg(unix)]
+#[test]
+fn grok_detection_falls_back_to_user_install_dirs_outside_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join(".grok/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("grok");
+    std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+    let environment = |path: &str| {
+        made_platform::Environment::from_pairs([
+            ("PATH", std::ffi::OsString::from(path)),
+            ("HOME", root.path().as_os_str().to_os_string()),
+        ])
+    };
+    assert!(
+        grok::detect_grok(&environment("/nonexistent")).is_none(),
+        "a non-executable file is not detected"
+    );
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        grok::detect_grok(&environment("/nonexistent")),
+        Some(executable),
+        "~/.grok/bin is found although the non-interactive PATH lacks it"
+    );
+    assert!(
+        grok::detect_grok(&made_platform::Environment::from_pairs([("PATH", "")])).is_none(),
+        "without HOME and PATH nothing is detected"
+    );
+}
+
+// POSIX-only: runs the real companion in install mode with grok only in the
+// user install dir, as under a non-interactive SSH command.
+#[cfg(unix)]
+#[test]
+fn install_mode_finds_grok_in_user_install_dir_outside_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let bin = home.join(".grok/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("grok");
+    std::fs::write(&fake, b"#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_made-remote"))
+        .arg("--install-grok-plugin")
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    let line = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(line.trim()).expect("one JSON line");
+    assert_ne!(
+        value["reason"], "grok-missing",
+        "grok in ~/.grok/bin must be detected: {line}"
+    );
+}
+
+// POSIX-only: fake executables in the PATH directory and the three install dirs.
+#[cfg(unix)]
+#[test]
+fn grok_detection_prefers_path_then_tries_install_dirs_in_order() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let make = |relative: &str| {
+        let dir = root.path().join(relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("grok");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, file)
+    };
+    let (path_dir, path_grok) = make("path-bin");
+    let (_, cargo) = make(".cargo/bin");
+    let (_, local) = make(".local/bin");
+    let (_, grok_home) = make(".grok/bin");
+    let environment = |path: &std::ffi::OsStr| {
+        made_platform::Environment::from_pairs([
+            ("PATH", path.to_os_string()),
+            ("HOME", root.path().as_os_str().to_os_string()),
+        ])
+    };
+    let nowhere = std::ffi::OsString::from("/nonexistent");
+    assert_eq!(
+        grok::detect_grok(&environment(path_dir.as_os_str())),
+        Some(path_grok),
+        "PATH wins over every install dir"
+    );
+    assert_eq!(
+        grok::detect_grok(&environment(&nowhere)),
+        Some(grok_home.clone())
+    );
+    std::fs::remove_file(&grok_home).unwrap();
+    assert_eq!(
+        grok::detect_grok(&environment(&nowhere)),
+        Some(local.clone())
+    );
+    std::fs::remove_file(&local).unwrap();
+    assert_eq!(grok::detect_grok(&environment(&nowhere)), Some(cargo));
+}
+
+/// The follow-up shell replaces the exited Grok child: its sessions and its
+/// running flag are the old child's, never the new shell's.
+#[test]
+fn rebinding_to_the_follow_up_shell_drops_the_old_childs_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let home = grok_home(root.path());
+    inventory(
+        &home,
+        &format!(
+            "[{}]",
+            owned_row(10, "direct", "/direct", "2024-01-01T00:00:02Z")
+        ),
+    );
+    let mut tracker = tracker(
+        Some(home),
+        None,
+        Some(10),
+        true,
+        Box::new(parent_chain(vec![])),
+    );
+    let mut clock = Clock::start();
+    let first = snapshot_of(&tracker.tick(clock.now(), true)).expect("initial snapshot");
+    assert!(first.running);
+    assert_eq!(session_ids(&first), vec!["direct"]);
+
+    // The shell that replaced it is another process; Grok's file still lists
+    // the old row until Grok cleans it up.
+    tracker.rebind(Some(20), false);
+    let after = snapshot_of(&tracker.tick(clock.step(INVENTORY_CADENCE), true))
+        .expect("the change is pushed");
+    assert!(!after.running, "a shell is not a running Grok child");
+    assert!(after.sessions.is_empty(), "{:?}", session_ids(&after));
+    assert!(after.revision > first.revision);
+}

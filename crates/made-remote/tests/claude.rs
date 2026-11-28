@@ -486,6 +486,29 @@ mod tracker {
     }
 
     #[test]
+    fn rebinding_to_the_follow_up_shell_drops_the_old_childs_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let table = Table::with(&[(10, 1), (20, 10)]);
+        let (mut tracker, path) = shell_tab(temp.path(), &table);
+        let now = Instant::now();
+        tracker.tick(now, true);
+        append(
+            &path,
+            &record("s1", "/work/a", "SessionStart", "idle", &[99, 20, 10]),
+        );
+        let pushed = tracker.tick(now + Duration::from_millis(200), true);
+        let before = snapshot(&pushed).expect("the session is pushed");
+        assert_eq!(before.sessions.len(), 1);
+
+        // The replacement shell is another process tree.
+        tracker.rebind(Some(30), false);
+        let pushed = tracker.tick(now + Duration::from_millis(400), true);
+        let after = snapshot(&pushed).expect("the change is pushed");
+        assert!(after.sessions.is_empty());
+        assert!(after.revision > before.revision);
+    }
+
+    #[test]
     fn only_records_appended_after_the_session_started_apply() {
         let temp = tempfile::tempdir().unwrap();
         let table = Table::with(&[(10, 1), (20, 10)]);

@@ -164,6 +164,54 @@ fn primary_scrollback_survives_alternate_screen_resnapshot() {
 }
 
 #[test]
+fn a_fresh_resnapshot_leaves_no_blank_scrollback_line_to_surface_when_the_pane_grows() {
+    let mut owner = VtState::new(36, 120);
+    owner.feed(b"vscode > ");
+    let mut restored = TerminalCore::with_size(
+        TerminalSize {
+            rows: 36,
+            cols: 120,
+        },
+        SCROLLBACK_LINES,
+    );
+    restored.feed(&owner.resnapshot());
+    assert!(
+        restored.history(SCROLLBACK_LINES).is_empty(),
+        "the snapshot must not push a blank line into scrollback"
+    );
+    // The real pane is taller than the attach size.
+    restored.resize(50, 200);
+    assert_eq!(
+        restored.screen_text().lines().next().map(str::trim_end),
+        Some("vscode >"),
+        "the prompt stays on the first row, got {:?}",
+        restored.screen_text()
+    );
+}
+
+#[test]
+fn resnapshot_with_history_does_not_duplicate_scrollback_lines() {
+    let mut owner = VtState::new(4, 20);
+    for n in 0..10 {
+        owner.feed(format!("line-{n}\r\n").as_bytes());
+    }
+    let mut restored =
+        TerminalCore::with_size(TerminalSize { rows: 4, cols: 20 }, SCROLLBACK_LINES);
+    restored.feed(&owner.resnapshot());
+    let mut all = restored
+        .history(SCROLLBACK_LINES)
+        .into_iter()
+        .map(|line| line.text)
+        .collect::<Vec<_>>();
+    all.extend(restored.screen_text().lines().map(str::to_owned));
+    for n in 0..10 {
+        let needle = format!("line-{n}");
+        let count = all.iter().filter(|line| line.trim_end() == needle).count();
+        assert_eq!(count, 1, "{needle} must appear exactly once in {all:?}");
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn same_child_pid_and_session_survive_frontend_drop_without_tmux() {
     let platform = made_platform::host_platform();

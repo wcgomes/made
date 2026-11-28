@@ -1051,7 +1051,12 @@ fn screen_panels(
                         .id(ssh_field_id("screen-prompt"))
                         .password(true)
                         .desired_width(f32::INFINITY);
-                    ui.add(edit);
+                    let response = ui.add(edit);
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        *command = Some(ScreenCommand::Prompt(true));
+                    }
                 }
             }
             ui.horizontal(|ui| {
@@ -3174,7 +3179,7 @@ fn restore_ssh_field_focus(ui: &mut Ui) {
     ui.memory_mut(|memory| memory.request_focus(field));
 }
 
-fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) {
+fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) -> egui::Response {
     let id = ssh_field_id(field);
     let mut edit = egui::TextEdit::singleline(text)
         .id(id)
@@ -3201,6 +3206,7 @@ fn ssh_text_edit(ui: &mut Ui, field: &str, text: &mut String, password: bool) {
             );
         });
     }
+    response
 }
 
 /// Keep a held SSH prompt field focused across the terminal's own focus
@@ -3474,7 +3480,31 @@ pub fn workspace_strip(model: &mut AppModel, ui: &mut Ui) -> bool {
         model.close_workspace(id);
     }
     if let Some(notice) = model.remote_close_notice() {
-        ui.label(theme::micro(sanitize_display(notice, 180)));
+        // A floating notice in the window's bottom-left corner, never a label
+        // in the strip's layout flow.
+        egui::Area::new(egui::Id::unique("made-remote-close-notice"))
+            .anchor(
+                Align2::LEFT_BOTTOM,
+                egui::vec2(layout.gutter, layout.toast_bottom_offset()),
+            )
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(if layout.compact { 300.0 } else { 360.0 });
+                egui::Frame::new()
+                    .fill(theme::BG_ELEVATED)
+                    .stroke(Stroke::new(1.0, theme::BORDER_CONTROL))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .shadow(theme::SHADOW_TOAST)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(sanitize_display(notice, 180))
+                                .font(FontId::proportional(11.0))
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    });
+            });
     }
     if toggle_explorer {
         if let Some(workbench) = model.workbench_mut() {
@@ -4238,7 +4268,11 @@ impl Workbench {
             let detail = self.remote_detail().unwrap_or(
                 "Remote terminal input is paused until SSH attaches. No local shell was started.",
             );
-            terminal_unavailable_card(&mut body_ui, layout, detail, false);
+            if self.remote_connecting() {
+                terminal_connecting_card(&mut body_ui, detail);
+            } else {
+                terminal_unavailable_card(&mut body_ui, layout, detail, false);
+            }
         } else {
             terminal_unavailable_card(
                 &mut body_ui,
@@ -4332,20 +4366,37 @@ impl Workbench {
             self.set_notice(notice);
         }
         if output.restart_requested {
-            if let Some(terminal) = self.terminal.as_mut() {
-                let label = self.terminal_target.program_label();
-                match terminal.relaunch(&self.platform, self.diag.log_mut()) {
-                    Ok(()) => self.set_notice(format!("{label} restarted.")),
-                    Err(error) => {
-                        self.diag.log_mut().record(
-                            crate::diagnostics::LogLevel::Error,
-                            format!(
-                                "{} relaunch failed: {error}",
-                                self.terminal_target.log_label()
-                            ),
-                        );
-                        self.set_notice(format!("{label} relaunch failed: {error}"));
-                    }
+            self.restart_terminal();
+        }
+    }
+
+    /// The exit banner's action: relaunch the exited local child. A remote
+    /// pane has no local child to relaunch, and nothing ever runs on this
+    /// host in its place: its action opens a shell on the server, or
+    /// reconnects a lost session.
+    pub(crate) fn restart_terminal(&mut self) {
+        if self.is_remote() {
+            // While the SSH transport is connected the banner offers `Open
+            // shell`; once it is lost, Reconnect. Neither starts a program
+            // here or replays input.
+            if !self.open_remote_shell() && !self.reconnect_remote() {
+                self.set_notice("The SSH session is not available to open a shell.");
+            }
+            return;
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            let label = self.terminal_target.program_label();
+            match terminal.relaunch(&self.platform, self.diag.log_mut()) {
+                Ok(()) => self.set_notice(format!("{label} restarted.")),
+                Err(error) => {
+                    self.diag.log_mut().record(
+                        crate::diagnostics::LogLevel::Error,
+                        format!(
+                            "{} relaunch failed: {error}",
+                            self.terminal_target.log_label()
+                        ),
+                    );
+                    self.set_notice(format!("{label} relaunch failed: {error}"));
                 }
             }
         }
@@ -6159,7 +6210,13 @@ fn grok_install_consent_card(model: &mut crate::app::AppModel, ui: &mut Ui, layo
 }
 // END remote-path
 
-fn ssh_prompt_card(ui: &mut Ui, class: &crate::remote_session::SshPromptClass, draft: &mut String) {
+/// Paints the prompt; returns `true` when Enter in the secret field submits it.
+fn ssh_prompt_card(
+    ui: &mut Ui,
+    class: &crate::remote_session::SshPromptClass,
+    draft: &mut String,
+) -> bool {
+    let mut submitted = false;
     match class {
         crate::remote_session::SshPromptClass::ChangedHostKey { .. } => {
             ui.label(theme::body("the remote host key changed and was refused"));
@@ -6175,9 +6232,12 @@ fn ssh_prompt_card(ui: &mut Ui, class: &crate::remote_session::SshPromptClass, d
         }
         crate::remote_session::SshPromptClass::Secret { text } => {
             ui.label(theme::body(sanitize_display(text, 400)));
-            ssh_text_edit(ui, "prompt", draft, true);
+            let response = ssh_text_edit(ui, "prompt", draft, true);
+            submitted =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
         }
     }
+    submitted
 }
 
 fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
@@ -6317,7 +6377,9 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
                     }
                 }
                 if let Some(draft) = workbench.remote_prompt_draft() {
-                    ssh_prompt_card(ui, &class, draft);
+                    if ssh_prompt_card(ui, &class, draft) {
+                        workbench.submit_remote_auth(true);
+                    }
                 }
                 let changed = matches!(
                     class,
@@ -6339,6 +6401,31 @@ fn remote_open_card(ui: &mut Ui, layout: &Layout, workbench: &mut Workbench) {
                 let _ = workbench.reconnect_remote();
             }
             let _ = layout;
+        });
+}
+
+/// Neutral state of a remote tab that is still connecting. The error card is
+/// reserved for real failures.
+fn terminal_connecting_card(ui: &mut Ui, message: &str) {
+    let available = ui.max_rect();
+    let width = (available.width() - 48.0).clamp(200.0, 520.0);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(available.left() + 24.0, available.top() + 24.0),
+        egui::vec2(width, 72.0),
+    );
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
+    egui::Frame::new()
+        .fill(theme::BG_ELEVATED)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .show(&mut child, |ui| {
+            ui.label(
+                RichText::new("Connecting…")
+                    .font(FontId::proportional(13.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.label(theme::body(sanitize_display(message, 500)));
         });
 }
 

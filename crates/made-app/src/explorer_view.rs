@@ -817,6 +817,10 @@ pub struct ExplorerPane {
     rows_dirty: bool,
     row_rebuilds: u64,
     pending_expand: Vec<PathBuf>,
+    /// Directories whose reload was requested while a load of them was
+    /// already in flight. That load may predate the change, so it is read
+    /// again once it lands instead of the request being dropped.
+    reload_after: BTreeSet<PathBuf>,
     preview: PreviewState,
     preview_opened: bool,
     preview_focus_pending: bool,
@@ -871,6 +875,7 @@ impl ExplorerPane {
             rows_dirty: true,
             row_rebuilds: 0,
             pending_expand: Vec::new(),
+            reload_after: BTreeSet::new(),
             preview: PreviewState::default(),
             preview_opened: false,
             preview_focus_pending: false,
@@ -1053,6 +1058,7 @@ impl ExplorerPane {
         self.row_icons.clear();
         self.rows_dirty = true;
         self.pending_expand.clear();
+        self.reload_after.clear();
         self.preview = PreviewState::default();
         self.preview_opened = false;
         self.preview_focus_pending = false;
@@ -1147,6 +1153,7 @@ impl ExplorerPane {
             return None;
         }
         if force && tree.is_loading(&dir) {
+            self.reload_after.insert(dir);
             return None;
         }
         match tree.begin_load(&dir) {
@@ -1397,6 +1404,9 @@ impl ExplorerPane {
             }
             self.rows_dirty = true;
             self.note_root_loaded(&dir);
+            if self.reload_after.remove(&dir) {
+                self.queue_reload(dir);
+            }
         }
     }
 
@@ -6250,18 +6260,29 @@ mod tests {
         assert!(document.lines.is_empty());
     }
 
+    /// A pane whose root is listed and that never installs a watcher. Landing
+    /// the watcher queues one more root reload, so a test that swaps the tree
+    /// worker while a load is in flight would depend on how fast the platform
+    /// starts its watch stream.
+    fn unwatched_pane(root: &Path, log: &mut DiagnosticLog) -> ExplorerPane {
+        let mut pane = ExplorerPane::new(root, RootGeneration::INITIAL);
+        // Dropping the installer discards the queued install and its result.
+        pane.watcher_installer = WatcherInstaller::blocked();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !pane.is_root_ready() {
+            pane.tick(log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pane.is_root_ready());
+        pane
+    }
+
     #[test]
     fn tree_queue_saturation_keeps_cached_rows_and_does_not_install_errors() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("keep.txt"), "keep").unwrap();
-        let mut pane = ExplorerPane::new(temp.path(), RootGeneration::INITIAL);
         let mut log = DiagnosticLog::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !pane.is_root_ready() {
-            pane.tick(&mut log);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(pane.is_root_ready());
+        let mut pane = unwatched_pane(temp.path(), &mut log);
         let rows_before = pane.visible_row_count();
         assert!(rows_before >= 1);
 
@@ -6274,6 +6295,52 @@ mod tests {
         assert!(pane.root_error().is_none());
         pane.retry_pending_tree_loads();
         assert_eq!(pane.visible_row_count(), rows_before);
+    }
+
+    #[test]
+    fn a_reload_requested_during_a_load_runs_after_it_lands() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("first.txt"), "1").unwrap();
+        let mut log = DiagnosticLog::new();
+        let mut pane = unwatched_pane(temp.path(), &mut log);
+        let root = pane.root.clone().expect("root");
+
+        // A load is in flight (its worker is not running yet) when a change
+        // asks for another: it used to be dropped.
+        pane.tree_worker = TreeWorker::blocked();
+        pane.queue_reload(root.clone());
+        fs::write(temp.path().join("second.txt"), "2").unwrap();
+        pane.queue_reload(root.clone());
+        assert!(
+            pane.reload_after.contains(&root),
+            "the reload is remembered"
+        );
+
+        pane.tree_worker = TreeWorker::start();
+        pane.retry_pending_tree_loads();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let listed = |pane: &ExplorerPane| {
+            pane.tree
+                .as_ref()
+                .is_some_and(|tree| tree.is_loaded(&root) && !tree.is_loading(&root))
+        };
+        while Instant::now() < deadline && !(listed(&pane) && pane.reload_after.is_empty()) {
+            pane.tick(&mut log);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(pane.reload_after.is_empty(), "the remembered reload ran");
+        assert!(listed(&pane));
+        assert!(
+            pane.tree
+                .as_ref()
+                .unwrap()
+                .listing(&root)
+                .is_some_and(|listing| listing
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path.ends_with("second.txt"))),
+            "the listing shows the file created while the load was in flight"
+        );
     }
 
     #[test]

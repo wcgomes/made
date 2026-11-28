@@ -8,6 +8,7 @@ pub mod filesystem;
 pub mod git;
 pub mod grok;
 pub mod integration;
+pub mod launch;
 pub mod protocol;
 pub mod sanitize;
 pub mod supervisor;

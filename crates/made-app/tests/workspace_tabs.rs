@@ -3235,6 +3235,8 @@ fn grok_ssh_requires_detection_and_launches_remote_grok_directly() {
         helper_version: "probe".to_owned(),
         grok: true,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let no_grok_capabilities = Capabilities {
         grok: false,
@@ -3372,6 +3374,8 @@ fn grok_install_consent_is_explicit_bounded_and_withdrawable() {
         helper_version: "probe".to_owned(),
         grok: true,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let id = model
@@ -3508,6 +3512,8 @@ fn grok_install_approval_is_gated_until_the_companion_is_provisioned() {
                 helper_version: "probe".to_owned(),
                 grok: true,
                 python3: false,
+                watch_dirs: false,
+                start_shell: false,
             }),
         )
         .expect("probe result records");
@@ -3556,6 +3562,8 @@ fn grok_install_attempts_stay_independent_across_servers() {
         helper_version: "probe".to_owned(),
         grok: true,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let mut model = AppModel::from_launch(WorkspaceLaunch::waiting_for_picker(), AppOptions::new());
     let server_a = model
@@ -3764,6 +3772,8 @@ fn remote_update_model_for(
                     helper_version: "probe".to_owned(),
                     grok: false,
                     python3: false,
+                    watch_dirs: false,
+                    start_shell: false,
                 }),
             )
             .expect("probe result records");
@@ -4135,6 +4145,8 @@ fn claude_ssh_requires_detection_and_launches_remote_claude_directly() {
         helper_version: "probe".to_owned(),
         grok: false,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
@@ -5452,6 +5464,8 @@ fn a_remote_tui_that_vanished_before_launch_fails_scoped_and_starts_nothing_loca
         helper_version: "probe".to_owned(),
         grok: false,
         python3: false,
+        watch_dirs: false,
+        start_shell: false,
     };
     model.hold_ssh_probe_result(server, Ok(detected)).unwrap();
     open(&mut model, &root);

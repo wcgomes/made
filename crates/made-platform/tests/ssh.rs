@@ -260,6 +260,88 @@ fn probe_reports_grok_with_metadata_only_path_lookup_and_never_looks_up_python3(
 
 #[test]
 #[cfg(unix)]
+fn probe_finds_grok_in_user_install_dir_missing_from_non_interactive_path() {
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let grok_bin = home.join(".grok/bin");
+    std::fs::create_dir_all(&grok_bin).unwrap();
+    let executed = temp.path().join("grok-executed");
+    write_executable(
+        &grok_bin.join("grok"),
+        format!("#!/bin/sh\nprintf x >> '{}'\nexit 4\n", executed.display()),
+    );
+    let tools = temp.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools = probe_fixture_uname(&tools);
+    let output = Command::new("/bin/sh")
+        .args(["-c", SshCommand::Probe.script()])
+        .current_dir(temp.path())
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("/bin:{}", tools.display()))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "fixed probe failed");
+    let lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\n')
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines[4], format!("{}/grok", grok_bin.display()));
+    assert!(!executed.exists(), "detection must never spawn grok");
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_prefers_path_grok_then_tries_install_dirs_in_order() {
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let path_bin = temp.path().join("path-bin");
+    std::fs::create_dir_all(&path_bin).unwrap();
+    let make = |dir: std::path::PathBuf| {
+        std::fs::create_dir_all(&dir).unwrap();
+        write_executable(&dir.join("grok"), "#!/bin/sh\nexit 4\n");
+        dir.join("grok")
+    };
+    let on_path = make(path_bin.clone());
+    let grok_home = make(home.join(".grok/bin"));
+    let local = make(home.join(".local/bin"));
+    let cargo = make(home.join(".cargo/bin"));
+    let tools = temp.path().join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tools = probe_fixture_uname(&tools);
+    let grok_line = |path: String| {
+        let output = Command::new("/bin/sh")
+            .args(["-c", SshCommand::Probe.script()])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixed probe failed");
+        String::from_utf8_lossy(&output.stdout)
+            .split('\n')
+            .nth(4)
+            .unwrap()
+            .to_owned()
+    };
+    let without = format!("/bin:{}", tools.display());
+    assert_eq!(
+        grok_line(format!("{}:{without}", path_bin.display())),
+        on_path.display().to_string(),
+        "PATH wins over every install dir"
+    );
+    assert_eq!(grok_line(without.clone()), grok_home.display().to_string());
+    std::fs::remove_file(&grok_home).unwrap();
+    assert_eq!(grok_line(without.clone()), local.display().to_string());
+    std::fs::remove_file(&local).unwrap();
+    assert_eq!(grok_line(without), cargo.display().to_string());
+}
+
+#[test]
+#[cfg(unix)]
 fn probe_reports_claude_as_one_more_metadata_only_path_line() {
     use std::process::Command;
     let temp = tempfile::tempdir().unwrap();
@@ -2092,6 +2174,55 @@ fn stage_update_required_exit_is_not_generic_io_and_keeps_no_stderr() {
     let debug = format!("{failure:?} {failure}");
     assert!(!debug.contains("MADE-STAGE-UPDATE-REQUIRED"));
     assert!(!debug.contains("deadbeef"));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dropped_connection_keeps_sshs_last_stderr_lines_for_the_log_only() {
+    use made_platform::ssh::{SshEvent, SshFailureKind, SshProcess};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let known_hosts = root.join("known_hosts");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&known_hosts)
+        .unwrap();
+    let fake = root.join("ssh");
+    write_executable(&fake, "#!/bin/sh\nif [ \"$1\" = \"-V\" ]; then printf 'OpenSSH_9.6p1\\n' >&2; exit 0; fi\nprintf 'noise\\nclient_loop: send disconnect: Broken pipe\\n' >&2\nexit 255\n",);
+    let askpass = root.join("askpass");
+    write_executable(&askpass, "#!/bin/sh\nexit 0\n");
+    let mut options = options();
+    options.executable = fake;
+    options.askpass_executable = askpass;
+    options.private_directory = root.to_path_buf();
+    options.known_hosts = known_hosts;
+    options.command = SshCommand::Stage;
+    let mut process = SshProcess::spawn(options).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let failure = loop {
+        match process.poll() {
+            Some(SshEvent::Failed(failure)) => break failure,
+            Some(event) => panic!("unexpected event: {event:?}"),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => panic!("the exit was not reported"),
+        }
+    };
+    assert_eq!(failure.kind(), SshFailureKind::Io);
+    // The failure itself stays a fixed, program-neutral sentence.
+    assert!(!format!("{failure:?} {failure}").contains("Broken pipe"));
+    let tail = process.stderr_tail();
+    assert!(
+        tail.contains("client_loop: send disconnect: Broken pipe"),
+        "{tail}"
+    );
+    assert!(tail.chars().all(|c| !c.is_control()));
 }
 
 #[test]

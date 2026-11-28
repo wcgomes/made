@@ -223,7 +223,7 @@ mod neutrality {
         ("diagnostics.rs", 2),
         ("tui.rs", 7),
         ("ui.rs", 5),
-        ("workbench.rs", 23),
+        ("workbench.rs", 25),
     ];
 
     /// Lines inside remote-path regions per core file (the lines between the
@@ -234,7 +234,7 @@ mod neutrality {
         ("diagnostics.rs", 222),
         ("tui.rs", 40),
         ("ui.rs", 193),
-        ("workbench.rs", 410),
+        ("workbench.rs", 447),
     ];
 
     /// Core-named items that stay outside remote-path regions, in two named

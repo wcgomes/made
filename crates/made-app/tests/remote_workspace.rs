@@ -717,7 +717,8 @@ fn bounded_requests_and_outside_root_require_explicit_grant() {
             None
         )
         .is_err());
-    for _ in 0..MAX_IN_FLIGHT {
+    // The workspace keeps two of the client's slots free (heartbeat, resize).
+    for _ in 0..MAX_IN_FLIGHT - 2 {
         workspace.request(Operation::SessionState, None).unwrap();
     }
     assert!(workspace.request(Operation::SessionState, None).is_err());

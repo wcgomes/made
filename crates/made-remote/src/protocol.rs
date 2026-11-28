@@ -16,6 +16,11 @@ pub const MAX_DIRECTORY_ENTRIES: usize = made_explorer::tree::MAX_DIR_ENTRIES;
 pub const MAX_TREE_ROWS: usize = made_explorer::tree::MAX_TREE_ROWS;
 pub const MAX_TREE_DEPTH: usize = made_explorer::tree::MAX_TREE_DEPTH;
 pub const MAX_GIT_BYTES: u64 = 2 * 1024 * 1024;
+/// Directories one tab may have under a `WatchDir` subscription at a time,
+/// the workspace root included. A bound on the server's platform watch table
+/// (inotify watches are a per-user resource); a request beyond it is answered
+/// with `ErrorCode::Limit` and the client falls back to its periodic refresh.
+pub const MAX_DIR_WATCHES: usize = 32;
 pub const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 pub const DETACHED_LEASE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -277,6 +282,20 @@ pub struct Capabilities {
     /// it is never probed; the field stays only for wire compatibility.
     #[serde(default)]
     pub python3: bool,
+    /// The supervisor decodes `WatchDir`, `UnwatchDir` and encodes
+    /// `GitChanged`. Additive within major 1: a companion that predates it
+    /// omits the field, which reads as false, and is then never sent those
+    /// operations (it would treat them as fatal decode errors); the client
+    /// keeps the root-only `Watch` and its periodic refresh instead.
+    #[serde(default)]
+    pub watch_dirs: bool,
+    /// The supervisor decodes `StartShell` and encodes `ShellStarted`.
+    /// Additive within major 1: a companion that predates it omits the field,
+    /// which reads as false, and is then never sent that operation (it would
+    /// treat it as a fatal decode error); the exit banner says why no shell
+    /// can be opened.
+    #[serde(default)]
+    pub start_shell: bool,
 }
 
 /// Bounded Grok activity vocabulary shared by snapshots and events; mirrors the
@@ -545,9 +564,33 @@ pub enum Operation {
     Rescan {
         path: RemotePath,
     },
+    /// Reply to `Watch`, `WatchDir` and `Rescan`, and the unsolicited push
+    /// that follows a `Watch`/`WatchDir` acknowledgement under the same
+    /// request id. A `Watch` push names the watched path itself (anything
+    /// beneath it may have changed). A `WatchDir` push names the entry that
+    /// changed inside the watched directory, or the directory itself.
     Changed {
         path: RemotePath,
     },
+    /// Subscribe to one directory, non-recursively; additive, so a tab holds
+    /// one subscription per expanded folder (at most `MAX_DIR_WATCHES`).
+    /// Acknowledged with `Changed { path }`, then every change inside the
+    /// directory is pushed as `Changed` under this request id. Subscribing to
+    /// the workspace root also subscribes to the repository metadata the root
+    /// belongs to (`HEAD`, the index, refs), reported as `GitChanged` under the
+    /// same request id. A companion that predates it treats an unknown
+    /// operation as a fatal decode error, so it is sent only to a supervisor
+    /// whose `Capabilities.watch_dirs` is true.
+    WatchDir {
+        path: RemotePath,
+    },
+    /// Release the `WatchDir` subscription of `path`. Answered with `Ack`.
+    UnwatchDir {
+        path: RemotePath,
+    },
+    /// Unsolicited, under the request id of the root's `WatchDir`: the Git
+    /// state of the watched root (HEAD, index, refs) changed.
+    GitChanged,
     GitRead {
         command: GitRead,
     },
@@ -615,6 +658,21 @@ pub enum Operation {
     },
     TerminalExit {
         code: u32,
+    },
+    /// Start the remote interactive shell (the one `LaunchTarget::Shell`
+    /// starts) in this attachment's terminal after a launch-bar TUI exited
+    /// cleanly. The screen and scrollback the TUI left stay; the new shell
+    /// runs at the terminal's current size in `directory`, or in `fallback`
+    /// (the tab's launch folder) when `directory` is not a usable directory
+    /// on the server. Refused while the child still runs. Answered with
+    /// `ShellStarted`.
+    StartShell {
+        directory: RemotePath,
+        fallback: RemotePath,
+    },
+    /// Reply to `StartShell`: the directory the new shell starts in.
+    ShellStarted {
+        path: RemotePath,
     },
     UploadBegin {
         upload_id: u64,
@@ -839,6 +897,8 @@ impl WireEnvelope {
             | Preview { path }
             | Refresh { path }
             | Watch { path }
+            | WatchDir { path }
+            | UnwatchDir { path }
             | Rescan { path } => {
                 if !path.is_within(root) {
                     return Err(ProtocolError::Path);
@@ -857,6 +917,7 @@ impl WireEnvelope {
             | ClaudeTrigger
             | TerminalInput { .. }
             | TerminalResize { .. }
+            | StartShell { .. }
             | UploadBegin { .. }
             | UploadChunk { .. }
             | UploadCommit { .. }
@@ -892,6 +953,8 @@ impl WireEnvelope {
                 | ClaudeTrigger,
                 Ack,
             )
+            | (UnwatchDir { .. }, Ack)
+            | (StartShell { .. }, ShellStarted { .. })
             | (SessionState, SessionSnapshot { .. })
             | (GrokState, GrokSnapshot { .. })
             | (ClaudeState, ClaudeSnapshot { .. }) => true,
@@ -913,7 +976,10 @@ impl WireEnvelope {
             ) => a == b && *generation > request.identity.generation,
             (List { path: a }, Listed { path: b, .. })
             | (Preview { path: a } | Refresh { path: a }, PreviewResult { path: b, .. })
-            | (Watch { path: a } | Rescan { path: a }, Changed { path: b }) => a == b,
+            | (
+                Watch { path: a } | WatchDir { path: a } | Rescan { path: a },
+                Changed { path: b },
+            ) => a == b,
             (GitRead { command: a }, GitResult { command: b, .. }) => a == b,
             (Focus { session_id: a }, FocusResult { session_id: b, .. }) => a == b,
             (UploadCommit { upload_id: a }, UploadResult { upload_id: b, .. }) => a == b,
@@ -1072,6 +1138,8 @@ impl ReplyProgress {
                 | Preview { .. }
                 | Refresh { .. }
                 | Watch { .. }
+                | WatchDir { .. }
+                | UnwatchDir { .. }
                 | Rescan { .. }
                 | GitRead { .. }
                 | SessionState
@@ -1081,6 +1149,7 @@ impl ReplyProgress {
                 | ClaudeTrigger
                 | TerminalInput { .. }
                 | TerminalResize { .. }
+                | StartShell { .. }
                 | UploadBegin { .. }
                 | UploadChunk { .. }
                 | UploadCommit { .. }
